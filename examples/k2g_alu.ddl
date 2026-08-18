@@ -24,14 +24,14 @@
 -- two copies of an opcode map is the exact failure this project already paid
 -- for once, so there is one copy now.
 
-fun rdt_is_signed (t: i3, signed_: out i1)
+fun rdt_is_signed (t: rdt_e, signed_: out i1)
   signed_ = t[2]
 
 fun k2g_alu (
     a: i32,
     b: i32,
-    a_tag: i3,           -- rdt_e of the left operand
-    b_tag: i3,           -- rdt_e of the right operand
+    a_tag: rdt_e,        -- interpretation of the left operand
+    b_tag: rdt_e,        -- interpretation of the right operand
     arith_op: arith_e,
     logic_op: logic_e,
     cmp_op: cmp_e,

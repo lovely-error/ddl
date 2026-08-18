@@ -1486,6 +1486,21 @@ unsafe fn try_parse_invocation_tuple(
     loop {
         let (_, tail) = skip_whitespaces(char_ptr, char_end_ptr);
         char_ptr = tail;
+        // An argument list may continue on the next line, whether the break
+        // comes after the open paren or after a comma. A call with eight
+        // operands is unreadable on one line, and every port list in the
+        // SystemVerilog this replaces is wrapped.
+        //
+        // The continuation must be indented PAST the statement that opened the
+        // call. That is what keeps it distinguishable from the other thing a
+        // line break can start here -- an indented block -- and it is the same
+        // test the closing paren below makes, one level in the other
+        // direction.
+        let (depth, tail_) = skip_trivia(char_ptr, char_end_ptr);
+        let continues_on_next_line = depth > parent_depth;
+        if continues_on_next_line {
+            char_ptr = tail_;
+        }
         let (is_paren_end, tail) = strip_prefix_on_match(char_ptr, char_end_ptr, ")");
         if is_paren_end {
             char_ptr = tail;
@@ -1496,7 +1511,7 @@ unsafe fn try_parse_invocation_tuple(
         args.push(arg);
         let (is_comma, tail) = strip_prefix_on_match(char_ptr, char_end_ptr, ",");
         if is_comma {
-            char_ptr = tail
+            char_ptr = tail;
         }
         {
             // special case to make it valid for closing paren to appear on newline e.g. call(...\n)

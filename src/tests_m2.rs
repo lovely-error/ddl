@@ -434,7 +434,7 @@ fn the_ported_modules_still_compile() {
         return;
     }
     for (path, needs_types) in [
-        ("examples/k2g_shift.ddl", false),
+        ("examples/k2g_shift.ddl", true),
         ("examples/k2g_alu.ddl", true),
     ] {
         let text = match std::fs::read_to_string(path) {
@@ -2202,7 +2202,7 @@ fn the_verified_alu_and_shifter_can_be_called() {
         + &std::fs::read_to_string("examples/k2g_alu.ddl").expect("alu")
         + &std::fs::read_to_string("examples/k2g_shift.ddl").expect("shift")
         + concat!(
-            "\nfun both (a: i32, b: i32, t: i3, n: i5, ra: out i32, rs: out i32)\n",
+            "\nfun both (a: i32, b: i32, t: rdt_e, n: i5, ra: out i32, rs: out i32)\n",
             "  let (arith, ovf, log_r, cmp_r, un) = k2g_alu(a, b, t, t, ARITH_ADD, LOGIC_AND, CMP_EQ, UNARY_NEG)\n",
             "  let (sh, bx, bi) = k2g_shift(a, b, n, SHIFT_LL, 5'd0, 5'd8)\n",
             "  ra = arith\n",

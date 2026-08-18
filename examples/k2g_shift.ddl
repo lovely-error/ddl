@@ -4,7 +4,7 @@
 -- `fun`: the three results leave through `out` parameters, which is how a
 -- function expresses a module with more than one output.
 --
--- shift_op is `i2` rather than the SystemVerilog `shift_e`. Enums land in M2;
+-- shift_op is `shift_e`, shared with k2g_types.ddl.
 -- until then the encoding is written out, and an SV `shift_e` signal connects
 -- to a `[1:0]` port without a cast.
 
@@ -12,7 +12,7 @@ fun k2g_shift (
     value: i32,          -- shift operand, and the BINS destination
     src: i32,            -- BEXT source, and the BINS insert source
     amount: i5,          -- shift amount, already masked to 5 bits
-    shift_op: i2,        -- 0 = SHIFT_LL, 1 = SHIFT_LR, 2 = SHIFT_AR
+    shift_op: shift_e,
     bm_start: i5,
     bm_span: i5,
 
@@ -29,10 +29,10 @@ fun k2g_shift (
   -- `>>` is arithmetic when its left operand is signed and logical when it is
   -- unsigned, so @signed is what picks SHRA -- the same job `value_s` does in
   -- the SystemVerilog.
-  if shift_op == 2'd0 then
+  if shift_op == SHIFT_LL then
     shift_result = value << amount
   else
-    if shift_op == 2'd1 then
+    if shift_op == SHIFT_LR then
       shift_result = value >> amount
     else
       shift_result = @unsigned(@signed(value) >> amount)

@@ -23,7 +23,7 @@ GW_SH="${GW_SH:-/c/Gowin/Gowin_V1.9.12.02_SP2_x64/IDE/bin/gw_sh.exe}"
 WORK="${WORK:-$DDL_ROOT/target/verify}"
 RTL="$K2G/rtl"
 
-ALL_MODULES=(k2g_shift k2g_alu k2g_decode k2g_regfile k3g_stage fsm_adder mul3)
+ALL_MODULES=(k2g_shift k2g_alu k2g_decode k2g_xstage k3g_stage fsm_adder mul3)
 MODULES=("$@")
 [ ${#MODULES[@]} -eq 0 ] && MODULES=("${ALL_MODULES[@]}")
 
@@ -52,10 +52,16 @@ for m in "${MODULES[@]}"; do
   # compiled from a concatenation. k2g_pkg.ddl is generated from the emulator
   # by emu/src/ddl_gen.rs -- the same source as k2g_pkg.sv.
   case "$m" in
-    k2g_alu | k2g_decode | k2g_regfile)
+    k2g_alu | k2g_decode | k2g_shift | k2g_xstage)
       mkdir -p "$WORK/$m"
       src="$WORK/$m/src.ddl"
-      cat "$K2G/rtl/k2g_pkg.ddl"           "$DDL_ROOT/examples/k2g_types.ddl"           "$DDL_ROOT/examples/$m.ddl" > "$src"
+      helpers=""
+      if [ "$m" = "k2g_xstage" ]; then
+        # The slice CALLS the verified ALU and shifter rather than repeating
+        # them, so they are part of its source.
+        helpers="$DDL_ROOT/examples/k2g_alu.ddl $DDL_ROOT/examples/k2g_shift.ddl"
+      fi
+      cat "$K2G/rtl/k2g_pkg.ddl" "$DDL_ROOT/examples/k2g_types.ddl" $helpers "$DDL_ROOT/examples/$m.ddl" > "$src"
       ;;
   esac
 
@@ -70,10 +76,18 @@ for m in "${MODULES[@]}"; do
   ref_sv="$RTL/$m.sv"
   ref_srcs=("$RTL/k2g_pkg.sv" "$RTL/k2g_types.svh" "$RTL/$m.sv")
   standalone=0
+  parts=()
   if [ -f "$DDL_ROOT/examples/${m}_ref.sv" ]; then
     ref_sv="$DDL_ROOT/examples/${m}_ref.sv"
     ref_srcs=("$ref_sv")
     standalone=1
+  fi
+  # k2g_xstage's reference is not hand-written logic: it instantiates the
+  # unmodified regfile, ALU and shifter and wires them the way k2g_core.sv
+  # does. They compile with it, and synthesize with it.
+  if [ "$m" = "k2g_xstage" ]; then
+    parts=("$RTL/k2g_pkg.sv" "$RTL/k2g_types.svh" "$RTL/k2g_regfile.sv" "$RTL/k2g_alu.sv" "$RTL/k2g_shift.sv")
+    ref_srcs=("${parts[@]}" "$ref_sv")
   fi
 
   eq="$WORK/$m/equiv"
@@ -128,7 +142,15 @@ set_option -verilog_std sysv2017
 set_option -include_path {.}
 run syn
 TCL
-  if [ "$standalone" = "1" ]; then
+  if [ ${#parts[@]} -gt 0 ]; then
+    cp "${parts[@]}" "$syn/ref/"
+    cp "$ref_sv" "$syn/ref/$m.sv"
+    ref_top="${m}_ref"
+    pkg_line="add_file -type verilog {k2g_pkg.sv}
+add_file -type verilog {k2g_regfile.sv}
+add_file -type verilog {k2g_alu.sv}
+add_file -type verilog {k2g_shift.sv}"
+  elif [ "$standalone" = "1" ]; then
     cp "$ref_sv" "$syn/ref/$m.sv"
     ref_top="${m}_ref"
     pkg_line=""

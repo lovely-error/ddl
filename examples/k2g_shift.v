@@ -1,9 +1,31 @@
 // GENERATED FILE -- DO NOT EDIT BY HAND
 //
-// Regenerate with: ddl build E:/Code/ddl/examples/k2g_shift.ddl -o E:/Code/ddl/examples/k2g_shift.v
+// Regenerate with: ddl build E:/Code/ddl/target/verify/k2g_shift/src.ddl -o E:/Code/ddl/examples/k2g_shift.v
 //
 // Verilog-2005. No `$clog2`, no width casts in expressions and no
 // function calls: all three make GowinSynthesis exit with an empty log.
+
+module uop_nop (
+    output [126:0] u
+);
+
+  assign u = 127'd0;
+
+endmodule
+
+module uop_fault (
+    input  [4:0]   cause,
+    input  [15:0]  cp,
+    output [126:0] u
+);
+
+  wire [126:0] f = 127'd0;
+  wire [126:0] n5 = {5'h12, f[121:0]};
+  wire [126:0] n8 = {n5[126:37], cause, n5[31:0]};
+
+  assign u = {n8[126:112], {16'd0, cp}, n8[79:0]};
+
+endmodule
 
 module k2g_shift (
     input  [31:0] value,
@@ -17,14 +39,14 @@ module k2g_shift (
     output [31:0] bins_result
 );
 
-  wire signed [31:0] n12 = value;
-  wire signed [31:0] n13 = n12 >>> amount;
-  wire [31:0] n14 = n13;
+  wire signed [31:0] n16 = value;
+  wire signed [31:0] n17 = n16 >>> amount;
+  wire [31:0] n18 = n17;
   wire [31:0] span_mask = (bm_span == 5'd0) ? 32'd0 : ((32'd1 << bm_span) - 32'd1);
   wire [31:0] placed_mask = span_mask << bm_start;
   wire [31:0] placed_src = (src & span_mask) << bm_start;
 
-  assign shift_result = ((shift_op == 2'd0) ? (value << amount) : ((shift_op == 2'd1) ? (value >> amount) : n14));
+  assign shift_result = ((shift_op == 2'd0) ? (value << amount) : ((shift_op == 2'd1) ? (value >> amount) : n18));
   assign bext_result = ((src >> bm_start) & span_mask);
   assign bins_result = ((value & (~placed_mask)) | placed_src);
 
