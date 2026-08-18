@@ -18,6 +18,7 @@ pub struct PrecArgTupleEntry {
     pub arg_name: AlphanumSpan,
     pub qualifier: ArgTypeQualifier,
     pub type_expr: PrecTypeExpr,
+    pub default: Option<PrecResExpr>,
 }
 #[derive(Debug, Clone)]
 pub struct PrecArgDefTuple {
@@ -800,10 +801,15 @@ unsafe fn resolve_arg_tuple(
     for item in entries {
         let ty = &item.type_expr;
         let k = resolve_type(char_ptr, ty)?;
+        let default = match &item.default {
+            Some(e) => Some(resolve_precedence(char_ptr, e)?),
+            None => None,
+        };
         let x = PrecArgTupleEntry {
             arg_name: item.arg_name,
             qualifier: item.qualifier,
             type_expr: k,
+            default,
         };
         result.push(x);
     }

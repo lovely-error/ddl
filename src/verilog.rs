@@ -75,6 +75,20 @@ pub fn emit_module(module: &Module, _opts: &EmitOptions) -> String {
 }
 
 fn emit_header(out: &mut String, module: &Module) {
+    // Constants are folded to literals before they get here, so without this
+    // the file gives no hint that the shape it has was a choice.
+    if !module.params.is_empty() {
+        out.push_str("// Built with:\n");
+        for (name, ty, value) in &module.params {
+            out.push_str(&format!(
+                "//   {} : {} = {}\n",
+                name,
+                ty.display(),
+                render_const(*value, ty)
+            ));
+        }
+        out.push_str("//\n");
+    }
     out.push_str(&format!("module {} (\n", sanitize(&module.name)));
 
     // Widest declaration prefix, so the port names line up in a column.

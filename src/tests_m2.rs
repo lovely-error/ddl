@@ -1098,16 +1098,27 @@ fn zeroed_takes_the_type_of_an_assignment_target() {
 }
 
 // ---- clocked processes ---------------------------------------------------
+//
+// A process takes data through pipes and nothing else, so these all share one
+// boundary: `src` carries the stimulus and `got` is "an item arrived this
+// cycle" -- which is exactly what a bare `go: i1` input used to mean, spelled
+// so the compiler owns the protocol. `o` is a `stream out` because these are
+// observations of state, and a stream sink never stalls its producer.
+
+/// The header every register test uses, plus the receive that drives it.
+const PROC_IN: &str = concat!(
+    "process p (src: buffer in i8, o: stream out i8)\n",
+    "  var c: i8 = @zeroed()\n",
+    "  let (x, go) = @try_rcv(src)\n",
+);
 
 #[test]
 fn a_process_gets_implicit_clock_and_reset() {
     // "A process has channel ports and clock/reset. Nothing else."
-    let v = compile(concat!(
-        "process p (go: i1, o: out i8)\n",
-        "  var c: i8 = @zeroed()\n",
-        "  if go then\n",
-        "    c = c + 8'd1\n",
-        "  o = c\n",
+    let v = compile(&format!(
+        "{}{}",
+        PROC_IN,
+        concat!("  if go then\n", "    c = c + 8'd1\n", "  let _s = @try_send(o, c)\n")
     ));
     assert!(v.contains("input        clk"), "{}", v);
     assert!(v.contains("input        rst_n"), "{}", v);
@@ -1118,11 +1129,12 @@ fn a_process_gets_implicit_clock_and_reset() {
 #[test]
 fn a_var_in_a_process_becomes_a_register() {
     let v = compile(concat!(
-        "process p (go: i1, o: out i8)\n",
+        "process p (src: buffer in i8, o: stream out i8)\n",
         "  var c: i8 = 8'd7\n",
+        "  let (x, go) = @try_rcv(src)\n",
         "  if go then\n",
         "    c = c + 8'd1\n",
-        "  o = c\n",
+        "  let _s = @try_send(o, c)\n",
     ));
     assert!(v.contains("reg [7:0] c;"), "{}", v);
     assert!(v.contains("c <= 8'd7;"), "reset value from the declaration:\n{}", v);
@@ -1132,14 +1144,12 @@ fn a_var_in_a_process_becomes_a_register() {
 fn an_unassigned_register_keeps_its_value() {
     // This is what makes a conditional assignment a clock enable: the else
     // branch of the mux is the register itself.
-    let v = compile(concat!(
-        "process p (go: i1, o: out i8)\n",
-        "  var c: i8 = @zeroed()\n",
-        "  if go then\n",
-        "    c = c + 8'd1\n",
-        "  o = c\n",
+    let v = compile(&format!(
+        "{}{}",
+        PROC_IN,
+        concat!("  if go then\n", "    c = c + 8'd1\n", "  let _s = @try_send(o, c)\n")
     ));
-    assert!(v.contains("go ? (c + 8'd1) : c"), "{}", v);
+    assert!(v.contains("? (c + 8'd1) : c"), "{}", v);
 }
 
 /// Reads see the value at the start of the cycle plus whatever the body has
@@ -1148,37 +1158,34 @@ fn an_unassigned_register_keeps_its_value() {
 /// carries the current or the next value.
 #[test]
 fn a_register_read_sees_earlier_assignments_in_the_same_cycle() {
-    let before = compile(concat!(
-        "process p (go: i1, o: out i8)\n",
-        "  var c: i8 = @zeroed()\n",
-        "  o = c\n",
-        "  if go then\n",
-        "    c = c + 8'd1\n",
+    let before = compile(&format!(
+        "{}{}",
+        PROC_IN,
+        concat!("  let _s = @try_send(o, c)\n", "  if go then\n", "    c = c + 8'd1\n")
     ));
-    // Read first: the output is the registered value.
-    assert!(before.contains("assign o = c;"), "{}", before);
+    // Sent first: what leaves is the registered value, untouched.
+    assert!(before.contains("? c : o_hold"), "{}", before);
 
-    let after = compile(concat!(
-        "process p (go: i1, o: out i8)\n",
-        "  var c: i8 = @zeroed()\n",
-        "  if go then\n",
-        "    c = c + 8'd1\n",
-        "  o = c\n",
+    let after = compile(&format!(
+        "{}{}",
+        PROC_IN,
+        concat!("  if go then\n", "    c = c + 8'd1\n", "  let _s = @try_send(o, c)\n")
     ));
-    // Read after: the output is what will be clocked in.
-    assert!(!after.contains("assign o = c;"), "{}", after);
-    assert!(after.contains("go ? "), "{}", after);
+    // Sent after: what leaves is what will be clocked in.
+    assert!(!after.contains("? c : o_hold"), "{}", after);
+    assert!(after.contains("(c + 8'd1)"), "{}", after);
 }
 
 #[test]
 fn a_register_can_hold_a_struct_and_be_updated_field_by_field() {
     let v = compile(&format!(
         concat!(
-            "{}process p (k: kind_e, go: i1, o: out uop_t)\n",
+            "{}process p (src: buffer in kind_e, o: stream out uop_t)\n",
             "  var acc: uop_t = @zeroed()\n",
+            "  let (k, go) = @try_rcv(src)\n",
             "  if go then\n",
             "    acc.kind = k\n",
-            "  o = acc\n",
+            "  let _s = @try_send(o, acc)\n",
         ),
         UOP
     ));
@@ -1193,11 +1200,12 @@ fn an_enum_register_resets_to_its_named_variant() {
         "  S_IDLE\n",
         "  S_RUN\n",
         "  S_DONE\n",
-        "process p (go: i1, o: out st_e)\n",
+        "process p (src: buffer in i8, o: stream out st_e)\n",
         "  var st: st_e = S_RUN\n",
+        "  let (x, go) = @try_rcv(src)\n",
         "  if go then\n",
         "    st = S_DONE\n",
-        "  o = st\n",
+        "  let _s = @try_send(o, st)\n",
     ));
     assert!(v.contains("st <= 2'd1;"), "S_RUN is 1:\n{}", v);
 }
@@ -1205,35 +1213,79 @@ fn an_enum_register_resets_to_its_named_variant() {
 #[test]
 fn a_register_reset_value_must_be_constant() {
     let text = compile_err(concat!(
-        "process p (seed: i8, o: out i8)\n",
-        "  var c: i8 = seed\n",
-        "  o = c\n",
+        "process p (src: buffer in i8, o: stream out i1)\n",
+        "  var c: i1 = clk\n",
+        "  let _s = @try_send(o, c)\n",
     ));
     assert!(text.contains("must be a constant"), "{}", text);
 }
 
 #[test]
+fn a_constant_parameter_can_be_a_reset_value() {
+    // The counterpart: a plain parameter is a compile-time constant, so it is
+    // exactly what a reset value is allowed to be.
+    let v = compile(concat!(
+        "process p (seed: i8 = 8'd9, src: buffer in i8, o: stream out i8)\n",
+        "  var c: i8 = seed\n",
+        "  let (x, got) = @try_rcv(src)\n",
+        "  let _s = @try_send(o, c)\n",
+    ));
+    assert!(v.contains("c <= 8'd9;"), "{}", v);
+    // Named in the header comment so the file is readable, and folded away
+    // everywhere else: it is not a port.
+    assert!(v.contains("//   seed : i8 = 8'd9"), "{}", v);
+    let body = v.split("module p (").nth(1).expect("a module");
+    assert!(!body.contains("seed"), "{}", body);
+}
+
+#[test]
 fn a_register_needs_a_declared_type() {
     let text = compile_err(concat!(
-        "process p (go: i1, o: out i8)\n",
+        "process p (src: buffer in i8, o: stream out i8)\n",
         "  var c = 8'd0\n",
-        "  o = c\n",
+        "  let _s = @try_send(o, c)\n",
     ));
     assert!(text.contains("needs a declared type"), "{}", text);
 }
 
 #[test]
-fn a_process_with_no_state_should_be_a_fun() {
-    let text = compile_err("process p (a: i8, o: out i8)\n  o = a\n");
-    assert!(text.contains("should be a `fun`"), "{}", text);
+fn a_process_needs_at_least_one_pipe() {
+    // Constants alone are not a boundary: nothing can observe this.
+    let text = compile_err(concat!(
+        "process p (a: i8 = 8'd1)\n",
+        "  var c: i8 = @zeroed()\n",
+        "  c = a\n",
+    ));
+    assert!(text.contains("at least one pipe"), "{}", text);
+}
+
+#[test]
+fn a_process_has_no_plain_data_ports() {
+    // The rule the language is built on: a process cannot present a raw wire
+    // and hand-roll a protocol over it.
+    let ins = compile_err(concat!(
+        "process p (cp: i16, dst: buffer out i16)\n",
+        "  var c: i16 = @zeroed()\n",
+        "  c = cp\n",
+        "  let _s = @try_send(dst, c)\n",
+    ));
+    assert!(ins.contains("has no value"), "{}", ins);
+    assert!(ins.contains("buffer in"), "{}", ins);
+
+    let outs = compile_err(concat!(
+        "process p (src: buffer in i16, o: out i16)\n",
+        "  let (x, got) = @try_rcv(src)\n",
+        "  o = x\n",
+    ));
+    assert!(outs.contains("no plain outputs"), "{}", outs);
 }
 
 #[test]
 fn clk_and_rst_n_cannot_be_declared_by_hand() {
     let text = compile_err(concat!(
-        "process p (clk: i1, o: out i8)\n",
+        "process p (clk: i1, o: stream out i8)\n",
         "  var c: i8 = @zeroed()\n",
-        "  o = c\n",
+        "  let _s = @try_send(o, c)\n",
     ));
     assert!(text.contains("implicit on a process"), "{}", text);
 }
@@ -1245,14 +1297,17 @@ fn clk_and_rst_n_cannot_be_declared_by_hand() {
 #[test]
 fn a_two_level_dedent_after_a_nested_if_parses() {
     let v = compile(concat!(
-        "process p (go: i1, clear: i1, o: out i8)\n",
+        "process p (src: buffer in i8, o: stream out i8)\n",
         "  var c: i8 = @zeroed()\n",
+        "  let (x, got) = @try_rcv(src)\n",
+        "  let clear: i1 = x[0]\n",
+        "  let go: i1 = x[1]\n",
         "  if clear then\n",
         "    c = @zeroed()\n",
         "  else\n",
         "    if go then\n",
         "      c = c + 8'd1\n",
-        "  o = c\n",
+        "  let _s = @try_send(o, c)\n",
     ));
     assert!(v.contains("clear ?"), "{}", v);
     assert!(v.contains("go ?"), "{}", v);
@@ -1424,7 +1479,7 @@ fn a_value_crossing_a_state_becomes_a_register() {
 #[test]
 fn a_barrier_inside_a_conditional_is_rejected_rather_than_mis_scheduled() {
     let text = compile_err(concat!(
-        "process p (src: buffer in i32, dst: buffer out i32, go: i1)\n",
+        "process p (go: i1 = 1'b1, src: buffer in i32, dst: buffer out i32)\n",
         "  loop\n",
         "    if go then\n",
         "      let a = @rcv(src)\n",
@@ -1537,12 +1592,24 @@ fn a_sequence_must_end_by_sending() {
 
 // ---- M5: memories, assertions, and the emit modes ------------------------
 
+const CMD: &str = concat!(
+    "struct cmd_t\n",
+    "  we: i1\n",
+    "  addr: i5\n",
+    "  data: i32\n",
+);
+
 const REGFILE: &str = concat!(
-    "process rf (ra: i5, we: i1, wa: i5, wd: i32, rd: out i32)\n",
+    "struct cmd_t\n",
+    "  we: i1\n",
+    "  addr: i5\n",
+    "  data: i32\n",
+    "process rf (cmd: buffer in cmd_t, rd: stream out i32)\n",
     "  var vals: #[impl(lutram)] [i32; 32] = @zeroed()\n",
-    "  rd = vals[ra]\n",
-    "  if we then\n",
-    "    vals[wa] = wd\n",
+    "  let (c, got) = @try_rcv(cmd)\n",
+    "  let _s = @try_send(rd, vals[c.addr])\n",
+    "  if c.we then\n",
+    "    vals[c.addr] = c.data\n",
 );
 
 #[test]
@@ -1562,18 +1629,18 @@ fn a_memory_read_is_asynchronous() {
     // The read is a continuous assignment, not something clocked: that is the
     // shape SSRAM is inferred from, and it is what lets one cycle do
     // read -> forward -> add.
-    assert!(v.contains("= vals[ra];"), "{}", v);
+    assert!(v.contains("= vals[cmd_data[36:32]];"), "{}", v);
 }
 
 #[test]
 fn a_conditional_write_becomes_a_write_enable() {
     let v = compile(REGFILE);
-    assert!(v.contains("end else if (we) begin"), "{}", v);
-    assert!(v.contains("vals[wa] <= wd;"), "{}", v);
+    assert!(v.contains("end else if (cmd_data[37]) begin"), "{}", v);
+    assert!(v.contains("vals[cmd_data[36:32]] <= cmd_data[31:0];"), "{}", v);
     // The address and the data must NOT carry the enable's mux as well: the
     // write does not happen when the enable is low, so muxing them is pure
     // area. The SSA join produces those muxes and they are dropped again.
-    assert!(!v.contains("(we ? wa"), "{}", v);
+    assert!(!v.contains("? cmd_data[36:32] :"), "{}", v);
 }
 
 #[test]
@@ -1591,26 +1658,30 @@ fn an_initialised_memory_gets_a_reset_loop() {
 fn a_memory_with_no_initialiser_has_no_reset_loop() {
     // Not a default: the reset loop costs about 85 LUTs and some extra RAM
     // primitives on the K2G value array, so the source decides.
-    let v = compile(concat!(
-        "process rf (ra: i5, we: i1, wa: i5, wd: i32, rd: out i32)\n",
-        "  var vals: #[impl(lutram)] [i32; 32]\n",
-        "  rd = vals[ra]\n",
-        "  if we then\n",
-        "    vals[wa] = wd\n",
+    let v = compile(&format!(
+        "{}{}",
+        CMD,
+        concat!(
+            "process rf (cmd: buffer in cmd_t, rd: stream out i32)\n",
+            "  var vals: #[impl(lutram)] [i32; 32]\n",
+            "  let (c, got) = @try_rcv(cmd)\n",
+            "  let _s = @try_send(rd, vals[c.addr])\n",
+            "  if c.we then\n",
+            "    vals[c.addr] = c.data\n",
+        )
     ));
     assert!(!v.contains("integer vals_ix;"), "{}", v);
     assert!(!v.contains("for ("), "{}", v);
-    assert!(v.contains("if (we) begin"), "{}", v);
+    assert!(v.contains("if (cmd_data[37]) begin"), "{}", v);
 }
 
 #[test]
 fn the_element_type_can_be_an_enum() {
     let v = compile(&format!("{}{}", OPS, concat!(
-        "process rf (ra: i5, we: i1, wa: i5, wd: op_e, rd: out op_e)\n",
+        "process rf (addr: buffer in i5, rd: stream out op_e)\n",
         "  var tags: #[impl(lutram)] [op_e; 32] = OP_SUB\n",
-        "  rd = tags[ra]\n",
-        "  if we then\n",
-        "    tags[wa] = wd\n",
+        "  let (a, got) = @try_rcv(addr)\n",
+        "  let _s = @try_send(rd, tags[a])\n",
     )));
     assert!(v.contains("reg [1:0] tags [0:31];"), "{}", v);
     assert!(v.contains("<= 2'd1;"), "{}", v);
@@ -1619,16 +1690,18 @@ fn the_element_type_can_be_an_enum() {
 #[test]
 fn a_narrow_index_is_widened_and_a_wide_one_is_refused() {
     let v = compile(concat!(
-        "process rf (ra: i3, rd: out i32)\n",
+        "process rf (addr: buffer in i3, rd: stream out i32)\n",
         "  var vals: #[impl(lutram)] [i32; 32] = @zeroed()\n",
-        "  rd = vals[ra]\n",
+        "  let (a, got) = @try_rcv(addr)\n",
+        "  let _s = @try_send(rd, vals[a])\n",
     ));
     assert!(v.contains("vals["), "{}", v);
 
     let text = compile_err(concat!(
-        "process rf (ra: i8, rd: out i32)\n",
+        "process rf (addr: buffer in i8, rd: stream out i32)\n",
         "  var vals: #[impl(lutram)] [i32; 32] = @zeroed()\n",
-        "  rd = vals[ra]\n",
+        "  let (a, got) = @try_rcv(addr)\n",
+        "  let _s = @try_send(rd, vals[a])\n",
     ));
     assert!(text.contains("addressed by 5"), "{}", text);
     assert!(text.contains("@trunc"), "{}", text);
@@ -1637,9 +1710,10 @@ fn a_narrow_index_is_widened_and_a_wide_one_is_refused() {
 #[test]
 fn an_unknown_impl_is_rejected() {
     let text = compile_err(concat!(
-        "process rf (ra: i5, rd: out i32)\n",
+        "process rf (addr: buffer in i5, rd: stream out i32)\n",
         "  var vals: #[impl(sram)] [i32; 32] = @zeroed()\n",
-        "  rd = vals[ra]\n",
+        "  let (a, got) = @try_rcv(addr)\n",
+        "  let _s = @try_send(rd, vals[a])\n",
     ));
     assert!(text.contains("lutram"), "{}", text);
 }
@@ -1647,9 +1721,9 @@ fn an_unknown_impl_is_rejected() {
 #[test]
 fn a_memory_cannot_be_a_parameter() {
     let text = compile_err(concat!(
-        "process rf (vals: #[impl(lutram)] [i32; 32], ra: i5, rd: out i32)\n",
+        "process rf (vals: #[impl(lutram)] [i32; 32], rd: stream out i32)\n",
         "  var acc: i32 = 0\n",
-        "  rd = acc\n",
+        "  let _s = @try_send(rd, acc)\n",
     ));
     assert!(text.contains("cannot be a parameter"), "{}", text);
 }
@@ -1657,9 +1731,10 @@ fn a_memory_cannot_be_a_parameter() {
 #[test]
 fn a_memory_needs_a_constant_reset() {
     let text = compile_err(concat!(
-        "process rf (seed: i32, ra: i5, rd: out i32)\n",
-        "  var vals: #[impl(lutram)] [i32; 32] = seed\n",
-        "  rd = vals[ra]\n",
+        "process rf (addr: buffer in i5, rd: stream out i1)\n",
+        "  var vals: #[impl(lutram)] [i1; 32] = clk\n",
+        "  let (a, got) = @try_rcv(addr)\n",
+        "  let _s = @try_send(rd, vals[a])\n",
     ));
     assert!(text.contains("same constant"), "{}", text);
 }
@@ -1705,11 +1780,12 @@ fn an_assertion_is_guarded_on_simulation() {
 #[test]
 fn a_clocked_assertion_runs_on_the_edge_and_not_during_reset() {
     let v = compile(concat!(
-        "process p (x: i8, out_: out i8)\n",
+        "process p (src: buffer in i8, o: stream out i8)\n",
         "  var n: i8 = 0\n",
+        "  let (x, got) = @try_rcv(src)\n",
         "  @assert(x != 8'd0, \"x must not be zero\")\n",
         "  n = x\n",
-        "  out_ = n\n",
+        "  let _s = @try_send(o, n)\n",
     ));
     assert!(v.contains("always @(posedge clk) begin"), "{}", v);
     // Registers hold their reset value during reset, so an assertion about
@@ -1832,9 +1908,10 @@ fn bram_is_recognised_and_refused_rather_than_quietly_made_lutram() {
     // Accepting the annotation and emitting an asynchronous read would hand
     // back distributed RAM under a `bram` label.
     let text = compile_err(concat!(
-        "process rf (ra: i5, rd: out i32)\n",
+        "process rf (addr: buffer in i5, rd: stream out i32)\n",
         "  var vals: #[impl(bram)] [i32; 32] = @zeroed()\n",
-        "  rd = vals[ra]\n",
+        "  let (a, got) = @try_rcv(addr)\n",
+        "  let _s = @try_send(rd, vals[a])\n",
     ));
     assert!(text.contains("`#[impl(bram)]` is not supported yet"), "{}", text);
     assert!(text.contains("read takes a cycle"), "{}", text);

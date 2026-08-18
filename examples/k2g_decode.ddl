@@ -58,25 +58,42 @@ enum state_e: i2
 -- always_comb.)
 
 process k2g_decode (
-    -- Code point stream. `cp_valid` gates consumption; `flush` abandons a
-    -- partially accumulated instruction on a branch redirect.
-    cp: i16,
-    cp_valid: i1,
-    flush: i1,
-    -- Freezes the accumulator without suppressing the combinational decode.
-    -- Gating `cp_valid` with the pipeline stall instead would close a loop:
-    -- stall -> cp_valid -> uop_valid -> a CSP request -> stall.
-    hold: i1,
+    -- The code point stream. `cps_valid` / `cps_ready` / `cps_data` are
+    -- generated: the SystemVerilog spells the same handshake by hand as
+    -- `cp_valid` and `accept`.
+    cps: buffer in i16,
 
-    accept: out i1,        -- this code point was consumed
-    uop: out uop_t,
-    uop_valid: out i1)     -- `uop` completes an instruction
+    -- A branch redirect abandons a partially accumulated instruction. It is
+    -- an EVENT rather than a level, and it must not be able to stall its
+    -- producer -- a fetch unit cannot wait for the decoder to agree to be
+    -- flushed -- so it is a stream. The payload is unused; the arrival is the
+    -- whole message.
+    flush: stream in i1,
+
+    -- Micro-ops out. This is a `buffer`, and that is what removes `hold`.
+    --
+    -- The SystemVerilog needs a separate `hold` input because `uop_valid` has
+    -- no `ready` beside it: with no way for the sink to refuse an item, the
+    -- only way to stop the accumulator was a second signal that freezes it.
+    -- Its own comment records the trap that then opens -- gating `cp_valid`
+    -- with the stall instead would close a loop through
+    -- stall -> decode -> CSP request -> stall. A back-pressured channel has
+    -- no such choice to get wrong: `cps_ready` falls out of the slot being
+    -- full, `uop_valid` is a register, and rule 3 holds by construction.
+    uop: buffer out uop_t)
 
   var pfx: pfx_t = @zeroed()
   var state: state_e = S_PREFIX
   var llc_dst: i5 = @zeroed()
   var llc_kind: rdt_e = RDT_U32
   var llc_hi: i16 = @zeroed()
+
+  -- The item, and whether one transferred this cycle. `cp_valid` is the
+  -- TRANSFER, not the offer: it is already `cps_valid && cps_ready`, so it is
+  -- false on a cycle the sink is refusing -- which is exactly what
+  -- `cp_valid && !hold` used to spell out.
+  let (cp, cp_valid) = @try_rcv(cps)
+  let (_flush_payload, flushing) = @try_rcv(flush)
 
   -- The register values as of this clock edge. The body mutates the registers
   -- freely; these are what gets restored when the update is not taken, which
@@ -362,7 +379,6 @@ process k2g_decode (
 
   out_uop = @zeroed()
   emit = 1'b0
-  accept = cp_valid
 
   if cp_valid then
     pfx.bytes = pfx.bytes + 32'd2
@@ -440,16 +456,21 @@ process k2g_decode (
   -- Computed from the register, not from the copy the body may have already
   -- incremented, so it does not depend on `cp_valid`.
   out_uop.size_bytes = bytes_held + 32'd2
-  uop = out_uop
-  uop_valid = emit
+
+  -- A decoder does not produce a micro-op every cycle: a prefix accumulates
+  -- and emits nothing. The offer is made only on the cycles that complete an
+  -- instruction, and the generated handshake turns that into the write enable
+  -- on the output slot.
+  if emit then
+    @try_send(uop, out_uop)
 
   -- ---- register update ---------------------------------------------------
   -- Mirrors the always_ff of k2g_decode.sv: `flush` abandons a partially
   -- accumulated instruction on a branch redirect and resets everything;
   -- otherwise nothing moves unless a code point is actually consumed.
-  let update: i1 = cp_valid & !hold
+  let update: i1 = cp_valid
 
-  if flush then
+  if flushing then
     pfx = @zeroed()
     state = S_PREFIX
     llc_dst = @zeroed()

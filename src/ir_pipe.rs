@@ -126,7 +126,7 @@ pub fn lower_sequence(
             Binding { value: Some(v), ty: Ty::BOOL, is_output: false },
         );
     }
-    low.declare_pipes(&decl.args, sink)?;
+    low.declare_pipes(&decl.args, &mut env, sink)?;
 
     let inputs: Vec<usize> = (0..low.pipes.len()).filter(|i| low.pipes[*i].is_input).collect();
     let outputs: Vec<usize> = (0..low.pipes.len()).filter(|i| !low.pipes[*i].is_input).collect();
@@ -221,7 +221,10 @@ pub fn lower_sequence(
     let valid_base = 0usize;
     let v_last = low.emit(Ty::BOOL, Op::RegRead((valid_base + n - 1) as u32));
     low.name_value(v_last, format!("v{}", n - 1));
-    let out_ready = low.emit(Ty::BOOL, Op::Port(low.pipes[out_ix].ready_port));
+    let out_ready = match low.pipes[out_ix].ready_port {
+        Some(p) => low.emit(Ty::BOOL, Op::Port(p)),
+        None => low.emit(Ty::BOOL, Op::Const(1)),
+    };
     let not_last = low.emit(Ty::BOOL, Op::Un { op: UnOp::LogNot, arg: v_last });
     let en = low.emit(Ty::BOOL, Op::Bin { op: BinOp::Or, lhs: not_last, rhs: out_ready });
     low.name_value(en, "shift".to_string());
@@ -343,7 +346,9 @@ pub fn lower_sequence(
     }
 
     let mut drivers: Vec<(PortId, ValueId)> = Vec::new();
-    drivers.push((low.pipes[in_ix].ready_port, en));
+    if let Some(ready) = low.pipes[in_ix].ready_port {
+        drivers.push((ready, en));
+    }
     drivers.push((low.pipes[out_ix].valid_port, v_last));
     drivers.push((low.pipes[out_ix].data_port, out_held));
 
@@ -351,8 +356,10 @@ pub fn lower_sequence(
         return None;
     }
     let asserts = std::mem::take(&mut low.asserts);
+    let params = std::mem::take(&mut low.params);
     let (values, ports) = low.take_values();
     Some(crate::ir::Module {
+        params,
         asserts,
         mems: Vec::new(),
         name: anumspan_to_str(&decl.name).to_string(),

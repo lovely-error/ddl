@@ -295,6 +295,9 @@ pub struct RawArgTupleEntry {
     pub arg_name: AlphanumSpan,
     pub qualifier: ArgTypeQualifier,
     pub type_expr: RawTypeExpr,
+    /// `= <expr>`. A process parameter that is not a pipe is a constant, and
+    /// this is where its value comes from.
+    pub default: Option<RawExpr>,
 }
 #[derive(Debug, Clone)]
 pub struct RawArgDefTuple {
@@ -866,11 +869,23 @@ unsafe fn parse_arg_tuple(
             Ok(val) => val,
             Err(_) => return Err(()),
         };
+        // `= <expr>`: the value of a constant parameter.
+        let (_, after_ty) = skip_whitespaces(new_ptr, char_end_ptr);
+        let (has_default, after_eq) = strip_prefix_on_match(after_ty, char_end_ptr, "=");
+        let mut new_ptr = new_ptr;
+        let mut default = None;
+        if has_default {
+            let (_, tail) = skip_whitespaces(after_eq, char_end_ptr);
+            let (expr, tail) = try_parse_expr(tail, char_end_ptr, 0)?;
+            default = Some(expr);
+            new_ptr = tail;
+        }
         // we have everything we need to build arg entry
         let arg_entry = RawArgTupleEntry {
             arg_name,
             qualifier: argq,
             type_expr: ty_expr,
+            default,
         };
         entries.push(arg_entry);
         let (_, new_ptr) = skip_whitespaces(new_ptr, char_end_ptr);

@@ -382,7 +382,16 @@ pub fn lower_blocking(
     let mut fires: Vec<ValueId> = Vec::with_capacity(n_states);
     for (k, seg) in segments.iter().enumerate() {
         let pipe = low.pipes[seg.barrier.pipe_ix].clone();
-        let other = if seg.barrier.is_recv { pipe.valid_port } else { pipe.ready_port };
+        let other = match if seg.barrier.is_recv { Some(pipe.valid_port) } else { pipe.ready_port } {
+            Some(p) => p,
+            None => {
+                sink.err_span(
+                    map.span_of(&decl.name),
+                    "a blocking `@send` needs a `buffer` pipe; a `stream` send never blocks",
+                );
+                return None;
+            }
+        };
         let handshake = low.emit(Ty::BOOL, Op::Port(other));
         let fire = low.emit(Ty::BOOL, Op::Bin { op: BinOp::And, lhs: in_st[k], rhs: handshake });
         low.name_value(fire, format!("fire_s{}", k));
@@ -400,7 +409,9 @@ pub fn lower_blocking(
         let active = any_of(&mut low, &states);
         let pipe = low.pipes[ix].clone();
         if pipe.is_input {
-            drivers.push((pipe.ready_port, active));
+            if let Some(ready) = pipe.ready_port {
+                drivers.push((ready, active));
+            }
         } else {
             drivers.push((pipe.valid_port, active));
         }
@@ -570,8 +581,10 @@ pub fn lower_blocking(
         return None;
     }
     let asserts = std::mem::take(&mut low.asserts);
+    let params = std::mem::take(&mut low.params);
     let (values, ports) = low.take_values();
     Some(crate::ir::Module {
+        params,
         asserts,
         mems: Vec::new(),
         name: anumspan_to_str(&decl.name).to_string(),

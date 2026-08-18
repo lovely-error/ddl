@@ -34,8 +34,8 @@ module k2g_alu (
   wire [32:0] b33 = {1'b0, b};
   wire [32:0] sum = a33 + b33;
   wire [32:0] diff = a33 - b33;
-  reg n18;
-  reg [31:0] n19;
+  reg [31:0] n18;
+  reg n19;
   reg [31:0] n23;
   reg [31:0] n28;
   wire a_signed = a_tag[2];
@@ -48,15 +48,15 @@ module k2g_alu (
 
   always @* begin
     case (arith_op)
-      2'd1: n18 = diff[32];
-      default: n18 = sum[32];
+      2'd1: n18 = diff[31:0];
+      default: n18 = sum[31:0];
     endcase
   end
 
   always @* begin
     case (arith_op)
-      2'd1: n19 = diff[31:0];
-      default: n19 = sum[31:0];
+      2'd1: n19 = diff[32];
+      default: n19 = sum[32];
     endcase
   end
 
@@ -86,8 +86,8 @@ module k2g_alu (
     endcase
   end
 
-  assign arith_result = n19;
-  assign arith_overflow = n18;
+  assign arith_result = n18;
+  assign arith_overflow = n19;
   assign logic_result = n23;
   assign cmp_result = n45;
   assign unary_result = n28;

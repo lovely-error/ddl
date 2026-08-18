@@ -215,6 +215,10 @@ pub struct Module {
     pub regs: Vec<Reg>,
     pub mems: Vec<Memory>,
     pub asserts: Vec<Assertion>,
+    /// Constant parameters, folded away before the backend runs. Kept only so
+    /// the emitted file can say what they were: a module whose shape depends
+    /// on a number that appears nowhere in it is hard to read.
+    pub params: Vec<(String, Ty, u128)>,
 }
 
 impl Module {
@@ -369,7 +373,11 @@ pub struct PipeInfo {
     pub is_input: bool,
     /// `<name>_valid`, `<name>_ready`, `<name>_data` in that order.
     pub valid_port: PortId,
-    pub ready_port: PortId,
+    /// `None` on a stream. A stream sink never refuses an item -- the oldest
+    /// is overwritten instead -- so there is nothing for a `ready` to say, and
+    /// emitting one that is tied high would invite someone to wire it up.
+    pub ready_port: Option<PortId>,
+    pub is_stream: bool,
     pub data_port: PortId,
     /// The value read from the data port; inputs only.
     pub data_value: Option<ValueId>,
@@ -377,6 +385,13 @@ pub struct PipeInfo {
     pub used: bool,
     /// What `@try_send` offered; outputs only.
     pub sent: Option<ValueId>,
+    /// The branch the `@try_send` sat on, if it was not at the top level.
+    ///
+    /// A decoder does not produce a micro-op every cycle. Without this an
+    /// offer written inside an `if` would leak out of it -- `sent` lives on
+    /// the lowerer rather than in the environment, so the SSA join that muxes
+    /// everything else never sees it.
+    pub send_guard: Option<ValueId>,
     /// Inputs: this pipe transferred this cycle. Outputs: the slot can take a
     /// new item. Both are computed before the body, from registers and the
     /// `ready` inputs only.
@@ -391,6 +406,50 @@ pub struct PipeInfo {
 enum PathTerm {
     Cond { value: ValueId, taken: bool },
     Labels { scrutinee: ValueId, labels: Vec<u128>, taken: bool },
+}
+
+/// What a parameter of a `process` or a `sequence` is.
+///
+/// Data crosses the boundary through pipes and through nothing else. A plain
+/// parameter is a CONSTANT: folded at elaboration, never a port. That is what
+/// separates DDL from a nicer Verilog -- a process cannot present a raw wire
+/// and hand-roll a protocol over it, because the protocol is the compiler's
+/// job and hand-rolling it is the thing this language exists to stop.
+pub enum ParamKind {
+    Pipe { is_input: bool, is_stream: bool },
+    Constant,
+}
+
+/// Classifies one parameter, or reports why it cannot be one.
+pub fn classify_param(
+    low: &Lowerer,
+    arg: &crate::parse::PrecArgTupleEntry,
+    sink: &mut DiagSink,
+) -> Option<ParamKind> {
+    match arg.qualifier {
+        ArgTypeQualifier::BufferIn => Some(ParamKind::Pipe { is_input: true, is_stream: false }),
+        ArgTypeQualifier::BufferOut => Some(ParamKind::Pipe { is_input: false, is_stream: false }),
+        ArgTypeQualifier::StreamIn => Some(ParamKind::Pipe { is_input: true, is_stream: true }),
+        ArgTypeQualifier::StreamOut => Some(ParamKind::Pipe { is_input: false, is_stream: true }),
+        ArgTypeQualifier::Inout => {
+            sink.err_at(&arg.arg_name, "`inout` parameters are not supported");
+            None
+        }
+        ArgTypeQualifier::Out => {
+            sink.push(
+                Diag::error(
+                    low.span_of(&arg.arg_name),
+                    format!(
+                        "`{}` is an `out` parameter, and a process has no plain outputs",
+                        anumspan_to_str(&arg.arg_name)
+                    ),
+                )
+                .with_note("results leave through a `buffer out` or `stream out` pipe"),
+            );
+            None
+        }
+        ArgTypeQualifier::In => Some(ParamKind::Constant),
+    }
 }
 
 pub struct Lowerer<'a> {
@@ -408,6 +467,8 @@ pub struct Lowerer<'a> {
     pub mems: Vec<Memory>,
     /// Immediate assertions, in source order.
     pub asserts: Vec<Assertion>,
+    /// Constant parameters, in declaration order.
+    pub params: Vec<(String, Ty, u128)>,
     /// The conditions under which the statements being lowered right now run,
     /// outermost first. Empty means unconditionally.
     ///
@@ -435,6 +496,7 @@ impl<'a> Lowerer<'a> {
             pipes: Vec::new(),
             mems: Vec::new(),
             asserts: Vec::new(),
+            params: Vec::new(),
             path: Vec::new(),
             values: Vec::new(),
             ports: Vec::new(),
@@ -448,21 +510,22 @@ impl<'a> Lowerer<'a> {
     pub fn declare_pipes(
         &mut self,
         args: &crate::parse::PrecArgDefTuple,
+        env: &mut Env,
         sink: &mut DiagSink,
     ) -> Option<()> {
         for arg in &args.entries {
             let name = anumspan_to_str(&arg.arg_name).to_string();
-            let is_input = match arg.qualifier {
-                ArgTypeQualifier::BufferIn => true,
-                ArgTypeQualifier::BufferOut => false,
-                ArgTypeQualifier::StreamIn | ArgTypeQualifier::StreamOut => {
+            let kind = classify_param(self, arg, sink)?;
+            let is_input = match kind {
+                ParamKind::Constant => {
+                    self.declare_constant(arg, env, sink)?;
+                    continue;
+                }
+                ParamKind::Pipe { is_stream: true, .. } => {
                     sink.err_at(&arg.arg_name, "`stream` pipes are not supported yet; `buffer` is");
                     return None;
                 }
-                _ => {
-                    sink.err_at(&arg.arg_name, "a sequence takes only pipe parameters");
-                    return None;
-                }
+                ParamKind::Pipe { is_input, .. } => is_input,
             };
             let ty = match resolve_type_expr(&arg.type_expr, self.syms) {
                 Ok(t) => t,
@@ -482,7 +545,7 @@ impl<'a> Lowerer<'a> {
                 id
             };
             let valid_port = mk(self, "valid", vd, Ty::BOOL);
-            let ready_port = mk(self, "ready", rd, Ty::BOOL);
+            let ready_port = Some(mk(self, "ready", rd, Ty::BOOL));
             let data_port = mk(self, "data", dd, ty.clone());
             let data_value = if is_input {
                 let v = self.emit(ty.clone(), Op::Port(data_port));
@@ -497,15 +560,97 @@ impl<'a> Lowerer<'a> {
                 is_input,
                 valid_port,
                 ready_port,
+                is_stream: false,
                 data_port,
                 data_value,
                 used: false,
                 sent: None,
+                send_guard: None,
                 fired: None,
                 busy_reg: None,
                 hold_reg: None,
             });
         }
+        Some(())
+    }
+
+    /// Binds a constant parameter, folding its value at elaboration.
+    ///
+    /// No port is emitted. A parameter with no value is the error the whole
+    /// rule exists to produce: it means the source expected per-cycle data
+    /// there, and per-cycle data arrives through a pipe.
+    pub fn declare_constant(
+        &mut self,
+        arg: &crate::parse::PrecArgTupleEntry,
+        env: &mut Env,
+        sink: &mut DiagSink,
+    ) -> Option<()> {
+        let name = anumspan_to_str(&arg.arg_name).to_string();
+        let ty = match resolve_type_expr(&arg.type_expr, self.syms) {
+            Ok(t) => t,
+            Err(e) => {
+                sink.err_at(&arg.arg_name, e.message());
+                return None;
+            }
+        };
+        if ty.is_memory() {
+            sink.push(
+                Diag::error(
+                    self.span_of(&arg.arg_name),
+                    format!("`{}` is a memory, which cannot be a parameter", name),
+                )
+                .with_note("declare it inside the process with `var`"),
+            );
+            return None;
+        }
+        let init = match &arg.default {
+            Some(e) => e,
+            None => {
+                sink.push(
+                    Diag::error(
+                        self.span_of(&arg.arg_name),
+                        format!("`{}` has no value", name),
+                    )
+                    .with_note(
+                        "a plain parameter is a compile-time constant and needs `= <value>`; data arrives through a `buffer in` or `stream in` pipe",
+                    ),
+                );
+                return None;
+            }
+        };
+        let empty: Env = HashMap::new();
+        let value = lower_expr_expecting(self, init, Some(&ty), &empty, sink)?;
+        let konst = match &self.values[value.0 as usize].op {
+            Op::Const(k) => *k,
+            _ => {
+                sink.err_at(&arg.arg_name, format!("`{}` must be a compile-time constant", name));
+                return None;
+            }
+        };
+        let have = self.ty_of(value);
+        if have != ty {
+            match self.coerce_const(value, &ty) {
+                Some(_) => {}
+                None => {
+                    sink.push(
+                        Diag::error(
+                            self.span_of(&arg.arg_name),
+                            format!(
+                                "`{}` is declared `{}` but its value is `{}`",
+                                name,
+                                ty.display(),
+                                have.display()
+                            ),
+                        )
+                        .with_note(cast_hint(&have, &ty)),
+                    );
+                    return None;
+                }
+            }
+        }
+        let folded = self.emit(ty.clone(), Op::Const(konst));
+        env.insert(name.clone(), Binding { value: Some(folded), ty: ty.clone(), is_output: false });
+        self.params.push((name, ty, konst));
         Some(())
     }
 
@@ -699,7 +844,7 @@ impl<'a> Lowerer<'a> {
     }
 
     /// Builds the value of the current path, emitting for the first time.
-    fn materialise_path(&mut self) -> Option<ValueId> {
+    pub fn materialise_path(&mut self) -> Option<ValueId> {
         let terms = self.path.clone();
         let mut acc: Option<ValueId> = None;
         for term in terms {
@@ -751,6 +896,26 @@ impl<'a> Lowerer<'a> {
         // this for a flag set on one branch of an `if`, and a memory write
         // enable is that flag, so without this every conditional write carries
         // a redundant mux into synthesis.
+        // `x & 1'b1` and `x | 1'b0` are `x`. The generated handshake produces
+        // both -- an input's readiness is an AND over output slots, and with a
+        // single stream output that identity is all there is.
+        if let Op::Bin { op: bin, lhs, rhs } = &op {
+            let (bin, lhs, rhs) = (*bin, *lhs, *rhs);
+            let identity = match bin {
+                BinOp::And => Some(1u128),
+                BinOp::Or => Some(0u128),
+                _ => None,
+            };
+            if let Some(k) = identity {
+                let one_bit = ty == Ty::BOOL;
+                if one_bit && self.is_const(rhs, k) {
+                    return lhs;
+                }
+                if one_bit && self.is_const(lhs, k) {
+                    return rhs;
+                }
+            }
+        }
         if let Op::Mux { cond, then_val, else_val } = &op {
             let (cond, then_val, else_val) = (*cond, *then_val, *else_val);
             let picks_the_condition = ty == Ty::BOOL
@@ -944,6 +1109,7 @@ pub fn lower_function(
     }
 
     Some(Module {
+        params: low.params,
         asserts: low.asserts,
         mems: Vec::new(),
         name: anumspan_to_str(&decl.name).to_string(),
@@ -974,7 +1140,6 @@ pub fn lower_process(
 ) -> Option<Module> {
     let mut low = Lowerer::new(map, syms, bodies);
     let mut env: Env = HashMap::new();
-    let mut out_ports: Vec<(PortId, String)> = Vec::new();
 
     // Clock and reset are implicit. "A process has channel ports and
     // clock/reset. Nothing else." -- k3g_chan.sv:31.
@@ -999,6 +1164,19 @@ pub fn lower_process(
             sink.err_at(&arg.arg_name, format!("`{}` is implicit on a process", name));
             return None;
         }
+        let kind = match classify_param(&low, arg, sink) {
+            Some(k) => k,
+            None => return None,
+        };
+        // A plain parameter is configuration, folded here and gone. Everything
+        // that changes cycle to cycle is a pipe.
+        let (is_input, is_stream) = match kind {
+            ParamKind::Constant => {
+                low.declare_constant(arg, &mut env, sink)?;
+                continue;
+            }
+            ParamKind::Pipe { is_input, is_stream } => (is_input, is_stream),
+        };
         let ty = match resolve_type_expr(&arg.type_expr, syms) {
             Ok(t) => t,
             Err(e) => {
@@ -1012,7 +1190,7 @@ pub fn lower_process(
                     map.span_of(&arg.arg_name),
                     format!("`{}` is a memory, which cannot be a parameter", name),
                 )
-                .with_note("declare it inside the process and expose the accesses as ports"),
+                .with_note("declare it inside the process with `var`"),
             );
             return None;
         }
@@ -1020,81 +1198,49 @@ pub fn lower_process(
         // k3g_chan.sv:60 already pre-commits to for the yosys-slang risk --
         // "every process port list flattens to valid/ready/data triples and
         // the rules stay exactly as written".
-        let pipe_dir = match arg.qualifier {
-            ArgTypeQualifier::BufferIn => Some(true),
-            ArgTypeQualifier::BufferOut => Some(false),
-            ArgTypeQualifier::StreamIn | ArgTypeQualifier::StreamOut => {
-                sink.err_at(
-                    &arg.arg_name,
-                    "`stream` pipes are not supported yet; `buffer` is",
-                );
-                return None;
-            }
-            _ => None,
+        let mk = |low: &mut Lowerer, suffix: &str, dir: PortDir, ty: Ty| {
+            let id = PortId(low.ports.len() as u32);
+            low.ports.push(Port { name: format!("{}_{}", name, suffix), dir, ty });
+            id
         };
-        if let Some(is_input) = pipe_dir {
-            let mk = |low: &mut Lowerer, suffix: &str, dir: PortDir, ty: Ty| {
-                let id = PortId(low.ports.len() as u32);
-                low.ports.push(Port { name: format!("{}_{}", name, suffix), dir, ty });
-                id
-            };
-            let (vdir, rdir, ddir) = if is_input {
-                (PortDir::In, PortDir::Out, PortDir::In)
-            } else {
-                (PortDir::Out, PortDir::In, PortDir::Out)
-            };
-            let valid_port = mk(&mut low, "valid", vdir, Ty::BOOL);
-            let ready_port = mk(&mut low, "ready", rdir, Ty::BOOL);
-            let data_port = mk(&mut low, "data", ddir, ty.clone());
-
-            let data_value = if is_input {
-                let v = low.emit(ty.clone(), Op::Port(data_port));
-                low.values[v.0 as usize].name = Some(format!("{}_data", name));
-                Some(v)
-            } else {
-                None
-            };
-            low.pipes.push(PipeInfo {
-                name: name.clone(),
-                ty,
-                is_input,
-                valid_port,
-                ready_port,
-                data_port,
-                data_value,
-                used: false,
-                sent: None,
-                fired: None,
-                busy_reg: None,
-                hold_reg: None,
-            });
-            continue;
-        }
-
-        let dir = match arg.qualifier {
-            ArgTypeQualifier::In => PortDir::In,
-            ArgTypeQualifier::Out => PortDir::Out,
-            ArgTypeQualifier::Inout => {
-                sink.err_at(&arg.arg_name, "`inout` parameters are not supported yet");
-                return None;
-            }
-            _ => unreachable!("pipe qualifiers handled above"),
+        let (vdir, rdir, ddir) = if is_input {
+            (PortDir::In, PortDir::Out, PortDir::In)
+        } else {
+            (PortDir::Out, PortDir::In, PortDir::Out)
         };
+        let valid_port = mk(&mut low, "valid", vdir, Ty::BOOL);
+        // A stream has no `ready`: its producer never waits, and its consumer
+        // takes whatever is being offered on the cycle it looks.
+        let ready_port = if is_stream {
+            None
+        } else {
+            Some(mk(&mut low, "ready", rdir, Ty::BOOL))
+        };
+        let data_port = mk(&mut low, "data", ddir, ty.clone());
 
-        let port_id = PortId(low.ports.len() as u32);
-        low.ports.push(Port { name: name.clone(), dir, ty: ty.clone() });
-
-        match dir {
-            PortDir::In => {
-                let v = low.emit(ty.clone(), Op::Port(port_id));
-                low.values[v.0 as usize].name = Some(name.clone());
-                env.insert(name, Binding { value: Some(v), ty, is_output: false });
-            }
-            PortDir::Out => {
-                out_ports.push((port_id, name.clone()));
-                env.insert(name, Binding { value: None, ty, is_output: true });
-            }
-        }
+        let data_value = if is_input {
+            let v = low.emit(ty.clone(), Op::Port(data_port));
+            low.values[v.0 as usize].name = Some(format!("{}_data", name));
+            Some(v)
+        } else {
+            None
+        };
+        low.pipes.push(PipeInfo {
+            name: name.clone(),
+            ty,
+            is_input,
+            valid_port,
+            ready_port,
+            is_stream,
+            data_port,
+            data_value,
+            used: false,
+            sent: None,
+            send_guard: None,
+            fired: None,
+            busy_reg: None,
+            hold_reg: None,
+        });
     }
 
     // Registers are the leading `var` declarations. Taking them before the
@@ -1206,10 +1352,13 @@ pub fn lower_process(
     }
 
     let has_pipes = !low.pipes.is_empty();
-    if out_ports.is_empty() && !has_pipes {
-        sink.err_span(
-            map.span_of(&decl.name),
-            "a process needs at least one `out` parameter or pipe",
+    if !has_pipes {
+        sink.push(
+            Diag::error(
+                map.span_of(&decl.name),
+                "a process needs at least one pipe",
+            )
+            .with_note("a process with no channels computes nothing anything else can see"),
         );
         return None;
     }
@@ -1245,7 +1394,7 @@ pub fn lower_process(
             return None;
         }
         return crate::ir_fsm::lower_blocking(
-            map, decl, low, env, out_ports, reg_names, reg_tys, reg_resets, &loop_body, sink,
+            map, decl, low, env, Vec::new(), reg_names, reg_tys, reg_resets, &loop_body, sink,
         );
     }
 
@@ -1273,14 +1422,23 @@ pub fn lower_process(
         let hold = low.emit(ty.clone(), Op::RegRead(hold_ix as u32));
         low.values[hold.0 as usize].name = Some(format!("{}_hold", pname));
 
-        // The slot can take a new item when it is empty, or is draining now.
-        let ready_in = low.emit(Ty::BOOL, Op::Port(low.pipes[ix].ready_port));
-        let not_busy = low.emit(Ty::BOOL, Op::Un { op: UnOp::LogNot, arg: busy });
-        let accept = low.emit(
-            Ty::BOOL,
-            Op::Bin { op: BinOp::Or, lhs: not_busy, rhs: ready_in },
-        );
-        accepts.push(accept);
+        // A buffer slot can take a new item when it is empty or is draining
+        // now. A STREAM slot can always take one: the oldest is overwritten,
+        // which is the whole difference between the two kinds, and it is why a
+        // process feeding only streams never has to stall its input.
+        let accept = match low.pipes[ix].ready_port {
+            None => low.emit(Ty::BOOL, Op::Const(1)),
+            Some(ready) => {
+                let ready_in = low.emit(Ty::BOOL, Op::Port(ready));
+                let not_busy = low.emit(Ty::BOOL, Op::Un { op: UnOp::LogNot, arg: busy });
+                let a = low.emit(
+                    Ty::BOOL,
+                    Op::Bin { op: BinOp::Or, lhs: not_busy, rhs: ready_in },
+                );
+                accepts.push(a);
+                a
+            }
+        };
 
         generated.push(Reg { name: format!("{}_busy", pname), ty: Ty::BOOL, reset: 0, next: busy });
         generated.push(Reg { name: format!("{}_hold", pname), ty, reset: 0, next: hold });
@@ -1308,10 +1466,15 @@ pub fn lower_process(
             continue;
         }
         let up_valid = low.emit(Ty::BOOL, Op::Port(low.pipes[ix].valid_port));
-        let fired = low.emit(
-            Ty::BOOL,
-            Op::Bin { op: BinOp::And, lhs: up_valid, rhs: ready_out },
-        );
+        // A buffer input transfers only when every buffer output can take the
+        // result. A stream input has no such contract -- it is a sample of
+        // whatever is being offered, and it happens whether or not this cycle
+        // produces anything.
+        let fired = if low.pipes[ix].is_stream {
+            up_valid
+        } else {
+            low.emit(Ty::BOOL, Op::Bin { op: BinOp::And, lhs: up_valid, rhs: ready_out })
+        };
         low.values[fired.0 as usize].name = Some(format!("{}_xfer", low.pipes[ix].name));
         low.pipes[ix].fired = Some(fired);
     }
@@ -1320,18 +1483,6 @@ pub fn lower_process(
     low.settle_memories(&env);
 
     let mut drivers = Vec::new();
-    for (port_id, name) in &out_ports {
-        match env.get(name).and_then(|b| b.value) {
-            Some(v) => drivers.push((*port_id, v)),
-            None => {
-                sink.err_span(
-                    map.span_of(&decl.name),
-                    format!("output `{}` is never assigned", name),
-                );
-                return None;
-            }
-        }
-    }
 
     // What the body offered decides the slot's next state. The offer is taken
     // on the same cycle the input transferred, which is the contract this
@@ -1348,14 +1499,15 @@ pub fn lower_process(
     for ix in 0..low.pipes.len() {
         let pipe = low.pipes[ix].clone();
         if pipe.is_input {
-            drivers.push((pipe.ready_port, ready_out));
+            if let Some(ready) = pipe.ready_port {
+                drivers.push((ready, ready_out));
+            }
             continue;
         }
         let busy_ix = pipe.busy_reg.expect("an output pipe has a busy register");
         let hold_ix = pipe.hold_reg.expect("an output pipe has a hold register");
         let busy = low.emit(Ty::BOOL, Op::RegRead(busy_ix as u32));
         let hold = low.emit(pipe.ty.clone(), Op::RegRead(hold_ix as u32));
-        let ready_in = low.emit(Ty::BOOL, Op::Port(pipe.ready_port));
 
         let sent = match pipe.sent {
             Some(v) => v,
@@ -1368,20 +1520,37 @@ pub fn lower_process(
             }
         };
 
-        // busy <= fired ? 1 : (ready ? 0 : busy)
-        let one = low.emit(Ty::BOOL, Op::Const(1));
-        let zero = low.emit(Ty::BOOL, Op::Const(0));
-        let drained = low.emit(
-            Ty::BOOL,
-            Op::Mux { cond: ready_in, then_val: zero, else_val: busy },
-        );
-        let busy_next = low.emit(
-            Ty::BOOL,
-            Op::Mux { cond: fired_any, then_val: one, else_val: drained },
-        );
+        // An offer written inside an `if` only happens on that branch.
+        let offering = match pipe.send_guard {
+            None => fired_any,
+            Some(g) => low.emit(Ty::BOOL, Op::Bin { op: BinOp::And, lhs: fired_any, rhs: g }),
+        };
+
+        // A buffer holds its offer until it is taken:
+        //     busy <= fired ? 1 : (ready ? 0 : busy)
+        // A stream does not. Its `valid` is one cycle per item, because there
+        // is no `ready` to tell it the item was read and holding it would turn
+        // "the oldest is overwritten" into "the newest is dropped". That
+        // one-cycle strobe is exactly `uop_valid` in k2g_decode.sv.
+        let busy_next = match pipe.ready_port {
+            None => offering,
+            Some(ready) => {
+                let ready_in = low.emit(Ty::BOOL, Op::Port(ready));
+                let one = low.emit(Ty::BOOL, Op::Const(1));
+                let zero = low.emit(Ty::BOOL, Op::Const(0));
+                let drained = low.emit(
+                    Ty::BOOL,
+                    Op::Mux { cond: ready_in, then_val: zero, else_val: busy },
+                );
+                low.emit(
+                    Ty::BOOL,
+                    Op::Mux { cond: offering, then_val: one, else_val: drained },
+                )
+            }
+        };
         let hold_next = low.emit(
             pipe.ty.clone(),
-            Op::Mux { cond: fired_any, then_val: sent, else_val: hold },
+            Op::Mux { cond: offering, then_val: sent, else_val: hold },
         );
 
         let idx = busy_ix - reg_names.len();
@@ -1412,16 +1581,9 @@ pub fn lower_process(
     if sink.has_errors() {
         return None;
     }
-    let has_state = !regs.is_empty() || !low.mems.is_empty();
-    if !has_state && !has_pipes {
-        sink.err_span(
-            map.span_of(&decl.name),
-            "a process with no state should be a `fun`",
-        );
-        return None;
-    }
 
     Some(Module {
+        params: low.params,
         asserts: low.asserts,
         mems: low.mems,
         name: anumspan_to_str(&decl.name).to_string(),
@@ -1843,6 +2005,13 @@ fn lower_stmt(
         }
 
         PrecResInnerStmt::CallStmt(call) => {
+            // A bare `@try_send(p, v)` discards the answer. Binding it would be
+            // the only way to write one inside an `if`, and a binding made on
+            // one branch and not the other is rejected by the SSA join.
+            if let PrecResExpr::Builtin(BuiltinOp::TrySend) = &call.base {
+                lower_builtin(low, BuiltinOp::TrySend, &call.args, env, sink)?;
+                return Some(());
+            }
             let checking = match &call.base {
                 PrecResExpr::Builtin(BuiltinOp::Assert) => Some(false),
                 PrecResExpr::Builtin(BuiltinOp::Fatal) => Some(true),
@@ -2425,6 +2594,7 @@ fn lower_builtin(
         }
         low.pipes[ix].used = true;
         low.pipes[ix].sent = Some(value);
+        low.pipes[ix].send_guard = low.materialise_path();
         // Whether the offer was taken is decided by the generated handshake;
         // a placeholder stands in until it is built.
         return Some(low.pipes[ix].fired.expect("computed before the body"));

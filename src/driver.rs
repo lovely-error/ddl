@@ -455,10 +455,31 @@ mod emit_tests {
     }
 
     #[test]
-    fn a_stream_pipe_says_what_is_missing_rather_than_failing_silently() {
-        // `buffer` pipes work; `stream` overwrites its oldest value and needs
-        // different generated logic.
-        let text = compile_err("process P (a: stream in i1, o: out i1)\n  o = 1'b0\n");
+    fn a_stream_output_has_no_ready_and_strobes_for_one_cycle() {
+        // A stream sink never refuses an item -- the oldest is overwritten --
+        // so there is no `ready` to emit, and `valid` cannot hold: with no
+        // `ready` to say the item was read, holding it would turn "the oldest
+        // is overwritten" into "the newest is dropped".
+        let v = compile(concat!(
+            "process P (src: buffer in i32, o: stream out i32)\n",
+            "  let (x, got) = @try_rcv(src)\n",
+            "  let _s = @try_send(o, x)\n",
+        ));
+        assert!(v.contains("output        o_valid"), "{}", v);
+        assert!(!v.contains("o_ready"), "{}", v);
+        assert!(v.contains("o_busy <= src_valid;"), "{}", v);
+        // Nothing downstream can stall this process, so its input is always
+        // ready. That is `hold` in k2g_decode.sv, gone.
+        assert!(v.contains("assign src_ready = 1'b1;"), "{}", v);
+    }
+
+    #[test]
+    fn a_stream_pipe_in_a_sequence_is_still_refused() {
+        let text = compile_err(concat!(
+            "sequence s (a: stream in i16, dst: buffer out i16)\n",
+            "  let x = @rcv(a)\n",
+            "  @send(dst, x)\n",
+        ));
         assert!(text.contains("`stream` pipes are not supported yet"), "{}", text);
     }
 }
