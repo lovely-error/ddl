@@ -16,7 +16,7 @@
 // `Mux` for every binding whose value differs -- an SSA join without needing
 // blocks, which works precisely because there are no loops.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use crate::diag::{Diag, DiagSink, SourceMap, Span};
 use crate::lex::{AlphanumSpan, ArgTypeQualifier};
@@ -356,7 +356,14 @@ pub struct Binding {
     pub is_output: bool,
 }
 
-pub type Env = HashMap<String, Binding>;
+/// Ordered, and that is load-bearing rather than tidy.
+///
+/// The SSA joins walk `env.keys()` to decide which bindings a branch disagreed
+/// about, so the iteration order decides the order values are emitted in. With
+/// a `HashMap` that order is randomised per process, and the same source
+/// compiled three times produced three different files -- which makes the
+/// `--check` staleness gate impossible to pass and every regeneration a diff.
+pub type Env = BTreeMap<String, Binding>;
 
 /// A pipe parameter, and what the body did with it.
 ///
@@ -469,6 +476,9 @@ pub struct Lowerer<'a> {
     pub asserts: Vec<Assertion>,
     /// Constant parameters, in declaration order.
     pub params: Vec<(String, Ty, u128)>,
+    /// `!done` for a process that stops, so its memories stop being written
+    /// when it does. `None` for one that repeats.
+    pub stop_writes: Option<ValueId>,
     /// The conditions under which the statements being lowered right now run,
     /// outermost first. Empty means unconditionally.
     ///
@@ -497,6 +507,7 @@ impl<'a> Lowerer<'a> {
             mems: Vec::new(),
             asserts: Vec::new(),
             params: Vec::new(),
+            stop_writes: None,
             path: Vec::new(),
             values: Vec::new(),
             ports: Vec::new(),
@@ -618,7 +629,7 @@ impl<'a> Lowerer<'a> {
                 return None;
             }
         };
-        let empty: Env = HashMap::new();
+        let empty: Env = Env::new();
         let value = lower_expr_expecting(self, init, Some(&ty), &empty, sink)?;
         let konst = match &self.values[value.0 as usize].op {
             Op::Const(k) => *k,
@@ -741,6 +752,11 @@ impl<'a> Lowerer<'a> {
                 self.mems[ix].data = v;
             }
             let we = self.mems[ix].we;
+            let we = match self.stop_writes {
+                None => we,
+                Some(r) => self.emit(Ty::BOOL, Op::Bin { op: BinOp::And, lhs: we, rhs: r }),
+            };
+            self.mems[ix].we = we;
             self.mems[ix].addr = self.drop_gated_mux(self.mems[ix].addr, we);
             self.mems[ix].data = self.drop_gated_mux(self.mems[ix].data, we);
         }
@@ -1028,7 +1044,7 @@ pub fn lower_function(
     sink: &mut DiagSink,
 ) -> Option<Module> {
     let mut low = Lowerer::new(map, syms, bodies);
-    let mut env: Env = HashMap::new();
+    let mut env: Env = Env::new();
     let mut out_ports: Vec<(PortId, String)> = Vec::new();
 
     for arg in &decl.args.entries {
@@ -1139,7 +1155,7 @@ pub fn lower_process(
     sink: &mut DiagSink,
 ) -> Option<Module> {
     let mut low = Lowerer::new(map, syms, bodies);
-    let mut env: Env = HashMap::new();
+    let mut env: Env = Env::new();
 
     // Clock and reset are implicit. "A process has channel ports and
     // clock/reset. Nothing else." -- k3g_chan.sv:31.
@@ -1363,24 +1379,44 @@ pub fn lower_process(
         return None;
     }
 
-    // A body that is one `loop` uses blocking channel operations and becomes a
-    // state machine instead of one pass per cycle.
+    // What the body MEANS, and it is the `loop` that decides.
+    //
+    // A process body is a program: it runs once and then the process stops
+    // (desc.md:39, "may stop (reach terminal state)"). `loop` is what makes it
+    // repeat. So there are three shapes, not two:
+    //
+    //   * a `loop` with blocking `@rcv`/`@send` -- a state machine, one state
+    //     per barrier, wrapping back to the first;
+    //   * a `loop` with none -- one pass per cycle, forever, which is the
+    //     elastic form below;
+    //   * a linear body -- one pass, then the terminal state.
+    //
+    // The middle one used to be spelled by leaving the `loop` out, which gave
+    // a linear body the meaning of an infinite one and left the terminal state
+    // with no way to be written at all.
     let rest = &decl.body[body_start..];
-    let is_blocking = rest.len() == 1 && matches!(&rest[0], PrecResInnerStmt::Loop(_));
-    if is_blocking {
-        let loop_body = match &rest[0] {
-            PrecResInnerStmt::Loop(l) => match &l.repeat_expr {
-                PrecResExpr::StmtBlock(b) => b.components.clone(),
-                _ => {
-                    sink.err_span(
-                        map.span_of(&decl.name),
-                        "a `loop` in a process needs an indented body",
-                    );
-                    return None;
-                }
-            },
-            _ => unreachable!(),
-        };
+    let loop_body: Option<Vec<PrecResInnerStmt>> = match rest {
+        [PrecResInnerStmt::Loop(l)] => match &l.repeat_expr {
+            PrecResExpr::StmtBlock(b) => Some(b.components.clone()),
+            _ => {
+                sink.err_span(
+                    map.span_of(&decl.name),
+                    "a `loop` in a process needs an indented body",
+                );
+                return None;
+            }
+        },
+        _ => None,
+    };
+    let repeats = loop_body.is_some();
+    let body_stmts: Vec<PrecResInnerStmt> = match &loop_body {
+        Some(b) => b.clone(),
+        None => rest.to_vec(),
+    };
+    let blocks = body_stmts.iter().any(crate::ir_fsm::contains_barrier);
+
+    if blocks {
+        let loop_body = body_stmts.clone();
         if !low.mems.is_empty() {
             sink.push(
                 Diag::error(
@@ -1394,7 +1430,8 @@ pub fn lower_process(
             return None;
         }
         return crate::ir_fsm::lower_blocking(
-            map, decl, low, env, Vec::new(), reg_names, reg_tys, reg_resets, &loop_body, sink,
+            map, decl, low, env, Vec::new(), reg_names, reg_tys, reg_resets, &loop_body,
+            repeats, sink,
         );
     }
 
@@ -1407,6 +1444,22 @@ pub fn lower_process(
     // construction rather than by review.
     let mut generated: Vec<Reg> = Vec::new();
     let mut accepts: Vec<ValueId> = Vec::new();
+
+    // A linear body runs ONCE. `done` is what makes the process stop: it is
+    // low for the first cycle after reset and high forever after, and while it
+    // is high nothing transfers and no register moves. With a `loop` there is
+    // no such register and the body simply repeats.
+    let done: Option<ValueId> = if repeats {
+        None
+    } else {
+        let ix = reg_names.len() + generated.len();
+        let d = low.emit(Ty::BOOL, Op::RegRead(ix as u32));
+        low.values[d.0 as usize].name = Some("done".to_string());
+        let one = low.emit(Ty::BOOL, Op::Const(1));
+        generated.push(Reg { name: "done".to_string(), ty: Ty::BOOL, reset: 0, next: one });
+        Some(d)
+    };
+    let running: Option<ValueId> = done.map(|d| low.logical_not(d));
 
     for ix in 0..low.pipes.len() {
         if low.pipes[ix].is_input {
@@ -1460,6 +1513,12 @@ pub fn lower_process(
     }
     let always_true = low.emit(Ty::BOOL, Op::Const(1));
     let ready_out = can_accept.unwrap_or(always_true);
+    // Once the pass is over the process refuses everything, which is what
+    // "reaches a terminal state" has to mean at a channel boundary.
+    let ready_out = match running {
+        None => ready_out,
+        Some(r) => low.emit(Ty::BOOL, Op::Bin { op: BinOp::And, lhs: ready_out, rhs: r }),
+    };
 
     for ix in 0..low.pipes.len() {
         if !low.pipes[ix].is_input {
@@ -1471,7 +1530,10 @@ pub fn lower_process(
         // whatever is being offered, and it happens whether or not this cycle
         // produces anything.
         let fired = if low.pipes[ix].is_stream {
-            up_valid
+            match running {
+                None => up_valid,
+                Some(r) => low.emit(Ty::BOOL, Op::Bin { op: BinOp::And, lhs: up_valid, rhs: r }),
+            }
         } else {
             low.emit(Ty::BOOL, Op::Bin { op: BinOp::And, lhs: up_valid, rhs: ready_out })
         };
@@ -1479,7 +1541,8 @@ pub fn lower_process(
         low.pipes[ix].fired = Some(fired);
     }
 
-    lower_stmts(&mut low, &decl.body[body_start..], &mut env, sink)?;
+    lower_stmts(&mut low, &body_stmts, &mut env, sink)?;
+    low.stop_writes = running;
     low.settle_memories(&env);
 
     let mut drivers = Vec::new();
@@ -1568,6 +1631,17 @@ pub fn lower_process(
             .get(name)
             .and_then(|b| b.value)
             .expect("a register is bound when it is declared");
+        // The terminal state holds whatever the single pass left behind.
+        let next = match done {
+            None => next,
+            Some(d) => {
+                let held = low.emit(reg_tys[ix].clone(), Op::RegRead(ix as u32));
+                low.emit(
+                    reg_tys[ix].clone(),
+                    Op::Mux { cond: d, then_val: held, else_val: next },
+                )
+            }
+        };
         regs.push(Reg {
             name: name.clone(),
             ty: reg_tys[ix].clone(),
@@ -2045,12 +2119,23 @@ fn lower_stmt(
 
         PrecResInnerStmt::MatchStmt(m) => crate::ir_match::lower_match(low, m, env, sink),
 
-        PrecResInnerStmt::Loop(_)
-        | PrecResInnerStmt::Break
-        | PrecResInnerStmt::ForLoop(_) => {
+        PrecResInnerStmt::Break => {
+            sink.push(
+                Diag::error(
+                    crate::driver::nowhere(),
+                    "`break` is not scheduled yet",
+                )
+                .with_note(
+                    "it needs a control-flow graph: a `break` inside a conditional has to stop the statements after it on that path only, and the statements in a state are joined by muxes rather than ordered. A linear process body already runs once and stops.",
+                ),
+            );
+            None
+        }
+
+        PrecResInnerStmt::Loop(_) | PrecResInnerStmt::ForLoop(_) => {
             sink.err_span(
                 crate::driver::nowhere(),
-                "loops need a state machine; they are not available in a `fun` yet",
+                "a `loop` belongs at the top of a `process` body, not nested inside it",
             );
             None
         }

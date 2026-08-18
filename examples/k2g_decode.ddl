@@ -88,404 +88,408 @@ process k2g_decode (
   var llc_kind: rdt_e = RDT_U32
   var llc_hi: i16 = @zeroed()
 
-  -- The item, and whether one transferred this cycle. `cp_valid` is the
-  -- TRANSFER, not the offer: it is already `cps_valid && cps_ready`, so it is
-  -- false on a cycle the sink is refusing -- which is exactly what
-  -- `cp_valid && !hold` used to spell out.
-  let (cp, cp_valid) = @try_rcv(cps)
-  let (_flush_payload, flushing) = @try_rcv(flush)
+  -- The process is a program: it runs once and stops. `loop` is what makes
+  -- it repeat, once per cycle, for as long as the design runs.
+  loop
 
-  -- The register values as of this clock edge. The body mutates the registers
-  -- freely; these are what gets restored when the update is not taken, which
-  -- is how `hold` freezes the accumulator without suppressing the decode.
-  let pfx_held: pfx_t = pfx
-  let state_held: state_e = state
-  let llc_dst_held: i5 = llc_dst
-  let llc_kind_held: rdt_e = llc_kind
-  let llc_hi_held: i16 = llc_hi
-  let bytes_held: i32 = pfx.bytes
+    -- The item, and whether one transferred this cycle. `cp_valid` is the
+    -- TRANSFER, not the offer: it is already `cps_valid && cps_ready`, so it is
+    -- false on a cycle the sink is refusing -- which is exactly what
+    -- `cp_valid && !hold` used to spell out.
+    let (cp, cp_valid) = @try_rcv(cps)
+    let (_flush_payload, flushing) = @try_rcv(flush)
 
-  -- ---- field extraction --------------------------------------------------
-  let lb: lb_e = @cast(cp[15..10])
-  let arg1: i5 = cp[9..5]
-  let arg2: i5 = cp[4..0]
-  let imm10: i10 = cp[9..0]
+    -- The register values as of this clock edge. The body mutates the registers
+    -- freely; these are what gets restored when the update is not taken, which
+    -- is how `hold` freezes the accumulator without suppressing the decode.
+    let pfx_held: pfx_t = pfx
+    let state_held: state_e = state
+    let llc_dst_held: i5 = llc_dst
+    let llc_kind_held: rdt_e = llc_kind
+    let llc_hi_held: i16 = llc_hi
+    let bytes_held: i32 = pfx.bytes
 
-  -- ---- prefix classification ---------------------------------------------
-  -- EP1 selects on arg2; EP2 escapes again and selects on arg1. Note the field
-  -- swap between the two levels (spec 2).
-  let is_ep1: i1 = lb == LB_EP1
-  let ep1_op: ep1_e = @cast(arg2)
-  let ep2_op: ep2_e = @cast(arg1)
-  let is_ep2: i1 = is_ep1 & (ep1_op == EP1_EP2)
-  let is_ep1_only: i1 = is_ep1 & !is_ep2
+    -- ---- field extraction --------------------------------------------------
+    let lb: lb_e = @cast(cp[15..10])
+    let arg1: i5 = cp[9..5]
+    let arg2: i5 = cp[4..0]
+    let imm10: i10 = cp[9..0]
 
-  let pfx_xi: i1 = (lb == LB_XI) | (lb == LB_XIZEXT)
-  let pfx_bmx: i1 = lb == LB_BMX_0_0
-  let pfx_xc: i1 = (lb == LB_XCP) | (lb == LB_XCN)
-  let pfx_uto: i1 = is_ep1_only & (ep1_op == EP1_UTO)
-  let pfx_order: i1 = is_ep1_only &
-      ((ep1_op == EP1_SS) | (ep1_op == EP1_SR) |
-       (ep1_op == EP1_SL) | (ep1_op == EP1_LTL))
-  let pfx_esp: i1 = is_ep1_only & (ep1_op == EP1_ESP)
-  let pfx_flag: i1 = is_ep2 & (ep2_op == EP2_FLAG)
-  let pfx_csp: i1 = is_ep2 & (ep2_op == EP2_CSP)
-  let pfx_mpi: i1 = is_ep2 & (ep2_op == EP2_MPI)
-  let pfx_mpd: i1 = is_ep2 & (ep2_op == EP2_MPD)
-  let pfx_icinvr: i1 = is_ep2 & (ep2_op == EP2_ICINVR)
+    -- ---- prefix classification ---------------------------------------------
+    -- EP1 selects on arg2; EP2 escapes again and selects on arg1. Note the field
+    -- swap between the two levels (spec 2).
+    let is_ep1: i1 = lb == LB_EP1
+    let ep1_op: ep1_e = @cast(arg2)
+    let ep2_op: ep2_e = @cast(arg1)
+    let is_ep2: i1 = is_ep1 & (ep1_op == EP1_EP2)
+    let is_ep1_only: i1 = is_ep1 & !is_ep2
 
-  let is_prefix: i1 = pfx_xi | pfx_bmx | pfx_xc | pfx_uto | pfx_order |
-      pfx_esp | pfx_flag | pfx_csp | pfx_mpi | pfx_mpd | pfx_icinvr
+    let pfx_xi: i1 = (lb == LB_XI) | (lb == LB_XIZEXT)
+    let pfx_bmx: i1 = lb == LB_BMX_0_0
+    let pfx_xc: i1 = (lb == LB_XCP) | (lb == LB_XCN)
+    let pfx_uto: i1 = is_ep1_only & (ep1_op == EP1_UTO)
+    let pfx_order: i1 = is_ep1_only &
+        ((ep1_op == EP1_SS) | (ep1_op == EP1_SR) |
+         (ep1_op == EP1_SL) | (ep1_op == EP1_LTL))
+    let pfx_esp: i1 = is_ep1_only & (ep1_op == EP1_ESP)
+    let pfx_flag: i1 = is_ep2 & (ep2_op == EP2_FLAG)
+    let pfx_csp: i1 = is_ep2 & (ep2_op == EP2_CSP)
+    let pfx_mpi: i1 = is_ep2 & (ep2_op == EP2_MPI)
+    let pfx_mpd: i1 = is_ep2 & (ep2_op == EP2_MPD)
+    let pfx_icinvr: i1 = is_ep2 & (ep2_op == EP2_ICINVR)
 
-  -- A condition code outside the assigned set makes XCP/XCN illegal. The
-  -- emulator used to fall back to treating the code point as a main opcode,
-  -- which then decoded as garbage; here it faults (spec 7).
-  var xc_cond: cond_kind_e = CCK_NONE
-  var xc_cond_ok: i1 = 1'b1
-  let cc: cc_e = @cast(arg2)
-  match cc
-    .CC_OVERFLOW_SET =>
-      xc_cond = CCK_OVERFLOW
-    .CC_FLAG_SET =>
-      xc_cond = CCK_FLAG
-    .CC_VALUE_ZERO =>
-      xc_cond = CCK_ZERO
-    .CC_VALUE_NEGATIVE =>
-      xc_cond = CCK_NEGATIVE
-    .CC_VALUE_POSITIVE =>
-      xc_cond = CCK_POSITIVE
-    _ =>
-      xc_cond = CCK_NONE
-      xc_cond_ok = 1'b0
+    let is_prefix: i1 = pfx_xi | pfx_bmx | pfx_xc | pfx_uto | pfx_order |
+        pfx_esp | pfx_flag | pfx_csp | pfx_mpi | pfx_mpd | pfx_icinvr
 
-  -- ---- immediate assembly ------------------------------------------------
-  -- XI sign-extends from bit 9, XIZEXT zero-extends (spec 4.1).
-  let imm10_sext: i32 = @concat(@rep(imm10[9], 22), imm10)
-  let imm10_zext: i32 = @concat(22'd0, imm10)
-  let xi_ext: i32 = if lb == LB_XI then imm10_sext else imm10_zext
+    -- A condition code outside the assigned set makes XCP/XCN illegal. The
+    -- emulator used to fall back to treating the code point as a main opcode,
+    -- which then decoded as garbage; here it faults (spec 7).
+    var xc_cond: cond_kind_e = CCK_NONE
+    var xc_cond_ok: i1 = 1'b1
+    let cc: cc_e = @cast(arg2)
+    match cc
+      .CC_OVERFLOW_SET =>
+        xc_cond = CCK_OVERFLOW
+      .CC_FLAG_SET =>
+        xc_cond = CCK_FLAG
+      .CC_VALUE_ZERO =>
+        xc_cond = CCK_ZERO
+      .CC_VALUE_NEGATIVE =>
+        xc_cond = CCK_NEGATIVE
+      .CC_VALUE_POSITIVE =>
+        xc_cond = CCK_POSITIVE
+      _ =>
+        xc_cond = CCK_NONE
+        xc_cond_ok = 1'b0
 
-  -- Three different combining rules depending on the main opcode (spec 4).
-  let imm_alu: i32 = if pfx.xi_valid
-      then @concat(pfx.xi_value[26..0], arg2)
-      else @concat(@rep(arg2[4], 27), arg2)
-  let imm_mem: i32 = if pfx.xi_valid then pfx.xi_value else 32'd0
+    -- ---- immediate assembly ------------------------------------------------
+    -- XI sign-extends from bit 9, XIZEXT zero-extends (spec 4.1).
+    let imm10_sext: i32 = @concat(@rep(imm10[9], 22), imm10)
+    let imm10_zext: i32 = @concat(22'd0, imm10)
+    let xi_ext: i32 = if lb == LB_XI then imm10_sext else imm10_zext
 
-  -- DISPI assembles a 20-bit displacement then shifts left by one. The
-  -- extension follows the prefix that supplied it -- previously this
-  -- sign-extended unconditionally, so XIZEXT could yield a negative
-  -- displacement (spec 4.1).
-  let disp20: i20 = @concat(pfx.xi_value[9..0], imm10)
-  let disp_from_xi: i32 = if pfx.xi_zext
-      then @concat(12'd0, disp20)
-      else @concat(@rep(disp20[19], 12), disp20)
-  let disp_ext: i32 = if pfx.xi_valid then disp_from_xi else imm10_sext
-  let disp_bytes: i32 = @concat(disp_ext[30..0], 1'b0)
+    -- Three different combining rules depending on the main opcode (spec 4).
+    let imm_alu: i32 = if pfx.xi_valid
+        then @concat(pfx.xi_value[26..0], arg2)
+        else @concat(@rep(arg2[4], 27), arg2)
+    let imm_mem: i32 = if pfx.xi_valid then pfx.xi_value else 32'd0
 
-  -- ---- main decode -------------------------------------------------------
-  var main_uop: uop_t = @zeroed()
-  var main_is_llc: i1 = 1'b0
-  var main_llc_kind: rdt_e = RDT_U32
+    -- DISPI assembles a 20-bit displacement then shifts left by one. The
+    -- extension follows the prefix that supplied it -- previously this
+    -- sign-extended unconditionally, so XIZEXT could yield a negative
+    -- displacement (spec 4.1).
+    let disp20: i20 = @concat(pfx.xi_value[9..0], imm10)
+    let disp_from_xi: i32 = if pfx.xi_zext
+        then @concat(12'd0, disp20)
+        else @concat(@rep(disp20[19], 12), disp20)
+    let disp_ext: i32 = if pfx.xi_valid then disp_from_xi else imm10_sext
+    let disp_bytes: i32 = @concat(disp_ext[30..0], 1'b0)
 
-  main_uop = @zeroed()
-  main_is_llc = 1'b0
-  main_llc_kind = RDT_U32
+    -- ---- main decode -------------------------------------------------------
+    var main_uop: uop_t = @zeroed()
+    var main_is_llc: i1 = 1'b0
+    var main_llc_kind: rdt_e = RDT_U32
 
-  -- Carry accumulated prefix state onto every decoded instruction.
-  main_uop.cond = pfx.cond
-  main_uop.cond_reg = pfx.cond_reg
-  main_uop.cond_invert = pfx.cond_invert
-  main_uop.uto_valid = pfx.uto_valid
-  main_uop.uto_reg = pfx.uto_reg
-  main_uop.on_flags = pfx.flag
-  main_uop.bm_start = pfx.bm_start
-  main_uop.bm_span = pfx.bm_span
-  main_uop.dst = arg1
-  main_uop.src = arg2
+    main_uop = @zeroed()
+    main_is_llc = 1'b0
+    main_llc_kind = RDT_U32
 
-  match lb
-    -- ---- put constant ----
-    .LB_PUC8 | .LB_PUC16 | .LB_PUC32 =>
-      main_uop.kind = UOP_PUT_IMM
-      main_uop.imm = imm_alu
-      main_uop.datakind = if lb == LB_PUC8 then RDT_U8
-          else if lb == LB_PUC16 then RDT_U16 else RDT_U32
+    -- Carry accumulated prefix state onto every decoded instruction.
+    main_uop.cond = pfx.cond
+    main_uop.cond_reg = pfx.cond_reg
+    main_uop.cond_invert = pfx.cond_invert
+    main_uop.uto_valid = pfx.uto_valid
+    main_uop.uto_reg = pfx.uto_reg
+    main_uop.on_flags = pfx.flag
+    main_uop.bm_start = pfx.bm_start
+    main_uop.bm_span = pfx.bm_span
+    main_uop.dst = arg1
+    main_uop.src = arg2
 
-    .LB_RDT =>
-      -- 3'b111 is the one unassigned tag encoding.
-      if (arg2[2..0] == 3'b111) | (arg2[4..3] != 2'b00) then
-        main_uop = uop_fault(FAULT_ILLEGAL_OPCODE, cp)
-      else
-        main_uop.kind = UOP_SET_TAG
-        main_uop.datakind = @cast(arg2[2..0])
+    match lb
+      -- ---- put constant ----
+      .LB_PUC8 | .LB_PUC16 | .LB_PUC32 =>
+        main_uop.kind = UOP_PUT_IMM
+        main_uop.imm = imm_alu
+        main_uop.datakind = if lb == LB_PUC8 then RDT_U8
+            else if lb == LB_PUC16 then RDT_U16 else RDT_U32
 
-    .LB_CPY =>
-      main_uop.kind = UOP_COPY
-
-    -- ---- loads ----
-    .LB_LD8 | .LB_LD16 | .LB_LD32 | .LB_LDF32 =>
-      main_uop.datakind = if lb == LB_LD8 then RDT_U8
-          else if lb == LB_LD16 then RDT_U16
-          else if lb == LB_LD32 then RDT_U32 else RDT_F32
-      if lb == LB_LDF32 then
-        main_uop = uop_fault(FAULT_FP_UNIMPLEMENTED, cp)   -- reserved (spec 11)
-      else
-        if pfx.csp then
-          -- CSP+LD: port number in arg2, destination arg1 (spec 9).
-          main_uop.kind = UOP_CSP_LOAD
+      .LB_RDT =>
+        -- 3'b111 is the one unassigned tag encoding.
+        if (arg2[2..0] == 3'b111) | (arg2[4..3] != 2'b00) then
+          main_uop = uop_fault(FAULT_ILLEGAL_OPCODE, cp)
         else
-          main_uop.kind = UOP_LOAD
-          main_uop.imm = imm_mem
+          main_uop.kind = UOP_SET_TAG
+          main_uop.datakind = @cast(arg2[2..0])
 
-    -- ---- stores, and the prefixes that replace them ----
-    .LB_ST =>
-      if pfx.icinvr then
-        -- Make this core's stores visible to its own instruction fetch
-        -- (spec 3.2).
-        main_uop.kind = UOP_ICINVR
-      else
-        if pfx.esp then
-          -- Still honoured as a no-op. Ignoring the prefix would perform a
-          -- real store, which is a silent wrong answer (spec 3.2, 10).
-          main_uop.kind = UOP_NOP
+      .LB_CPY =>
+        main_uop.kind = UOP_COPY
+
+      -- ---- loads ----
+      .LB_LD8 | .LB_LD16 | .LB_LD32 | .LB_LDF32 =>
+        main_uop.datakind = if lb == LB_LD8 then RDT_U8
+            else if lb == LB_LD16 then RDT_U16
+            else if lb == LB_LD32 then RDT_U32 else RDT_F32
+        if lb == LB_LDF32 then
+          main_uop = uop_fault(FAULT_FP_UNIMPLEMENTED, cp)   -- reserved (spec 11)
         else
           if pfx.csp then
-            -- CSP+ST: port number in arg1, data in arg2 -- the opposite
-            -- operand positions from the load form.
-            main_uop.kind = UOP_CSP_STORE
+            -- CSP+LD: port number in arg2, destination arg1 (spec 9).
+            main_uop.kind = UOP_CSP_LOAD
           else
-            main_uop.kind = UOP_STORE
+            main_uop.kind = UOP_LOAD
             main_uop.imm = imm_mem
 
-    -- ---- arithmetic ----
-    .LB_ADD | .LB_SUB | .LB_MUL | .LB_DIV =>
-      if lb == LB_DIV then
-        main_uop = uop_fault(FAULT_DIV_UNIMPLEMENTED, cp)   -- cut from v1
-      else
-        main_uop.kind = UOP_ARITH
-        main_uop.arith_op = if lb == LB_ADD then ARITH_ADD
-            else if lb == LB_SUB then ARITH_SUB else ARITH_MUL
-        main_uop.use_imm = pfx.xi_valid
-        main_uop.imm = imm_alu
-
-    -- ---- logic ----
-    .LB_AND | .LB_OR | .LB_XOR =>
-      main_uop.kind = UOP_LOGIC
-      main_uop.logic_op = if lb == LB_AND then LOGIC_AND
-          else if lb == LB_OR then LOGIC_OR else LOGIC_XOR
-      main_uop.use_imm = pfx.xi_valid
-      main_uop.imm = imm_alu
-      -- There is no immediate flag bit, so FLAG with an immediate is
-      -- meaningless (spec 5.6).
-      if pfx.flag & pfx.xi_valid then
-        main_uop = uop_fault(FAULT_ILLEGAL_PREFIX_COMBO, cp)
-
-    -- ---- shifts, and the bit-field ops that replace them ----
-    .LB_SHL | .LB_SHR | .LB_SHRA =>
-      if pfx.bmx_valid then
-        if lb == LB_SHL then
-          main_uop.kind = UOP_BEXT
-          if pfx.bm_span == 5'd0 then
-            main_uop = uop_fault(FAULT_BEXT_ZERO_SPAN, cp)
+      -- ---- stores, and the prefixes that replace them ----
+      .LB_ST =>
+        if pfx.icinvr then
+          -- Make this core's stores visible to its own instruction fetch
+          -- (spec 3.2).
+          main_uop.kind = UOP_ICINVR
         else
-          if lb == LB_SHR then
-            main_uop.kind = UOP_BINS      -- span 0 is a defined no-op
-          else
-            main_uop = uop_fault(FAULT_ILLEGAL_PREFIX_COMBO, cp)
-      else
-        main_uop.kind = UOP_SHIFT
-        main_uop.shift_op = if lb == LB_SHL then SHIFT_LL
-            else if lb == LB_SHR then SHIFT_LR else SHIFT_AR
-
-    -- Immediate shift amounts ignore XI entirely (spec 4).
-    .LB_SHLI | .LB_SHRI | .LB_SHRAI =>
-      main_uop.kind = UOP_SHIFT
-      main_uop.shift_op = if lb == LB_SHLI then SHIFT_LL
-          else if lb == LB_SHRI then SHIFT_LR else SHIFT_AR
-      main_uop.use_imm = 1'b1
-      main_uop.imm = @concat(27'd0, arg2)
-
-    -- ---- comparisons, and the prefetch that replaces them ----
-    .LB_TST | .LB_TSTN | .LB_LT | .LB_GT | .LB_LTE | .LB_GTE =>
-      if pfx.prefetch_d | pfx.prefetch_i then
-        -- Also a no-op that must be honoured: ignoring it would perform a
-        -- real compare and write a flag bit (spec 3.2).
-        main_uop.kind = UOP_NOP
-      else
-        main_uop.kind = UOP_CMP
-        main_uop.use_imm = pfx.xi_valid
-        main_uop.imm = imm_alu
-        main_uop.cmp_op = if lb == LB_TST then CMP_EQ
-            else if lb == LB_TSTN then CMP_NE
-            else if lb == LB_LT then CMP_LT
-            else if lb == LB_GT then CMP_GT
-            else if lb == LB_LTE then CMP_LE else CMP_GE
-
-    -- ---- control transfer ----
-    .LB_DISP =>
-      main_uop.kind = UOP_PREP_JUMP
-      if arg2 == EP1_DISP_OFF then
-        main_uop.jump_kind = JT_REL_REG
-      else
-        if arg2 == EP1_DISP_ABS then
-          main_uop.jump_kind = JT_ABS_REG
-        else
-          main_uop = uop_fault(FAULT_ILLEGAL_OPCODE, cp)
-
-    .LB_DISPI =>
-      main_uop.kind = UOP_PREP_JUMP
-      main_uop.jump_kind = JT_REL_IMM
-      main_uop.imm = disp_bytes
-
-    -- ---- escapes ----
-    .LB_EP1 =>
-      if is_ep2 then
-        if ep2_op == EP2_HALT then
-          main_uop.kind = UOP_HALT
-        else
-          if ep2_op == EP2_DNO then
+          if pfx.esp then
+            -- Still honoured as a no-op. Ignoring the prefix would perform a
+            -- real store, which is a silent wrong answer (spec 3.2, 10).
             main_uop.kind = UOP_NOP
           else
-            if ep2_op == EP2_TC then
-              main_uop.kind = UOP_PERFORM_JUMP
+            if pfx.csp then
+              -- CSP+ST: port number in arg1, data in arg2 -- the opposite
+              -- operand positions from the load form.
+              main_uop.kind = UOP_CSP_STORE
             else
-              main_uop = uop_fault(FAULT_ILLEGAL_OPCODE, cp)
-      else
-        if (ep1_op == EP1_NOT) | (ep1_op == EP1_NEG) then
-          main_uop.kind = UOP_UNARY
-          main_uop.unary_op = if ep1_op == EP1_NOT then UNARY_NOT else UNARY_NEG
-          -- Negating a single bit is meaningless (spec 5.6).
-          if pfx.flag & (ep1_op == EP1_NEG) then
-            main_uop = uop_fault(FAULT_ILLEGAL_PREFIX_COMBO, cp)
+              main_uop.kind = UOP_STORE
+              main_uop.imm = imm_mem
+
+      -- ---- arithmetic ----
+      .LB_ADD | .LB_SUB | .LB_MUL | .LB_DIV =>
+        if lb == LB_DIV then
+          main_uop = uop_fault(FAULT_DIV_UNIMPLEMENTED, cp)   -- cut from v1
         else
-          if (ep1_op == EP1_LLC_B8) | (ep1_op == EP1_LLC_B16) then
-            main_is_llc = 1'b1
-            main_llc_kind = if ep1_op == EP1_LLC_B8 then RDT_U8 else RDT_U16
+          main_uop.kind = UOP_ARITH
+          main_uop.arith_op = if lb == LB_ADD then ARITH_ADD
+              else if lb == LB_SUB then ARITH_SUB else ARITH_MUL
+          main_uop.use_imm = pfx.xi_valid
+          main_uop.imm = imm_alu
+
+      -- ---- logic ----
+      .LB_AND | .LB_OR | .LB_XOR =>
+        main_uop.kind = UOP_LOGIC
+        main_uop.logic_op = if lb == LB_AND then LOGIC_AND
+            else if lb == LB_OR then LOGIC_OR else LOGIC_XOR
+        main_uop.use_imm = pfx.xi_valid
+        main_uop.imm = imm_alu
+        -- There is no immediate flag bit, so FLAG with an immediate is
+        -- meaningless (spec 5.6).
+        if pfx.flag & pfx.xi_valid then
+          main_uop = uop_fault(FAULT_ILLEGAL_PREFIX_COMBO, cp)
+
+      -- ---- shifts, and the bit-field ops that replace them ----
+      .LB_SHL | .LB_SHR | .LB_SHRA =>
+        if pfx.bmx_valid then
+          if lb == LB_SHL then
+            main_uop.kind = UOP_BEXT
+            if pfx.bm_span == 5'd0 then
+              main_uop = uop_fault(FAULT_BEXT_ZERO_SPAN, cp)
           else
-            if ep1_op == EP1_LLC_B32 then
-              main_is_llc = 1'b1
-              main_llc_kind = RDT_U32
+            if lb == LB_SHR then
+              main_uop.kind = UOP_BINS      -- span 0 is a defined no-op
             else
-              if ep1_op == EP1_LLC_F32 then
-                main_uop = uop_fault(FAULT_FP_UNIMPLEMENTED, cp)
+              main_uop = uop_fault(FAULT_ILLEGAL_PREFIX_COMBO, cp)
+        else
+          main_uop.kind = UOP_SHIFT
+          main_uop.shift_op = if lb == LB_SHL then SHIFT_LL
+              else if lb == LB_SHR then SHIFT_LR else SHIFT_AR
+
+      -- Immediate shift amounts ignore XI entirely (spec 4).
+      .LB_SHLI | .LB_SHRI | .LB_SHRAI =>
+        main_uop.kind = UOP_SHIFT
+        main_uop.shift_op = if lb == LB_SHLI then SHIFT_LL
+            else if lb == LB_SHRI then SHIFT_LR else SHIFT_AR
+        main_uop.use_imm = 1'b1
+        main_uop.imm = @concat(27'd0, arg2)
+
+      -- ---- comparisons, and the prefetch that replaces them ----
+      .LB_TST | .LB_TSTN | .LB_LT | .LB_GT | .LB_LTE | .LB_GTE =>
+        if pfx.prefetch_d | pfx.prefetch_i then
+          -- Also a no-op that must be honoured: ignoring it would perform a
+          -- real compare and write a flag bit (spec 3.2).
+          main_uop.kind = UOP_NOP
+        else
+          main_uop.kind = UOP_CMP
+          main_uop.use_imm = pfx.xi_valid
+          main_uop.imm = imm_alu
+          main_uop.cmp_op = if lb == LB_TST then CMP_EQ
+              else if lb == LB_TSTN then CMP_NE
+              else if lb == LB_LT then CMP_LT
+              else if lb == LB_GT then CMP_GT
+              else if lb == LB_LTE then CMP_LE else CMP_GE
+
+      -- ---- control transfer ----
+      .LB_DISP =>
+        main_uop.kind = UOP_PREP_JUMP
+        if arg2 == EP1_DISP_OFF then
+          main_uop.jump_kind = JT_REL_REG
+        else
+          if arg2 == EP1_DISP_ABS then
+            main_uop.jump_kind = JT_ABS_REG
+          else
+            main_uop = uop_fault(FAULT_ILLEGAL_OPCODE, cp)
+
+      .LB_DISPI =>
+        main_uop.kind = UOP_PREP_JUMP
+        main_uop.jump_kind = JT_REL_IMM
+        main_uop.imm = disp_bytes
+
+      -- ---- escapes ----
+      .LB_EP1 =>
+        if is_ep2 then
+          if ep2_op == EP2_HALT then
+            main_uop.kind = UOP_HALT
+          else
+            if ep2_op == EP2_DNO then
+              main_uop.kind = UOP_NOP
+            else
+              if ep2_op == EP2_TC then
+                main_uop.kind = UOP_PERFORM_JUMP
               else
                 main_uop = uop_fault(FAULT_ILLEGAL_OPCODE, cp)
-
-    _ =>
-      main_uop = uop_fault(FAULT_ILLEGAL_OPCODE, cp)
-
-  -- ---- next-state logic --------------------------------------------------
-  var out_uop: uop_t = @zeroed()
-  var emit: i1 = 1'b0
-
-  out_uop = @zeroed()
-  emit = 1'b0
-
-  if cp_valid then
-    pfx.bytes = pfx.bytes + 32'd2
-
-    if state == S_PREFIX then
-      if is_prefix then
-        -- A chain longer than the bound is a fault rather than a hang; the
-        -- emulator's loop was previously unbounded (spec 3).
-        if pfx.count >= 4'd7 then
-          out_uop = uop_fault(FAULT_PREFIX_CHAIN_TOO_LONG, cp)
-          emit = 1'b1
         else
-          pfx.count = pfx.count + 4'd1
-          if pfx_xi then
-            pfx.xi_valid = 1'b1
-            pfx.xi_zext = lb == LB_XIZEXT
-            pfx.xi_value = xi_ext
-          if pfx_bmx then
-            pfx.bmx_valid = 1'b1
-            pfx.bm_start = arg1
-            pfx.bm_span = arg2
-          if pfx_xc then
-            if xc_cond_ok then
-              pfx.cond = xc_cond
-              pfx.cond_reg = arg1
-              pfx.cond_invert = lb == LB_XCN
+          if (ep1_op == EP1_NOT) | (ep1_op == EP1_NEG) then
+            main_uop.kind = UOP_UNARY
+            main_uop.unary_op = if ep1_op == EP1_NOT then UNARY_NOT else UNARY_NEG
+            -- Negating a single bit is meaningless (spec 5.6).
+            if pfx.flag & (ep1_op == EP1_NEG) then
+              main_uop = uop_fault(FAULT_ILLEGAL_PREFIX_COMBO, cp)
+          else
+            if (ep1_op == EP1_LLC_B8) | (ep1_op == EP1_LLC_B16) then
+              main_is_llc = 1'b1
+              main_llc_kind = if ep1_op == EP1_LLC_B8 then RDT_U8 else RDT_U16
             else
-              out_uop = uop_fault(FAULT_ILLEGAL_PREFIX_COMBO, cp)
-              emit = 1'b1
-          if pfx_uto then
-            pfx.uto_valid = 1'b1
-            pfx.uto_reg = arg1
-          if pfx_flag then
-            pfx.flag = 1'b1
-          if pfx_csp then
-            pfx.csp = 1'b1
-          if pfx_icinvr then
-            pfx.icinvr = 1'b1
-          if pfx_esp then
-            pfx.esp = 1'b1
-          if pfx_mpd then
-            pfx.prefetch_d = 1'b1
-          if pfx_mpi then
-            pfx.prefetch_i = 1'b1
-          if pfx_order then
-            pfx.ordering = 1'b1
-      else
-        if main_is_llc then
-          llc_dst = arg1
-          llc_kind = main_llc_kind
-          state = if main_llc_kind == RDT_U32 then S_LLC_HI else S_LLC_LO
+              if ep1_op == EP1_LLC_B32 then
+                main_is_llc = 1'b1
+                main_llc_kind = RDT_U32
+              else
+                if ep1_op == EP1_LLC_F32 then
+                  main_uop = uop_fault(FAULT_FP_UNIMPLEMENTED, cp)
+                else
+                  main_uop = uop_fault(FAULT_ILLEGAL_OPCODE, cp)
+
+      _ =>
+        main_uop = uop_fault(FAULT_ILLEGAL_OPCODE, cp)
+
+    -- ---- next-state logic --------------------------------------------------
+    var out_uop: uop_t = @zeroed()
+    var emit: i1 = 1'b0
+
+    out_uop = @zeroed()
+    emit = 1'b0
+
+    if cp_valid then
+      pfx.bytes = pfx.bytes + 32'd2
+
+      if state == S_PREFIX then
+        if is_prefix then
+          -- A chain longer than the bound is a fault rather than a hang; the
+          -- emulator's loop was previously unbounded (spec 3).
+          if pfx.count >= 4'd7 then
+            out_uop = uop_fault(FAULT_PREFIX_CHAIN_TOO_LONG, cp)
+            emit = 1'b1
+          else
+            pfx.count = pfx.count + 4'd1
+            if pfx_xi then
+              pfx.xi_valid = 1'b1
+              pfx.xi_zext = lb == LB_XIZEXT
+              pfx.xi_value = xi_ext
+            if pfx_bmx then
+              pfx.bmx_valid = 1'b1
+              pfx.bm_start = arg1
+              pfx.bm_span = arg2
+            if pfx_xc then
+              if xc_cond_ok then
+                pfx.cond = xc_cond
+                pfx.cond_reg = arg1
+                pfx.cond_invert = lb == LB_XCN
+              else
+                out_uop = uop_fault(FAULT_ILLEGAL_PREFIX_COMBO, cp)
+                emit = 1'b1
+            if pfx_uto then
+              pfx.uto_valid = 1'b1
+              pfx.uto_reg = arg1
+            if pfx_flag then
+              pfx.flag = 1'b1
+            if pfx_csp then
+              pfx.csp = 1'b1
+            if pfx_icinvr then
+              pfx.icinvr = 1'b1
+            if pfx_esp then
+              pfx.esp = 1'b1
+            if pfx_mpd then
+              pfx.prefetch_d = 1'b1
+            if pfx_mpi then
+              pfx.prefetch_i = 1'b1
+            if pfx_order then
+              pfx.ordering = 1'b1
         else
-          out_uop = main_uop
-          emit = 1'b1
-    else
-      if state == S_LLC_HI then
-        llc_hi = cp
-        state = S_LLC_LO
+          if main_is_llc then
+            llc_dst = arg1
+            llc_kind = main_llc_kind
+            state = if main_llc_kind == RDT_U32 then S_LLC_HI else S_LLC_LO
+          else
+            out_uop = main_uop
+            emit = 1'b1
       else
-        -- S_LLC_LO: the final literal code point completes the constant.
-        out_uop.kind = UOP_PUT_IMM
-        out_uop.dst = llc_dst
-        out_uop.datakind = llc_kind
-        out_uop.imm = if llc_kind == RDT_U32
-            then @concat(llc_hi, cp)
-            else @concat(16'd0, cp)
-        out_uop.cond = pfx.cond
-        out_uop.cond_reg = pfx.cond_reg
-        out_uop.cond_invert = pfx.cond_invert
-        emit = 1'b1
-        state = S_PREFIX
+        if state == S_LLC_HI then
+          llc_hi = cp
+          state = S_LLC_LO
+        else
+          -- S_LLC_LO: the final literal code point completes the constant.
+          out_uop.kind = UOP_PUT_IMM
+          out_uop.dst = llc_dst
+          out_uop.datakind = llc_kind
+          out_uop.imm = if llc_kind == RDT_U32
+              then @concat(llc_hi, cp)
+              else @concat(16'd0, cp)
+          out_uop.cond = pfx.cond
+          out_uop.cond_reg = pfx.cond_reg
+          out_uop.cond_invert = pfx.cond_invert
+          emit = 1'b1
+          state = S_PREFIX
 
-  -- The instruction's total length, needed for PC advance and the link
-  -- register. Counted here rather than in fetch so the two cannot disagree.
-  -- Computed from the register, not from the copy the body may have already
-  -- incremented, so it does not depend on `cp_valid`.
-  out_uop.size_bytes = bytes_held + 32'd2
+    -- The instruction's total length, needed for PC advance and the link
+    -- register. Counted here rather than in fetch so the two cannot disagree.
+    -- Computed from the register, not from the copy the body may have already
+    -- incremented, so it does not depend on `cp_valid`.
+    out_uop.size_bytes = bytes_held + 32'd2
 
-  -- A decoder does not produce a micro-op every cycle: a prefix accumulates
-  -- and emits nothing. The offer is made only on the cycles that complete an
-  -- instruction, and the generated handshake turns that into the write enable
-  -- on the output slot.
-  if emit then
-    @try_send(uop, out_uop)
+    -- A decoder does not produce a micro-op every cycle: a prefix accumulates
+    -- and emits nothing. The offer is made only on the cycles that complete an
+    -- instruction, and the generated handshake turns that into the write enable
+    -- on the output slot.
+    if emit then
+      @try_send(uop, out_uop)
 
-  -- ---- register update ---------------------------------------------------
-  -- Mirrors the always_ff of k2g_decode.sv: `flush` abandons a partially
-  -- accumulated instruction on a branch redirect and resets everything;
-  -- otherwise nothing moves unless a code point is actually consumed.
-  let update: i1 = cp_valid
+    -- ---- register update ---------------------------------------------------
+    -- Mirrors the always_ff of k2g_decode.sv: `flush` abandons a partially
+    -- accumulated instruction on a branch redirect and resets everything;
+    -- otherwise nothing moves unless a code point is actually consumed.
+    let update: i1 = cp_valid
 
-  if flushing then
-    pfx = @zeroed()
-    state = S_PREFIX
-    llc_dst = @zeroed()
-    llc_kind = RDT_U32
-    llc_hi = @zeroed()
-  else
-    if !update then
-      pfx = pfx_held
-      state = state_held
-      llc_dst = llc_dst_held
-      llc_kind = llc_kind_held
-      llc_hi = llc_hi_held
+    if flushing then
+      pfx = @zeroed()
+      state = S_PREFIX
+      llc_dst = @zeroed()
+      llc_kind = RDT_U32
+      llc_hi = @zeroed()
     else
-      -- Instruction complete: start the next one clean. The llc_* registers
-      -- keep the values the body left, exactly as the SystemVerilog does.
-      if emit then
-        pfx = @zeroed()
-        state = S_PREFIX
+      if !update then
+        pfx = pfx_held
+        state = state_held
+        llc_dst = llc_dst_held
+        llc_kind = llc_kind_held
+        llc_hi = llc_hi_held
+      else
+        -- Instruction complete: start the next one clean. The llc_* registers
+        -- keep the values the body left, exactly as the SystemVerilog does.
+        if emit then
+          pfx = @zeroed()
+          state = S_PREFIX

@@ -80,7 +80,7 @@ fn as_blocking_send(stmt: &PrecResInnerStmt) -> Option<(String, PrecResExpr)> {
 ///
 /// Used to reject a barrier nested in a conditional, which cannot be scheduled
 /// without a control-flow graph.
-fn contains_barrier(stmt: &PrecResInnerStmt) -> bool {
+pub fn contains_barrier(stmt: &PrecResInnerStmt) -> bool {
     fn in_expr(e: &PrecResExpr) -> bool {
         match e {
             PrecResExpr::Call { base, args } => {
@@ -344,6 +344,7 @@ pub fn lower_blocking(
     reg_tys: Vec<Ty>,
     reg_resets: Vec<u128>,
     body: &[PrecResInnerStmt],
+    repeats: bool,
     sink: &mut DiagSink,
 ) -> Option<crate::ir::Module> {
     let pipe_names: Vec<String> = low.pipes.iter().map(|p| p.name.clone()).collect();
@@ -364,7 +365,14 @@ pub fn lower_blocking(
         }
     }
 
-    let st_ty = Ty::UInt(state_width(n_states));
+    // A `loop` wraps back to the first state. A linear body does not: it runs
+    // once and stops, which is one more state than there are segments. The
+    // terminal state is not a segment, so nothing drives a `valid` or a
+    // `ready` in it and no barrier can fire -- the machine parks there and the
+    // registers hold whatever the last pass left.
+    let done_state = n_states as u128;
+    let encoded_states = if repeats { n_states } else { n_states + 1 };
+    let st_ty = Ty::UInt(state_width(encoded_states));
     let st_slot = reg_names.len();
     let state = low.emit(st_ty.clone(), Op::RegRead(st_slot as u32));
     low.name_value(state, "state".to_string());
@@ -524,7 +532,11 @@ pub fn lower_blocking(
     let last = n_states - 1;
     let mut next_state = low.emit(st_ty.clone(), Op::Const(0));
     for k in (0..n_states).rev() {
-        let target = if k == last { 0u128 } else { (k + 1) as u128 };
+        let target = if k == last {
+            if repeats { 0u128 } else { done_state }
+        } else {
+            (k + 1) as u128
+        };
         let tv = low.emit(st_ty.clone(), Op::Const(target));
         next_state = low.emit(
             st_ty.clone(),

@@ -114,7 +114,7 @@ pub fn lower_sequence(
     sink: &mut DiagSink,
 ) -> Option<crate::ir::Module> {
     let mut low = Lowerer::new(map, syms, bodies);
-    let mut env: Env = HashMap2::new();
+    let mut env: Env = Env::new();
 
     // Clock and reset are implicit, as for a process.
     for implicit in ["clk", "rst_n"] {
@@ -370,4 +370,3 @@ pub fn lower_sequence(
     })
 }
 
-type HashMap2 = std::collections::HashMap<String, Binding>;

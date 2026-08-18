@@ -431,7 +431,7 @@ pub fn inline_call(
 
     // Bind arguments into a fresh scope. The callee sees only its parameters,
     // never the caller's locals.
-    let mut callee_env: Env = HashMap::new();
+    let mut callee_env: Env = Env::new();
     for (arg_expr, (param_name, _, param_ty)) in args.iter().zip(inputs.iter()) {
         let mut value = crate::ir::lower_expr(low, arg_expr, env, sink)?;
         let have = low.ty_of(value);

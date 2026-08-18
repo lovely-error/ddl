@@ -1489,15 +1489,66 @@ fn a_barrier_inside_a_conditional_is_rejected_rather_than_mis_scheduled() {
 }
 
 #[test]
-fn a_loop_with_no_blocking_operation_is_rejected() {
+fn a_loop_with_no_blocking_operation_repeats_every_cycle() {
+    // Not an error and not a state machine: `loop` with no barrier is the
+    // per-cycle form, which is what most of this compiler's output is.
+    let v = compile(concat!(
+        "process p (src: buffer in i32, dst: buffer out i32)\n",
+        "  loop\n",
+        "    let (x, got) = @try_rcv(src)\n",
+        "    @try_send(dst, x)\n",
+    ));
+    assert!(v.contains("always @(posedge clk)"), "{}", v);
+    // No `state`, and no `done`: it never stops.
+    assert!(!v.contains("reg [1:0] state;"), "{}", v);
+    assert!(!v.contains("reg done;"), "{}", v);
+}
+
+#[test]
+fn a_linear_body_runs_once_and_stops() {
+    // desc.md:39 -- a process "may stop (reach terminal state)". `loop` is
+    // what makes a body repeat; without one it is a program that runs once.
+    let v = compile(concat!(
+        "process p (src: buffer in i32, dst: buffer out i32)\n",
+        "  var seen: i32 = @zeroed()\n",
+        "  let (x, got) = @try_rcv(src)\n",
+        "  seen = x\n",
+        "  @try_send(dst, seen)\n",
+    ));
+    assert!(v.contains("reg done;"), "{}", v);
+    assert!(v.contains("done <= 1'b1;"), "{}", v);
+    // Refuses everything once it has stopped, and holds its state.
+    assert!(v.contains("(!done)"), "{}", v);
+    assert!(v.contains("seen <= (done ? seen :"), "{}", v);
+}
+
+#[test]
+fn a_linear_body_with_barriers_ends_in_a_terminal_state() {
+    let v = compile(concat!(
+        "process p (src: buffer in i32, dst: buffer out i32)\n",
+        "  let a = @rcv(src)\n",
+        "  @send(dst, a)\n",
+    ));
+    // Two segments, so states 0 and 1 -- plus a third the machine parks in.
+    // Nothing drives a `valid` or a `ready` there, so it is terminal by
+    // construction rather than by a rule written out somewhere.
+    assert!(v.contains("reg [1:0] state;"), "{}", v);
+    assert!(v.contains("2'd2"), "{}", v);
+    assert!(v.contains("assign src_ready = in_s0;"), "{}", v);
+    assert!(v.contains("assign dst_valid = in_s1;"), "{}", v);
+}
+
+#[test]
+fn break_says_what_it_needs() {
     let text = compile_err(concat!(
         "process p (src: buffer in i32, dst: buffer out i32)\n",
         "  loop\n",
-        "    let x = 32'd1\n",
+        "    let (x, got) = @try_rcv(src)\n",
+        "    @try_send(dst, x)\n",
+        "    break\n",
     ));
-    // The "ends on a barrier" rule catches this first, which says the same
-    // thing more precisely.
-    assert!(text.contains("must be an `@rcv` or `@send`"), "{}", text);
+    assert!(text.contains("`break` is not scheduled yet"), "{}", text);
+    assert!(text.contains("control-flow graph"), "{}", text);
 }
 
 #[test]
@@ -1606,10 +1657,11 @@ const REGFILE: &str = concat!(
     "  data: i32\n",
     "process rf (cmd: buffer in cmd_t, rd: stream out i32)\n",
     "  var vals: #[impl(lutram)] [i32; 32] = @zeroed()\n",
-    "  let (c, got) = @try_rcv(cmd)\n",
-    "  let _s = @try_send(rd, vals[c.addr])\n",
-    "  if c.we then\n",
-    "    vals[c.addr] = c.data\n",
+    "  loop\n",
+    "    let (c, got) = @try_rcv(cmd)\n",
+    "    let _s = @try_send(rd, vals[c.addr])\n",
+    "    if c.we then\n",
+    "      vals[c.addr] = c.data\n",
 );
 
 #[test]
@@ -1664,10 +1716,11 @@ fn a_memory_with_no_initialiser_has_no_reset_loop() {
         concat!(
             "process rf (cmd: buffer in cmd_t, rd: stream out i32)\n",
             "  var vals: #[impl(lutram)] [i32; 32]\n",
-            "  let (c, got) = @try_rcv(cmd)\n",
-            "  let _s = @try_send(rd, vals[c.addr])\n",
-            "  if c.we then\n",
-            "    vals[c.addr] = c.data\n",
+            "  loop\n",
+            "    let (c, got) = @try_rcv(cmd)\n",
+            "    let _s = @try_send(rd, vals[c.addr])\n",
+            "    if c.we then\n",
+            "      vals[c.addr] = c.data\n",
         )
     ));
     assert!(!v.contains("integer vals_ix;"), "{}", v);
@@ -1915,4 +1968,19 @@ fn bram_is_recognised_and_refused_rather_than_quietly_made_lutram() {
     ));
     assert!(text.contains("`#[impl(bram)]` is not supported yet"), "{}", text);
     assert!(text.contains("read takes a cycle"), "{}", text);
+}
+
+
+#[test]
+fn the_same_source_compiles_to_the_same_bytes() {
+    // The SSA joins walk `env.keys()`, so the environment's iteration order
+    // decides the order values are emitted in. With a `HashMap` that order is
+    // randomised per process and three builds of one source produced three
+    // different files -- which makes `--check` impossible to pass and every
+    // regeneration a diff. Ten builds here, because a random order can agree
+    // with itself twice by luck.
+    let first = compile(REGFILE);
+    for _ in 0..9 {
+        assert_eq!(compile(REGFILE), first, "output is not reproducible");
+    }
 }

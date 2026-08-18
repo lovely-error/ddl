@@ -35,22 +35,26 @@ struct out_item_t
   is_mem: i1
 
 process k3g_stage (iops: buffer in in_item_t, uops: buffer out out_item_t)
-  let (item, got) = @try_rcv(iops)
 
-  -- A fixed-format expansion, not a decode: unpack known fields and hand them
-  -- on. `got` is available but this stage never stalls for its own reasons, so
-  -- it does not need to look at it.
-  var out: out_item_t = @zeroed()
-  out.epoch = item.epoch
-  out.kind = item.kind
-  out.dst = item.dst
-  out.src = item.src
-  out.imm = @concat(16'd0, item.imm)
+  -- The process is a program: it runs once and stops. `loop` is what makes
+  -- it repeat, once per cycle, for as long as the design runs.
+  loop
+    let (item, got) = @try_rcv(iops)
 
-  match item.kind
-    .K_LOAD | .K_STORE =>
-      out.is_mem = 1'b1
-    _ =>
-      out.is_mem = 1'b0
+    -- A fixed-format expansion, not a decode: unpack known fields and hand them
+    -- on. `got` is available but this stage never stalls for its own reasons, so
+    -- it does not need to look at it.
+    var out: out_item_t = @zeroed()
+    out.epoch = item.epoch
+    out.kind = item.kind
+    out.dst = item.dst
+    out.src = item.src
+    out.imm = @concat(16'd0, item.imm)
 
-  let _taken = @try_send(uops, out)
+    match item.kind
+      .K_LOAD | .K_STORE =>
+        out.is_mem = 1'b1
+      _ =>
+        out.is_mem = 1'b0
+
+    let _taken = @try_send(uops, out)

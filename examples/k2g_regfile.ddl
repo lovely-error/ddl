@@ -75,42 +75,46 @@ process k2g_regfile (req: buffer in rf_req_t, rsp: buffer out rf_rsp_t)
   var overflow: #[impl(lutram)] [i1; 32] = @zeroed()
   var flagbit: #[impl(lutram)] [i1; 32] = @zeroed()
 
-  let (r, got) = @try_rcv(req)
+  -- The process is a program: it runs once and stops. `loop` is what makes
+  -- it repeat, once per cycle, for as long as the design runs.
+  loop
 
-  var out: rf_rsp_t = @zeroed()
-  out.ra_value = values[r.ra_addr]
-  out.rb_value = values[r.rb_addr]
-  out.rc_value = values[r.rc_addr]
+    let (r, got) = @try_rcv(req)
 
-  out.ra_tag = tags[r.ra_addr]
-  out.rb_tag = tags[r.rb_addr]
-  -- The predicate port's tag is read for one reason: F32 is reserved, and a
-  -- predicate register carrying it faults like any other read.
-  out.rc_tag = tags[r.rc_addr]
+    var out: rf_rsp_t = @zeroed()
+    out.ra_value = values[r.ra_addr]
+    out.rb_value = values[r.rb_addr]
+    out.rc_value = values[r.rc_addr]
 
-  out.ra_overflow = overflow[r.ra_addr]
-  out.rb_overflow = overflow[r.rb_addr]
-  out.rc_overflow = overflow[r.rc_addr]
+    out.ra_tag = tags[r.ra_addr]
+    out.rb_tag = tags[r.rb_addr]
+    -- The predicate port's tag is read for one reason: F32 is reserved, and a
+    -- predicate register carrying it faults like any other read.
+    out.rc_tag = tags[r.rc_addr]
 
-  out.ra_flag = flagbit[r.ra_addr]
-  out.rb_flag = flagbit[r.rb_addr]
-  out.rc_flag = flagbit[r.rc_addr]
+    out.ra_overflow = overflow[r.ra_addr]
+    out.rb_overflow = overflow[r.rb_addr]
+    out.rc_overflow = overflow[r.rc_addr]
 
-  @try_send(rsp, out)
+    out.ra_flag = flagbit[r.ra_addr]
+    out.rb_flag = flagbit[r.rb_addr]
+    out.rc_flag = flagbit[r.rc_addr]
 
-  if r.we_value then
-    values[r.w_addr] = r.w_value
+    @try_send(rsp, out)
 
-  if r.we_tag then
-    -- RDT_UNCLAIMED_7 is a reserved encoding: nothing produces it, and a tag
-    -- carrying it would leave store width and comparison signedness
-    -- undefined. Written inside the `if`, so it says nothing about cycles
-    -- that do not write a tag.
-    @assert(r.w_tag != RDT_UNCLAIMED_7, "the reserved tag encoding was written")
-    tags[r.w_addr] = r.w_tag
+    if r.we_value then
+      values[r.w_addr] = r.w_value
 
-  if r.we_overflow then
-    overflow[r.w_addr] = r.w_overflow
+    if r.we_tag then
+      -- RDT_UNCLAIMED_7 is a reserved encoding: nothing produces it, and a tag
+      -- carrying it would leave store width and comparison signedness
+      -- undefined. Written inside the `if`, so it says nothing about cycles
+      -- that do not write a tag.
+      @assert(r.w_tag != RDT_UNCLAIMED_7, "the reserved tag encoding was written")
+      tags[r.w_addr] = r.w_tag
 
-  if r.we_flag then
-    flagbit[r.w_addr] = r.w_flag
+    if r.we_overflow then
+      overflow[r.w_addr] = r.w_overflow
+
+    if r.we_flag then
+      flagbit[r.w_addr] = r.w_flag

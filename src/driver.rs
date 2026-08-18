@@ -462,8 +462,9 @@ mod emit_tests {
         // is overwritten" into "the newest is dropped".
         let v = compile(concat!(
             "process P (src: buffer in i32, o: stream out i32)\n",
-            "  let (x, got) = @try_rcv(src)\n",
-            "  let _s = @try_send(o, x)\n",
+            "  loop\n",
+            "    let (x, got) = @try_rcv(src)\n",
+            "    let _s = @try_send(o, x)\n",
         ));
         assert!(v.contains("output        o_valid"), "{}", v);
         assert!(!v.contains("o_ready"), "{}", v);
