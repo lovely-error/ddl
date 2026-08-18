@@ -12,7 +12,8 @@ use crate::ir::{lower_function, lower_process};
 use crate::lex::{find_tab, parse_top_level, TopLevelDecl};
 use crate::parse::{
     FunctionDecl, anumspan_to_str, resolve_precedence_for_enum, resolve_precedence_for_function,
-    resolve_precedence_for_process, resolve_precedence_for_struct,
+    resolve_precedence_for_process, resolve_precedence_for_sequence,
+    resolve_precedence_for_struct,
 };
 use crate::symbols;
 use crate::verilog::{EmitOptions, emit_banner, emit_module};
@@ -87,6 +88,7 @@ pub fn compile_to_verilog(map: &SourceMap, opts: &EmitOptions) -> Result<String,
     let mut structs = Vec::new();
     let mut funcs = Vec::new();
     let mut procs = Vec::new();
+    let mut seqs = Vec::new();
 
     for decl in &parsed.decls {
         match decl {
@@ -115,10 +117,10 @@ pub fn compile_to_verilog(map: &SourceMap, opts: &EmitOptions) -> Result<String,
                 }
             }
             TopLevelDecl::SequenceDecl(sq) => {
-                sink.err_at(
-                    &sq.name,
-                    "`sequence` needs the pipeline scheduler, which is not built yet",
-                );
+                match unsafe { resolve_precedence_for_sequence(base, sq) } {
+                    Ok(r) => seqs.push(r),
+                    Err(_) => sink.err_at(&sq.name, "could not resolve this sequence"),
+                }
             }
         }
     }
@@ -148,6 +150,13 @@ pub fn compile_to_verilog(map: &SourceMap, opts: &EmitOptions) -> Result<String,
             emitted += 1;
         }
     }
+    for seq in &seqs {
+        if let Some(module) = crate::ir_pipe::lower_sequence(map, &syms, &bodies, seq, &mut sink) {
+            out.push('\n');
+            out.push_str(&emit_module(&module, opts));
+            emitted += 1;
+        }
+    }
     for proc in &procs {
         if let Some(module) = lower_process(map, &syms, &bodies, proc, &mut sink) {
             out.push('\n');
@@ -160,7 +169,7 @@ pub fn compile_to_verilog(map: &SourceMap, opts: &EmitOptions) -> Result<String,
         return Err(sink.into_diags());
     }
     if emitted == 0 {
-        return Err(vec![Diag::error_no_span("nothing to emit: no `fun` or `process` declarations found")]);
+        return Err(vec![Diag::error_no_span("nothing to emit: no `fun`, `process` or `sequence` declarations found")]);
     }
     Ok(out)
 }

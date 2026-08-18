@@ -1461,3 +1461,69 @@ fn receiving_from_an_output_pipe_is_rejected_in_a_loop() {
     ));
     assert!(text.contains("can only be sent to"), "{}", text);
 }
+
+// ---- sequences -----------------------------------------------------------
+
+const PIPE3: &str = concat!(
+    "sequence s (src: buffer in i16, dst: buffer out i32)\n",
+    "  let a = @rcv(src)\n",
+    "  let doubled: i16 = a + a\n",
+    "  |||\n",
+    "  let wide: i32 = @zext(doubled, 32)\n",
+    "  |||\n",
+    "  let scaled: i32 = wide + wide\n",
+    "  @send(dst, scaled)\n",
+);
+
+#[test]
+fn a_stage_cut_becomes_a_register_bank_and_a_validity_bit() {
+    // `|||` was parsed and thrown away since before this work started.
+    let v = compile(PIPE3);
+    assert!(v.contains("reg v0;"), "{}", v);
+    assert!(v.contains("reg v1;"), "{}", v);
+    assert!(v.contains("reg v2;"), "{}", v);
+    assert!(v.contains("reg [15:0] doubled_s1;"), "{}", v);
+    assert!(v.contains("reg [31:0] wide_s2;"), "{}", v);
+}
+
+#[test]
+fn the_pipeline_shifts_when_its_sink_has_a_slot() {
+    let v = compile(PIPE3);
+    assert!(v.contains("wire shift = (!v2) | dst_ready;"), "{}", v);
+    assert!(v.contains("assign src_ready = shift;"), "{}", v);
+    // Rule 3: the output valid is the last validity bit, a register.
+    assert!(v.contains("assign dst_valid = v2;"), "{}", v);
+    assert!(v.contains("v1 <= (shift ? v0 : v1);"), "{}", v);
+}
+
+#[test]
+fn the_item_leaving_is_registered_alongside_its_validity_bit() {
+    // Without this the pipeline would offer the CURRENT input while
+    // advertising the validity of one three cycles older.
+    let v = compile(PIPE3);
+    assert!(v.contains("reg [31:0] out_hold;"), "{}", v);
+    assert!(v.contains("assign dst_data = out_hold;"), "{}", v);
+}
+
+#[test]
+fn a_blocking_read_outside_the_head_stage_is_rejected() {
+    let text = compile_err(concat!(
+        "sequence s (src: buffer in i16, dst: buffer out i32)\n",
+        "  let a = @rcv(src)\n",
+        "  |||\n",
+        "  let b = @rcv(src)\n",
+        "  @send(dst, @zext(b, 32))\n",
+    ));
+    assert!(text.contains("only the first stage"), "{}", text);
+}
+
+#[test]
+fn a_sequence_must_end_by_sending() {
+    let text = compile_err(concat!(
+        "sequence s (src: buffer in i16, dst: buffer out i32)\n",
+        "  let a = @rcv(src)\n",
+        "  |||\n",
+        "  let b: i32 = @zext(a, 32)\n",
+    ));
+    assert!(text.contains("ends by sending"), "{}", text);
+}

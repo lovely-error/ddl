@@ -256,8 +256,82 @@ impl<'a> Lowerer<'a> {
         }
     }
 
+    /// Declares the pipe parameters of a process or sequence.
+    ///
+    /// A pipe becomes three flat ports, which is the flattening k3g_chan.sv:60
+    /// already pre-commits to for the yosys-slang risk.
+    pub fn declare_pipes(
+        &mut self,
+        args: &crate::parse::PrecArgDefTuple,
+        sink: &mut DiagSink,
+    ) -> Option<()> {
+        for arg in &args.entries {
+            let name = anumspan_to_str(&arg.arg_name).to_string();
+            let is_input = match arg.qualifier {
+                ArgTypeQualifier::BufferIn => true,
+                ArgTypeQualifier::BufferOut => false,
+                ArgTypeQualifier::StreamIn | ArgTypeQualifier::StreamOut => {
+                    sink.err_at(&arg.arg_name, "`stream` pipes are not supported yet; `buffer` is");
+                    return None;
+                }
+                _ => {
+                    sink.err_at(&arg.arg_name, "a sequence takes only pipe parameters");
+                    return None;
+                }
+            };
+            let ty = match resolve_type_expr(&arg.type_expr, self.syms) {
+                Ok(t) => t,
+                Err(e) => {
+                    sink.err_at(&arg.arg_name, e.message());
+                    return None;
+                }
+            };
+            let (vd, rd, dd) = if is_input {
+                (PortDir::In, PortDir::Out, PortDir::In)
+            } else {
+                (PortDir::Out, PortDir::In, PortDir::Out)
+            };
+            let mut mk = |low: &mut Self, suffix: &str, dir: PortDir, t: Ty| {
+                let id = PortId(low.ports.len() as u32);
+                low.ports.push(Port { name: format!("{}_{}", name, suffix), dir, ty: t });
+                id
+            };
+            let valid_port = mk(self, "valid", vd, Ty::BOOL);
+            let ready_port = mk(self, "ready", rd, Ty::BOOL);
+            let data_port = mk(self, "data", dd, ty.clone());
+            let data_value = if is_input {
+                let v = self.emit(ty.clone(), Op::Port(data_port));
+                self.values[v.0 as usize].name = Some(format!("{}_data", name));
+                Some(v)
+            } else {
+                None
+            };
+            self.pipes.push(PipeInfo {
+                name,
+                ty,
+                is_input,
+                valid_port,
+                ready_port,
+                data_port,
+                data_value,
+                used: false,
+                sent: None,
+                fired: None,
+                busy_reg: None,
+                hold_reg: None,
+            });
+        }
+        Some(())
+    }
+
     pub fn take_values(self) -> (Vec<ValueDef>, Vec<Port>) {
         (self.values, self.ports)
+    }
+
+    pub fn add_port(&mut self, name: String, dir: PortDir, ty: Ty) -> PortId {
+        let id = PortId(self.ports.len() as u32);
+        self.ports.push(Port { name, dir, ty });
+        id
     }
 
     pub fn name_value(&mut self, v: ValueId, name: String) {

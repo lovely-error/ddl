@@ -20,6 +20,7 @@ mod ty;
 mod ir;
 mod ir_fsm;
 mod ir_match;
+mod ir_pipe;
 mod verilog;
 
 #[cfg(test)]

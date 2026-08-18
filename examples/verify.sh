@@ -23,7 +23,7 @@ GW_SH="${GW_SH:-/c/Gowin/Gowin_V1.9.12.02_SP2_x64/IDE/bin/gw_sh.exe}"
 WORK="${WORK:-$DDL_ROOT/target/verify}"
 RTL="$K2G/rtl"
 
-ALL_MODULES=(k2g_shift k2g_alu k2g_decode k3g_stage fsm_adder)
+ALL_MODULES=(k2g_shift k2g_alu k2g_decode k3g_stage fsm_adder mul3)
 MODULES=("$@")
 [ ${#MODULES[@]} -eq 0 ] && MODULES=("${ALL_MODULES[@]}")
 
