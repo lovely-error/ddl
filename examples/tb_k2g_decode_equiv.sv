@@ -18,6 +18,13 @@
 // own transfer. When the DDL's output slot is full and the sink is refusing,
 // `cps_ready` falls, no code point moves, and the reference does not advance
 // either -- which is exactly the behaviour `hold` was wired up to produce.
+//
+// The redirect is IN THE STREAM. The SystemVerilog takes it on a separate
+// `flush` wire that lands whether or not a code point is consumed; the DDL
+// carries a `restart` bit on the item, so it lands with the transfer. The
+// reference is driven with `flush = xfer & restart` to match, which is what
+// makes the two comparable -- and which is the whole behavioural difference
+// the change makes.
 `timescale 1ns/1ps
 `include "k2g_types.svh"
 
@@ -30,8 +37,8 @@ module tb_k2g_decode_equiv;
   always #5 clk = ~clk;
 
   logic [15:0] cp;
+  logic        restart;     // this code point begins a new instruction stream
   logic        offer;       // the producer has a code point available
-  logic        flush;
   logic        uop_ready;   // the consumer will take a micro-op
 
   logic         ref_accept, ref_uop_valid;
@@ -39,8 +46,13 @@ module tb_k2g_decode_equiv;
   logic         ddl_cps_ready, ddl_uop_valid;
   logic [126:0] ddl_uop;
 
-  // The reference consumes exactly when the DDL does.
+  // The reference consumes exactly when the DDL does, and sees the redirect at
+  // the moment the item carrying it transfers.
   wire xfer = offer & ddl_cps_ready;
+  wire flush = xfer & restart;
+
+  // The item, packed the way the DDL packs `cp_item_t`: first field high.
+  wire [16:0] cps_item = {cp, restart};
 
   k2g_decode u_ref (
       .clk(clk), .rst_n(rst_n),
@@ -50,8 +62,7 @@ module tb_k2g_decode_equiv;
 
   k2g_decode_ddl u_ddl (
       .clk(clk), .rst_n(rst_n),
-      .cps_valid(offer), .cps_ready(ddl_cps_ready), .cps_data(cp),
-      .flush_valid(flush), .flush_data(1'b0),
+      .cps_valid(offer), .cps_ready(ddl_cps_ready), .cps_data(cps_item),
       .uop_valid(ddl_uop_valid), .uop_ready(uop_ready), .uop_data(ddl_uop)
   );
 
@@ -86,7 +97,7 @@ module tb_k2g_decode_equiv;
   endtask
 
   task automatic step(logic [15:0] c, logic v, logic f, logic r);
-    cp = c; offer = v; flush = f; uop_ready = r;
+    cp = c; offer = v; restart = f; uop_ready = r;
     #1;
 
     // Rule 2: an offer may not be withdrawn or altered before it is taken.
@@ -163,7 +174,7 @@ module tb_k2g_decode_equiv;
 
   initial begin
     rst_n = 1'b0;
-    cp = 16'd0; offer = 1'b0; flush = 1'b0; uop_ready = 1'b1;
+    cp = 16'd0; offer = 1'b0; restart = 1'b0; uop_ready = 1'b1;
     repeat (3) @(posedge clk);
     rst_n = 1'b1;
     @(posedge clk);
@@ -194,7 +205,8 @@ module tb_k2g_decode_equiv;
     end
 
     // 4. Random traffic with a sink that refuses often. This is what `hold`
-    //    used to be, and nothing in the DDL source mentions it.
+    //    used to be, and nothing in the DDL source mentions it. The redirect
+    //    rides in-band, so it only lands on cycles an item actually moves.
     for (int t = 0; t < 60000; t++)
       step($urandom,
            $urandom_range(9) != 0,      // the producer mostly has something

@@ -57,18 +57,28 @@ enum state_e: i2
 -- five comparisons, which the SystemVerilog avoids by computing them in one
 -- always_comb.)
 
+-- One code point, and whether it starts a new instruction stream.
+--
+-- The SystemVerilog carries the redirect on a separate `flush` wire, and that
+-- leaves a question nothing answers: when a flush and a code point arrive on
+-- the same cycle, which happened first? Today the code point is accepted --
+-- `accept` does not consult `flush` -- and then thrown away by the reset
+-- branch, so the producer is told an item was delivered and it was not.
+--
+-- Carried IN the stream it redirects, the ordering is a fact of the channel
+-- rather than a convention, and nothing is accepted-then-discarded. It also
+-- stops the redirect being something that can be dropped: a lost flush would
+-- leave the accumulator holding prefixes from an abandoned path and decode the
+-- new stream as a continuation of it.
+struct cp_item_t
+  code: i16
+  restart: i1
+
 process k2g_decode (
     -- The code point stream. `cps_valid` / `cps_ready` / `cps_data` are
     -- generated: the SystemVerilog spells the same handshake by hand as
     -- `cp_valid` and `accept`.
-    cps: buffer in i16,
-
-    -- A branch redirect abandons a partially accumulated instruction. It is
-    -- an EVENT rather than a level, and it must not be able to stall its
-    -- producer -- a fetch unit cannot wait for the decoder to agree to be
-    -- flushed -- so it is a stream. The payload is unused; the arrival is the
-    -- whole message.
-    flush: stream in i1,
+    cps: buffer in cp_item_t,
 
     -- Micro-ops out. This is a `buffer`, and that is what removes `hold`.
     --
@@ -96,8 +106,12 @@ process k2g_decode (
     -- TRANSFER, not the offer: it is already `cps_valid && cps_ready`, so it is
     -- false on a cycle the sink is refusing -- which is exactly what
     -- `cp_valid && !hold` used to spell out.
-    let (cp, cp_valid) = @try_rcv(cps)
-    let (_flush_payload, flushing) = @try_rcv(flush)
+    let (item, cp_valid) = @try_rcv(cps)
+    let cp: i16 = item.code
+
+    -- The redirect rides with the code point that begins the new stream, so it
+    -- cannot arrive out of order with it and cannot be lost.
+    let flushing: i1 = cp_valid & item.restart
 
     -- The register values as of this clock edge. The body mutates the registers
     -- freely; these are what gets restored when the update is not taken, which
