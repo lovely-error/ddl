@@ -1,0 +1,1463 @@
+// M2 regression tests: enums, `match`, and calls to user-defined functions.
+//
+// In their own file rather than inside driver.rs because they exercise the
+// whole pipeline, not the driver specifically.
+
+use crate::diag::SourceMap;
+use crate::driver::compile_to_verilog;
+use crate::verilog::EmitOptions;
+
+fn compile(src: &str) -> String {
+    let map = SourceMap::new("t.ddl", src);
+    let verilog = match compile_to_verilog(&map, &EmitOptions::default()) {
+        Ok(v) => v,
+        Err(diags) => panic!("compile failed:\n{}", map.render_all(&diags)),
+    };
+    assert_no_undeclared_nets(&verilog);
+    verilog
+}
+
+/// Every generated net must be declared before it is read.
+///
+/// Worth checking on every compile: folding single-use values and aliasing
+/// no-op casts were two mechanisms that each removed a wire, and together they
+/// once emitted `assign k = n1;` with no `n1` anywhere -- Verilog that no test
+/// asserting on substrings would have noticed.
+fn assert_no_undeclared_nets(verilog: &str) {
+    for module in verilog.split("module ").skip(1) {
+        let mut declared: Vec<&str> = Vec::new();
+        for line in module.lines() {
+            let t = line.trim();
+            for kw in ["wire ", "reg "] {
+                if let Some(rest) = t.strip_prefix(kw) {
+                    // `wire x = e;` and `reg x;` both declare their last name
+                    // before the `=` or the `;`.
+                    let head = rest.split('=').next().unwrap_or(rest);
+                    let head = head.trim_end_matches(';');
+                    if let Some(last) = head.split_whitespace().last() {
+                        declared.push(last);
+                    }
+                }
+            }
+            let is_port = t.starts_with("input ") || t.starts_with("output");
+            if is_port {
+                let cleaned = t.trim_end_matches([',', ')', ';']);
+                if let Some(last) = cleaned.split_whitespace().last() {
+                    declared.push(last);
+                }
+            }
+        }
+        // Generated temporaries are the ones at risk; `let` names and ports
+        // are declared by construction.
+        for tok in module.split(|c: char| !c.is_ascii_alphanumeric() && c != '_') {
+            let looks_generated = tok.len() >= 2
+                && tok.starts_with('n')
+                && tok[1..].bytes().all(|b| b.is_ascii_digit());
+            if looks_generated {
+                assert!(
+                    declared.contains(&tok),
+                    "`{}` is read but never declared:\nmodule {}",
+                    tok,
+                    module
+                );
+            }
+        }
+    }
+}
+
+fn compile_err(src: &str) -> String {
+    let map = SourceMap::new("t.ddl", src);
+    match compile_to_verilog(&map, &EmitOptions::default()) {
+        Ok(v) => panic!("expected failure, got:\n{}", v),
+        Err(diags) => map.render_all(&diags),
+    }
+}
+
+const OPS: &str = concat!(
+    "enum op_e: i2\n",
+    "  OP_ADD\n",
+    "  OP_SUB\n",
+    "  OP_AND\n",
+    "  OP_OR\n",
+);
+
+// ---- enums ---------------------------------------------------------------
+
+#[test]
+fn implicit_discriminants_count_up() {
+    let v = compile(&format!(
+        "{}fun f (op: op_e, o: out i1)\n  o = op == OP_AND\n",
+        OPS
+    ));
+    // OP_AND is the third variant, so 2.
+    assert!(v.contains("2'd2"), "{}", v);
+    // Two bits wide, so the port is [1:0].
+    assert!(v.contains("input  [1:0] op"), "{}", v);
+}
+
+#[test]
+fn explicit_discriminants_are_honoured() {
+    let v = compile(concat!(
+        "enum lb_e: i6\n",
+        "  LB_ADD = 6'b110101\n",
+        "  LB_EP1 = 6'b111111\n",
+        "fun f (op: lb_e, o: out i1)\n",
+        "  o = op == LB_ADD\n",
+    ));
+    assert!(v.contains("6'h35"), "{}", v);
+    assert!(v.contains("input  [5:0] op"), "{}", v);
+}
+
+#[test]
+fn the_tag_width_is_inferred_when_not_written() {
+    let v = compile(concat!(
+        "enum small_e\n",
+        "  A\n",
+        "  B\n",
+        "  C\n",
+        "fun f (x: small_e, o: out i1)\n",
+        "  o = x == C\n",
+    ));
+    // Largest discriminant 2, so two bits.
+    assert!(v.contains("input  [1:0] x"), "{}", v);
+}
+
+#[test]
+fn a_tag_too_narrow_for_its_variants_is_rejected() {
+    let text = compile_err(concat!(
+        "enum bad_e: i1\n",
+        "  A\n",
+        "  B\n",
+        "  C\n",
+        "fun f (x: bad_e, o: out i1)\n",
+        "  o = x == A\n",
+    ));
+    assert!(text.contains("1 bits wide"), "{}", text);
+    assert!(text.contains("needs 2"), "{}", text);
+}
+
+#[test]
+fn duplicate_discriminant_values_are_rejected() {
+    // SystemVerilog rejects duplicate labels but accepts duplicate values,
+    // which is the dangerous direction.
+    let text = compile_err(concat!(
+        "enum dup_e: i2\n",
+        "  A = 1\n",
+        "  B = 1\n",
+        "fun f (x: dup_e, o: out i1)\n",
+        "  o = x == A\n",
+    ));
+    assert!(text.contains("already used"), "{}", text);
+}
+
+#[test]
+fn enums_do_arithmetic_nowhere() {
+    let text = compile_err(&format!(
+        "{}fun f (op: op_e, o: out i2)\n  o = op + op\n",
+        OPS
+    ));
+    assert!(text.contains("expected an integer"), "{}", text);
+}
+
+// ---- match ---------------------------------------------------------------
+
+#[test]
+fn match_becomes_a_case_statement() {
+    let v = compile(&format!(
+        concat!(
+            "{}fun f (op: op_e, a: i8, b: i8, o: out i8)\n",
+            "  match op\n",
+            "    .OP_ADD =>\n",
+            "      o = a + b\n",
+            "    .OP_SUB =>\n",
+            "      o = a - b\n",
+            "    _ =>\n",
+            "      o = a & b\n",
+        ),
+        OPS
+    ));
+    // A ternary chain is a PRIORITY structure synthesis must honour in
+    // order; a case says the arms are parallel. Measured on the GW1NR-9C:
+    // 536 cells as nested ternaries against 210 as a case.
+    assert!(v.contains("always @* begin"), "{}", v);
+    assert!(v.contains("case (op)"), "{}", v);
+    assert!(v.contains("2'd0: "), "{}", v);
+    assert!(v.contains("2'd1: "), "{}", v);
+    assert!(v.contains("default: "), "{}", v);
+    assert!(v.contains("a + b"), "{}", v);
+    assert!(v.contains("a - b"), "{}", v);
+    assert!(v.contains("a & b"), "{}", v);
+}
+
+#[test]
+fn a_match_emits_no_mux_for_bindings_no_arm_touched() {
+    // Every arm used to emit `cond ? x : x` for every name in scope.
+    let v = compile(&format!(
+        concat!(
+            "{}fun f (op: op_e, a: i8, b: i8, c: i8, d: i8, o: out i8)\n",
+            "  let untouched = c & d\n",
+            "  match op\n",
+            "    .OP_ADD =>\n",
+            "      o = a\n",
+            "    _ =>\n",
+            "      o = b\n",
+        ),
+        OPS
+    ));
+    // Only `o` differs between the arms, so only `o` gets a case.
+    assert_eq!(v.matches("always @* begin").count(), 1, "{}", v);
+    assert!(!v.contains("untouched"), "an untouched binding needs no case:\n{}", v);
+}
+
+#[test]
+fn a_non_exhaustive_match_is_rejected_as_a_latch() {
+    let text = compile_err(&format!(
+        concat!(
+            "{}fun f (op: op_e, a: i8, o: out i8)\n",
+            "  match op\n",
+            "    .OP_ADD =>\n",
+            "      o = a\n",
+            "    .OP_SUB =>\n",
+            "      o = a\n",
+        ),
+        OPS
+    ));
+    assert!(text.contains("does not cover"), "{}", text);
+    assert!(text.contains("OP_AND"), "{}", text);
+    assert!(text.contains("OP_OR"), "{}", text);
+    assert!(text.contains("latch"), "{}", text);
+}
+
+#[test]
+fn covering_every_variant_needs_no_catch_all() {
+    let v = compile(concat!(
+        "enum two_e: i1\n",
+        "  LO\n",
+        "  HI\n",
+        "fun f (x: two_e, a: i8, b: i8, o: out i8)\n",
+        "  match x\n",
+        "    .LO =>\n",
+        "      o = a\n",
+        "    .HI =>\n",
+        "      o = b\n",
+    ));
+    assert!(v.contains("case (x)"), "{}", v);
+}
+
+#[test]
+fn an_unknown_variant_lists_the_real_ones() {
+    let text = compile_err(&format!(
+        concat!(
+            "{}fun f (op: op_e, a: i8, o: out i8)\n",
+            "  match op\n",
+            "    .OP_NOPE =>\n",
+            "      o = a\n",
+            "    _ =>\n",
+            "      o = a\n",
+        ),
+        OPS
+    ));
+    assert!(text.contains("not a variant"), "{}", text);
+    assert!(text.contains("OP_ADD, OP_SUB, OP_AND, OP_OR"), "{}", text);
+}
+
+#[test]
+fn a_variant_matched_twice_is_rejected() {
+    let text = compile_err(&format!(
+        concat!(
+            "{}fun f (op: op_e, a: i8, o: out i8)\n",
+            "  match op\n",
+            "    .OP_ADD =>\n",
+            "      o = a\n",
+            "    .OP_ADD =>\n",
+            "      o = a\n",
+            "    _ =>\n",
+            "      o = a\n",
+        ),
+        OPS
+    ));
+    assert!(text.contains("matched twice"), "{}", text);
+}
+
+#[test]
+fn an_arm_after_a_catch_all_is_unreachable() {
+    let text = compile_err(&format!(
+        concat!(
+            "{}fun f (op: op_e, a: i8, o: out i8)\n",
+            "  match op\n",
+            "    _ =>\n",
+            "      o = a\n",
+            "    .OP_ADD =>\n",
+            "      o = a\n",
+        ),
+        OPS
+    ));
+    assert!(text.contains("unreachable"), "{}", text);
+}
+
+#[test]
+fn matching_on_a_plain_integer_is_rejected() {
+    let text = compile_err(concat!(
+        "fun f (x: i2, a: i8, o: out i8)\n",
+        "  match x\n",
+        "    _ =>\n",
+        "      o = a\n",
+    ));
+    assert!(text.contains("needs an enum"), "{}", text);
+}
+
+// ---- calls ---------------------------------------------------------------
+
+#[test]
+fn a_call_is_inlined() {
+    let v = compile(concat!(
+        "fun helper (t: i3, o: out i1)\n",
+        "  o = t[2]\n",
+        "fun caller (t: i3, o: out i1)\n",
+        "  o = helper(t)\n",
+    ));
+    let caller = v.split("module caller").nth(1).expect("caller emitted");
+    assert!(caller.contains("t[2]"), "inlined, not instantiated:\n{}", v);
+}
+
+#[test]
+fn a_function_declared_later_is_still_callable() {
+    let v = compile(concat!(
+        "fun caller (t: i3, o: out i1)\n",
+        "  o = helper(t)\n",
+        "fun helper (t: i3, o: out i1)\n",
+        "  o = t[0]\n",
+    ));
+    assert!(v.contains("module caller"), "{}", v);
+}
+
+#[test]
+fn call_arity_is_checked() {
+    let text = compile_err(concat!(
+        "fun helper (a: i3, b: i3, o: out i1)\n",
+        "  o = a[0] & b[0]\n",
+        "fun caller (t: i3, o: out i1)\n",
+        "  o = helper(t)\n",
+    ));
+    assert!(text.contains("takes 2 argument(s), found 1"), "{}", text);
+}
+
+#[test]
+fn call_argument_types_are_checked() {
+    let text = compile_err(concat!(
+        "fun helper (a: i3, o: out i1)\n",
+        "  o = a[0]\n",
+        "fun caller (t: i8, o: out i1)\n",
+        "  o = helper(t)\n",
+    ));
+    assert!(text.contains("is `i3` but `i8` was given"), "{}", text);
+}
+
+#[test]
+fn a_recursive_call_is_rejected_as_a_circuit_that_never_settles() {
+    let text = compile_err(concat!(
+        "fun loopy (a: i3, o: out i1)\n",
+        "  o = loopy(a)\n",
+    ));
+    assert!(text.contains("calls itself"), "{}", text);
+    assert!(text.contains("never settles"), "{}", text);
+}
+
+#[test]
+fn a_multi_output_function_cannot_be_an_expression() {
+    let text = compile_err(concat!(
+        "fun two (a: i3, x: out i1, y: out i1)\n",
+        "  x = a[0]\n",
+        "  y = a[1]\n",
+        "fun caller (t: i3, o: out i1)\n",
+        "  o = two(t)\n",
+    ));
+    assert!(text.contains("cannot be used as an expression"), "{}", text);
+}
+
+#[test]
+fn calling_something_that_is_not_a_function_is_rejected() {
+    let text = compile_err(concat!(
+        "fun caller (t: i3, o: out i1)\n",
+        "  o = nope(t)\n",
+    ));
+    assert!(text.contains("is not a function"), "{}", text);
+}
+
+// ---- whole-file --------------------------------------------------------
+
+#[test]
+fn a_duplicate_declaration_is_rejected() {
+    let text = compile_err(concat!(
+        "fun f (a: i1, o: out i1)\n",
+        "  o = a\n",
+        "fun f (a: i1, o: out i1)\n",
+        "  o = a\n",
+    ));
+    assert!(text.contains("declared more than once"), "{}", text);
+}
+
+#[test]
+fn the_banner_appears_once_for_a_multi_module_file() {
+    let v = compile(concat!(
+        "fun a1 (x: i1, o: out i1)\n",
+        "  o = x\n",
+        "fun a2 (x: i1, o: out i1)\n",
+        "  o = x\n",
+    ));
+    assert_eq!(v.matches("GENERATED FILE").count(), 1, "{}", v);
+    assert_eq!(v.matches("endmodule").count(), 2, "{}", v);
+}
+
+/// The two ported modules must keep compiling. Their bit-exactness is proven
+/// by examples/verify.sh against Questa; this only catches a compiler change
+/// that stops them building at all.
+#[test]
+fn the_ported_modules_still_compile() {
+    for path in ["examples/k2g_shift.ddl", "examples/k2g_alu.ddl"] {
+        let text = match std::fs::read_to_string(path) {
+            Ok(t) => t,
+            // Tests may run from elsewhere; skip rather than fail spuriously.
+            Err(_) => continue,
+        };
+        let map = SourceMap::new(path, text);
+        if let Err(diags) = compile_to_verilog(&map, &EmitOptions::default()) {
+            panic!("{} stopped compiling:\n{}", path, map.render_all(&diags));
+        }
+    }
+}
+
+// ---- structs -------------------------------------------------------------
+
+const REQ: &str = concat!(
+    "enum kind_e: i2\n",
+    "  K_LOAD\n",
+    "  K_STORE\n",
+    "  K_ALU\n",
+    "struct req_t\n",
+    "  kind: kind_e\n",
+    "  addr: i16\n",
+    "  data: i8\n",
+);
+
+#[test]
+fn a_struct_packs_first_field_into_the_high_bits() {
+    // Matching SystemVerilog packed structs, so a DDL struct and its SV
+    // counterpart have the same layout across a module boundary.
+    let v = compile(&format!(
+        "{}fun unpack (r: req_t, k: out kind_e, a: out i16, d: out i8)\n  k = r.kind\n  a = r.addr\n  d = r.data\n",
+        REQ
+    ));
+    assert!(v.contains("input  [25:0] r"), "26 bits total:\n{}", v);
+    assert!(v.contains("r[25:24]"), "kind is highest:\n{}", v);
+    assert!(v.contains("r[23:8]"), "then addr:\n{}", v);
+    assert!(v.contains("r[7:0]"), "then data:\n{}", v);
+}
+
+#[test]
+fn a_struct_is_built_with_call_syntax() {
+    let v = compile(&format!(
+        "{}fun pack (k: kind_e, a: i16, d: i8, r: out req_t)\n  r = req_t(k, a, d)\n",
+        REQ
+    ));
+    assert!(v.contains("{k, a, d}"), "{}", v);
+    assert!(v.contains("output [25:0] r"), "{}", v);
+}
+
+#[test]
+fn a_field_keeps_its_own_type() {
+    // The slice is a bag of bits, but `kind` must come back out as an enum or
+    // it could not be matched on.
+    let v = compile(&format!(
+        concat!(
+            "{}fun f (r: req_t, yes: out i1)\n",
+            "  match r.kind\n",
+            "    .K_STORE =>\n",
+            "      yes = 1'b1\n",
+            "    _ =>\n",
+            "      yes = 1'b0\n",
+        ),
+        REQ
+    ));
+    assert!(v.contains("r[25:24]"), "{}", v);
+    assert!(v.contains("case ("), "{}", v);
+}
+
+#[test]
+fn an_unknown_field_lists_the_real_ones() {
+    let text = compile_err(&format!(
+        "{}fun f (r: req_t, o: out i8)\n  o = r.nope\n",
+        REQ
+    ));
+    assert!(text.contains("has no field `nope`"), "{}", text);
+    assert!(text.contains("kind, addr, data"), "{}", text);
+}
+
+#[test]
+fn struct_construction_checks_arity_and_types() {
+    let text = compile_err(&format!(
+        "{}fun f (k: kind_e, a: i16, r: out req_t)\n  r = req_t(k, a)\n",
+        REQ
+    ));
+    assert!(text.contains("has 3 field(s), found 2"), "{}", text);
+
+    let text = compile_err(&format!(
+        "{}fun f (k: kind_e, a: i16, d: i32, r: out req_t)\n  r = req_t(k, a, d)\n",
+        REQ
+    ));
+    assert!(text.contains("field `data`"), "{}", text);
+    assert!(text.contains("`i8` but `i32` was given"), "{}", text);
+}
+
+#[test]
+fn taking_a_field_of_a_non_struct_is_rejected() {
+    let text = compile_err("fun f (x: i8, o: out i8)\n  o = x.nope\n");
+    assert!(text.contains("has no fields"), "{}", text);
+}
+
+#[test]
+fn a_struct_round_trips_through_pack_and_unpack() {
+    let v = compile(&format!(
+        concat!(
+            "{}fun pack (k: kind_e, a: i16, d: i8, r: out req_t)\n",
+            "  r = req_t(k, a, d)\n",
+            "fun roundtrip (k: kind_e, a: i16, d: i8, o: out i16)\n",
+            "  let packed = req_t(k, a, d)\n",
+            "  o = packed.addr\n",
+        ),
+        REQ
+    ));
+    // The concat and the slice cancel out in synthesis, but both must appear.
+    assert!(v.contains("{k, a, d}"), "{}", v);
+    assert!(v.contains("[23:8]"), "{}", v);
+}
+
+#[test]
+fn a_struct_field_may_be_another_struct() {
+    let v = compile(concat!(
+        "struct inner_t\n",
+        "  lo: i4\n",
+        "  hi: i4\n",
+        "struct outer_t\n",
+        "  tag: i2\n",
+        "  body: inner_t\n",
+        "fun f (o: outer_t, r: out i4)\n",
+        "  r = o.body.hi\n",
+    ));
+    assert!(v.contains("input  [9:0] o"), "2 + 8 bits:\n{}", v);
+    // body is [7:0]; hi is its high nibble, so [7:4] of the whole.
+    assert!(v.contains("[7:0]"), "{}", v);
+}
+
+#[test]
+fn a_sparse_enum_needs_a_wildcard_even_when_every_variant_is_covered() {
+    // 3 variants in a 2-bit tag leaves 2'b11 naming no variant. Covering all
+    // three arms used to be accepted, and the LAST arm silently became the
+    // fallback -- so reordering otherwise-equivalent arms changed what 2'b11
+    // produced.
+    let text = compile_err(concat!(
+        "enum logic_e: i2\n",
+        "  LOGIC_AND\n",
+        "  LOGIC_OR\n",
+        "  LOGIC_XOR\n",
+        "fun f (op: logic_e, a: i8, b: i8, o: out i8)\n",
+        "  match op\n",
+        "    .LOGIC_AND =>\n",
+        "      o = a & b\n",
+        "    .LOGIC_OR =>\n",
+        "      o = a | b\n",
+        "    .LOGIC_XOR =>\n",
+        "      o = a ^ b\n",
+    ));
+    assert!(text.contains("covers every variant"), "{}", text);
+    assert!(text.contains("1 pattern(s) that name no variant"), "{}", text);
+    assert!(text.contains("reordering the arms"), "{}", text);
+}
+
+#[test]
+fn a_dense_enum_still_needs_no_wildcard() {
+    // 4 variants in a 2-bit tag: every pattern names a variant, so covering
+    // them all really is exhaustive and the check stays out of the way.
+    let v = compile(&format!(
+        concat!(
+            "{}fun f (op: op_e, a: i8, b: i8, o: out i8)\n",
+            "  match op\n",
+            "    .OP_ADD =>\n",
+            "      o = a + b\n",
+            "    .OP_SUB =>\n",
+            "      o = a - b\n",
+            "    .OP_AND =>\n",
+            "      o = a & b\n",
+            "    .OP_OR =>\n",
+            "      o = a | b\n",
+        ),
+        OPS
+    ));
+    assert!(v.contains("case (op)"), "{}", v);
+    assert_eq!(v.matches("      2'd").count(), 3, "three labelled arms:\n{}", v);
+}
+
+// ---- @unreachable, and CRLF ----------------------------------------------
+
+const SPARSE: &str = concat!(
+    "enum logic_e: i2\n",
+    "  LOGIC_AND\n",
+    "  LOGIC_OR\n",
+    "  LOGIC_XOR\n",
+);
+
+#[test]
+fn unreachable_lets_a_sparse_enum_be_covered_by_name() {
+    // The three variants sit in a 2-bit tag, so 2'b11 names no variant. The
+    // author asserts it cannot occur, which is what `unique case` means.
+    let v = compile(&format!(
+        concat!(
+            "{}fun f (op: logic_e, a: i8, b: i8, o: out i8)\n",
+            "  match op\n",
+            "    .LOGIC_AND =>\n",
+            "      o = a & b\n",
+            "    .LOGIC_OR =>\n",
+            "      o = a | b\n",
+            "    .LOGIC_XOR =>\n",
+            "      o = a ^ b\n",
+            "    _ => @unreachable\n",
+        ),
+        SPARSE
+    ));
+    // The last real arm serves the impossible pattern, which is sound
+    // precisely because it was declared impossible.
+    assert!(v.contains("case (op)"), "{}", v);
+    assert!(v.contains("default: "), "{}", v);
+    assert!(v.contains("a ^ b"), "{}", v);
+}
+
+#[test]
+fn unreachable_does_not_excuse_a_missing_variant() {
+    // A declared variant is a value that can occur, so `@unreachable` must not
+    // be usable to skip one.
+    let text = compile_err(&format!(
+        concat!(
+            "{}fun f (op: logic_e, a: i8, b: i8, o: out i8)\n",
+            "  match op\n",
+            "    .LOGIC_AND =>\n",
+            "      o = a & b\n",
+            "    _ => @unreachable\n",
+        ),
+        SPARSE
+    ));
+    assert!(text.contains("does not cover"), "{}", text);
+    assert!(text.contains("LOGIC_OR"), "{}", text);
+    assert!(text.contains("LOGIC_XOR"), "{}", text);
+}
+
+#[test]
+fn unreachable_must_sit_on_a_catch_all() {
+    let text = compile_err(&format!(
+        concat!(
+            "{}fun f (op: logic_e, a: i8, b: i8, o: out i8)\n",
+            "  match op\n",
+            "    .LOGIC_AND =>\n",
+            "      o = a & b\n",
+            "    .LOGIC_OR =>\n",
+            "      o = a | b\n",
+            "    .LOGIC_XOR => @unreachable\n",
+            "    _ =>\n",
+            "      o = a\n",
+        ),
+        SPARSE
+    ));
+    assert!(text.contains("belongs on a `_` arm"), "{}", text);
+}
+
+#[test]
+fn the_sparse_enum_error_names_unreachable_as_an_option() {
+    let text = compile_err(&format!(
+        concat!(
+            "{}fun f (op: logic_e, a: i8, b: i8, o: out i8)\n",
+            "  match op\n",
+            "    .LOGIC_AND =>\n",
+            "      o = a & b\n",
+            "    .LOGIC_OR =>\n",
+            "      o = a | b\n",
+            "    .LOGIC_XOR =>\n",
+            "      o = a ^ b\n",
+        ),
+        SPARSE
+    ));
+    assert!(text.contains("@unreachable"), "{}", text);
+}
+
+#[test]
+fn a_match_diagnostic_points_at_the_match_not_the_file() {
+    // It used to anchor at 1:1, which is useless in a module with several.
+    let text = compile_err(&format!(
+        concat!(
+            "{}fun f (op: logic_e, a: i8, b: i8, o: out i8)\n",
+            "  match op\n",
+            "    .LOGIC_AND =>\n",
+            "      o = a & b\n",
+            "    .LOGIC_OR =>\n",
+            "      o = a | b\n",
+            "    .LOGIC_XOR =>\n",
+            "      o = a ^ b\n",
+        ),
+        SPARSE
+    ));
+    assert!(text.contains("t.ddl:7:6"), "should point at .LOGIC_AND:\n{}", text);
+}
+
+#[test]
+fn every_unhandled_match_is_reported_not_just_the_first() {
+    let text = compile_err(&format!(
+        concat!(
+            "{}fun f (op: logic_e, a: i8, b: i8, x: out i8, y: out i8)\n",
+            "  match op\n",
+            "    .LOGIC_AND =>\n",
+            "      x = a\n",
+            "    .LOGIC_OR =>\n",
+            "      x = b\n",
+            "    .LOGIC_XOR =>\n",
+            "      x = a\n",
+            "  match op\n",
+            "    .LOGIC_AND =>\n",
+            "      y = a\n",
+            "    .LOGIC_OR =>\n",
+            "      y = b\n",
+            "    .LOGIC_XOR =>\n",
+            "      y = a\n",
+        ),
+        SPARSE
+    ));
+    assert_eq!(
+        text.matches("covers every variant").count(),
+        2,
+        "both matches should be reported:\n{}",
+        text
+    );
+}
+
+/// Blocks are delimited by indentation, so a line-ending bug does not produce
+/// a syntax error -- it changes which block a statement belongs to, or makes a
+/// body vanish. This repo is on Windows, so CRLF is the default hazard.
+#[test]
+fn crlf_parses_the_same_as_lf() {
+    let lf = format!(
+        concat!(
+            "{}-- a comment, which must not disturb the block probe\n",
+            "fun f (op: logic_e, a: i8, b: i8, o: out i8)\n",
+            "  match op\n",
+            "    .LOGIC_AND =>\n",
+            "      o = a & b\n",
+            "    .LOGIC_OR =>\n",
+            "      o = a | b\n",
+            "    .LOGIC_XOR =>\n",
+            "      o = a ^ b\n",
+            "    _ => @unreachable\n",
+        ),
+        SPARSE
+    );
+    let crlf = lf.replace('\n', "\r\n");
+
+    let from_lf = compile(&lf);
+    let from_crlf = compile(&crlf);
+    assert_eq!(from_lf, from_crlf, "CRLF must generate identical Verilog");
+}
+
+#[test]
+fn crlf_survives_nested_blocks() {
+    let lf = concat!(
+        "fun f (c: i1, a: i8, b: i8, o: out i8)\n",
+        "  if c then\n",
+        "    o = a\n",
+        "  else\n",
+        "    o = b\n",
+    );
+    let from_lf = compile(lf);
+    let from_crlf = compile(&lf.replace('\n', "\r\n"));
+    assert_eq!(from_lf, from_crlf);
+}
+
+// ---- or-patterns ---------------------------------------------------------
+
+/// Dense: four variants filling a two-bit tag exactly.
+const LB4: &str = concat!(
+    "enum lb_e: i2\n",
+    "  LB_ADD\n",
+    "  LB_SUB\n",
+    "  LB_AND\n",
+    "  LB_OR\n",
+);
+
+#[test]
+fn an_or_pattern_makes_a_grouped_match_exhaustive() {
+    // The point of the feature: k2g_decode.sv groups opcodes into eight case
+    // items. Without `|` that is either duplicated bodies or a `_` that turns
+    // the check off, on the one enum whose drift history motivated it.
+    let v = compile(&format!(
+        concat!(
+            "{}fun f (lb: lb_e, a: i8, b: i8, o: out i8)\n",
+            "  match lb\n",
+            "    .LB_ADD | .LB_SUB =>\n",
+            "      o = a + b\n",
+            "    .LB_AND | .LB_OR =>\n",
+            "      o = a & b\n",
+        ),
+        LB4
+    ));
+    assert!(v.contains("a + b"), "{}", v);
+    assert!(v.contains("a & b"), "{}", v);
+}
+
+#[test]
+fn an_or_pattern_becomes_several_labels_on_one_arm() {
+    // `LB_ADD, LB_SUB, LB_MUL, LB_DIV:` is exactly how the SystemVerilog
+    // groups opcodes, and is why or-patterns were worth building.
+    let v = compile(&format!(
+        concat!(
+            "{}fun f (lb: lb_e, a: i8, b: i8, o: out i8)\n",
+            "  match lb\n",
+            "    .LB_ADD | .LB_SUB | .LB_AND =>\n",
+            "      o = a + b\n",
+            "    .LB_OR =>\n",
+            "      o = a & b\n",
+        ),
+        LB4
+    ));
+    assert!(v.contains("case (lb)"), "{}", v);
+    assert!(v.contains("2'd0, 2'd1, 2'd2:"), "one arm, three labels:\n{}", v);
+}
+
+#[test]
+fn a_final_or_pattern_costs_no_logic() {
+    // The last arm is the default by elimination, so its selector is dead and
+    // liveness drops it -- grouping must not cost gates.
+    let v = compile(&format!(
+        concat!(
+            "{}fun f (lb: lb_e, a: i8, b: i8, o: out i8)\n",
+            "  match lb\n",
+            "    .LB_ADD =>\n",
+            "      o = a + b\n",
+            "    .LB_SUB | .LB_AND | .LB_OR =>\n",
+            "      o = a & b\n",
+        ),
+        LB4
+    ));
+    // The grouped arm is last, so it is the default and costs no labels.
+    assert!(v.contains("default: "), "{}", v);
+    assert_eq!(v.matches("2'd").count(), 1, "one label only:\n{}", v);
+}
+
+#[test]
+fn an_or_pattern_still_reports_a_missing_variant() {
+    let text = compile_err(&format!(
+        concat!(
+            "{}fun f (lb: lb_e, a: i8, o: out i8)\n",
+            "  match lb\n",
+            "    .LB_ADD | .LB_SUB =>\n",
+            "      o = a\n",
+            "    .LB_AND =>\n",
+            "      o = a\n",
+        ),
+        LB4
+    ));
+    assert!(text.contains("does not cover LB_OR"), "{}", text);
+}
+
+#[test]
+fn a_variant_repeated_across_alternatives_is_rejected() {
+    let text = compile_err(&format!(
+        concat!(
+            "{}fun f (lb: lb_e, a: i8, o: out i8)\n",
+            "  match lb\n",
+            "    .LB_ADD | .LB_ADD =>\n",
+            "      o = a\n",
+            "    _ =>\n",
+            "      o = a\n",
+        ),
+        LB4
+    ));
+    assert!(text.contains("matched twice"), "{}", text);
+}
+
+#[test]
+fn a_variant_repeated_in_a_later_arm_is_rejected() {
+    let text = compile_err(&format!(
+        concat!(
+            "{}fun f (lb: lb_e, a: i8, o: out i8)\n",
+            "  match lb\n",
+            "    .LB_ADD | .LB_SUB =>\n",
+            "      o = a\n",
+            "    .LB_SUB =>\n",
+            "      o = a\n",
+            "    _ =>\n",
+            "      o = a\n",
+        ),
+        LB4
+    ));
+    assert!(text.contains("matched twice"), "{}", text);
+}
+
+#[test]
+fn an_alternative_cannot_mix_a_binding_with_variants() {
+    // `.LB_ADD | x` would match everything and leave the named one dead.
+    let text = compile_err(&format!(
+        concat!(
+            "{}fun f (lb: lb_e, a: i8, o: out i8)\n",
+            "  match lb\n",
+            "    .LB_ADD | x =>\n",
+            "      o = a\n",
+            "    _ =>\n",
+            "      o = a\n",
+        ),
+        LB4
+    ));
+    assert!(text.contains("cannot mix a catch-all"), "{}", text);
+}
+
+#[test]
+fn an_unknown_variant_inside_an_alternative_is_caught() {
+    let text = compile_err(&format!(
+        concat!(
+            "{}fun f (lb: lb_e, a: i8, o: out i8)\n",
+            "  match lb\n",
+            "    .LB_ADD | .LB_NOPE =>\n",
+            "      o = a\n",
+            "    _ =>\n",
+            "      o = a\n",
+        ),
+        LB4
+    ));
+    assert!(text.contains("`LB_NOPE` is not a variant"), "{}", text);
+}
+
+#[test]
+fn or_patterns_compose_with_unreachable_on_a_sparse_enum() {
+    let v = compile(&format!(
+        concat!(
+            "{}fun f (op: logic_e, a: i8, b: i8, o: out i8)\n",
+            "  match op\n",
+            "    .LOGIC_AND | .LOGIC_OR =>\n",
+            "      o = a & b\n",
+            "    .LOGIC_XOR =>\n",
+            "      o = a ^ b\n",
+            "    _ => @unreachable\n",
+        ),
+        SPARSE
+    ));
+    assert!(v.contains("a & b"), "{}", v);
+    assert!(v.contains("a ^ b"), "{}", v);
+}
+
+// ---- field assignment and @zeroed() --------------------------------------
+
+const UOP: &str = concat!(
+    "enum kind_e: i2\n",
+    "  K_NOP\n",
+    "  K_ADD\n",
+    "  K_SUB\n",
+    "  K_LD\n",
+    "struct uop_t\n",
+    "  kind: kind_e\n",
+    "  dst: i5\n",
+    "  imm: i8\n",
+);
+
+#[test]
+fn a_struct_is_built_field_by_field() {
+    // How k2g_decode writes a 28-field uop: zero it, then assign the fields
+    // that this opcode uses.
+    let v = compile(&format!(
+        concat!(
+            "{}fun build (k: kind_e, d: i5, i: i8, o: out uop_t)\n",
+            "  var u: uop_t = @zeroed()\n",
+            "  u.kind = k\n",
+            "  u.dst = d\n",
+            "  u.imm = i\n",
+            "  o = u\n",
+        ),
+        UOP
+    ));
+    assert!(v.contains("15'd0"), "starts from zero:\n{}", v);
+    assert!(v.contains("output [14:0] o"), "2 + 5 + 8 bits:\n{}", v);
+    // Each write keeps the bits it did not touch.
+    assert!(v.contains("{k, "), "{}", v);
+    assert!(v.contains(", d, "), "{}", v);
+    assert!(v.contains(", i}"), "{}", v);
+}
+
+/// Verilog-2005 allows a part-select only on a name -- neither `15'd0[12:0]`
+/// nor `{a, b}[14:8]` is legal. Both fell out of folding: the first from
+/// always folding constants, the second from field assignment rebuilding a
+/// struct by concatenation and slicing it apart again.
+#[test]
+fn a_part_select_always_reads_from_a_name() {
+    let v = compile(&format!(
+        concat!(
+            "{}fun build (k: kind_e, d: i5, i: i8, o: out uop_t)\n",
+            "  var u: uop_t = @zeroed()\n",
+            "  u.kind = k\n",
+            "  u.dst = d\n",
+            "  u.imm = i\n",
+            "  o = u\n",
+        ),
+        UOP
+    ));
+    for line in v.lines() {
+        if let Some(open) = line.find('[') {
+            let before = &line[..open];
+            let is_select = before.ends_with(|c: char| c.is_ascii_alphanumeric() || c == '_');
+            let is_decl = before.trim_start().starts_with("wire")
+                || before.trim_start().starts_with("input")
+                || before.trim_start().starts_with("output");
+            if is_select && !is_decl {
+                let base: String = before
+                    .chars()
+                    .rev()
+                    .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                    .collect();
+                let base: String = base.chars().rev().collect();
+                assert!(
+                    !base.chars().next().unwrap_or('a').is_ascii_digit(),
+                    "part-select on a literal:\n{}",
+                    line
+                );
+            }
+        }
+        assert!(!line.contains("}["), "part-select on a concatenation:\n{}", line);
+    }
+}
+
+#[test]
+fn a_nested_field_can_be_assigned() {
+    let v = compile(concat!(
+        "struct inner_t\n",
+        "  lo: i4\n",
+        "  hi: i4\n",
+        "struct outer_t\n",
+        "  tag: i2\n",
+        "  body: inner_t\n",
+        "fun f (t: i2, x: i4, o: out outer_t)\n",
+        "  var v: outer_t = @zeroed()\n",
+        "  v.tag = t\n",
+        "  v.body.hi = x\n",
+        "  o = v\n",
+    ));
+    assert!(v.contains("output [9:0] o"), "{}", v);
+    assert!(v.contains("10'd0"), "{}", v);
+}
+
+#[test]
+fn assigning_an_unknown_field_is_rejected() {
+    let text = compile_err(&format!(
+        "{}fun f (k: kind_e, o: out uop_t)\n  var u: uop_t = @zeroed()\n  u.nope = k\n  o = u\n",
+        UOP
+    ));
+    assert!(text.contains("has no field `nope`"), "{}", text);
+    assert!(text.contains("kind, dst, imm"), "{}", text);
+}
+
+#[test]
+fn a_field_assignment_is_type_checked() {
+    let text = compile_err(&format!(
+        "{}fun f (x: i8, o: out uop_t)\n  var u: uop_t = @zeroed()\n  u.dst = x\n  o = u\n",
+        UOP
+    ));
+    assert!(text.contains("cannot assign"), "{}", text);
+}
+
+#[test]
+fn taking_a_field_of_a_non_struct_target_is_rejected() {
+    let text = compile_err(concat!(
+        "fun f (x: i8, o: out i8)\n",
+        "  var v: i8 = @zeroed()\n",
+        "  v.nope = x\n",
+        "  o = v\n",
+    ));
+    assert!(text.contains("has no fields"), "{}", text);
+}
+
+#[test]
+fn zeroed_needs_a_type_it_can_take_from_context() {
+    let text = compile_err("fun f (o: out i8)\n  let x = @zeroed()\n  o = x\n");
+    assert!(text.contains("needs a type from its context"), "{}", text);
+}
+
+#[test]
+fn zeroed_takes_the_type_of_an_assignment_target() {
+    let v = compile(&format!(
+        "{}fun f (o: out uop_t)\n  var u: uop_t = @zeroed()\n  u.dst = 5'd0\n  o = u\n",
+        UOP
+    ));
+    assert!(v.contains("15'd0"), "{}", v);
+}
+
+// ---- clocked processes ---------------------------------------------------
+
+#[test]
+fn a_process_gets_implicit_clock_and_reset() {
+    // "A process has channel ports and clock/reset. Nothing else."
+    let v = compile(concat!(
+        "process p (go: i1, o: out i8)\n",
+        "  var c: i8 = @zeroed()\n",
+        "  if go then\n",
+        "    c = c + 8'd1\n",
+        "  o = c\n",
+    ));
+    assert!(v.contains("input        clk"), "{}", v);
+    assert!(v.contains("input        rst_n"), "{}", v);
+    assert!(v.contains("always @(posedge clk)"), "{}", v);
+    assert!(v.contains("if (!rst_n) begin"), "sync active-low reset:\n{}", v);
+}
+
+#[test]
+fn a_var_in_a_process_becomes_a_register() {
+    let v = compile(concat!(
+        "process p (go: i1, o: out i8)\n",
+        "  var c: i8 = 8'd7\n",
+        "  if go then\n",
+        "    c = c + 8'd1\n",
+        "  o = c\n",
+    ));
+    assert!(v.contains("reg [7:0] c;"), "{}", v);
+    assert!(v.contains("c <= 8'd7;"), "reset value from the declaration:\n{}", v);
+}
+
+#[test]
+fn an_unassigned_register_keeps_its_value() {
+    // This is what makes a conditional assignment a clock enable: the else
+    // branch of the mux is the register itself.
+    let v = compile(concat!(
+        "process p (go: i1, o: out i8)\n",
+        "  var c: i8 = @zeroed()\n",
+        "  if go then\n",
+        "    c = c + 8'd1\n",
+        "  o = c\n",
+    ));
+    assert!(v.contains("go ? (c + 8'd1) : c"), "{}", v);
+}
+
+/// Reads see the value at the start of the cycle plus whatever the body has
+/// already assigned. That is the SystemVerilog `_next` shadow idiom without
+/// the shadow, and it means the order of statements decides whether an output
+/// carries the current or the next value.
+#[test]
+fn a_register_read_sees_earlier_assignments_in_the_same_cycle() {
+    let before = compile(concat!(
+        "process p (go: i1, o: out i8)\n",
+        "  var c: i8 = @zeroed()\n",
+        "  o = c\n",
+        "  if go then\n",
+        "    c = c + 8'd1\n",
+    ));
+    // Read first: the output is the registered value.
+    assert!(before.contains("assign o = c;"), "{}", before);
+
+    let after = compile(concat!(
+        "process p (go: i1, o: out i8)\n",
+        "  var c: i8 = @zeroed()\n",
+        "  if go then\n",
+        "    c = c + 8'd1\n",
+        "  o = c\n",
+    ));
+    // Read after: the output is what will be clocked in.
+    assert!(!after.contains("assign o = c;"), "{}", after);
+    assert!(after.contains("go ? "), "{}", after);
+}
+
+#[test]
+fn a_register_can_hold_a_struct_and_be_updated_field_by_field() {
+    let v = compile(&format!(
+        concat!(
+            "{}process p (k: kind_e, go: i1, o: out uop_t)\n",
+            "  var acc: uop_t = @zeroed()\n",
+            "  if go then\n",
+            "    acc.kind = k\n",
+            "  o = acc\n",
+        ),
+        UOP
+    ));
+    assert!(v.contains("reg [14:0] acc;"), "{}", v);
+    assert!(v.contains("always @(posedge clk)"), "{}", v);
+}
+
+#[test]
+fn an_enum_register_resets_to_its_named_variant() {
+    let v = compile(concat!(
+        "enum st_e: i2\n",
+        "  S_IDLE\n",
+        "  S_RUN\n",
+        "  S_DONE\n",
+        "process p (go: i1, o: out st_e)\n",
+        "  var st: st_e = S_RUN\n",
+        "  if go then\n",
+        "    st = S_DONE\n",
+        "  o = st\n",
+    ));
+    assert!(v.contains("st <= 2'd1;"), "S_RUN is 1:\n{}", v);
+}
+
+#[test]
+fn a_register_reset_value_must_be_constant() {
+    let text = compile_err(concat!(
+        "process p (seed: i8, o: out i8)\n",
+        "  var c: i8 = seed\n",
+        "  o = c\n",
+    ));
+    assert!(text.contains("must be a constant"), "{}", text);
+}
+
+#[test]
+fn a_register_needs_a_declared_type() {
+    let text = compile_err(concat!(
+        "process p (go: i1, o: out i8)\n",
+        "  var c = 8'd0\n",
+        "  o = c\n",
+    ));
+    assert!(text.contains("needs a declared type"), "{}", text);
+}
+
+#[test]
+fn a_process_with_no_state_should_be_a_fun() {
+    let text = compile_err("process p (a: i8, o: out i8)\n  o = a\n");
+    assert!(text.contains("should be a `fun`"), "{}", text);
+}
+
+#[test]
+fn clk_and_rst_n_cannot_be_declared_by_hand() {
+    let text = compile_err(concat!(
+        "process p (clk: i1, o: out i8)\n",
+        "  var c: i8 = @zeroed()\n",
+        "  o = c\n",
+    ));
+    assert!(text.contains("implicit on a process"), "{}", text);
+}
+
+/// Dedenting two levels at once after a nested bare `if` used to be a hard
+/// parse error blamed on the enclosing declaration, because the `else` probe
+/// treated "next token is shallower" as a failure instead of "there is no
+/// else".
+#[test]
+fn a_two_level_dedent_after_a_nested_if_parses() {
+    let v = compile(concat!(
+        "process p (go: i1, clear: i1, o: out i8)\n",
+        "  var c: i8 = @zeroed()\n",
+        "  if clear then\n",
+        "    c = @zeroed()\n",
+        "  else\n",
+        "    if go then\n",
+        "      c = c + 8'd1\n",
+        "  o = c\n",
+    ));
+    assert!(v.contains("clear ?"), "{}", v);
+    assert!(v.contains("go ?"), "{}", v);
+}
+
+// ---- channels ------------------------------------------------------------
+
+const PIPE: &str = concat!(
+    "struct item_t\n",
+    "  tag: i4\n",
+    "  payload: i16\n",
+);
+
+#[test]
+fn a_pipe_becomes_a_valid_ready_data_triple() {
+    // The flattening k3g_chan.sv:60 pre-commits to for the yosys-slang risk.
+    let v = compile(&format!(
+        concat!(
+            "{}process p (src: buffer in item_t, dst: buffer out item_t)\n",
+            "  let (it, got) = @try_rcv(src)\n",
+            "  let _ok = @try_send(dst, it)\n",
+        ),
+        PIPE
+    ));
+    assert!(v.contains("input         src_valid"), "{}", v);
+    assert!(v.contains("output        src_ready"), "{}", v);
+    assert!(v.contains("input  [19:0] src_data"), "{}", v);
+    assert!(v.contains("output        dst_valid"), "{}", v);
+    assert!(v.contains("input         dst_ready"), "{}", v);
+    assert!(v.contains("output [19:0] dst_data"), "{}", v);
+}
+
+/// Channel rule 3: `valid` must not depend combinationally on `ready`. It
+/// cannot here -- an output's `valid` IS the busy register and nothing else is
+/// allowed to drive it. k2g_chan.sv records the bug this prevents: routing a
+/// stall into `cp_valid` closed a loop through stall -> decode -> CSP request
+/// -> stall.
+#[test]
+fn an_output_valid_is_a_register_output() {
+    let v = compile(&format!(
+        concat!(
+            "{}process p (src: buffer in item_t, dst: buffer out item_t)\n",
+            "  let (it, got) = @try_rcv(src)\n",
+            "  let _ok = @try_send(dst, it)\n",
+        ),
+        PIPE
+    ));
+    assert!(v.contains("reg dst_busy;"), "{}", v);
+    assert!(v.contains("assign dst_valid = dst_busy;"), "valid is the register:\n{}", v);
+    // The generated ready is the k3g_expand form: `!busy || down.ready`.
+    assert!(v.contains("(!dst_busy) | dst_ready"), "{}", v);
+}
+
+#[test]
+fn a_slot_holds_until_it_drains() {
+    let v = compile(&format!(
+        concat!(
+            "{}process p (src: buffer in item_t, dst: buffer out item_t)\n",
+            "  let (it, got) = @try_rcv(src)\n",
+            "  let _ok = @try_send(dst, it)\n",
+        ),
+        PIPE
+    ));
+    assert!(v.contains("always @(posedge clk)"), "{}", v);
+    assert!(
+        v.contains("dst_busy <= (src_xfer ? 1'b1 : (dst_ready ? 1'b0 : dst_busy));"),
+        "{}",
+        v
+    );
+}
+
+#[test]
+fn receiving_from_an_output_pipe_is_rejected() {
+    let text = compile_err(&format!(
+        "{}process p (dst: buffer out item_t)\n  let (it, got) = @try_rcv(dst)\n  let _o = @try_send(dst, it)\n",
+        PIPE
+    ));
+    assert!(text.contains("cannot be received from"), "{}", text);
+}
+
+#[test]
+fn sending_to_an_input_pipe_is_rejected() {
+    let text = compile_err(&format!(
+        "{}process p (src: buffer in item_t)\n  let (it, got) = @try_rcv(src)\n  let _o = @try_send(src, it)\n",
+        PIPE
+    ));
+    assert!(text.contains("cannot be sent to"), "{}", text);
+}
+
+#[test]
+fn an_output_pipe_that_is_never_sent_to_is_rejected() {
+    let text = compile_err(&format!(
+        "{}process p (src: buffer in item_t, dst: buffer out item_t)\n  let (it, got) = @try_rcv(src)\n",
+        PIPE
+    ));
+    assert!(text.contains("is never sent to"), "{}", text);
+}
+
+#[test]
+fn sending_twice_in_one_cycle_is_rejected() {
+    let text = compile_err(&format!(
+        concat!(
+            "{}process p (src: buffer in item_t, dst: buffer out item_t)\n",
+            "  let (it, got) = @try_rcv(src)\n",
+            "  let _a = @try_send(dst, it)\n",
+            "  let _b = @try_send(dst, it)\n",
+        ),
+        PIPE
+    ));
+    assert!(text.contains("sent to more than once"), "{}", text);
+}
+
+#[test]
+fn a_pipe_payload_is_type_checked() {
+    let text = compile_err(&format!(
+        concat!(
+            "{}process p (src: buffer in item_t, dst: buffer out item_t)\n",
+            "  let (it, got) = @try_rcv(src)\n",
+            "  let _o = @try_send(dst, it.tag)\n",
+        ),
+        PIPE
+    ));
+    assert!(text.contains("carries `item_t`"), "{}", text);
+}
+
+#[test]
+fn only_try_rcv_produces_a_pair() {
+    let text = compile_err("fun f (a: i8, o: out i8)\n  let (x, y) = a\n  o = x\n");
+    assert!(text.contains("only `@try_rcv(p)` produces a pair"), "{}", text);
+}
+
+// ---- blocking channel operations -----------------------------------------
+
+const ADDER: &str = concat!(
+    "process p (src: buffer in i32, dst: buffer out i32)\n",
+    "  loop\n",
+    "    let a = @rcv(src)\n",
+    "    let b = @rcv(src)\n",
+    "    @send(dst, a + b)\n",
+);
+
+#[test]
+fn blocking_ops_become_one_state_each() {
+    let v = compile(ADDER);
+    assert!(v.contains("reg [1:0] state;"), "three states need two bits:\n{}", v);
+    assert!(v.contains("in_s0"), "{}", v);
+    assert!(v.contains("in_s1"), "{}", v);
+    assert!(v.contains("in_s2"), "{}", v);
+}
+
+/// Rule 3 again, now for the FSM form: in a send state `valid` is `state == i`
+/// and state is a register, so it still cannot depend on `ready`.
+#[test]
+fn a_send_states_valid_is_a_function_of_state() {
+    let v = compile(ADDER);
+    assert!(v.contains("assign dst_valid = in_s2;"), "{}", v);
+    assert!(v.contains("assign src_ready = (in_s0 | in_s1);"), "{}", v);
+}
+
+#[test]
+fn a_value_crossing_a_state_becomes_a_register() {
+    // `a` is received in state 0 and read in state 2, so it cannot be a wire.
+    let v = compile(ADDER);
+    assert!(v.contains("reg [31:0] a_r;"), "{}", v);
+    assert!(v.contains("a_r <= (fire_s0 ? src_data : a_r);"), "{}", v);
+    assert!(v.contains("dst_data = (a_r + b_r)"), "{}", v);
+}
+
+#[test]
+fn a_barrier_inside_a_conditional_is_rejected_rather_than_mis_scheduled() {
+    let text = compile_err(concat!(
+        "process p (src: buffer in i32, dst: buffer out i32, go: i1)\n",
+        "  loop\n",
+        "    if go then\n",
+        "      let a = @rcv(src)\n",
+        "    @send(dst, 32'd0)\n",
+    ));
+    assert!(text.contains("inside a conditional is not scheduled yet"), "{}", text);
+}
+
+#[test]
+fn a_loop_with_no_blocking_operation_is_rejected() {
+    let text = compile_err(concat!(
+        "process p (src: buffer in i32, dst: buffer out i32)\n",
+        "  loop\n",
+        "    let x = 32'd1\n",
+    ));
+    // The "ends on a barrier" rule catches this first, which says the same
+    // thing more precisely.
+    assert!(text.contains("must be an `@rcv` or `@send`"), "{}", text);
+}
+
+#[test]
+fn a_blocking_loop_must_end_on_a_barrier() {
+    let text = compile_err(concat!(
+        "process p (src: buffer in i32, dst: buffer out i32)\n",
+        "  loop\n",
+        "    let a = @rcv(src)\n",
+        "    @send(dst, a)\n",
+        "    let x = 32'd1\n",
+    ));
+    assert!(text.contains("must be an `@rcv` or `@send`"), "{}", text);
+}
+
+#[test]
+fn receiving_from_an_output_pipe_is_rejected_in_a_loop() {
+    let text = compile_err(concat!(
+        "process p (src: buffer in i32, dst: buffer out i32)\n",
+        "  loop\n",
+        "    let a = @rcv(dst)\n",
+        "    @send(dst, a)\n",
+    ));
+    assert!(text.contains("can only be sent to"), "{}", text);
+}

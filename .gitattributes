@@ -1,0 +1,9 @@
+# LF in the repository for everything textual.
+#
+# Not cosmetic here: DDL delimits blocks by indentation, so a line-ending
+# change does not raise a syntax error -- it changes which block a statement
+# belongs to. The compiler accepts CRLF, and there is a test proving CRLF and
+# LF produce identical Verilog, but the sources stay LF regardless.
+* text=auto eol=lf
+*.png binary
+*.fs binary
