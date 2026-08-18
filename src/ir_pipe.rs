@@ -121,10 +121,7 @@ pub fn lower_sequence(
         let id = low.add_port(implicit.to_string(), crate::ir::PortDir::In, Ty::BOOL);
         let v = low.emit(Ty::BOOL, Op::Port(id));
         low.name_value(v, implicit.to_string());
-        env.insert(
-            implicit.to_string(),
-            Binding { value: Some(v), ty: Ty::BOOL, is_output: false },
-        );
+        env.insert(implicit.to_string(), Binding::constant(v, Ty::BOOL));
     }
     low.declare_pipes(&decl.args, &mut env, sink)?;
 
@@ -231,10 +228,7 @@ pub fn lower_sequence(
 
     // ---- stage bodies -----------------------------------------------------
     let in_data = low.pipes[in_ix].data_value.expect("an input pipe has data");
-    env.insert(
-        recv_bind.clone(),
-        Binding { value: Some(in_data), ty: low.pipes[in_ix].ty.clone(), is_output: false },
-    );
+    env.insert(recv_bind.clone(), Binding::constant(in_data, low.pipes[in_ix].ty.clone()));
 
     let defs: Vec<HashSet<String>> = plain
         .iter()
@@ -288,7 +282,11 @@ pub fn lower_sequence(
                 Op::Mux { cond: en, then_val: v, else_val: held },
             );
             pending.push((format!("{}_s{}", name, k + 1), b.ty.clone(), next, slot));
-            env.insert(name, Binding { value: Some(held), ty: b.ty, is_output: false });
+            let stays_mutable = b.is_mutable;
+            env.insert(
+                name,
+                Binding { value: Some(held), ty: b.ty, is_output: false, is_mutable: stays_mutable },
+            );
         }
     }
 

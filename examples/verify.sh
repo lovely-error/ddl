@@ -52,7 +52,7 @@ for m in "${MODULES[@]}"; do
   # compiled from a concatenation. k2g_pkg.ddl is generated from the emulator
   # by emu/src/ddl_gen.rs -- the same source as k2g_pkg.sv.
   case "$m" in
-    k2g_decode | k2g_regfile)
+    k2g_alu | k2g_decode | k2g_regfile)
       mkdir -p "$WORK/$m"
       src="$WORK/$m/src.ddl"
       cat "$K2G/rtl/k2g_pkg.ddl"           "$DDL_ROOT/examples/k2g_types.ddl"           "$DDL_ROOT/examples/$m.ddl" > "$src"

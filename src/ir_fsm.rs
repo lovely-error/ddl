@@ -454,10 +454,7 @@ pub fn lower_blocking(
         if let Some(bind) = &seg.barrier.bind {
             let pipe = low.pipes[seg.barrier.pipe_ix].clone();
             let data = pipe.data_value.expect("an input pipe has a data value");
-            env.insert(
-                bind.clone(),
-                Binding { value: Some(data), ty: pipe.ty.clone(), is_output: false },
-            );
+            env.insert(bind.clone(), Binding::constant(data, pipe.ty.clone()));
         }
         // What this state leaves behind for later states.
         for name in &cross[k] {
@@ -491,7 +488,11 @@ pub fn lower_blocking(
                 if let Some((_, _, ty)) = cross_writes.get(name).cloned() {
                     let r = low.emit(ty.clone(), Op::RegRead(slot as u32));
                     low.name_value(r, format!("{}_r", name));
-                    env.insert(name.clone(), Binding { value: Some(r), ty, is_output: false });
+                    let stays_mutable = env.get(name).is_some_and(|b| b.is_mutable);
+                    env.insert(
+                        name.clone(),
+                        Binding { value: Some(r), ty, is_output: false, is_mutable: stays_mutable },
+                    );
                 }
             }
         }

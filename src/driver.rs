@@ -456,22 +456,32 @@ mod emit_tests {
 
     #[test]
     fn a_stream_output_has_no_ready_and_strobes_for_one_cycle() {
-        // A stream sink never refuses an item -- the oldest is overwritten --
-        // so there is no `ready` to emit, and `valid` cannot hold: with no
+        // `stream` is the exception, and this is the shape it exists for: a
+        // running count published for whoever is watching. A reader that
+        // misses a sample loses nothing, because the next one supersedes it --
+        // and the counter must not be stalled by a monitor that stopped
+        // looking, which is exactly what a `buffer` here would allow.
+        //
+        // So there is no `ready` to emit, and `valid` cannot hold: with no
         // `ready` to say the item was read, holding it would turn "the oldest
         // is overwritten" into "the newest is dropped".
+        //
+        // Anything whose loss changes the result wants a `buffer`.
         let v = compile(concat!(
-            "process P (src: buffer in i32, o: stream out i32)\n",
+            "process event_counter (ev: buffer in i1, count: stream out i32)\n",
+            "  var seen: i32 = @zeroed()\n",
             "  loop\n",
-            "    let (x, got) = @try_rcv(src)\n",
-            "    let _s = @try_send(o, x)\n",
+            "    let (_e, happened) = @try_rcv(ev)\n",
+            "    if happened then\n",
+            "      seen = seen + 32'd1\n",
+            "    @try_send(count, seen)\n",
         ));
-        assert!(v.contains("output        o_valid"), "{}", v);
-        assert!(!v.contains("o_ready"), "{}", v);
-        assert!(v.contains("o_busy <= src_valid;"), "{}", v);
-        // Nothing downstream can stall this process, so its input is always
-        // ready. That is `hold` in k2g_decode.sv, gone.
-        assert!(v.contains("assign src_ready = 1'b1;"), "{}", v);
+        assert!(v.contains("output        count_valid"), "{}", v);
+        assert!(!v.contains("count_ready"), "{}", v);
+        assert!(v.contains("count_busy <= ev_valid;"), "{}", v);
+        // A monitor that stops reading cannot stall the counter: its input
+        // stays ready no matter what the sink does.
+        assert!(v.contains("assign ev_ready = 1'b1;"), "{}", v);
     }
 
     #[test]

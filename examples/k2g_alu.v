@@ -1,9 +1,31 @@
 // GENERATED FILE -- DO NOT EDIT BY HAND
 //
-// Regenerate with: ddl build E:/Code/ddl/examples/k2g_alu.ddl -o E:/Code/ddl/examples/k2g_alu.v
+// Regenerate with: ddl build E:/Code/ddl/target/verify/k2g_alu/src.ddl -o E:/Code/ddl/examples/k2g_alu.v
 //
 // Verilog-2005. No `$clog2`, no width casts in expressions and no
 // function calls: all three make GowinSynthesis exit with an empty log.
+
+module uop_nop (
+    output [126:0] u
+);
+
+  assign u = 127'd0;
+
+endmodule
+
+module uop_fault (
+    input  [4:0]   cause,
+    input  [15:0]  cp,
+    output [126:0] u
+);
+
+  wire [126:0] f = 127'd0;
+  wire [126:0] n5 = {5'h12, f[121:0]};
+  wire [126:0] n8 = {n5[126:37], cause, n5[31:0]};
+
+  assign u = {n8[126:112], {16'd0, cp}, n8[79:0]};
+
+endmodule
 
 module rdt_is_signed (
     input  [2:0] t,

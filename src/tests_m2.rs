@@ -415,17 +415,34 @@ fn the_banner_appears_once_for_a_multi_module_file() {
     assert_eq!(v.matches("endmodule").count(), 2, "{}", v);
 }
 
-/// The two ported modules must keep compiling. Their bit-exactness is proven
-/// by examples/verify.sh against Questa; this only catches a compiler change
-/// that stops them building at all.
+/// The ported modules must keep compiling. Their bit-exactness is proven by
+/// examples/verify.sh against Questa; this only catches a compiler change that
+/// stops them building at all.
+///
+/// `k2g_alu` is compiled with `k2g_types.ddl` in front of it, the same way
+/// `verify.sh` does: it used to carry its own copy of the operation enums, and
+/// two copies of an opcode map is the failure this project already paid for.
 #[test]
 fn the_ported_modules_still_compile() {
-    for path in ["examples/k2g_shift.ddl", "examples/k2g_alu.ddl"] {
+    let pkg = std::fs::read_to_string("../KAMASUTRA2G/rtl/k2g_pkg.ddl").unwrap_or_default();
+    let types = format!(
+        "{}{}",
+        pkg,
+        std::fs::read_to_string("examples/k2g_types.ddl").unwrap_or_default()
+    );
+    if types.is_empty() {
+        return;
+    }
+    for (path, needs_types) in [
+        ("examples/k2g_shift.ddl", false),
+        ("examples/k2g_alu.ddl", true),
+    ] {
         let text = match std::fs::read_to_string(path) {
             Ok(t) => t,
             // Tests may run from elsewhere; skip rather than fail spuriously.
             Err(_) => continue,
         };
+        let text = if needs_types { format!("{}{}", types, text) } else { text };
         let map = SourceMap::new(path, text);
         if let Err(diags) = compile_to_verilog(&map, &EmitOptions::default()) {
             panic!("{} stopped compiling:\n{}", path, map.render_all(&diags));
@@ -1102,12 +1119,12 @@ fn zeroed_takes_the_type_of_an_assignment_target() {
 // A process takes data through pipes and nothing else, so these all share one
 // boundary: `src` carries the stimulus and `got` is "an item arrived this
 // cycle" -- which is exactly what a bare `go: i1` input used to mean, spelled
-// so the compiler owns the protocol. `o` is a `stream out` because these are
+// so the compiler owns the protocol. `o` is a `buffer out` because these are
 // observations of state, and a stream sink never stalls its producer.
 
 /// The header every register test uses, plus the receive that drives it.
 const PROC_IN: &str = concat!(
-    "process p (src: buffer in i8, o: stream out i8)\n",
+    "process p (src: buffer in i8, o: buffer out i8)\n",
     "  var c: i8 = @zeroed()\n",
     "  let (x, go) = @try_rcv(src)\n",
 );
@@ -1129,7 +1146,7 @@ fn a_process_gets_implicit_clock_and_reset() {
 #[test]
 fn a_var_in_a_process_becomes_a_register() {
     let v = compile(concat!(
-        "process p (src: buffer in i8, o: stream out i8)\n",
+        "process p (src: buffer in i8, o: buffer out i8)\n",
         "  var c: i8 = 8'd7\n",
         "  let (x, go) = @try_rcv(src)\n",
         "  if go then\n",
@@ -1180,7 +1197,7 @@ fn a_register_read_sees_earlier_assignments_in_the_same_cycle() {
 fn a_register_can_hold_a_struct_and_be_updated_field_by_field() {
     let v = compile(&format!(
         concat!(
-            "{}process p (src: buffer in kind_e, o: stream out uop_t)\n",
+            "{}process p (src: buffer in kind_e, o: buffer out uop_t)\n",
             "  var acc: uop_t = @zeroed()\n",
             "  let (k, go) = @try_rcv(src)\n",
             "  if go then\n",
@@ -1200,7 +1217,7 @@ fn an_enum_register_resets_to_its_named_variant() {
         "  S_IDLE\n",
         "  S_RUN\n",
         "  S_DONE\n",
-        "process p (src: buffer in i8, o: stream out st_e)\n",
+        "process p (src: buffer in i8, o: buffer out st_e)\n",
         "  var st: st_e = S_RUN\n",
         "  let (x, go) = @try_rcv(src)\n",
         "  if go then\n",
@@ -1213,7 +1230,7 @@ fn an_enum_register_resets_to_its_named_variant() {
 #[test]
 fn a_register_reset_value_must_be_constant() {
     let text = compile_err(concat!(
-        "process p (src: buffer in i8, o: stream out i1)\n",
+        "process p (src: buffer in i8, o: buffer out i1)\n",
         "  var c: i1 = clk\n",
         "  let _s = @try_send(o, c)\n",
     ));
@@ -1225,7 +1242,7 @@ fn a_constant_parameter_can_be_a_reset_value() {
     // The counterpart: a plain parameter is a compile-time constant, so it is
     // exactly what a reset value is allowed to be.
     let v = compile(concat!(
-        "process p (seed: i8 = 8'd9, src: buffer in i8, o: stream out i8)\n",
+        "process p (seed: i8 = 8'd9, src: buffer in i8, o: buffer out i8)\n",
         "  var c: i8 = seed\n",
         "  let (x, got) = @try_rcv(src)\n",
         "  let _s = @try_send(o, c)\n",
@@ -1241,7 +1258,7 @@ fn a_constant_parameter_can_be_a_reset_value() {
 #[test]
 fn a_register_needs_a_declared_type() {
     let text = compile_err(concat!(
-        "process p (src: buffer in i8, o: stream out i8)\n",
+        "process p (src: buffer in i8, o: buffer out i8)\n",
         "  var c = 8'd0\n",
         "  let _s = @try_send(o, c)\n",
     ));
@@ -1283,7 +1300,7 @@ fn a_process_has_no_plain_data_ports() {
 #[test]
 fn clk_and_rst_n_cannot_be_declared_by_hand() {
     let text = compile_err(concat!(
-        "process p (clk: i1, o: stream out i8)\n",
+        "process p (clk: i1, o: buffer out i8)\n",
         "  var c: i8 = @zeroed()\n",
         "  let _s = @try_send(o, c)\n",
     ));
@@ -1297,7 +1314,7 @@ fn clk_and_rst_n_cannot_be_declared_by_hand() {
 #[test]
 fn a_two_level_dedent_after_a_nested_if_parses() {
     let v = compile(concat!(
-        "process p (src: buffer in i8, o: stream out i8)\n",
+        "process p (src: buffer in i8, o: buffer out i8)\n",
         "  var c: i8 = @zeroed()\n",
         "  let (x, got) = @try_rcv(src)\n",
         "  let clear: i1 = x[0]\n",
@@ -1655,7 +1672,7 @@ const REGFILE: &str = concat!(
     "  we: i1\n",
     "  addr: i5\n",
     "  data: i32\n",
-    "process rf (cmd: buffer in cmd_t, rd: stream out i32)\n",
+    "process rf (cmd: buffer in cmd_t, rd: buffer out i32)\n",
     "  var vals: #[impl(lutram)] [i32; 32] = @zeroed()\n",
     "  loop\n",
     "    let (c, got) = @try_rcv(cmd)\n",
@@ -1714,7 +1731,7 @@ fn a_memory_with_no_initialiser_has_no_reset_loop() {
         "{}{}",
         CMD,
         concat!(
-            "process rf (cmd: buffer in cmd_t, rd: stream out i32)\n",
+            "process rf (cmd: buffer in cmd_t, rd: buffer out i32)\n",
             "  var vals: #[impl(lutram)] [i32; 32]\n",
             "  loop\n",
             "    let (c, got) = @try_rcv(cmd)\n",
@@ -1731,7 +1748,7 @@ fn a_memory_with_no_initialiser_has_no_reset_loop() {
 #[test]
 fn the_element_type_can_be_an_enum() {
     let v = compile(&format!("{}{}", OPS, concat!(
-        "process rf (addr: buffer in i5, rd: stream out op_e)\n",
+        "process rf (addr: buffer in i5, rd: buffer out op_e)\n",
         "  var tags: #[impl(lutram)] [op_e; 32] = OP_SUB\n",
         "  let (a, got) = @try_rcv(addr)\n",
         "  let _s = @try_send(rd, tags[a])\n",
@@ -1743,7 +1760,7 @@ fn the_element_type_can_be_an_enum() {
 #[test]
 fn a_narrow_index_is_widened_and_a_wide_one_is_refused() {
     let v = compile(concat!(
-        "process rf (addr: buffer in i3, rd: stream out i32)\n",
+        "process rf (addr: buffer in i3, rd: buffer out i32)\n",
         "  var vals: #[impl(lutram)] [i32; 32] = @zeroed()\n",
         "  let (a, got) = @try_rcv(addr)\n",
         "  let _s = @try_send(rd, vals[a])\n",
@@ -1751,7 +1768,7 @@ fn a_narrow_index_is_widened_and_a_wide_one_is_refused() {
     assert!(v.contains("vals["), "{}", v);
 
     let text = compile_err(concat!(
-        "process rf (addr: buffer in i8, rd: stream out i32)\n",
+        "process rf (addr: buffer in i8, rd: buffer out i32)\n",
         "  var vals: #[impl(lutram)] [i32; 32] = @zeroed()\n",
         "  let (a, got) = @try_rcv(addr)\n",
         "  let _s = @try_send(rd, vals[a])\n",
@@ -1763,7 +1780,7 @@ fn a_narrow_index_is_widened_and_a_wide_one_is_refused() {
 #[test]
 fn an_unknown_impl_is_rejected() {
     let text = compile_err(concat!(
-        "process rf (addr: buffer in i5, rd: stream out i32)\n",
+        "process rf (addr: buffer in i5, rd: buffer out i32)\n",
         "  var vals: #[impl(sram)] [i32; 32] = @zeroed()\n",
         "  let (a, got) = @try_rcv(addr)\n",
         "  let _s = @try_send(rd, vals[a])\n",
@@ -1774,7 +1791,7 @@ fn an_unknown_impl_is_rejected() {
 #[test]
 fn a_memory_cannot_be_a_parameter() {
     let text = compile_err(concat!(
-        "process rf (vals: #[impl(lutram)] [i32; 32], rd: stream out i32)\n",
+        "process rf (vals: #[impl(lutram)] [i32; 32], rd: buffer out i32)\n",
         "  var acc: i32 = 0\n",
         "  let _s = @try_send(rd, acc)\n",
     ));
@@ -1784,7 +1801,7 @@ fn a_memory_cannot_be_a_parameter() {
 #[test]
 fn a_memory_needs_a_constant_reset() {
     let text = compile_err(concat!(
-        "process rf (addr: buffer in i5, rd: stream out i1)\n",
+        "process rf (addr: buffer in i5, rd: buffer out i1)\n",
         "  var vals: #[impl(lutram)] [i1; 32] = clk\n",
         "  let (a, got) = @try_rcv(addr)\n",
         "  let _s = @try_send(rd, vals[a])\n",
@@ -1833,7 +1850,7 @@ fn an_assertion_is_guarded_on_simulation() {
 #[test]
 fn a_clocked_assertion_runs_on_the_edge_and_not_during_reset() {
     let v = compile(concat!(
-        "process p (src: buffer in i8, o: stream out i8)\n",
+        "process p (src: buffer in i8, o: buffer out i8)\n",
         "  var n: i8 = 0\n",
         "  let (x, got) = @try_rcv(src)\n",
         "  @assert(x != 8'd0, \"x must not be zero\")\n",
@@ -1961,7 +1978,7 @@ fn bram_is_recognised_and_refused_rather_than_quietly_made_lutram() {
     // Accepting the annotation and emitting an asynchronous read would hand
     // back distributed RAM under a `bram` label.
     let text = compile_err(concat!(
-        "process rf (addr: buffer in i5, rd: stream out i32)\n",
+        "process rf (addr: buffer in i5, rd: buffer out i32)\n",
         "  var vals: #[impl(bram)] [i32; 32] = @zeroed()\n",
         "  let (a, got) = @try_rcv(addr)\n",
         "  let _s = @try_send(rd, vals[a])\n",
@@ -1983,4 +2000,220 @@ fn the_same_source_compiles_to_the_same_bytes() {
     for _ in 0..9 {
         assert_eq!(compile(REGFILE), first, "output is not reproducible");
     }
+}
+
+
+// ---- M7: `let` is a constant, `var` is a variable -------------------------
+//
+// Until this, `is_mutable` was read in exactly one place in the compiler -- the
+// scan that picks registers out of a process body -- so the distinction lived
+// only in the reader's head. The first run of the check found a real one:
+// `k2g_shift.ddl` declared `let span_mask` and then assigned it on both
+// branches of an `if`, which made its initialiser dead code.
+
+#[test]
+fn a_let_cannot_be_assigned() {
+    let text = compile_err(concat!(
+        "fun f (x: i8, y: out i8)\n",
+        "  let acc: i8 = 8'd0\n",
+        "  acc = x\n",
+        "  y = acc\n",
+    ));
+    assert!(text.contains("is a `let` binding"), "{}", text);
+    assert!(text.contains("declare it `var`"), "{}", text);
+}
+
+#[test]
+fn a_var_can_be_assigned() {
+    let v = compile(concat!(
+        "fun f (x: i8, y: out i8)\n",
+        "  var acc: i8 = 8'd0\n",
+        "  acc = x\n",
+        "  y = acc\n",
+    ));
+    assert!(v.contains("assign y = x;"), "{}", v);
+}
+
+#[test]
+fn an_out_parameter_is_assignable_without_being_a_var() {
+    // `out` is written once and read back by the caller, which is a different
+    // thing from state that changes.
+    let v = compile("fun f (x: i8, y: out i8)\n  y = x\n");
+    assert!(v.contains("assign y = x;"), "{}", v);
+}
+
+#[test]
+fn a_constant_parameter_cannot_be_assigned() {
+    let text = compile_err(concat!(
+        "process p (n: i8 = 8'd3, src: buffer in i8, o: buffer out i8)\n",
+        "  loop\n",
+        "    let (x, got) = @try_rcv(src)\n",
+        "    n = x\n",
+        "    @try_send(o, n)\n",
+    ));
+    assert!(text.contains("is a constant parameter"), "{}", text);
+    assert!(text.contains("buffer in"), "{}", text);
+}
+
+#[test]
+fn a_received_item_cannot_be_assigned() {
+    let text = compile_err(concat!(
+        "process p (src: buffer in i8, o: buffer out i8)\n",
+        "  loop\n",
+        "    let (x, got) = @try_rcv(src)\n",
+        "    x = 8'd0\n",
+        "    @try_send(o, x)\n",
+    ));
+    assert!(text.contains("is a `let` binding"), "{}", text);
+}
+
+#[test]
+fn a_register_is_still_mutable() {
+    // The leading `var` scan and the assignability check have to agree.
+    let v = compile(concat!(
+        "process p (src: buffer in i8, o: buffer out i8)\n",
+        "  var c: i8 = 8'd0\n",
+        "  loop\n",
+        "    let (x, got) = @try_rcv(src)\n",
+        "    c = c + x\n",
+        "    @try_send(o, c)\n",
+    ));
+    assert!(v.contains("reg [7:0] c;"), "{}", v);
+    assert!(v.contains("c <= "), "{}", v);
+}
+
+#[test]
+fn a_let_keeps_its_name_where_a_mux_join_would_not() {
+    // What the k2g_shift repair bought: a conditional value written as one
+    // `let` is a NAMED wire, where the same thing written as an `if` over a
+    // pre-initialised binding became an anonymous temporary.
+    let v = compile(concat!(
+        "fun f (c: i1, y: out i32)\n",
+        "  let picked: i32 = if c then 32'd1 else 32'd2\n",
+        "  y = picked\n",
+    ));
+    assert!(v.contains("wire [31:0] picked ="), "{}", v);
+}
+
+
+// ---- M7b: a call can produce more than one value --------------------------
+
+const DIVMOD: &str = concat!(
+    "fun divmod (a: i8, b: i8, q: out i8, r: out i8)\n",
+    "  q = a / b\n",
+    "  r = a % b\n",
+);
+
+#[test]
+fn a_tuple_binding_takes_one_name_per_output() {
+    let v = compile(&format!("{}{}", DIVMOD, concat!(
+        "fun f (x: i8, y: i8, s: out i8)\n",
+        "  let (quot, rem) = divmod(x, y)\n",
+        "  s = quot + rem\n",
+    )));
+    // The CALLER's names reach the Verilog, not the callee's parameter names.
+    assert!(v.contains("wire [7:0] quot = x / y;"), "{}", v);
+    assert!(v.contains("wire [7:0] rem = x % y;"), "{}", v);
+    assert!(v.contains("assign s = (quot + rem);"), "{}", v);
+}
+
+#[test]
+fn declaration_order_decides_which_name_gets_which() {
+    let v = compile(&format!("{}{}", DIVMOD, concat!(
+        "fun f (x: i8, y: i8, s: out i8)\n",
+        "  let (first, second) = divmod(x, y)\n",
+        "  s = first\n",
+    )));
+    // `q` is declared first, so `first` is the quotient.
+    assert!(v.contains("assign s = x / y;") || v.contains("wire [7:0] first = x / y;"), "{}", v);
+}
+
+#[test]
+fn binding_the_wrong_number_of_names_says_what_the_outputs_are() {
+    let text = compile_err(&format!("{}{}", DIVMOD, concat!(
+        "fun f (x: i8, y: i8, s: out i8)\n",
+        "  let (a, b, c) = divmod(x, y)\n",
+        "  s = a\n",
+    )));
+    assert!(text.contains("has 2 outputs but 3 name"), "{}", text);
+    assert!(text.contains("q, r"), "{}", text);
+}
+
+#[test]
+fn a_multi_output_function_is_still_refused_in_expression_position() {
+    let text = compile_err(&format!("{}{}", DIVMOD, concat!(
+        "fun f (x: i8, y: i8, s: out i8)\n",
+        "  s = divmod(x, y)\n",
+    )));
+    assert!(text.contains("cannot be used as an expression"), "{}", text);
+    assert!(text.contains("let (a, b) = f(..)"), "{}", text);
+}
+
+#[test]
+fn a_function_with_no_outputs_produces_nothing_to_bind() {
+    let text = compile_err(concat!(
+        "fun nothing (a: i8)\n",
+        "  let unused: i8 = a\n",
+        "fun f (x: i8, s: out i8)\n",
+        "  let (a, b) = nothing(x)\n",
+        "  s = x\n",
+    ));
+    assert!(text.contains("has no `out` parameters"), "{}", text);
+}
+
+#[test]
+fn a_multi_output_call_inside_a_branch_is_muxed() {
+    // The results are ordinary bindings, so the SSA join treats them like any
+    // other -- but only if both arms bind them.
+    let v = compile(&format!("{}{}", DIVMOD, concat!(
+        "fun f (c: i1, x: i8, y: i8, s: out i8)\n",
+        "  if c then\n",
+        "    let (q, r) = divmod(x, y)\n",
+        "    s = q + r\n",
+        "  else\n",
+        "    s = x\n",
+    )));
+    assert!(v.contains("c ? "), "{}", v);
+}
+
+#[test]
+fn a_multi_output_call_cannot_recurse() {
+    let text = compile_err(concat!(
+        "fun loopy (a: i8, p: out i8, q: out i8)\n",
+        "  let (x, y) = loopy(a)\n",
+        "  p = x\n",
+        "  q = y\n",
+    ));
+    assert!(text.contains("calls itself"), "{}", text);
+}
+
+#[test]
+fn the_verified_alu_and_shifter_can_be_called() {
+    // The reason this feature exists: k2g_alu has five `out` parameters and
+    // k2g_shift has three, so neither was reachable from DDL until now.
+    let pkg = match std::fs::read_to_string("../KAMASUTRA2G/rtl/k2g_pkg.ddl") {
+        Ok(t) => t,
+        // The generated package lives in the consumer's tree; skip when it is
+        // not beside us rather than fail spuriously.
+        Err(_) => return,
+    };
+    let src = pkg
+        + &std::fs::read_to_string("examples/k2g_types.ddl").expect("types")
+        + &std::fs::read_to_string("examples/k2g_alu.ddl").expect("alu")
+        + &std::fs::read_to_string("examples/k2g_shift.ddl").expect("shift")
+        + concat!(
+            "\nfun both (a: i32, b: i32, t: i3, n: i5, ra: out i32, rs: out i32)\n",
+            "  let (arith, ovf, log_r, cmp_r, un) = k2g_alu(a, b, t, t, ARITH_ADD, LOGIC_AND, CMP_EQ, UNARY_NEG)\n",
+            "  let (sh, bx, bi) = k2g_shift(a, b, n, SHIFT_LL, 5'd0, 5'd8)\n",
+            "  ra = arith\n",
+            "  rs = sh\n",
+        );
+    let v = compile(&src);
+    assert!(v.contains("module both ("), "{}", v);
+    // Both helpers were inlined into one module: the ALU's carry-extended
+    // adder and the shifter's arithmetic right shift are both present, and
+    // there is no hierarchy -- one `module both`, no instantiations.
+    assert!(v.contains("a33 + b33"), "{}", v);
+    assert!(v.contains(">>>"), "{}", v);
+    assert!(!v.contains("k2g_alu u_"), "{}", v);
 }

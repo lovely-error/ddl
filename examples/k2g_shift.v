@@ -20,12 +20,12 @@ module k2g_shift (
   wire signed [31:0] n12 = value;
   wire signed [31:0] n13 = n12 >>> amount;
   wire [31:0] n14 = n13;
-  wire [31:0] n26 = (bm_span == 5'd0) ? 32'd0 : ((32'd1 << bm_span) - 32'd1);
-  wire [31:0] placed_mask = n26 << bm_start;
-  wire [31:0] placed_src = (src & n26) << bm_start;
+  wire [31:0] span_mask = (bm_span == 5'd0) ? 32'd0 : ((32'd1 << bm_span) - 32'd1);
+  wire [31:0] placed_mask = span_mask << bm_start;
+  wire [31:0] placed_src = (src & span_mask) << bm_start;
 
   assign shift_result = ((shift_op == 2'd0) ? (value << amount) : ((shift_op == 2'd1) ? (value >> amount) : n14));
-  assign bext_result = ((src >> bm_start) & n26);
+  assign bext_result = ((src >> bm_start) & span_mask);
   assign bins_result = ((value & (~placed_mask)) | placed_src);
 
 endmodule

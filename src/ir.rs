@@ -354,6 +354,23 @@ pub struct Binding {
     /// Output parameters are assigned rather than read; reading one before it
     /// has been written is an error rather than an undefined wire.
     pub is_output: bool,
+    /// Declared `var`. `let` is a constant, and assigning to one is an error
+    /// rather than a redefinition -- the distinction existed only in the
+    /// reader's head until this field, because nothing consulted `is_mutable`
+    /// outside the scan that picks registers out of a process body.
+    pub is_mutable: bool,
+}
+
+impl Binding {
+    /// A `let`: bound once, never assigned.
+    pub fn constant(value: ValueId, ty: Ty) -> Binding {
+        Binding { value: Some(value), ty, is_output: false, is_mutable: false }
+    }
+
+    /// A `var`: state, or a mutable local.
+    pub fn variable(value: ValueId, ty: Ty) -> Binding {
+        Binding { value: Some(value), ty, is_output: false, is_mutable: true }
+    }
 }
 
 /// Ordered, and that is load-bearing rather than tidy.
@@ -660,7 +677,7 @@ impl<'a> Lowerer<'a> {
             }
         }
         let folded = self.emit(ty.clone(), Op::Const(konst));
-        env.insert(name.clone(), Binding { value: Some(folded), ty: ty.clone(), is_output: false });
+        env.insert(name.clone(), Binding::constant(folded, ty.clone()));
         self.params.push((name, ty, konst));
         Some(())
     }
@@ -712,15 +729,16 @@ impl<'a> Lowerer<'a> {
         let data = self.emit(elem.clone(), Op::Const(0));
 
         let (we_key, addr_key, data_key) = Self::mem_port_keys(&name);
-        env.insert(we_key, Binding { value: Some(we), ty: Ty::BOOL, is_output: false });
-        env.insert(
-            addr_key,
-            Binding { value: Some(addr), ty: Ty::UInt(addr_width), is_output: false },
-        );
-        env.insert(data_key, Binding { value: Some(data), ty: elem.clone(), is_output: false });
+        env.insert(we_key, Binding::constant(we, Ty::BOOL));
+        env.insert(addr_key, Binding::constant(addr, Ty::UInt(addr_width)));
+        env.insert(data_key, Binding::constant(data, elem.clone()));
 
         let mem_ty = Ty::Mem { elem: Box::new(elem.clone()), len, kind };
-        env.insert(name.clone(), Binding { value: None, ty: mem_ty, is_output: false });
+        // A memory is reached by subscript, never assigned as a whole.
+        env.insert(
+            name.clone(),
+            Binding { value: None, ty: mem_ty, is_output: false, is_mutable: false },
+        );
 
         let ix = self.mems.len();
         self.mems.push(Memory {
@@ -903,6 +921,22 @@ impl<'a> Lowerer<'a> {
         self.asserts.push(Assertion { cond: guarded, message, is_fatal });
     }
 
+    /// Names a value unless it is already a signal in its own right.
+    ///
+    /// A port or a register read has a name the backend depends on, and a
+    /// constant is folded rather than declared -- renaming any of them would
+    /// produce a reference to a wire that is never emitted.
+    pub fn name_value_safe(&mut self, v: ValueId, name: String) {
+        let is_already_a_signal = matches!(
+            self.values[v.0 as usize].op,
+            Op::Port(_) | Op::RegRead(_) | Op::Const(_)
+        );
+        if is_already_a_signal {
+            return;
+        }
+        self.values[v.0 as usize].name = Some(name);
+    }
+
     pub fn name_value(&mut self, v: ValueId, name: String) {
         self.values[v.0 as usize].name = Some(name);
     }
@@ -1082,11 +1116,16 @@ pub fn lower_function(
             PortDir::In => {
                 let v = low.emit(ty.clone(), Op::Port(port_id));
                 low.values[v.0 as usize].name = Some(name.clone());
-                env.insert(name, Binding { value: Some(v), ty, is_output: false });
+                env.insert(name, Binding::constant(v, ty));
             }
             PortDir::Out => {
                 out_ports.push((port_id, name.clone()));
-                env.insert(name, Binding { value: None, ty, is_output: true });
+                // An `out` parameter is assignable through `is_output`, not through
+                // `is_mutable`: it is written once and read back by the caller.
+                env.insert(
+                    name,
+                    Binding { value: None, ty, is_output: true, is_mutable: false },
+                );
             }
         }
     }
@@ -1168,10 +1207,7 @@ pub fn lower_process(
         });
         let v = low.emit(Ty::BOOL, Op::Port(port_id));
         low.values[v.0 as usize].name = Some(implicit.to_string());
-        env.insert(
-            implicit.to_string(),
-            Binding { value: Some(v), ty: Ty::BOOL, is_output: false },
-        );
+        env.insert(implicit.to_string(), Binding::constant(v, Ty::BOOL));
     }
 
     for arg in &decl.args.entries {
@@ -1357,10 +1393,7 @@ pub fn lower_process(
 
         let held = low.emit(ty.clone(), Op::RegRead(reg_names.len() as u32));
         low.values[held.0 as usize].name = Some(name.clone());
-        env.insert(
-            name.clone(),
-            Binding { value: Some(held), ty: ty.clone(), is_output: false },
-        );
+        env.insert(name.clone(), Binding::variable(held, ty.clone()));
         reg_names.push(name);
         reg_resets.push(reset);
         reg_tys.push(ty);
@@ -1734,8 +1767,8 @@ fn lower_try_rcv_binding(
 
     let item = anumspan_to_str(&decl.name).to_string();
     let got = anumspan_to_str(&decl.rest[0]).to_string();
-    env.insert(item, Binding { value: Some(data), ty, is_output: false });
-    env.insert(got, Binding { value: Some(fired), ty: Ty::BOOL, is_output: false });
+    env.insert(item, Binding::constant(data, ty));
+    env.insert(got, Binding::constant(fired, Ty::BOOL));
     Some(())
 }
 
@@ -1777,9 +1810,28 @@ fn lower_stmt(
         PrecResInnerStmt::VarDecl(decl) => {
             let name = anumspan_to_str(&decl.name).to_string();
 
-            // `let (item, got) = @try_rcv(p)`. A non-blocking receive answers
-            // with both, and there is no way to use it without taking both.
+            // A tuple binding takes one name per result. There are two things
+            // that produce several: `@try_rcv`, which answers with the item and
+            // whether there was one, and a `fun` with several `out` parameters.
             if !decl.rest.is_empty() {
+                let callee = match &decl.assign_val {
+                    Some(PrecResExpr::Call { base, .. }) => match &**base {
+                        PrecResExpr::Ref(n) => Some(*n),
+                        _ => None,
+                    },
+                    _ => None,
+                };
+                if let Some(callee) = callee {
+                    let args = match &decl.assign_val {
+                        Some(PrecResExpr::Call { args, .. }) => args.clone(),
+                        _ => unreachable!("matched a call above"),
+                    };
+                    let mut names = vec![decl.name];
+                    names.extend(decl.rest.iter().copied());
+                    return crate::ir_match::inline_call_multi(
+                        low, &callee, &args, &names, env, sink,
+                    );
+                }
                 return lower_try_rcv_binding(low, decl, env, sink);
             }
             let declared = match &decl.ty_expr {
@@ -1840,7 +1892,10 @@ fn lower_stmt(
             }
             let ty = low.ty_of(value);
             low.values[value.0 as usize].name.get_or_insert(name.clone());
-            env.insert(name, Binding { value: Some(value), ty, is_output: false });
+            env.insert(
+                name,
+                Binding { value: Some(value), ty, is_output: false, is_mutable: decl.is_mutable },
+            );
             Some(())
         }
 
@@ -1881,13 +1936,39 @@ fn lower_stmt(
             };
             let target = path.base;
             let name = anumspan_to_str(&target).to_string();
-            let base_ty = match env.get(&name) {
-                Some(b) => b.ty.clone(),
+            let binding = match env.get(&name) {
+                Some(b) => b.clone(),
                 None => {
                     sink.err_at(&target, format!("`{}` is not declared", name));
                     return None;
                 }
             };
+            let base_ty = binding.ty.clone();
+
+            // `let` is a constant. An `out` parameter is assignable without
+            // being a variable: it is written once and read back by the
+            // caller, which is a different thing from state that changes.
+            let assignable = binding.is_mutable || binding.is_output;
+            if !assignable {
+                let is_constant_parameter = low.params.iter().any(|(n, _, _)| *n == name);
+                let diag = if is_constant_parameter {
+                    Diag::error(
+                        low.span_of(&target),
+                        format!("`{}` is a constant parameter and cannot be assigned", name),
+                    )
+                    .with_note(
+                        "a plain parameter is folded at compile time; per-cycle data arrives through a `buffer in` or `stream in` pipe",
+                    )
+                } else {
+                    Diag::error(
+                        low.span_of(&target),
+                        format!("`{}` is a `let` binding and cannot be assigned", name),
+                    )
+                    .with_note("declare it `var` if it has to change")
+                };
+                sink.push(diag);
+                return None;
+            }
             // Compound assignment (`x += y`) is not desugared yet; the parser
             // records the kind, so reject it explicitly rather than silently
             // treating it as a plain assignment.
@@ -2596,12 +2677,9 @@ fn lower_mem_write(
 
     let one = low.emit(Ty::BOOL, Op::Const(1));
     let (we_key, addr_key, data_key) = Lowerer::mem_port_keys(&name);
-    env.insert(we_key, Binding { value: Some(one), ty: Ty::BOOL, is_output: false });
-    env.insert(
-        addr_key,
-        Binding { value: Some(addr), ty: Ty::UInt(addr_width), is_output: false },
-    );
-    env.insert(data_key, Binding { value: Some(value), ty: elem, is_output: false });
+    env.insert(we_key, Binding::constant(one, Ty::BOOL));
+    env.insert(addr_key, Binding::constant(addr, Ty::UInt(addr_width)));
+    env.insert(data_key, Binding::constant(value, elem));
     Some(())
 }
 

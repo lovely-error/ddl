@@ -175,6 +175,7 @@ pub fn lower_match(
             arm_env.insert(
                 bound,
                 Binding {
+                    is_mutable: false,
                     value: Some(scrutinee),
                     ty: scrutinee_ty.clone(),
                     is_output: false,
@@ -368,16 +369,11 @@ pub fn inline_call(
     sink: &mut DiagSink,
 ) -> Option<ValueId> {
     let name = anumspan_to_str(callee).to_string();
-
-    let sig = match low.syms.funcs.get(&name) {
-        Some(s) => s.clone(),
-        None => {
-            sink.err_at(callee, format!("`{}` is not a function", name));
-            return None;
-        }
-    };
-
+    let sig = signature_of(low, callee, sink)?;
     let outputs: Vec<_> = sig.outputs().cloned().collect();
+
+    // An expression is one value. A function with several `out` parameters is
+    // called with a tuple binding instead -- see `inline_call_multi`.
     let has_exactly_one_output = outputs.len() == 1;
     if !has_exactly_one_output {
         sink.push(
@@ -389,12 +385,127 @@ pub fn inline_call(
                     outputs.len()
                 ),
             )
-            .with_note("a function used in an expression needs exactly one `out` parameter"),
+            .with_note(
+                "a function used in an expression needs exactly one `out` parameter; bind several with `let (a, b) = f(..)`",
+            ),
         );
         return None;
     }
 
+    let callee_env = inline_body(low, callee, args, &sig, env, sink)?;
+    let (out_name, _, _) = &outputs[0];
+    match callee_env.get(out_name).and_then(|b| b.value) {
+        Some(v) => Some(v),
+        None => {
+            sink.err_at(
+                callee,
+                format!("`{}` never assigns its output `{}`", name, out_name),
+            );
+            None
+        }
+    }
+}
+
+/// `let (a, b, c) = f(x, y)` -- one name per `out` parameter, in declaration
+/// order.
+///
+/// The same inlining as the expression form; only what happens to the results
+/// differs. Statement position rather than expression position because a call
+/// producing several values has nowhere to sit inside a larger expression --
+/// which is also why the two verified helpers this exists for, `k2g_alu` with
+/// five outputs and `k2g_shift` with three, were unreachable until now.
+pub fn inline_call_multi(
+    low: &mut Lowerer,
+    callee: &AlphanumSpan,
+    args: &[PrecResExpr],
+    results: &[AlphanumSpan],
+    env: &mut Env,
+    sink: &mut DiagSink,
+) -> Option<()> {
+    let name = anumspan_to_str(callee).to_string();
+    let sig = signature_of(low, callee, sink)?;
+    let outputs: Vec<_> = sig.outputs().cloned().collect();
+
+    if outputs.is_empty() {
+        sink.push(
+            Diag::error(
+                low.span_of(callee),
+                format!("`{}` has no `out` parameters, so it produces nothing to bind", name),
+            )
+            .with_note("give it an `out` parameter, or call it for its effect if it had one"),
+        );
+        return None;
+    }
+    let names_match_outputs = results.len() == outputs.len();
+    if !names_match_outputs {
+        let out_names: Vec<&str> = outputs.iter().map(|(n, _, _)| n.as_str()).collect();
+        sink.push(
+            Diag::error(
+                low.span_of(callee),
+                format!(
+                    "`{}` has {} outputs but {} name(s) were bound",
+                    name,
+                    outputs.len(),
+                    results.len()
+                ),
+            )
+            .with_note(format!("its outputs, in order: {}", out_names.join(", "))),
+        );
+        return None;
+    }
+
+    let callee_env = inline_body(low, callee, args, &sig, env, sink)?;
+
+    for (bind_span, (out_name, _, out_ty)) in results.iter().zip(outputs.iter()) {
+        let v = match callee_env.get(out_name).and_then(|b| b.value) {
+            Some(v) => v,
+            None => {
+                sink.err_at(
+                    callee,
+                    format!("`{}` never assigns its output `{}`", name, out_name),
+                );
+                return None;
+            }
+        };
+        let bound = anumspan_to_str(bind_span).to_string();
+        low.name_value_safe(v, bound.clone());
+        env.insert(bound, Binding::constant(v, out_ty.clone()));
+    }
+    Some(())
+}
+
+fn signature_of(
+    low: &Lowerer,
+    callee: &AlphanumSpan,
+    sink: &mut DiagSink,
+) -> Option<crate::symbols::FuncSig> {
+    let name = anumspan_to_str(callee).to_string();
+    match low.syms.funcs.get(&name) {
+        Some(s) => Some(s.clone()),
+        None => {
+            sink.err_at(callee, format!("`{}` is not a function", name));
+            None
+        }
+    }
+}
+
+/// Checks arity and recursion, binds the arguments into a fresh scope, lowers
+/// the callee body, and hands back the environment it left behind.
+///
+/// The caller decides what to do with the outputs; everything before that is
+/// the same whether one value is wanted or five.
+fn inline_body(
+    low: &mut Lowerer,
+    callee: &AlphanumSpan,
+    args: &[PrecResExpr],
+    sig: &crate::symbols::FuncSig,
+    env: &Env,
+    sink: &mut DiagSink,
+) -> Option<Env> {
+    let name = anumspan_to_str(callee).to_string();
     let inputs: Vec<_> = sig.inputs().cloned().collect();
+    let outputs: Vec<_> = sig.outputs().cloned().collect();
+
     let arity_matches = args.len() == inputs.len();
     if !arity_matches {
         sink.err_at(
@@ -456,30 +567,19 @@ pub fn inline_call(
                 }
             }
         }
+        callee_env.insert(param_name.clone(), Binding::constant(value, param_ty.clone()));
+    }
+    for (out_name, _, out_ty) in &outputs {
         callee_env.insert(
-            param_name.clone(),
-            Binding { value: Some(value), ty: param_ty.clone(), is_output: false },
+            out_name.clone(),
+            Binding { value: None, ty: out_ty.clone(), is_output: true, is_mutable: false },
         );
     }
-    let (out_name, _, out_ty) = &outputs[0];
-    callee_env.insert(
-        out_name.clone(),
-        Binding { value: None, ty: out_ty.clone(), is_output: true },
-    );
 
     low.call_stack.push(name.clone());
     let lowered = lower_stmts(low, &body.body, &mut callee_env, sink);
     low.call_stack.pop();
     lowered?;
 
-    match callee_env.get(out_name).and_then(|b| b.value) {
-        Some(v) => Some(v),
-        None => {
-            sink.err_at(
-                callee,
-                format!("`{}` never assigns its output `{}`", name, out_name),
-            );
-            None
-        }
-    }
+    Some(callee_env)
 }

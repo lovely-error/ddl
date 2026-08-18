@@ -41,11 +41,9 @@ fun k2g_shift (
   -- A span of 32 would overflow a 5-bit field, so span is 0..31 by
   -- construction; span 0 yields an all-zero mask, which makes BINS a no-op --
   -- the defined behaviour (spec 5.8). BEXT with span 0 is caught in decode.
-  let span_mask: i32 = 0
-  if bm_span == 5'd0 then
-    span_mask = 32'd0
-  else
-    span_mask = (32'd1 << bm_span) - 32'd1
+  let span_mask: i32 = if bm_span == 5'd0
+      then 32'd0
+      else (32'd1 << bm_span) - 32'd1
 
   -- Extract reads the SOURCE register (arg2), not the destination. Extracting
   -- from `value` instead was an actual bug, caught by randomized lockstep

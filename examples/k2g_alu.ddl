@@ -19,31 +19,11 @@
 
 -- These mirror k2g_types.svh. Discriminants are implicit because the
 -- SystemVerilog leaves them implicit too, so the encodings stay in step.
-enum arith_e: i2
-  ARITH_ADD
-  ARITH_SUB
-  ARITH_MUL
-  ARITH_DIV
+-- The operation enums live in k2g_types.ddl, which this is compiled with.
+-- They were duplicated here while this was the only module that needed them;
+-- two copies of an opcode map is the exact failure this project already paid
+-- for once, so there is one copy now.
 
-enum logic_e: i2
-  LOGIC_AND
-  LOGIC_OR
-  LOGIC_XOR
-
-enum cmp_e: i3
-  CMP_EQ
-  CMP_NE
-  CMP_LT
-  CMP_GT
-  CMP_LE
-  CMP_GE
-
-enum unary_e: i2
-  UNARY_NOT
-  UNARY_NEG
-
--- rdt_e is flat, but its values carry structure (see k2g_pkg): bit 2 is
--- signedness, the low bits are the width code.
 fun rdt_is_signed (t: i3, signed_: out i1)
   signed_ = t[2]
 
