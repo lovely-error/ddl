@@ -239,10 +239,28 @@ pub enum BindingPattern {
     AnyOf(Vec<BindingPattern>),
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy)]
 pub struct AlphanumSpan {
     pub byte_ptr: *const u8,
     pub len: u32,
+}
+
+/// Prints the identifier, not the pointer.
+///
+/// Every AST dump goes through this, and a tree of raw addresses says nothing
+/// about the source it came from. The text is borrowed from the SourceMap,
+/// which outlives every AST that refers to it.
+impl core::fmt::Debug for AlphanumSpan {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let text = unsafe { core::str::from_raw_parts(self.byte_ptr, self.len as usize) };
+        write!(f, "`{}`", text)
+    }
+}
+
+impl core::fmt::Debug for StrSpan {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "{:?}", self.as_str())
+    }
 }
 
 #[derive(Debug)]
@@ -287,6 +305,9 @@ pub struct RawArgDefTuple {
 pub enum RawTypeExpr {
     Ident(AlphanumSpan), 
     Array(Box<RawTypeExpr>, RawExpr),
+    /// `#[impl(lutram)] [T; n]` -- an array that asks for a particular backing
+    /// store rather than being a packed vector. desc.md:92.
+    MemArray { elem: Box<RawTypeExpr>, len: RawExpr, kind: AlphanumSpan },
 }
 #[derive(Debug, Clone, Copy)]
 pub enum ArgTypeQualifier {
@@ -740,6 +761,44 @@ unsafe fn try_parse_type_expr(
     mut char_ptr: *const u8,
     char_end_ptr: *const u8,
 ) -> Result<(RawTypeExpr, *const u8), ()> {
+    // `#[impl(lutram)] [T; n]`. The annotation binds to the array that follows,
+    // so it is parsed here rather than at the declaration: it is part of what
+    // the type IS, not a property of the name it is given.
+    let (is_annotated, new_ptr) = strip_prefix_on_match(char_ptr, char_end_ptr, "#[");
+    if is_annotated {
+        char_ptr = new_ptr;
+        let (word, new_ptr) = try_parse_alphanum(char_ptr, char_end_ptr)?;
+        char_ptr = new_ptr;
+        // `impl` is the only annotation there is; anything else is a typo, and
+        // silently ignoring it would silently ignore a memory shape request.
+        let word_text = core::str::from_raw_parts(word.byte_ptr, word.len as usize);
+        if word_text != "impl" {
+            return Err(());
+        }
+        let (open, new_ptr) = strip_prefix_on_match(char_ptr, char_end_ptr, "(");
+        if !open {
+            return Err(());
+        }
+        char_ptr = new_ptr;
+        let (kind, new_ptr) = try_parse_alphanum(char_ptr, char_end_ptr)?;
+        char_ptr = new_ptr;
+        let (close, new_ptr) = strip_prefix_on_match(char_ptr, char_end_ptr, ")]");
+        if !close {
+            return Err(());
+        }
+        char_ptr = new_ptr;
+        let (_, new_ptr) = skip_whitespaces(char_ptr, char_end_ptr);
+        char_ptr = new_ptr;
+        let (inner, new_ptr) = try_parse_type_expr(char_ptr, char_end_ptr)?;
+        let (elem, len) = match inner {
+            RawTypeExpr::Array(elem, len) => (elem, len),
+            // `#[impl(bram)] i32` asks for a memory that holds one thing; the
+            // annotation only means anything on an array.
+            _ => return Err(()),
+        };
+        return Ok((RawTypeExpr::MemArray { elem, len, kind }, new_ptr));
+    }
+
     let (is_arr_begin, new_ptr) = strip_prefix_on_match(char_ptr, char_end_ptr, "[");
     if is_arr_begin {
         char_ptr = new_ptr;
@@ -1538,12 +1597,19 @@ unsafe fn try_parse_line_string(
 
 #[derive(Debug, Clone)]
 pub struct StrLiteral {
-    pieces: Vec<StrSpan>,
+    pub pieces: Vec<StrSpan>,
 }
-#[derive(Debug, Clone, Copy)]
+#[derive(Clone, Copy)]
 pub struct StrSpan {
     pub start_ptr: *const u8,
     pub len: usize,
+}
+
+impl StrSpan {
+    /// The text between the quotes, borrowed from the source.
+    pub fn as_str<'a>(&self) -> &'a str {
+        unsafe { core::str::from_raw_parts(self.start_ptr, self.len) }
+    }
 }
 
 

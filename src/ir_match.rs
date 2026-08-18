@@ -222,7 +222,19 @@ pub fn lower_match(
             labels
         };
 
+        // An arm runs when the scrutinee carries one of its labels. The
+        // catch-all arm runs when no EARLIER arm claimed the value, which is
+        // what the `case` default does, so its guard is the negation of every
+        // label taken so far.
+        let depth = if labels.is_empty() {
+            let claimed: Vec<u128> =
+                arms.iter().flat_map(|a: &Arm| a.labels.iter().copied()).collect();
+            low.push_labels(scrutinee, claimed, false)
+        } else {
+            low.push_labels(scrutinee, labels.clone(), true)
+        };
         lower_branch(low, &case.rhs, &mut arm_env, sink)?;
+        low.pop_path(depth);
         arms.push(Arm { labels, env: arm_env });
     }
 

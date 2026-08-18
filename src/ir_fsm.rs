@@ -569,8 +569,11 @@ pub fn lower_blocking(
     if sink.has_errors() {
         return None;
     }
+    let asserts = std::mem::take(&mut low.asserts);
     let (values, ports) = low.take_values();
     Some(crate::ir::Module {
+        asserts,
+        mems: Vec::new(),
         name: anumspan_to_str(&decl.name).to_string(),
         ports,
         values,

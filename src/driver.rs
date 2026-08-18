@@ -74,7 +74,26 @@ pub fn parse_source(map: &SourceMap) -> Result<Parsed, Vec<Diag>> {
 /// combinational `fun`, emit. Declarations that are not functions are skipped
 /// with a diagnostic rather than silently ignored -- `process` and `sequence`
 /// need a state machine and a pipeline scheduler respectively.
+/// How far to run, and what to print.
+///
+/// The two early exits are for reading, not for feeding to another tool: they
+/// answer "did the parser see what I wrote" and "what did the compiler decide"
+/// without having to infer either from the Verilog.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Emit {
+    /// Declarations after precedence resolution.
+    Ast,
+    /// Lowered modules, before the backend folds anything.
+    Ir,
+    /// The generated Verilog-2005.
+    Verilog,
+}
+
 pub fn compile_to_verilog(map: &SourceMap, opts: &EmitOptions) -> Result<String, Vec<Diag>> {
+    compile(map, opts, Emit::Verilog)
+}
+
+pub fn compile(map: &SourceMap, opts: &EmitOptions, emit: Emit) -> Result<String, Vec<Diag>> {
     let parsed = parse_source(map)?;
     let base = map.base_ptr();
     let mut sink = DiagSink::new(map);
@@ -128,6 +147,26 @@ pub fn compile_to_verilog(map: &SourceMap, opts: &EmitOptions) -> Result<String,
         return Err(sink.into_diags());
     }
 
+    if emit == Emit::Ast {
+        let mut out = String::new();
+        for e in &enums {
+            out.push_str(&format!("{:#?}\n", e));
+        }
+        for s in &structs {
+            out.push_str(&format!("{:#?}\n", s));
+        }
+        for f in &funcs {
+            out.push_str(&format!("{:#?}\n", f));
+        }
+        for s in &seqs {
+            out.push_str(&format!("{:#?}\n", s));
+        }
+        for p in &procs {
+            out.push_str(&format!("{:#?}\n", p));
+        }
+        return Ok(out);
+    }
+
     // Pass 2: the symbol table.
     let syms = symbols::build(&enums, &structs, &funcs, &mut sink);
     if sink.has_errors() {
@@ -141,26 +180,32 @@ pub fn compile_to_verilog(map: &SourceMap, opts: &EmitOptions) -> Result<String,
         .map(|f| (anumspan_to_str(&f.name).to_string(), f))
         .collect();
 
-    let mut out = emit_banner(opts);
+    let dumping_ir = emit == Emit::Ir;
+    let mut out = if dumping_ir { String::new() } else { emit_banner(opts) };
     let mut emitted = 0usize;
+    let mut render = |out: &mut String, module: &crate::ir::Module| {
+        out.push('\n');
+        if dumping_ir {
+            out.push_str(&crate::ir::render_module(module));
+        } else {
+            out.push_str(&emit_module(module, opts));
+        }
+    };
     for func in &funcs {
         if let Some(module) = lower_function(map, &syms, &bodies, func, &mut sink) {
-            out.push('\n');
-            out.push_str(&emit_module(&module, opts));
+            render(&mut out, &module);
             emitted += 1;
         }
     }
     for seq in &seqs {
         if let Some(module) = crate::ir_pipe::lower_sequence(map, &syms, &bodies, seq, &mut sink) {
-            out.push('\n');
-            out.push_str(&emit_module(&module, opts));
+            render(&mut out, &module);
             emitted += 1;
         }
     }
     for proc in &procs {
         if let Some(module) = lower_process(map, &syms, &bodies, proc, &mut sink) {
-            out.push('\n');
-            out.push_str(&emit_module(&module, opts));
+            render(&mut out, &module);
             emitted += 1;
         }
     }

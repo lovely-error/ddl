@@ -8,6 +8,9 @@ use crate::lex::{
 pub enum PrecTypeExpr {
     Ident(AlphanumSpan),
     Array(Box<PrecTypeExpr>, PrecResExpr),
+    /// `#[impl(lutram)] [T; n]`. The kind span is kept rather than resolved to
+    /// an enum here so an unknown one reports at its own source position.
+    MemArray { elem: Box<PrecTypeExpr>, len: PrecResExpr, kind: AlphanumSpan },
 }
 
 #[derive(Debug, Clone)]
@@ -257,6 +260,11 @@ pub enum BuiltinOp {
     Concat,
     Rep,
     Zeroed,
+    /// `@assert(cond)` / `@assert(cond, "message")` -- checked in simulation,
+    /// absent from synthesis. `@fatal` is the same with `$fatal` instead of
+    /// `$error`, for a condition there is no point continuing past.
+    Assert,
+    Fatal,
     // Channels.
     TrySend,
     TryRecieve,
@@ -296,6 +304,8 @@ unsafe fn resolve_anum_span(anum_span: &AlphanumSpan) -> Result<AnumResolution, 
             "zeroed" => return Ok(AnumResolution::Builtin(BuiltinOp::Zeroed)),
             "unreachable" => return Ok(AnumResolution::Builtin(BuiltinOp::Unreachable)),
             "cast" => return Ok(AnumResolution::Builtin(BuiltinOp::Cast)),
+            "assert" => return Ok(AnumResolution::Builtin(BuiltinOp::Assert)),
+            "fatal" => return Ok(AnumResolution::Builtin(BuiltinOp::Fatal)),
             _ => return Err(()), // we dont know this one
         }
     }
@@ -768,6 +778,15 @@ unsafe fn resolve_type(
             let resolved_ty = resolve_type(char_ptr, &item_type)?;
             let resolved_count = resolve_precedence(char_ptr, count)?;
             Ok(PrecTypeExpr::Array(Box::new(resolved_ty), resolved_count))
+        },
+        RawTypeExpr::MemArray { elem, len, kind } => {
+            let resolved_elem = resolve_type(char_ptr, elem)?;
+            let resolved_len = resolve_precedence(char_ptr, len)?;
+            Ok(PrecTypeExpr::MemArray {
+                elem: Box::new(resolved_elem),
+                len: resolved_len,
+                kind: *kind,
+            })
         },
     }
 }

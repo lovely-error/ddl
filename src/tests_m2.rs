@@ -33,7 +33,13 @@ fn assert_no_undeclared_nets(verilog: &str) {
                     // `wire x = e;` and `reg x;` both declare their last name
                     // before the `=` or the `;`.
                     let head = rest.split('=').next().unwrap_or(rest);
-                    let head = head.trim_end_matches(';');
+                    let head = head.trim_end_matches(';').trim_end();
+                    // `reg [31:0] vals [0:31];` declares `vals`, which is the
+                    // second-to-last token rather than the last.
+                    let head = match head.rfind(" [") {
+                        Some(at) if head.ends_with(']') => &head[..at],
+                        _ => head,
+                    };
                     if let Some(last) = head.split_whitespace().last() {
                         declared.push(last);
                     }
@@ -1526,4 +1532,310 @@ fn a_sequence_must_end_by_sending() {
         "  let b: i32 = @zext(a, 32)\n",
     ));
     assert!(text.contains("ends by sending"), "{}", text);
+}
+
+
+// ---- M5: memories, assertions, and the emit modes ------------------------
+
+const REGFILE: &str = concat!(
+    "process rf (ra: i5, we: i1, wa: i5, wd: i32, rd: out i32)\n",
+    "  var vals: #[impl(lutram)] [i32; 32] = @zeroed()\n",
+    "  rd = vals[ra]\n",
+    "  if we then\n",
+    "    vals[wa] = wd\n",
+);
+
+#[test]
+fn a_memory_becomes_an_unpacked_array_with_one_write_port() {
+    let v = compile(REGFILE);
+    assert!(v.contains("reg [31:0] vals [0:31];"), "{}", v);
+    // ONE write, not one per source assignment. Two write ports infer no RAM
+    // at all on this device -- the K2G value array collapsed to ~3700 LUTs
+    // when a second was added.
+    assert_eq!(v.matches("vals[").count() - v.matches("vals[vals_ix]").count(), 2, "{}", v);
+    assert!(v.contains("wire [31:0] "), "{}", v);
+}
+
+#[test]
+fn a_memory_read_is_asynchronous() {
+    let v = compile(REGFILE);
+    // The read is a continuous assignment, not something clocked: that is the
+    // shape SSRAM is inferred from, and it is what lets one cycle do
+    // read -> forward -> add.
+    assert!(v.contains("= vals[ra];"), "{}", v);
+}
+
+#[test]
+fn a_conditional_write_becomes_a_write_enable() {
+    let v = compile(REGFILE);
+    assert!(v.contains("end else if (we) begin"), "{}", v);
+    assert!(v.contains("vals[wa] <= wd;"), "{}", v);
+    // The address and the data must NOT carry the enable's mux as well: the
+    // write does not happen when the enable is low, so muxing them is pure
+    // area. The SSA join produces those muxes and they are dropped again.
+    assert!(!v.contains("(we ? wa"), "{}", v);
+}
+
+#[test]
+fn an_initialised_memory_gets_a_reset_loop() {
+    let v = compile(REGFILE);
+    assert!(
+        v.contains("for (vals_ix = 0; vals_ix < 32; vals_ix = vals_ix + 1) vals[vals_ix] <= 32'd0;"),
+        "{}",
+        v
+    );
+    assert!(v.contains("integer vals_ix;"), "{}", v);
+}
+
+#[test]
+fn a_memory_with_no_initialiser_has_no_reset_loop() {
+    // Not a default: the reset loop costs about 85 LUTs and some extra RAM
+    // primitives on the K2G value array, so the source decides.
+    let v = compile(concat!(
+        "process rf (ra: i5, we: i1, wa: i5, wd: i32, rd: out i32)\n",
+        "  var vals: #[impl(lutram)] [i32; 32]\n",
+        "  rd = vals[ra]\n",
+        "  if we then\n",
+        "    vals[wa] = wd\n",
+    ));
+    assert!(!v.contains("integer vals_ix;"), "{}", v);
+    assert!(!v.contains("for ("), "{}", v);
+    assert!(v.contains("if (we) begin"), "{}", v);
+}
+
+#[test]
+fn the_element_type_can_be_an_enum() {
+    let v = compile(&format!("{}{}", OPS, concat!(
+        "process rf (ra: i5, we: i1, wa: i5, wd: op_e, rd: out op_e)\n",
+        "  var tags: #[impl(lutram)] [op_e; 32] = OP_SUB\n",
+        "  rd = tags[ra]\n",
+        "  if we then\n",
+        "    tags[wa] = wd\n",
+    )));
+    assert!(v.contains("reg [1:0] tags [0:31];"), "{}", v);
+    assert!(v.contains("<= 2'd1;"), "{}", v);
+}
+
+#[test]
+fn a_narrow_index_is_widened_and_a_wide_one_is_refused() {
+    let v = compile(concat!(
+        "process rf (ra: i3, rd: out i32)\n",
+        "  var vals: #[impl(lutram)] [i32; 32] = @zeroed()\n",
+        "  rd = vals[ra]\n",
+    ));
+    assert!(v.contains("vals["), "{}", v);
+
+    let text = compile_err(concat!(
+        "process rf (ra: i8, rd: out i32)\n",
+        "  var vals: #[impl(lutram)] [i32; 32] = @zeroed()\n",
+        "  rd = vals[ra]\n",
+    ));
+    assert!(text.contains("addressed by 5"), "{}", text);
+    assert!(text.contains("@trunc"), "{}", text);
+}
+
+#[test]
+fn an_unknown_impl_is_rejected() {
+    let text = compile_err(concat!(
+        "process rf (ra: i5, rd: out i32)\n",
+        "  var vals: #[impl(sram)] [i32; 32] = @zeroed()\n",
+        "  rd = vals[ra]\n",
+    ));
+    assert!(text.contains("lutram"), "{}", text);
+}
+
+#[test]
+fn a_memory_cannot_be_a_parameter() {
+    let text = compile_err(concat!(
+        "process rf (vals: #[impl(lutram)] [i32; 32], ra: i5, rd: out i32)\n",
+        "  var acc: i32 = 0\n",
+        "  rd = acc\n",
+    ));
+    assert!(text.contains("cannot be a parameter"), "{}", text);
+}
+
+#[test]
+fn a_memory_needs_a_constant_reset() {
+    let text = compile_err(concat!(
+        "process rf (seed: i32, ra: i5, rd: out i32)\n",
+        "  var vals: #[impl(lutram)] [i32; 32] = seed\n",
+        "  rd = vals[ra]\n",
+    ));
+    assert!(text.contains("same constant"), "{}", text);
+}
+
+#[test]
+fn a_memory_in_a_blocking_process_is_rejected() {
+    // The accesses would have to be scheduled into the states, and saying so
+    // beats dropping the array silently.
+    let text = compile_err(concat!(
+        "process p (src: buffer in i32, dst: buffer out i32)\n",
+        "  var vals: #[impl(lutram)] [i32; 32] = @zeroed()\n",
+        "  loop\n",
+        "    let a = @rcv(src)\n",
+        "    @send(dst, a)\n",
+    ));
+    assert!(text.contains("blocks is not supported yet"), "{}", text);
+}
+
+#[test]
+fn a_memory_is_not_a_value() {
+    let text = compile_err(concat!(
+        "fun f (x: i32, y: out i32)\n",
+        "  let vals: #[impl(lutram)] [i32; 32] = @zeroed()\n",
+        "  y = x\n",
+    ));
+    assert!(text.contains("state rather than a value"), "{}", text);
+}
+
+#[test]
+fn an_assertion_is_guarded_on_simulation() {
+    let v = compile(concat!(
+        "fun f (x: i8, y: out i8)\n",
+        "  @assert(x != 8'd0, \"x must not be zero\")\n",
+        "  y = x\n",
+    ));
+    // GowinSynthesis does not define SYNTHESIS, so SIMULATION is the guard
+    // that works on this toolchain.
+    assert!(v.contains("`ifdef SIMULATION"), "{}", v);
+    assert!(v.contains("`endif"), "{}", v);
+    assert!(v.contains("$error(\"%m: x must not be zero\")"), "{}", v);
+}
+
+#[test]
+fn a_clocked_assertion_runs_on_the_edge_and_not_during_reset() {
+    let v = compile(concat!(
+        "process p (x: i8, out_: out i8)\n",
+        "  var n: i8 = 0\n",
+        "  @assert(x != 8'd0, \"x must not be zero\")\n",
+        "  n = x\n",
+        "  out_ = n\n",
+    ));
+    assert!(v.contains("always @(posedge clk) begin"), "{}", v);
+    // Registers hold their reset value during reset, so an assertion about
+    // what the design computes has nothing to say then.
+    assert!(v.contains("if (rst_n) begin"), "{}", v);
+}
+
+#[test]
+fn an_assertion_inside_an_if_is_an_implication() {
+    let v = compile(concat!(
+        "fun f (c: i1, x: i8, y: out i8)\n",
+        "  if c then\n",
+        "    @assert(x != 8'd0, \"x must not be zero when c\")\n",
+        "    y = x\n",
+        "  else\n",
+        "    y = 8'd1\n",
+    ));
+    // Written as a plain condition it would fire on the other branch too.
+    assert!(v.contains("(!c)"), "{}", v);
+    assert!(v.contains("| (x != 8'd0)"), "{}", v);
+}
+
+#[test]
+fn an_assertion_in_a_match_arm_is_guarded_by_that_arm() {
+    let v = compile(&format!("{}{}", OPS, concat!(
+        "fun f (op: op_e, x: i8, y: out i8)\n",
+        "  match op\n",
+        "    .OP_ADD =>\n",
+        "      @assert(x != 8'd0, \"no zero on add\")\n",
+        "      y = x\n",
+        "    _ =>\n",
+        "      y = 8'd0\n",
+    )));
+    assert!(v.contains("$error(\"%m: no zero on add\")"), "{}", v);
+    // The guard is the arm's own label test, so the assertion says nothing
+    // about the other opcodes.
+    assert!(v.contains("2'd0"), "{}", v);
+}
+
+#[test]
+fn fatal_uses_the_fatal_task() {
+    let v = compile(concat!(
+        "fun f (x: i8, y: out i8)\n",
+        "  @fatal(x != 8'd0, \"x must not be zero\")\n",
+        "  y = x\n",
+    ));
+    assert!(v.contains("$fatal(1, \"%m: x must not be zero\")"), "{}", v);
+}
+
+#[test]
+fn an_assertion_message_is_escaped() {
+    // A bare `%` would be read by `$error` as a format specifier and would
+    // consume an argument that is not there.
+    let v = compile(concat!(
+        "fun f (x: i8, y: out i8)\n",
+        "  @assert(x != 8'd0, \"100% of the time\")\n",
+        "  y = x\n",
+    ));
+    assert!(v.contains("100%% of the time"), "{}", v);
+}
+
+#[test]
+fn an_assertion_condition_must_be_i1() {
+    let text = compile_err(concat!(
+        "fun f (x: i8, y: out i8)\n",
+        "  @assert(x, \"nope\")\n",
+        "  y = x\n",
+    ));
+    assert!(text.contains("`i1` condition"), "{}", text);
+}
+
+#[test]
+fn an_assertion_message_must_be_a_literal() {
+    let text = compile_err(concat!(
+        "fun f (x: i8, y: out i8)\n",
+        "  @assert(x != 8'd0, x)\n",
+        "  y = x\n",
+    ));
+    assert!(text.contains("string literal"), "{}", text);
+}
+
+#[test]
+fn an_assertion_keeps_its_cone_alive() {
+    // Nothing downstream reads an assertion, so without it being a root the
+    // whole cone feeding it would look dead and be stripped.
+    let v = compile(concat!(
+        "fun f (a: i8, b: i8, y: out i8)\n",
+        "  let sum: i8 = a + b\n",
+        "  @assert(sum != 8'd0, \"sum must not be zero\")\n",
+        "  y = a\n",
+    ));
+    assert!(v.contains("sum"), "{}", v);
+}
+
+#[test]
+fn emit_ir_shows_what_the_compiler_decided() {
+    use crate::driver::{Emit, compile as compile_with};
+    let map = SourceMap::new("t.ddl", REGFILE);
+    let ir = compile_with(&map, &EmitOptions::default(), Emit::Ir)
+        .expect("compiles");
+    assert!(ir.contains("mem   vals : [i32; 32] lutram"), "{}", ir);
+    assert!(ir.contains("memread vals["), "{}", ir);
+    // No banner: this is for reading, not for checking in.
+    assert!(!ir.contains("GENERATED FILE"), "{}", ir);
+}
+
+#[test]
+fn emit_ast_prints_names_rather_than_pointers() {
+    use crate::driver::{Emit, compile as compile_with};
+    let map = SourceMap::new("t.ddl", REGFILE);
+    let ast = compile_with(&map, &EmitOptions::default(), Emit::Ast)
+        .expect("parses");
+    assert!(ast.contains("`rf`"), "{}", ast);
+    assert!(!ast.contains("byte_ptr"), "{}", ast);
+}
+
+
+#[test]
+fn bram_is_recognised_and_refused_rather_than_quietly_made_lutram() {
+    // Accepting the annotation and emitting an asynchronous read would hand
+    // back distributed RAM under a `bram` label.
+    let text = compile_err(concat!(
+        "process rf (ra: i5, rd: out i32)\n",
+        "  var vals: #[impl(bram)] [i32; 32] = @zeroed()\n",
+        "  rd = vals[ra]\n",
+    ));
+    assert!(text.contains("`#[impl(bram)]` is not supported yet"), "{}", text);
+    assert!(text.contains("read takes a cycle"), "{}", text);
 }

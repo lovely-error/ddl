@@ -23,7 +23,7 @@ GW_SH="${GW_SH:-/c/Gowin/Gowin_V1.9.12.02_SP2_x64/IDE/bin/gw_sh.exe}"
 WORK="${WORK:-$DDL_ROOT/target/verify}"
 RTL="$K2G/rtl"
 
-ALL_MODULES=(k2g_shift k2g_alu k2g_decode k3g_stage fsm_adder mul3)
+ALL_MODULES=(k2g_shift k2g_alu k2g_decode k2g_regfile k3g_stage fsm_adder mul3)
 MODULES=("$@")
 [ ${#MODULES[@]} -eq 0 ] && MODULES=("${ALL_MODULES[@]}")
 
@@ -52,10 +52,10 @@ for m in "${MODULES[@]}"; do
   # compiled from a concatenation. k2g_pkg.ddl is generated from the emulator
   # by emu/src/ddl_gen.rs -- the same source as k2g_pkg.sv.
   case "$m" in
-    k2g_decode)
+    k2g_decode | k2g_regfile)
       mkdir -p "$WORK/$m"
       src="$WORK/$m/src.ddl"
-      cat "$K2G/rtl/k2g_pkg.ddl"           "$DDL_ROOT/examples/k2g_types.ddl"           "$DDL_ROOT/examples/k2g_decode.ddl" > "$src"
+      cat "$K2G/rtl/k2g_pkg.ddl"           "$DDL_ROOT/examples/k2g_types.ddl"           "$DDL_ROOT/examples/$m.ddl" > "$src"
       ;;
   esac
 
@@ -97,7 +97,7 @@ for m in "${MODULES[@]}"; do
       "$QUESTA/vlib.exe" work >/dev/null 2>&1
       srcs=()
       for f in "${ref_srcs[@]}"; do srcs+=("$(cygpath -m "$f")"); done
-      "$QUESTA/vlog.exe" -sv -quiet "+incdir+$RTL_W" \
+      "$QUESTA/vlog.exe" -sv -quiet +define+SIMULATION "+incdir+$RTL_W" \
           "${srcs[@]}" \
           "${m}_ddl.v" "$(basename "$tb")" > vlog.log 2>&1 \
           || { tail -20 vlog.log; exit 1; }
@@ -152,7 +152,7 @@ TCL
     # that produced a perfectly good result.
     local vg="$1/impl/gwsynthesis/project.vg"
     [ -f "$vg" ] || { echo "-1"; return; }
-    grep -cE '^\s*(LUT[0-9]|ALU|MUX2_LUT[0-9]|DFF[A-Z]*)\b' "$vg"
+    grep -cE '^\s*(LUT[0-9]|ALU|MUX2_LUT[0-9]|DFF[A-Z]*|RAM16[A-Z0-9]*|SDPB?|DPB?|SP|ROM)\b' "$vg"
   }
 
   # gw_sh intermittently exits having written nothing at all: no netlist, no
@@ -192,6 +192,19 @@ TCL
     # Reported rather than failed on, because they are not this compiler's bug
     # to fix -- but reported every run, because this toolchain's real failures
     # are documented as easy to miss and must not hide among these.
+    count_rams() {
+      local vg="$1/impl/gwsynthesis/project.vg"
+      [ -f "$vg" ] || { echo 0; return; }
+      grep -cE '^\s*(RAM16[A-Z0-9]*|SDPB?|DPB?|SP|ROM)\b' "$vg"
+    }
+    ddl_rams=$(count_rams "$syn/ddl")
+    ref_rams=$(count_rams "$syn/ref")
+    if [ "$ddl_rams" -gt 0 ] || [ "$ref_rams" -gt 0 ]; then
+      note "RAM primitives: ddl $ddl_rams, ref $ref_rams"
+      if [ "$ref_rams" -gt 0 ] && [ "$ddl_rams" -eq 0 ]; then
+        fail "the reference inferred RAM and the DDL version did not"
+      fi
+    fi
     gw_errors=$(grep -c 'ERROR' "$syn/ddl/syn.log" 2>/dev/null)
     ref_errors=$(grep -c 'ERROR' "$syn/ref/syn.log" 2>/dev/null)
     [ -z "$gw_errors" ] && gw_errors=0

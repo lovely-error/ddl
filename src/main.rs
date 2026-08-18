@@ -29,6 +29,7 @@ mod tests_m2;
 use std::process::ExitCode;
 
 use diag::SourceMap;
+use driver::Emit;
 use verilog::EmitOptions;
 
 const USAGE: &str = "\
@@ -42,9 +43,14 @@ USAGE:
     check   parse and type-check only, emitting nothing
 
 OPTIONS:
-    -o <path>   write the generated Verilog here
-    --check     with `build`, verify that <output.v> is up to date and exit 1
-                if it is not, without writing. Mirrors `gen_defs --check`.
+    -o <path>       write the output here
+    --check         with `build`, verify that <output.v> is up to date and exit
+                    1 if it is not, without writing. Mirrors
+                    `gen_defs --check`.
+    --emit=<what>   what to produce: `v` (default) the Verilog-2005, `ir` the
+                    lowered modules before the backend folds anything, or
+                    `ast` the declarations after precedence resolution.
+                    `--check` applies to `v` only.
 ";
 
 fn main() -> ExitCode {
@@ -73,12 +79,14 @@ struct BuildArgs {
     input: String,
     output: Option<String>,
     check_only: bool,
+    emit: Emit,
 }
 
 fn parse_build_args(args: &[String]) -> Result<BuildArgs, String> {
     let mut input = None;
     let mut output = None;
     let mut check_only = false;
+    let mut emit = Emit::Verilog;
     let mut ix = 0;
     while ix < args.len() {
         match args[ix].as_str() {
@@ -90,6 +98,19 @@ fn parse_build_args(args: &[String]) -> Result<BuildArgs, String> {
                 }
             }
             "--check" => check_only = true,
+            other if other.starts_with("--emit=") => {
+                emit = match &other["--emit=".len()..] {
+                    "v" | "verilog" => Emit::Verilog,
+                    "ir" => Emit::Ir,
+                    "ast" => Emit::Ast,
+                    what => {
+                        return Err(format!(
+                            "unknown --emit target `{}`; expected `v`, `ir` or `ast`",
+                            what
+                        ));
+                    }
+                };
+            }
             other if other.starts_with('-') => {
                 return Err(format!("unknown option `{}`", other));
             }
@@ -103,7 +124,7 @@ fn parse_build_args(args: &[String]) -> Result<BuildArgs, String> {
         ix += 1;
     }
     match input {
-        Some(input) => Ok(BuildArgs { input, output, check_only }),
+        Some(input) => Ok(BuildArgs { input, output, check_only, emit }),
         None => Err("no input file given".to_string()),
     }
 }
@@ -138,7 +159,15 @@ fn run_build(args: &[String]) -> ExitCode {
         },
     };
 
-    let verilog = match driver::compile_to_verilog(&map, &opts) {
+    // `--check` compares against a checked-in generated file, and only the
+    // Verilog is ever checked in. Failing here beats silently comparing an IR
+    // dump against a .v and reporting it stale forever.
+    if args.check_only && args.emit != Emit::Verilog {
+        eprintln!("error: --check applies to `--emit=v` only");
+        return ExitCode::FAILURE;
+    }
+
+    let verilog = match driver::compile(&map, &opts, args.emit) {
         Ok(v) => v,
         Err(diags) => {
             driver::report(&map, &diags);

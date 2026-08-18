@@ -18,8 +18,8 @@
 // The same output is accepted by Questa `vlog -sv`, `gw_sh`, and yosys-slang,
 // so one backend serves simulation, the FPGA build and the ASIC flow.
 
-use crate::ir::{BinOp, CmpOp, Module, Op, Port, PortDir, UnOp, ValueDef, ValueId};
-use crate::ty::Ty;
+use crate::ir::{BinOp, CmpOp, Memory, Module, Op, Port, PortDir, UnOp, ValueDef, ValueId};
+use crate::ty::{MemKind, Ty};
 
 pub struct EmitOptions {
     /// Printed in the banner so a reader knows how to regenerate the file.
@@ -122,6 +122,14 @@ fn live_values(module: &Module) -> Vec<bool> {
     // Roots: everything an output drives, and everything a register clocks in.
     let mut stack: Vec<ValueId> = module.drivers.iter().map(|(_, v)| *v).collect();
     stack.extend(module.regs.iter().map(|r| r.next));
+    for mem in &module.mems {
+        stack.push(mem.we);
+        stack.push(mem.addr);
+        stack.push(mem.data);
+    }
+    // An assertion is a use even though nothing downstream reads it, or the
+    // whole cone feeding it would look dead and be stripped.
+    stack.extend(module.asserts.iter().map(|a| a.cond));
 
     while let Some(id) = stack.pop() {
         let ix = id.0 as usize;
@@ -160,17 +168,21 @@ fn live_values(module: &Module) -> Vec<bool> {
                 }
                 push(default);
             }
+            Op::MemRead { addr, .. } => push(addr),
         }
     }
     live
 }
 
 /// How many times each live value is read.
-fn use_counts(module: &Module) -> Vec<u32> {
+fn use_counts(module: &Module, live: &[bool]) -> Vec<u32> {
     let mut counts = vec![0u32; module.values.len()];
     let mut bump = |id: &ValueId, counts: &mut Vec<u32>| counts[id.0 as usize] += 1;
 
     for def in &module.values {
+        if !live[def.id.0 as usize] {
+            continue;
+        }
         match &def.op {
             Op::Port(_) | Op::RegRead(_) | Op::Const(_) => {}
             Op::Bin { lhs, rhs, .. } | Op::Cmp { lhs, rhs, .. } => {
@@ -205,6 +217,7 @@ fn use_counts(module: &Module) -> Vec<u32> {
                 }
                 bump(default, &mut counts);
             }
+            Op::MemRead { addr, .. } => bump(addr, &mut counts),
         }
     }
     for (_, v) in &module.drivers {
@@ -214,6 +227,14 @@ fn use_counts(module: &Module) -> Vec<u32> {
     // register would look dead and be eliminated.
     for reg in &module.regs {
         bump(&reg.next, &mut counts);
+    }
+    for mem in &module.mems {
+        bump(&mem.we, &mut counts);
+        bump(&mem.addr, &mut counts);
+        bump(&mem.data, &mut counts);
+    }
+    for a in &module.asserts {
+        bump(&a.cond, &mut counts);
     }
     counts
 }
@@ -231,8 +252,8 @@ fn use_counts(module: &Module) -> Vec<u32> {
 /// A value is folded when it is read exactly once and did not come from a
 /// named `let`. Constants are always folded: `32'd1` reads better inline, and
 /// a constant has no bus to eliminate.
-fn foldable(module: &Module) -> Vec<bool> {
-    let counts = use_counts(module);
+fn foldable(module: &Module, live: &[bool]) -> Vec<bool> {
+    let counts = use_counts(module, live);
 
     // A part-select needs a NAME to select from. Verilog-2005 allows neither
     // `15'd0[12:0]` nor `{a, b}[14:8]`, and both fall out of folding: the
@@ -240,6 +261,9 @@ fn foldable(module: &Module) -> Vec<bool> {
     // which rebuilds a struct by concatenation and then slices it apart again.
     let mut must_be_named = vec![false; module.values.len()];
     for def in &module.values {
+        if !live[def.id.0 as usize] {
+            continue;
+        }
         match &def.op {
             // `case (x)` selects on a signal, and the arm values are assigned
             // inside the block, so none of them may be folded away.
@@ -259,7 +283,10 @@ fn foldable(module: &Module) -> Vec<bool> {
         .map(|def| match &def.op {
             // A port or a register is a signal in its own right, and a case
             // drives a reg from a procedural block.
-            Op::Port(_) | Op::RegRead(_) | Op::Case { .. } => false,
+            // A memory read is an array subscript, which needs its own wire
+            // for the same reason: it may not be folded into a bigger
+            // expression that is then sliced.
+            Op::Port(_) | Op::RegRead(_) | Op::Case { .. } | Op::MemRead { .. } => false,
             Op::Const(_) => !must_be_named[def.id.0 as usize],
             // A cast that changes nothing about the bits renders as its
             // operand. One that changes signedness must keep its wire, since
@@ -374,7 +401,7 @@ fn emit_case_blocks(
 
 fn emit_body(out: &mut String, module: &Module, names: &NameTable) {
     let live = live_values(module);
-    let fold = foldable(module);
+    let fold = foldable(module, &live);
 
     for reg in &module.regs {
         out.push_str(&format!(
@@ -384,6 +411,23 @@ fn emit_body(out: &mut String, module: &Module, names: &NameTable) {
         ));
     }
     if !module.regs.is_empty() {
+        out.push('\n');
+    }
+
+    for mem in &module.mems {
+        out.push_str(&format!(
+            "  reg {}{} [0:{}];\n",
+            signed_and_range(&mem.elem),
+            sanitize(&mem.name),
+            mem.len - 1
+        ));
+        // Verilog-2005 has no `for (integer i = ...)`, so the loop variable is
+        // a module-level `integer`. It is touched only in the reset branch.
+        if mem.reset.is_some() {
+            out.push_str(&format!("  integer {}_ix;\n", sanitize(&mem.name)));
+        }
+    }
+    if !module.mems.is_empty() {
         out.push('\n');
     }
 
@@ -437,8 +481,146 @@ fn emit_body(out: &mut String, module: &Module, names: &NameTable) {
         }
     }
 
-    if module.is_clocked() {
+    if !module.regs.is_empty() {
         emit_clocked_block(out, module, names, &fold);
+    }
+    for mem in &module.mems {
+        emit_memory_block(out, module, names, &fold, mem);
+    }
+    emit_assertions(out, module, names, &fold);
+}
+
+/// Immediate assertions, and nothing of them in synthesis.
+///
+/// Guarded on SIMULATION rather than on the absence of SYNTHESIS, because
+/// GowinSynthesis does not define SYNTHESIS -- docs/gowin-sv-support.md, and
+/// the hand-written RTL guards all fifteen of its assertion sites the same
+/// way. `$error` and `$fatal` are SystemVerilog system tasks, which is fine
+/// precisely because nothing outside a simulator ever reads this block.
+///
+/// In a clocked module the checks run on the edge and are held off during
+/// reset: registers hold their reset value then, and an assertion about what
+/// the design computes has nothing to say about a design that is being held.
+fn emit_assertions(out: &mut String, module: &Module, names: &NameTable, fold: &[bool]) {
+    if module.asserts.is_empty() {
+        return;
+    }
+    let clocked = module.is_clocked();
+    out.push('\n');
+    out.push_str("`ifdef SIMULATION\n");
+    if clocked {
+        out.push_str("  always @(posedge clk) begin\n");
+        out.push_str("    if (rst_n) begin\n");
+    } else {
+        out.push_str("  always @* begin\n");
+    }
+    // Two levels inside a clocked block, one inside a combinational one.
+    let indent = if clocked { "      " } else { "    " };
+    for a in &module.asserts {
+        let task = if a.is_fatal { "$fatal(1, " } else { "$error(" };
+        out.push_str(&format!(
+            "{}if (!({})) {}\"%m: {}\");\n",
+            indent,
+            operand(module, names, fold, a.cond),
+            task,
+            escape_message(&a.message)
+        ));
+    }
+    if clocked {
+        out.push_str("    end\n");
+    }
+    out.push_str("  end\n");
+    out.push_str("`endif\n");
+}
+
+/// Makes a message safe to sit inside a Verilog string.
+///
+/// A `%` in the text would be read as a format specifier by `$error` and would
+/// consume an argument that is not there.
+fn escape_message(msg: &str) -> String {
+    let mut out = String::with_capacity(msg.len());
+    for ch in msg.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '%' => out.push_str("%%"),
+            '\n' => out.push_str("\\n"),
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+/// One memory, in the shape GowinSynthesis infers a RAM from.
+///
+/// Measured constraints from docs/gowin-sv-support.md: SSRAM inference needs
+/// ONE synchronous write port and asynchronous reads. Two write ports infer no
+/// RAM at all -- the K2G value array collapsed to ~3700 LUTs when a second was
+/// added -- so the IR carries exactly one write port and several source writes
+/// mux onto it.
+///
+/// The reset loop is emitted only when the source asked for one. It is not
+/// free: k2g_regfile.sv:76 measures it at ~85 LUTs plus some extra RAM
+/// primitives. It is usually worth paying, because without it the array powers
+/// up undefined and cosimulation cannot compare a register until something
+/// writes it -- but that is the source's call, not this backend's.
+fn emit_memory_block(
+    out: &mut String,
+    module: &Module,
+    names: &NameTable,
+    fold: &[bool],
+    mem: &Memory,
+) {
+    let name = sanitize(&mem.name);
+    // A memory nothing writes is a lookup table. Emitting `if (1'b0)` around a
+    // dead assignment would only give synthesis something to warn about.
+    let never_written = matches!(module.value(mem.we).op, Op::Const(0));
+    if never_written && mem.reset.is_none() {
+        return;
+    }
+    let we = operand(module, names, fold, mem.we);
+    let addr = operand(module, names, fold, mem.addr);
+    let data = operand(module, names, fold, mem.data);
+
+    out.push('\n');
+    out.push_str(&format!("  // {} [0:{}] -- {}\n", name, mem.len - 1, mem_note(mem.kind)));
+    out.push_str("  always @(posedge clk) begin\n");
+    match mem.reset {
+        Some(k) => {
+            out.push_str("    if (!rst_n) begin\n");
+            out.push_str(&format!(
+                "      for ({ix} = 0; {ix} < {len}; {ix} = {ix} + 1) {nm}[{ix}] <= {val};\n",
+                ix = format!("{}_ix", name),
+                len = mem.len,
+                nm = name,
+                val = render_const(k, &mem.elem)
+            ));
+            if never_written {
+                out.push_str("    end\n");
+                out.push_str("  end\n");
+                return;
+            }
+            out.push_str(&format!("    end else if ({}) begin\n", we));
+        }
+        None => {
+            out.push_str(&format!("    if ({}) begin\n", we));
+        }
+    }
+    out.push_str(&format!("      {}[{}] <= {};\n", name, addr, data));
+    out.push_str("    end\n");
+    out.push_str("  end\n");
+}
+
+/// The resource each memory asked for, as a comment above its always block.
+///
+/// Nothing in Verilog-2005 says "put this in block RAM", so the request
+/// survives as inference shape plus this note. A reader diffing the output
+/// against the DDL source needs to see that the request was heard.
+fn mem_note(kind: MemKind) -> &'static str {
+    match kind {
+        MemKind::LutRam => "distributed RAM: one sync write port, async reads",
+        MemKind::BlockRam => "block RAM: one sync write port, sync reads",
+        MemKind::BankedRam => "banked RAM",
     }
 }
 
@@ -501,6 +683,10 @@ fn signed_and_range(ty: &Ty) -> String {
 
 fn render_op(module: &Module, names: &NameTable, fold: &[bool], op: &Op, ty: &Ty) -> String {
     match op {
+        Op::MemRead { mem, addr } => {
+            let m = &module.mems[*mem as usize];
+            format!("{}[{}]", sanitize(&m.name), operand(module, names, fold, *addr))
+        }
         // Emitted as its own always block by emit_case_blocks, never inline.
         Op::Case { .. } => unreachable!("a case is emitted as a procedural block"),
         Op::Port(id) => sanitize(&module.port(*id).name),

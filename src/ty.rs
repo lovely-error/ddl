@@ -44,6 +44,45 @@ pub enum Ty {
     Enum { name: String, width: u32 },
     /// A named packed struct, likewise carrying its total width.
     Struct { name: String, width: u32 },
+    /// `#[impl(k)] [T; n]` -- storage, not a value.
+    ///
+    /// Distinct from `Array` because the two lower to different things: an
+    /// `Array` is a packed vector that can be a port, a struct field or an
+    /// operand, and a `Mem` is an unpacked array with a write port and a read
+    /// port that only a subscript can reach.
+    Mem { elem: Box<Ty>, len: u32, kind: MemKind },
+}
+
+/// Which FPGA resource the array asks to be built from. desc.md:93.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemKind {
+    /// Distributed RAM: one synchronous write port, asynchronous reads.
+    /// GowinSynthesis infers SSRAM from exactly that shape, measured at
+    /// RAM16SDP4 x32 for the 32x32 K2G value array.
+    LutRam,
+    /// Block RAM: one synchronous write port, synchronous reads.
+    BlockRam,
+    /// Banked, with conflict minimisation.
+    BankedRam,
+}
+
+impl MemKind {
+    pub fn parse(name: &str) -> Option<MemKind> {
+        match name {
+            "lutram" => Some(MemKind::LutRam),
+            "bram" => Some(MemKind::BlockRam),
+            "bkram" => Some(MemKind::BankedRam),
+            _ => None,
+        }
+    }
+
+    pub fn display(&self) -> &'static str {
+        match self {
+            MemKind::LutRam => "lutram",
+            MemKind::BlockRam => "bram",
+            MemKind::BankedRam => "bkram",
+        }
+    }
 }
 
 impl Ty {
@@ -56,7 +95,15 @@ impl Ty {
             Ty::UInt(w) | Ty::SInt(w) => *w,
             Ty::Array(elem, n) => elem.bit_width() * n,
             Ty::Enum { width, .. } | Ty::Struct { width, .. } => *width,
+            // Total storage. Never the width of a wire -- a memory is not a
+            // value and `is_memory` gates every place one could be used as
+            // one -- but a definite number is more useful than a panic.
+            Ty::Mem { elem, len, .. } => elem.bit_width() * len,
         }
+    }
+
+    pub fn is_memory(&self) -> bool {
+        matches!(self, Ty::Mem { .. })
     }
 
     pub fn is_signed(&self) -> bool {
@@ -78,6 +125,9 @@ impl Ty {
             Ty::SInt(w) => format!("s{}", w),
             Ty::Array(elem, n) => format!("[{}; {}]", elem.display(), n),
             Ty::Enum { name, .. } | Ty::Struct { name, .. } => name.clone(),
+            Ty::Mem { elem, len, kind } => {
+                format!("#[impl({})] [{}; {}]", kind.display(), elem.display(), len)
+            }
         }
     }
 
@@ -96,6 +146,8 @@ pub enum TyError {
     NonConstArrayLen,
     /// Arrays are parsed but not yet lowered.
     Unsupported(String),
+    /// `#[impl(...)]` naming something that is not a backing store.
+    UnknownImpl(String),
 }
 
 impl TyError {
@@ -110,6 +162,10 @@ impl TyError {
                 "array length must be a constant known at compile time".to_string()
             }
             TyError::Unsupported(what) => format!("{} is not supported yet", what),
+            TyError::UnknownImpl(n) => format!(
+                "`{}` is not a memory implementation; expected `lutram`, `bram` or `bkram`",
+                n
+            ),
         }
     }
 }
@@ -162,6 +218,27 @@ pub fn resolve_type_expr(expr: &PrecTypeExpr, syms: &Symbols) -> Result<Ty, TyEr
                 return Err(TyError::NonConstArrayLen);
             }
             Ok(Ty::Array(Box::new(elem), len as u32))
+        }
+        PrecTypeExpr::MemArray { elem, len, kind } => {
+            let elem_ty = resolve_type_expr(elem, syms)?;
+            // A memory of memories has no meaning: the annotation names one
+            // backing store, and nesting would need two.
+            if elem_ty.is_memory() {
+                return Err(TyError::Unsupported("a memory of memories".to_string()));
+            }
+            let len = const_eval(len).map_err(|_| TyError::NonConstArrayLen)?;
+            let len_is_usable = len > 0 && len <= u32::MAX as u128;
+            if !len_is_usable {
+                return Err(TyError::NonConstArrayLen);
+            }
+            let kind_name = anumspan_to_str(kind);
+            let kind = match MemKind::parse(kind_name) {
+                Some(k) => k,
+                None => {
+                    return Err(TyError::UnknownImpl(kind_name.to_string()));
+                }
+            };
+            Ok(Ty::Mem { elem: Box::new(elem_ty), len: len as u32, kind })
         }
     }
 }
@@ -269,7 +346,7 @@ pub fn literal_fits(value: u128, ty: &Ty) -> bool {
             let fits_as_bit_pattern = !holds_every_value && value < (1u128 << w);
             holds_every_value || fits_as_bit_pattern
         }
-        Ty::Array(..) => false,
+        Ty::Array(..) | Ty::Mem { .. } => false,
     }
 }
 

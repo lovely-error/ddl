@@ -26,8 +26,8 @@ use crate::parse::{
 };
 use crate::symbols::Symbols;
 use crate::ty::{
-    self, OpTyError, Ty, binop_result, comparison_operand_ty, const_eval, literal_fits,
-    resolve_type_expr,
+    self, MemKind, OpTyError, Ty, binop_result, bits_for, comparison_operand_ty, const_eval,
+    literal_fits, resolve_type_expr,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -126,6 +126,15 @@ pub enum Op {
         arms: Vec<(Vec<u128>, ValueId)>,
         default: ValueId,
     },
+    /// An asynchronous read of `Module::mems[mem]`.
+    ///
+    /// Reads see the memory as of the start of the cycle: the write lands at
+    /// the clock edge, so a read and a write of the same address in one cycle
+    /// give the OLD value. That is read-before-write, it is what the SSRAM
+    /// primitive does anyway, and k2g_regfile.sv:118 records why it must not
+    /// be bypassed -- a write-first bypass there closes a combinational loop
+    /// through the register file and hangs simulation.
+    MemRead { mem: u32, addr: ValueId },
 }
 
 #[derive(Debug, Clone)]
@@ -151,6 +160,50 @@ pub struct Reg {
     pub next: ValueId,
 }
 
+/// An array with a backing store: one write port, asynchronous reads.
+///
+/// One write port is not a simplification, it is the constraint. K2G paid for
+/// learning it: a second write port on the 32x32 value array inferred no RAM
+/// at all and the array collapsed to 1120 flip-flops and ~3700 LUTs of read
+/// muxing, against 32 SSRAM primitives and ~100 LUTs for the single-port
+/// version (k2g_regfile.sv:18-24). So the write port is a fixed part of the
+/// shape here, and several writes in the source mux onto it rather than
+/// multiplying it.
+#[derive(Debug, Clone)]
+pub struct Memory {
+    pub name: String,
+    pub elem: Ty,
+    pub len: u32,
+    pub kind: MemKind,
+    /// Folded to a literal here so the backend never emits `$clog2`, which
+    /// makes GowinSynthesis exit 1 with an empty log.
+    pub addr_width: u32,
+    /// What every element takes on reset, or `None` for a memory that powers
+    /// up undefined. The reset loop costs area -- roughly 85 LUTs on the K2G
+    /// value array -- so it is a choice the source makes, not a default.
+    pub reset: Option<u128>,
+    /// The write port, as ordinary values in the same graph.
+    pub we: ValueId,
+    pub addr: ValueId,
+    pub data: ValueId,
+}
+
+/// An immediate assertion: a condition that must hold, checked in simulation.
+///
+/// `cond` is already guarded by the path it was written on, so an assertion
+/// inside an `if` reads as an implication and is vacuously true elsewhere.
+/// Nothing about it reaches synthesis -- the emitted block sits inside
+/// `ifdef SIMULATION`, which is the guard the target toolchain needs because
+/// GowinSynthesis does not define `SYNTHESIS`.
+#[derive(Debug, Clone)]
+pub struct Assertion {
+    pub cond: ValueId,
+    pub message: String,
+    /// `$fatal` rather than `$error`: stop, do not carry on producing output
+    /// that is already known to be wrong.
+    pub is_fatal: bool,
+}
+
 #[derive(Debug)]
 pub struct Module {
     pub name: String,
@@ -160,11 +213,13 @@ pub struct Module {
     pub drivers: Vec<(PortId, ValueId)>,
     /// Empty for a combinational `fun`; a `process` has clk/rst_n and these.
     pub regs: Vec<Reg>,
+    pub mems: Vec<Memory>,
+    pub asserts: Vec<Assertion>,
 }
 
 impl Module {
     pub fn is_clocked(&self) -> bool {
-        !self.regs.is_empty()
+        !self.regs.is_empty() || !self.mems.is_empty()
     }
 }
 
@@ -175,6 +230,113 @@ impl Module {
 
     pub fn port(&self, id: PortId) -> &Port {
         &self.ports[id.0 as usize]
+    }
+}
+
+/// The IR of one module, as text.
+///
+/// For `--emit=ir`. The point is to be able to see what the compiler decided
+/// BEFORE the backend folds expressions together: which values became
+/// registers, where the pipeline cut, what the write port of each memory ended
+/// up carrying. Reading that out of the emitted Verilog means reading it
+/// through one more transformation.
+pub fn render_module(m: &Module) -> String {
+    let mut out = String::new();
+    out.push_str(&format!("module {}\n", m.name));
+    for (ix, p) in m.ports.iter().enumerate() {
+        let dir = match p.dir {
+            PortDir::In => "in ",
+            PortDir::Out => "out",
+        };
+        out.push_str(&format!("  port  #{} {} {} : {}\n", ix, dir, p.name, p.ty.display()));
+    }
+    for mem in &m.mems {
+        let reset = match mem.reset {
+            Some(k) => format!("reset={}", k),
+            None => "no reset".to_string(),
+        };
+        out.push_str(&format!(
+            "  mem   {} : [{}; {}] {} addr:{}b {} we=%{} addr=%{} data=%{}\n",
+            mem.name,
+            mem.elem.display(),
+            mem.len,
+            mem.kind.display(),
+            mem.addr_width,
+            reset,
+            mem.we.0,
+            mem.addr.0,
+            mem.data.0
+        ));
+    }
+    for (ix, r) in m.regs.iter().enumerate() {
+        out.push_str(&format!(
+            "  reg   #{} {} : {} reset={} next=%{}\n",
+            ix, r.name, r.ty.display(), r.reset, r.next.0
+        ));
+    }
+    out.push('\n');
+    for def in &m.values {
+        let named = match &def.name {
+            Some(n) => format!("  ; {}", n),
+            None => String::new(),
+        };
+        out.push_str(&format!(
+            "  %{} : {} = {}{}\n",
+            def.id.0,
+            def.ty.display(),
+            render_op_ir(m, &def.op),
+            named
+        ));
+    }
+    if !m.drivers.is_empty() {
+        out.push('\n');
+    }
+    for (port, value) in &m.drivers {
+        out.push_str(&format!("  drive {} = %{}\n", m.port(*port).name, value.0));
+    }
+    for a in &m.asserts {
+        let kind = if a.is_fatal { "fatal " } else { "assert" };
+        out.push_str(&format!("  {} %{} {:?}\n", kind, a.cond.0, a.message));
+    }
+    out
+}
+
+fn render_op_ir(m: &Module, op: &Op) -> String {
+    match op {
+        Op::Port(p) => format!("port {}", m.port(*p).name),
+        Op::RegRead(ix) => format!("reg {}", m.regs.get(*ix as usize).map_or("?", |r| &r.name)),
+        Op::Const(k) => format!("const {}", k),
+        Op::Bin { op, lhs, rhs } => format!("{:?} %{}, %{}", op, lhs.0, rhs.0),
+        Op::Cmp { op, lhs, rhs } => format!("{:?} %{}, %{}", op, lhs.0, rhs.0),
+        Op::Un { op, arg } => format!("{:?} %{}", op, arg.0),
+        Op::Slice { arg, hi, lo } => format!("slice %{}[{}:{}]", arg.0, hi, lo),
+        Op::DynSlice { arg, base, width } => {
+            format!("dynslice %{}[%{} +: {}]", arg.0, base.0, width)
+        }
+        Op::Concat(parts) => {
+            let items: Vec<String> = parts.iter().map(|p| format!("%{}", p.0)).collect();
+            format!("concat {}", items.join(", "))
+        }
+        Op::Repeat { arg, times } => format!("repeat %{} x{}", arg.0, times),
+        Op::ZExt { arg, to } => format!("zext %{} to {}", arg.0, to),
+        Op::SExt { arg, to } => format!("sext %{} to {}", arg.0, to),
+        Op::Trunc { arg, to } => format!("trunc %{} to {}", arg.0, to),
+        Op::Cast { arg } => format!("cast %{}", arg.0),
+        Op::Mux { cond, then_val, else_val } => {
+            format!("mux %{} ? %{} : %{}", cond.0, then_val.0, else_val.0)
+        }
+        Op::Case { scrutinee, arms, default } => {
+            let mut text = format!("case %{}", scrutinee.0);
+            for (labels, v) in arms {
+                let ls: Vec<String> = labels.iter().map(|l| l.to_string()).collect();
+                text.push_str(&format!(" [{} -> %{}]", ls.join("|"), v.0));
+            }
+            text.push_str(&format!(" [_ -> %{}]", default.0));
+            text
+        }
+        Op::MemRead { mem, addr } => {
+            format!("memread {}[%{}]", m.mems[*mem as usize].name, addr.0)
+        }
     }
 }
 
@@ -224,6 +386,13 @@ pub struct PipeInfo {
     pub hold_reg: Option<usize>,
 }
 
+/// One narrowing of the path an assertion sits on.
+#[derive(Debug, Clone)]
+enum PathTerm {
+    Cond { value: ValueId, taken: bool },
+    Labels { scrutinee: ValueId, labels: Vec<u128>, taken: bool },
+}
+
 pub struct Lowerer<'a> {
     map: &'a SourceMap,
     pub syms: &'a Symbols,
@@ -235,6 +404,19 @@ pub struct Lowerer<'a> {
     pub call_stack: Vec<String>,
     /// Pipe parameters in declaration order.
     pub pipes: Vec<PipeInfo>,
+    /// Memories in declaration order. Reads name one by index.
+    pub mems: Vec<Memory>,
+    /// Immediate assertions, in source order.
+    pub asserts: Vec<Assertion>,
+    /// The conditions under which the statements being lowered right now run,
+    /// outermost first. Empty means unconditionally.
+    ///
+    /// Kept as a DESCRIPTION rather than as emitted values, because only
+    /// assertions ever consult it. Materialising each branch guard eagerly
+    /// would put a comparison and an `and` into the graph for every `if` and
+    /// every match arm in the program -- dead, stripped by the backend, and
+    /// still enough to renumber every generated wire in every module.
+    path: Vec<PathTerm>,
     values: Vec<ValueDef>,
     ports: Vec<Port>,
 }
@@ -251,6 +433,9 @@ impl<'a> Lowerer<'a> {
             bodies,
             call_stack: Vec::new(),
             pipes: Vec::new(),
+            mems: Vec::new(),
+            asserts: Vec::new(),
+            path: Vec::new(),
             values: Vec::new(),
             ports: Vec::new(),
         }
@@ -334,14 +519,255 @@ impl<'a> Lowerer<'a> {
         id
     }
 
+    /// Env keys holding a memory's write port while the body runs.
+    ///
+    /// `#` cannot appear in an identifier, so these cannot collide with a name
+    /// the source chose. Keeping them in the ordinary environment is what
+    /// makes a write inside an `if` work with no extra machinery: the SSA join
+    /// muxes them exactly as it muxes any other binding, so
+    /// `if we_value: values[w_addr] = w_value` becomes a write enable.
+    pub fn mem_port_keys(name: &str) -> (String, String, String) {
+        (
+            format!("{}#we", name),
+            format!("{}#addr", name),
+            format!("{}#data", name),
+        )
+    }
+
+    pub fn mem_index(&self, name: &str) -> Option<usize> {
+        self.mems.iter().position(|m| m.name == name)
+    }
+
+    /// Declares a memory, its write port and the binding a subscript reaches.
+    pub fn declare_memory(
+        &mut self,
+        name: String,
+        elem: Ty,
+        len: u32,
+        kind: MemKind,
+        reset: Option<u128>,
+        env: &mut Env,
+    ) -> usize {
+        // `len - 1` rather than `len`: 32 entries are addressed by 5 bits, and
+        // `bits_for(32)` would say 6.
+        let addr_width = bits_for((len - 1) as u128);
+        let we = self.emit(Ty::BOOL, Op::Const(0));
+        let addr = self.emit(Ty::UInt(addr_width), Op::Const(0));
+        let data = self.emit(elem.clone(), Op::Const(0));
+
+        let (we_key, addr_key, data_key) = Self::mem_port_keys(&name);
+        env.insert(we_key, Binding { value: Some(we), ty: Ty::BOOL, is_output: false });
+        env.insert(
+            addr_key,
+            Binding { value: Some(addr), ty: Ty::UInt(addr_width), is_output: false },
+        );
+        env.insert(data_key, Binding { value: Some(data), ty: elem.clone(), is_output: false });
+
+        let mem_ty = Ty::Mem { elem: Box::new(elem.clone()), len, kind };
+        env.insert(name.clone(), Binding { value: None, ty: mem_ty, is_output: false });
+
+        let ix = self.mems.len();
+        self.mems.push(Memory {
+            name,
+            elem,
+            len,
+            kind,
+            addr_width,
+            reset,
+            we,
+            addr,
+            data,
+        });
+        ix
+    }
+
+    /// Reads back the write port each memory was left with at the end of the
+    /// body, so what the source did decides what the write port carries.
+    pub fn settle_memories(&mut self, env: &Env) {
+        for ix in 0..self.mems.len() {
+            let (we_key, addr_key, data_key) = Self::mem_port_keys(&self.mems[ix].name);
+            if let Some(v) = env.get(&we_key).and_then(|b| b.value) {
+                self.mems[ix].we = v;
+            }
+            if let Some(v) = env.get(&addr_key).and_then(|b| b.value) {
+                self.mems[ix].addr = v;
+            }
+            if let Some(v) = env.get(&data_key).and_then(|b| b.value) {
+                self.mems[ix].data = v;
+            }
+            let we = self.mems[ix].we;
+            self.mems[ix].addr = self.drop_gated_mux(self.mems[ix].addr, we);
+            self.mems[ix].data = self.drop_gated_mux(self.mems[ix].data, we);
+        }
+    }
+
+    /// Strips `gate ? x : <idle>` from a value the write enable already gates.
+    ///
+    /// The SSA join gives the address and the data the same mux it gives the
+    /// write enable, because it does not know the three belong together. When
+    /// the enable is false the write does not happen, so the address and the
+    /// data are don't-cares -- but only when the mux is selected by exactly
+    /// that enable, which is why this compares value ids rather than trying to
+    /// prove an implication.
+    fn drop_gated_mux(&self, mut value: ValueId, gate: ValueId) -> ValueId {
+        loop {
+            match &self.values[value.0 as usize].op {
+                Op::Mux { cond, then_val, .. } if *cond == gate => value = *then_val,
+                _ => return value,
+            }
+        }
+    }
+
+    /// Adapts an index expression to a memory's address width.
+    ///
+    /// A narrower index is zero-extended, because an address that cannot reach
+    /// the whole array is not an error. A wider one is refused: dropping high
+    /// address bits silently would turn an out-of-range access into a
+    /// different in-range one.
+    pub fn fit_address(
+        &mut self,
+        idx: ValueId,
+        want: u32,
+        at: &AlphanumSpan,
+        sink: &mut DiagSink,
+    ) -> Option<ValueId> {
+        let have = self.ty_of(idx);
+        if have.is_signed() {
+            sink.err_at(at, format!("an address must be unsigned, found `{}`", have.display()));
+            return None;
+        }
+        let w = have.bit_width();
+        if w == want {
+            return Some(idx);
+        }
+        if w < want {
+            return Some(self.emit(Ty::UInt(want), Op::ZExt { arg: idx, to: want }));
+        }
+        sink.push(
+            Diag::error(
+                self.span_of(at),
+                format!(
+                    "an index of `{}` is {} bits wide, but this memory is addressed by {}",
+                    anumspan_to_str(at),
+                    w,
+                    want
+                ),
+            )
+            .with_note(format!("narrow it with `@trunc(x, {})`", want)),
+        );
+        None
+    }
+
+    /// Enters the `then` (or `else`) side of an `if`. The answer is the depth
+    /// to hand back to `pop_path`.
+    pub fn push_cond(&mut self, value: ValueId, taken: bool) -> usize {
+        self.path.push(PathTerm::Cond { value, taken });
+        self.path.len() - 1
+    }
+
+    /// Enters a match arm: the scrutinee carries one of `labels`, or -- for
+    /// the catch-all -- none of the labels the earlier arms claimed.
+    pub fn push_labels(&mut self, scrutinee: ValueId, labels: Vec<u128>, taken: bool) -> usize {
+        self.path.push(PathTerm::Labels { scrutinee, labels, taken });
+        self.path.len() - 1
+    }
+
+    pub fn pop_path(&mut self, depth: usize) {
+        self.path.truncate(depth);
+    }
+
+    fn logical_not(&mut self, v: ValueId) -> ValueId {
+        self.emit(Ty::BOOL, Op::Un { op: UnOp::LogNot, arg: v })
+    }
+
+    /// `v == labels[0] | v == labels[1] | ...`, and `0` for no labels.
+    fn any_equal(&mut self, v: ValueId, labels: &[u128]) -> ValueId {
+        let ty = self.ty_of(v);
+        let mut acc: Option<ValueId> = None;
+        for k in labels {
+            let konst = self.emit(ty.clone(), Op::Const(*k));
+            let eq = self.emit(Ty::BOOL, Op::Cmp { op: CmpOp::Eq, lhs: v, rhs: konst });
+            acc = Some(match acc {
+                None => eq,
+                Some(prev) => self.emit(Ty::BOOL, Op::Bin { op: BinOp::Or, lhs: prev, rhs: eq }),
+            });
+        }
+        match acc {
+            Some(v) => v,
+            None => self.emit(Ty::BOOL, Op::Const(0)),
+        }
+    }
+
+    /// Builds the value of the current path, emitting for the first time.
+    fn materialise_path(&mut self) -> Option<ValueId> {
+        let terms = self.path.clone();
+        let mut acc: Option<ValueId> = None;
+        for term in terms {
+            let mut guard = match term {
+                PathTerm::Cond { value, .. } => value,
+                PathTerm::Labels { scrutinee, ref labels, .. } => {
+                    self.any_equal(scrutinee, labels)
+                }
+            };
+            let taken = match term {
+                PathTerm::Cond { taken, .. } | PathTerm::Labels { taken, .. } => taken,
+            };
+            if !taken {
+                guard = self.logical_not(guard);
+            }
+            acc = Some(match acc {
+                None => guard,
+                Some(outer) => {
+                    self.emit(Ty::BOOL, Op::Bin { op: BinOp::And, lhs: outer, rhs: guard })
+                }
+            });
+        }
+        acc
+    }
+
+    /// Records an assertion, weakened by the path it sits on.
+    ///
+    /// `path -> cond` is `!path | cond`, so an assertion inside an `if` says
+    /// nothing about the cycles the `if` did not take. Writing it as a plain
+    /// `cond` would make every conditional assertion fire on the other branch.
+    pub fn add_assert(&mut self, cond: ValueId, message: String, is_fatal: bool) {
+        let path = self.materialise_path();
+        let guarded = match path {
+            None => cond,
+            Some(path) => {
+                let off_path = self.logical_not(path);
+                self.emit(Ty::BOOL, Op::Bin { op: BinOp::Or, lhs: off_path, rhs: cond })
+            }
+        };
+        self.asserts.push(Assertion { cond: guarded, message, is_fatal });
+    }
+
     pub fn name_value(&mut self, v: ValueId, name: String) {
         self.values[v.0 as usize].name = Some(name);
     }
 
     pub fn emit(&mut self, ty: Ty, op: Op) -> ValueId {
+        // `c ? 1'b1 : 1'b0` is `c`. Not cosmetic: an SSA join produces exactly
+        // this for a flag set on one branch of an `if`, and a memory write
+        // enable is that flag, so without this every conditional write carries
+        // a redundant mux into synthesis.
+        if let Op::Mux { cond, then_val, else_val } = &op {
+            let (cond, then_val, else_val) = (*cond, *then_val, *else_val);
+            let picks_the_condition = ty == Ty::BOOL
+                && self.is_const(then_val, 1)
+                && self.is_const(else_val, 0)
+                && self.ty_of(cond) == Ty::BOOL;
+            if picks_the_condition {
+                return cond;
+            }
+        }
         let id = ValueId(self.values.len() as u32);
         self.values.push(ValueDef { id, ty, op, name: None });
         id
+    }
+
+    fn is_const(&self, v: ValueId, k: u128) -> bool {
+        matches!(&self.values[v.0 as usize].op, Op::Const(c) if *c == k)
     }
 
     pub fn ty_of(&self, id: ValueId) -> Ty {
@@ -518,6 +944,8 @@ pub fn lower_function(
     }
 
     Some(Module {
+        asserts: low.asserts,
+        mems: Vec::new(),
         name: anumspan_to_str(&decl.name).to_string(),
         ports: low.ports,
         values: low.values,
@@ -578,6 +1006,16 @@ pub fn lower_process(
                 return None;
             }
         };
+        if ty.is_memory() {
+            sink.push(
+                Diag::error(
+                    map.span_of(&arg.arg_name),
+                    format!("`{}` is a memory, which cannot be a parameter", name),
+                )
+                .with_note("declare it inside the process and expose the accesses as ports"),
+            );
+            return None;
+        }
         // A pipe becomes three flat ports. That is the flattening
         // k3g_chan.sv:60 already pre-commits to for the yosys-slang risk --
         // "every process port list flattens to valid/ready/data triples and
@@ -685,6 +1123,57 @@ pub fn lower_process(
                 return None;
             }
         };
+        // A memory is storage rather than a value, so it takes neither a
+        // register slot nor a reset value of its own -- the reset, if there is
+        // one, applies to every element.
+        if let Ty::Mem { elem, len, kind } = ty.clone() {
+            // A block RAM reads SYNCHRONOUSLY: the value arrives a cycle after
+            // the address. Accepting the annotation and then emitting an
+            // asynchronous read would quietly give the caller distributed RAM
+            // under a `bram` label, and accepting it with a real block RAM
+            // needs a scheduling model that does not exist yet.
+            let read_is_synchronous = kind != MemKind::LutRam;
+            if read_is_synchronous {
+                sink.push(
+                    Diag::error(
+                        map.span_of(&var_decl.name),
+                        format!(
+                            "`#[impl({})]` is not supported yet; only `lutram` is",
+                            kind.display()
+                        ),
+                    )
+                    .with_note(
+                        "its read takes a cycle, and there is no way yet to say where that cycle goes",
+                    ),
+                );
+                return None;
+            }
+            let reset = match &var_decl.assign_val {
+                None => None,
+                Some(e) => {
+                    let v = lower_expr_expecting(&mut low, e, Some(&elem), &env, sink)?;
+                    match &low.values[v.0 as usize].op {
+                        Op::Const(k) => Some(*k),
+                        _ => {
+                            sink.push(
+                                Diag::error(
+                                    map.span_of(&var_decl.name),
+                                    "a memory resets every element to the same constant",
+                                )
+                                .with_note(
+                                    "write `@zeroed()`, or leave the initialiser off for a memory that powers up undefined",
+                                ),
+                            );
+                            return None;
+                        }
+                    }
+                }
+            };
+            low.declare_memory(name, *elem, len, kind, reset, &mut env);
+            body_start += 1;
+            continue;
+        }
+
         let init = match &var_decl.assign_val {
             Some(e) => e,
             None => {
@@ -743,6 +1232,18 @@ pub fn lower_process(
             },
             _ => unreachable!(),
         };
+        if !low.mems.is_empty() {
+            sink.push(
+                Diag::error(
+                    map.span_of(&decl.name),
+                    "a memory in a process that blocks is not supported yet",
+                )
+                .with_note(
+                    "the accesses would have to be scheduled into the states; keep the memory in a process without `@rcv`/`@send`",
+                ),
+            );
+            return None;
+        }
         return crate::ir_fsm::lower_blocking(
             map, decl, low, env, out_ports, reg_names, reg_tys, reg_resets, &loop_body, sink,
         );
@@ -816,6 +1317,7 @@ pub fn lower_process(
     }
 
     lower_stmts(&mut low, &decl.body[body_start..], &mut env, sink)?;
+    low.settle_memories(&env);
 
     let mut drivers = Vec::new();
     for (port_id, name) in &out_ports {
@@ -910,7 +1412,8 @@ pub fn lower_process(
     if sink.has_errors() {
         return None;
     }
-    if regs.is_empty() && !has_pipes {
+    let has_state = !regs.is_empty() || !low.mems.is_empty();
+    if !has_state && !has_pipes {
         sink.err_span(
             map.span_of(&decl.name),
             "a process with no state should be a `fun`",
@@ -919,6 +1422,8 @@ pub fn lower_process(
     }
 
     Some(Module {
+        asserts: low.asserts,
+        mems: low.mems,
         name: anumspan_to_str(&decl.name).to_string(),
         ports: low.ports,
         values: low.values,
@@ -1051,6 +1556,18 @@ fn lower_stmt(
                 },
                 None => None,
             };
+            if declared.as_ref().is_some_and(|t| t.is_memory()) {
+                sink.push(
+                    Diag::error(
+                        low.span(&decl.name),
+                        format!("`{}` is a memory, which is state rather than a value", name),
+                    )
+                    .with_note(
+                        "declare it as a `var` at the top of a `process`; a `sequence` must not contain memory (desc.md:44)",
+                    ),
+                );
+                return None;
+            }
             let init = match &decl.assign_val {
                 Some(e) => e,
                 None => {
@@ -1095,6 +1612,27 @@ fn lower_stmt(
             // An assignment target is a path: a name, optionally followed by
             // field accesses. `uop.cond_reg = arg1` is how k2g_decode builds a
             // 28-field struct, so a bare name is not enough.
+            // `m[addr] = v` is a memory write, and the only assignment whose
+            // target is not a path.
+            if let PrecResExpr::SubscriptAccess(sub) = &assign.lvalue {
+                if let PrecResExpr::Ref(mem_name) = &sub.base {
+                    let is_memory = env
+                        .get(anumspan_to_str(mem_name))
+                        .is_some_and(|b| b.ty.is_memory());
+                    if is_memory {
+                        let plain =
+                            assign.kind == crate::lex::AssignStmtKind::PlainAssign;
+                        if !plain {
+                            sink.err_at(mem_name, "compound assignment to a memory is not supported yet");
+                            return None;
+                        }
+                        return lower_mem_write(
+                            low, *mem_name, &sub.index, &assign.rvalue, env, sink,
+                        );
+                    }
+                }
+            }
+
             let path = match lvalue_path(&assign.lvalue) {
                 Some(p) => p,
                 None => {
@@ -1239,11 +1777,15 @@ fn lower_stmt(
             }
 
             let mut then_env = env.clone();
+            let depth = low.push_cond(cond, true);
             lower_branch(low, &ite.then_case, &mut then_env, sink)?;
+            low.pop_path(depth);
 
             let mut else_env = env.clone();
             if let Some(else_case) = &ite.else_case {
+                let depth = low.push_cond(cond, false);
                 lower_branch(low, else_case, &mut else_env, sink)?;
+                low.pop_path(depth);
             }
 
             // SSA join: any binding the two arms disagree about becomes a mux.
@@ -1300,7 +1842,25 @@ fn lower_stmt(
             Some(())
         }
 
-        PrecResInnerStmt::TailVal(_) | PrecResInnerStmt::CallStmt(_) => {
+        PrecResInnerStmt::CallStmt(call) => {
+            let checking = match &call.base {
+                PrecResExpr::Builtin(BuiltinOp::Assert) => Some(false),
+                PrecResExpr::Builtin(BuiltinOp::Fatal) => Some(true),
+                _ => None,
+            };
+            match checking {
+                Some(is_fatal) => lower_assert(low, &call.args, is_fatal, env, sink),
+                None => {
+                    sink.err_span(
+                        crate::driver::nowhere(),
+                        "this statement has no effect in combinational logic",
+                    );
+                    None
+                }
+            }
+        }
+
+        PrecResInnerStmt::TailVal(_) => {
             sink.err_span(
                 crate::driver::nowhere(),
                 "this statement has no effect in combinational logic",
@@ -1607,6 +2167,15 @@ fn lower_subscript(
     env: &Env,
     sink: &mut DiagSink,
 ) -> Option<ValueId> {
+    // `m[i]` where `m` is a memory is a read of the array, not a bit select.
+    if let PrecResExpr::Ref(mem_name) = &sub.base {
+        let name = anumspan_to_str(mem_name);
+        let is_memory = env.get(name).is_some_and(|b| b.ty.is_memory());
+        if is_memory {
+            return lower_mem_read(low, *mem_name, &sub.index, env, sink);
+        }
+    }
+
     let base = lower_expr(low, &sub.base, env, sink)?;
     let base_ty = low.ty_of(base);
     let base_w = base_ty.bit_width();
@@ -1644,6 +2213,142 @@ fn lower_subscript(
     // `x[i]` with a computed index -- a one-bit `+:` part-select.
     let idx = lower_expr(low, &sub.index, env, sink)?;
     Some(low.emit(Ty::BOOL, Op::DynSlice { arg: base, base: idx, width: 1 }))
+}
+
+/// `@assert(cond)` or `@assert(cond, "message")`.
+///
+/// The message is a plain string because it is going into `$error`, which
+/// takes a format string; there is no interpolation, so nothing in it can
+/// depend on a value and it costs nothing to build.
+fn lower_assert(
+    low: &mut Lowerer,
+    args: &[PrecResExpr],
+    is_fatal: bool,
+    env: &Env,
+    sink: &mut DiagSink,
+) -> Option<()> {
+    let name = if is_fatal { "@fatal" } else { "@assert" };
+    let arity_is_right = args.len() == 1 || args.len() == 2;
+    if !arity_is_right {
+        sink.err_span(
+            crate::driver::nowhere(),
+            format!("{} takes a condition and an optional message", name),
+        );
+        return None;
+    }
+    let cond = lower_expr(low, &args[0], env, sink)?;
+    let cond_ty = low.ty_of(cond);
+    if cond_ty != Ty::BOOL {
+        sink.err_span(
+            crate::driver::nowhere(),
+            format!("{} needs an `i1` condition, found `{}`", name, cond_ty.display()),
+        );
+        return None;
+    }
+    let message = match args.get(1) {
+        None => format!("{} failed", name),
+        Some(PrecResExpr::Literal(Literal::StrLiteral(s))) => {
+            let mut text = String::new();
+            for piece in &s.pieces {
+                text.push_str(piece.as_str());
+            }
+            text
+        }
+        Some(_) => {
+            sink.err_span(
+                crate::driver::nowhere(),
+                format!("the second argument to {} must be a string literal", name),
+            );
+            return None;
+        }
+    };
+    low.add_assert(cond, message, is_fatal);
+    Some(())
+}
+
+/// `m[addr]` -- an asynchronous read.
+fn lower_mem_read(
+    low: &mut Lowerer,
+    mem_name: AlphanumSpan,
+    index: &PrecResExpr,
+    env: &Env,
+    sink: &mut DiagSink,
+) -> Option<ValueId> {
+    let name = anumspan_to_str(&mem_name).to_string();
+    let ix = match low.mem_index(&name) {
+        Some(ix) => ix,
+        None => {
+            // The binding says memory but no memory was declared, which can
+            // only happen if a memory-typed parameter slipped through.
+            sink.err_at(&mem_name, format!("`{}` is not a memory of this process", name));
+            return None;
+        }
+    };
+    let (elem, addr_width) = (low.mems[ix].elem.clone(), low.mems[ix].addr_width);
+    let raw = lower_expr(low, index, env, sink)?;
+    let addr = low.fit_address(raw, addr_width, &mem_name, sink)?;
+    Some(low.emit(elem, Op::MemRead { mem: ix as u32, addr }))
+}
+
+/// `m[addr] = value` -- an offer to the one write port.
+///
+/// The write is recorded as three ordinary bindings, so an assignment under an
+/// `if` becomes a write enable through the same SSA join that muxes everything
+/// else, and two writes on different branches share the port instead of asking
+/// for a second one.
+fn lower_mem_write(
+    low: &mut Lowerer,
+    mem_name: AlphanumSpan,
+    index: &PrecResExpr,
+    rvalue: &PrecResExpr,
+    env: &mut Env,
+    sink: &mut DiagSink,
+) -> Option<()> {
+    let name = anumspan_to_str(&mem_name).to_string();
+    let ix = match low.mem_index(&name) {
+        Some(ix) => ix,
+        None => {
+            sink.err_at(&mem_name, format!("`{}` is not a memory of this process", name));
+            return None;
+        }
+    };
+    let (elem, addr_width) = (low.mems[ix].elem.clone(), low.mems[ix].addr_width);
+
+    let raw = lower_expr(low, index, env, sink)?;
+    let addr = low.fit_address(raw, addr_width, &mem_name, sink)?;
+
+    let mut value = lower_expr_expecting(low, rvalue, Some(&elem), env, sink)?;
+    let have = low.ty_of(value);
+    if have != elem {
+        match low.coerce_const(value, &elem) {
+            Some(v) => value = v,
+            None => {
+                sink.push(
+                    Diag::error(
+                        low.span_of(&mem_name),
+                        format!(
+                            "`{}` holds `{}` but this write offers `{}`",
+                            name,
+                            elem.display(),
+                            have.display()
+                        ),
+                    )
+                    .with_note(cast_hint(&have, &elem)),
+                );
+                return None;
+            }
+        }
+    }
+
+    let one = low.emit(Ty::BOOL, Op::Const(1));
+    let (we_key, addr_key, data_key) = Lowerer::mem_port_keys(&name);
+    env.insert(we_key, Binding { value: Some(one), ty: Ty::BOOL, is_output: false });
+    env.insert(
+        addr_key,
+        Binding { value: Some(addr), ty: Ty::UInt(addr_width), is_output: false },
+    );
+    env.insert(data_key, Binding { value: Some(value), ty: elem, is_output: false });
+    Some(())
 }
 
 fn lower_builtin(

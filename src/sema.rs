@@ -378,6 +378,12 @@ fn check_scope_in_type(
             let name = anumspan_to_str(alphanum_span);
             validate_type_ident(name, aggregated_names, aggregated_errs);
         },
+        PrecTypeExpr::MemArray { elem, len, .. } => {
+            check_scope_in_type(aggregated_names, aggregated_errs, &PrecTypeExpr::Array(
+                elem.clone(),
+                len.clone(),
+            ));
+        },
         PrecTypeExpr::Array(prec_type_expr, prec_res_expr) => {
             match prec_res_expr {
                 PrecResExpr::Literal(Literal::IntLiteral { .. }) => {
