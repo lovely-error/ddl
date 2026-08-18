@@ -421,8 +421,9 @@ pub struct PipeInfo {
     /// `ready` inputs only.
     pub fired: Option<ValueId>,
     /// Outputs only: the `busy` and `hold` registers backing the slot.
-    pub busy_reg: Option<usize>,
-    pub hold_reg: Option<usize>,
+    /// First register of the output slot. A `buffer` takes four -- head
+    /// valid/data and skid valid/data -- and a `stream` takes two.
+    pub slot_reg: Option<usize>,
 }
 
 /// One narrowing of the path an assertion sits on.
@@ -595,8 +596,7 @@ impl<'a> Lowerer<'a> {
                 sent: None,
                 send_guard: None,
                 fired: None,
-                busy_reg: None,
-                hold_reg: None,
+                slot_reg: None,
             });
         }
         Some(())
@@ -1290,8 +1290,7 @@ pub fn lower_process(
             sent: None,
             send_guard: None,
             fired: None,
-            busy_reg: None,
-            hold_reg: None,
+            slot_reg: None,
         });
     }
 
@@ -1501,37 +1500,63 @@ pub fn lower_process(
         let ty = low.pipes[ix].ty.clone();
         let pname = low.pipes[ix].name.clone();
 
-        let busy_ix = reg_names.len() + generated.len();
-        let busy = low.emit(Ty::BOOL, Op::RegRead(busy_ix as u32));
+        let base = reg_names.len() + generated.len();
+        let busy = low.emit(Ty::BOOL, Op::RegRead(base as u32));
         low.values[busy.0 as usize].name = Some(format!("{}_busy", pname));
-        let hold_ix = busy_ix + 1;
-        let hold = low.emit(ty.clone(), Op::RegRead(hold_ix as u32));
+        let hold = low.emit(ty.clone(), Op::RegRead((base + 1) as u32));
         low.values[hold.0 as usize].name = Some(format!("{}_hold", pname));
+        generated.push(Reg { name: format!("{}_busy", pname), ty: Ty::BOOL, reset: 0, next: busy });
+        generated
+            .push(Reg { name: format!("{}_hold", pname), ty: ty.clone(), reset: 0, next: hold });
 
-        // A buffer slot can take a new item when it is empty or is draining
-        // now. A STREAM slot can always take one: the oldest is overwritten,
-        // which is the whole difference between the two kinds, and it is why a
-        // process feeding only streams never has to stall its input.
+        // A BUFFER is two deep, and the second entry is what makes `ready` a
+        // register.
+        //
+        // With one entry the only honest thing `ready` can say is "I am empty,
+        // or I am draining this cycle" -- and "draining" means the consumer's
+        // `ready`. So the producer's `ready` became a wire straight through to
+        // the consumer's, and a chain of N processes was one combinational path
+        // N modules long. Rule 3 was still satisfied (`valid` never looked at
+        // `ready`), but the path was there.
+        //
+        // With a skid entry, `ready` is `the skid is empty` -- register-derived,
+        // like `up.ready = !full` in k3g_chan.sv:193, whose comment insists on
+        // exactly this: "never a function of the opposite side's handshake".
+        // The producer now learns about a stall one cycle late and has a place
+        // to put the item it already committed to, which is the whole job of
+        // the second entry.
+        //
+        // A STREAM keeps one entry and never refuses: the oldest is
+        // overwritten, which is the difference between the two kinds, and it is
+        // why a process feeding only streams never stalls its input.
         let accept = match low.pipes[ix].ready_port {
             None => low.emit(Ty::BOOL, Op::Const(1)),
-            Some(ready) => {
-                let ready_in = low.emit(Ty::BOOL, Op::Port(ready));
-                let not_busy = low.emit(Ty::BOOL, Op::Un { op: UnOp::LogNot, arg: busy });
-                let a = low.emit(
-                    Ty::BOOL,
-                    Op::Bin { op: BinOp::Or, lhs: not_busy, rhs: ready_in },
-                );
+            Some(_) => {
+                let skid_busy = low.emit(Ty::BOOL, Op::RegRead((base + 2) as u32));
+                low.values[skid_busy.0 as usize].name = Some(format!("{}_skid_busy", pname));
+                let skid = low.emit(ty.clone(), Op::RegRead((base + 3) as u32));
+                low.values[skid.0 as usize].name = Some(format!("{}_skid", pname));
+                generated.push(Reg {
+                    name: format!("{}_skid_busy", pname),
+                    ty: Ty::BOOL,
+                    reset: 0,
+                    next: skid_busy,
+                });
+                generated.push(Reg {
+                    name: format!("{}_skid", pname),
+                    ty,
+                    reset: 0,
+                    next: skid,
+                });
+                let a = low.emit(Ty::BOOL, Op::Un { op: UnOp::LogNot, arg: skid_busy });
+                low.values[a.0 as usize].name = Some(format!("{}_room", pname));
                 accepts.push(a);
                 a
             }
         };
 
-        generated.push(Reg { name: format!("{}_busy", pname), ty: Ty::BOOL, reset: 0, next: busy });
-        generated.push(Reg { name: format!("{}_hold", pname), ty, reset: 0, next: hold });
-
         low.pipes[ix].fired = Some(accept);
-        low.pipes[ix].busy_reg = Some(busy_ix);
-        low.pipes[ix].hold_reg = Some(hold_ix);
+        low.pipes[ix].slot_reg = Some(base);
     }
 
     // An input transfers when upstream offers and every output slot can take
@@ -1600,10 +1625,9 @@ pub fn lower_process(
             }
             continue;
         }
-        let busy_ix = pipe.busy_reg.expect("an output pipe has a busy register");
-        let hold_ix = pipe.hold_reg.expect("an output pipe has a hold register");
-        let busy = low.emit(Ty::BOOL, Op::RegRead(busy_ix as u32));
-        let hold = low.emit(pipe.ty.clone(), Op::RegRead(hold_ix as u32));
+        let base = pipe.slot_reg.expect("an output pipe has a slot");
+        let busy = low.emit(Ty::BOOL, Op::RegRead(base as u32));
+        let hold = low.emit(pipe.ty.clone(), Op::RegRead((base + 1) as u32));
 
         let sent = match pipe.sent {
             Some(v) => v,
@@ -1622,36 +1646,85 @@ pub fn lower_process(
             Some(g) => low.emit(Ty::BOOL, Op::Bin { op: BinOp::And, lhs: fired_any, rhs: g }),
         };
 
-        // A buffer holds its offer until it is taken:
-        //     busy <= fired ? 1 : (ready ? 0 : busy)
-        // A stream does not. Its `valid` is one cycle per item, because there
-        // is no `ready` to tell it the item was read and holding it would turn
-        // "the oldest is overwritten" into "the newest is dropped". That
-        // one-cycle strobe is exactly `uop_valid` in k2g_decode.sv.
-        let busy_next = match pipe.ready_port {
-            None => offering,
-            Some(ready) => {
-                let ready_in = low.emit(Ty::BOOL, Op::Port(ready));
-                let one = low.emit(Ty::BOOL, Op::Const(1));
-                let zero = low.emit(Ty::BOOL, Op::Const(0));
-                let drained = low.emit(
-                    Ty::BOOL,
-                    Op::Mux { cond: ready_in, then_val: zero, else_val: busy },
+        let idx = base - reg_names.len();
+        match pipe.ready_port {
+            // A stream holds nothing. Its `valid` is one cycle per item,
+            // because there is no `ready` to tell it the item was read and
+            // holding it would turn "the oldest is overwritten" into "the
+            // newest is dropped". That strobe is `uop_valid` in k2g_decode.sv.
+            None => {
+                let hold_next = low.emit(
+                    pipe.ty.clone(),
+                    Op::Mux { cond: offering, then_val: sent, else_val: hold },
                 );
-                low.emit(
-                    Ty::BOOL,
-                    Op::Mux { cond: offering, then_val: one, else_val: drained },
-                )
+                generated[idx].next = offering;
+                generated[idx + 1].next = hold_next;
             }
-        };
-        let hold_next = low.emit(
-            pipe.ty.clone(),
-            Op::Mux { cond: offering, then_val: sent, else_val: hold },
-        );
+            // A two-deep buffer: head, then skid.
+            //
+            // An offer can only arrive while the skid is empty, because that is
+            // what `ready` said -- so "push into the skid while the skid is
+            // moving into the head" cannot happen, and the four cases below are
+            // all of them.
+            Some(ready) => {
+                let skid_busy = low.emit(Ty::BOOL, Op::RegRead((base + 2) as u32));
+                let skid = low.emit(pipe.ty.clone(), Op::RegRead((base + 3) as u32));
+                let ready_in = low.emit(Ty::BOOL, Op::Port(ready));
 
-        let idx = busy_ix - reg_names.len();
-        generated[idx].next = busy_next;
-        generated[idx + 1].next = hold_next;
+                let pop = low.emit(Ty::BOOL, Op::Bin { op: BinOp::And, lhs: busy, rhs: ready_in });
+                low.values[pop.0 as usize].name = Some(format!("{}_pop", pipe.name));
+                let not_pop = low.logical_not(pop);
+
+                // The head takes a new item when it is empty or emptying, and
+                // takes the skid when the skid has something waiting.
+                let not_busy = low.logical_not(busy);
+                let head_free =
+                    low.emit(Ty::BOOL, Op::Bin { op: BinOp::Or, lhs: not_busy, rhs: pop });
+                let to_head =
+                    low.emit(Ty::BOOL, Op::Bin { op: BinOp::And, lhs: offering, rhs: head_free });
+                let from_skid =
+                    low.emit(Ty::BOOL, Op::Bin { op: BinOp::And, lhs: pop, rhs: skid_busy });
+                let keep_head =
+                    low.emit(Ty::BOOL, Op::Bin { op: BinOp::And, lhs: busy, rhs: not_pop });
+
+                let held_or_filled =
+                    low.emit(Ty::BOOL, Op::Bin { op: BinOp::Or, lhs: keep_head, rhs: from_skid });
+                let busy_next = low.emit(
+                    Ty::BOOL,
+                    Op::Bin { op: BinOp::Or, lhs: held_or_filled, rhs: to_head },
+                );
+                // `from_skid` and `to_head` cannot both hold: an offer needs an
+                // empty skid, and `from_skid` needs a full one.
+                let taken_from_skid = low.emit(
+                    pipe.ty.clone(),
+                    Op::Mux { cond: to_head, then_val: sent, else_val: hold },
+                );
+                let hold_next = low.emit(
+                    pipe.ty.clone(),
+                    Op::Mux { cond: from_skid, then_val: skid, else_val: taken_from_skid },
+                );
+
+                // The skid takes the offer only when the head is occupied and
+                // staying that way.
+                let head_stays =
+                    low.emit(Ty::BOOL, Op::Bin { op: BinOp::And, lhs: busy, rhs: not_pop });
+                let to_skid =
+                    low.emit(Ty::BOOL, Op::Bin { op: BinOp::And, lhs: offering, rhs: head_stays });
+                let skid_keeps =
+                    low.emit(Ty::BOOL, Op::Bin { op: BinOp::And, lhs: skid_busy, rhs: not_pop });
+                let skid_busy_next =
+                    low.emit(Ty::BOOL, Op::Bin { op: BinOp::Or, lhs: skid_keeps, rhs: to_skid });
+                let skid_next = low.emit(
+                    pipe.ty.clone(),
+                    Op::Mux { cond: to_skid, then_val: sent, else_val: skid },
+                );
+
+                generated[idx].next = busy_next;
+                generated[idx + 1].next = hold_next;
+                generated[idx + 2].next = skid_busy_next;
+                generated[idx + 3].next = skid_next;
+            }
+        }
 
         // `valid` is the register, never anything combinational.
         drivers.push((pipe.valid_port, busy));

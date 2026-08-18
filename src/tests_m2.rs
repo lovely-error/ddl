@@ -1344,8 +1344,9 @@ fn a_pipe_becomes_a_valid_ready_data_triple() {
     let v = compile(&format!(
         concat!(
             "{}process p (src: buffer in item_t, dst: buffer out item_t)\n",
-            "  let (it, got) = @try_rcv(src)\n",
-            "  let _ok = @try_send(dst, it)\n",
+            "  loop\n",
+            "    let (it, got) = @try_rcv(src)\n",
+            "    let _ok = @try_send(dst, it)\n",
         ),
         PIPE
     ));
@@ -1367,15 +1368,57 @@ fn an_output_valid_is_a_register_output() {
     let v = compile(&format!(
         concat!(
             "{}process p (src: buffer in item_t, dst: buffer out item_t)\n",
-            "  let (it, got) = @try_rcv(src)\n",
-            "  let _ok = @try_send(dst, it)\n",
+            "  loop\n",
+            "    let (it, got) = @try_rcv(src)\n",
+            "    let _ok = @try_send(dst, it)\n",
         ),
         PIPE
     ));
     assert!(v.contains("reg dst_busy;"), "{}", v);
     assert!(v.contains("assign dst_valid = dst_busy;"), "valid is the register:\n{}", v);
-    // The generated ready is the k3g_expand form: `!busy || down.ready`.
-    assert!(v.contains("(!dst_busy) | dst_ready"), "{}", v);
+    // And `ready` is a register output too, which is the reason for the second
+    // entry: with one, the only honest answer was "I am empty, or my consumer
+    // is taking it this cycle", and that put the consumer's `ready` on a wire
+    // straight through to the producer's.
+    assert!(v.contains("wire dst_room = !dst_skid_busy;"), "{}", v);
+    assert!(v.contains("assign src_ready = dst_room;"), "{}", v);
+    assert!(!v.contains("| dst_ready"), "ready must not reach ready:\n{}", v);
+}
+
+#[test]
+fn a_buffer_is_two_deep() {
+    // desc.md:99 calls a pipe a fifo and desc.md:104 says the producer stalls
+    // "when no slots available" -- plural. One entry is not that, and it is
+    // also what forced `ready` to be combinational.
+    let v = compile(&format!(
+        concat!(
+            "{}process p (src: buffer in item_t, dst: buffer out item_t)\n",
+            "  loop\n",
+            "    let (it, got) = @try_rcv(src)\n",
+            "    let _ok = @try_send(dst, it)\n",
+        ),
+        PIPE
+    ));
+    assert!(v.contains("reg dst_busy;"), "head:\n{}", v);
+    assert!(v.contains("reg dst_skid_busy;"), "skid:\n{}", v);
+    assert!(v.contains("reg [19:0] dst_hold;"), "{}", v);
+    assert!(v.contains("reg [19:0] dst_skid;"), "{}", v);
+    // The skid drains into the head, never straight out.
+    assert!(v.contains("dst_hold <= "), "{}", v);
+    assert!(v.contains("dst_skid"), "{}", v);
+}
+
+#[test]
+fn a_stream_stays_one_deep() {
+    // A stream overwrites its oldest item, so a second entry would only mean
+    // dropping a newer one instead of an older one.
+    let v = compile(concat!(
+        "process p (src: buffer in i32, o: stream out i32)\n",
+        "  let (x, got) = @try_rcv(src)\n",
+        "  let _s = @try_send(o, x)\n",
+    ));
+    assert!(v.contains("reg o_busy;"), "{}", v);
+    assert!(!v.contains("o_skid"), "a stream has no skid:\n{}", v);
 }
 
 #[test]
@@ -1383,17 +1426,21 @@ fn a_slot_holds_until_it_drains() {
     let v = compile(&format!(
         concat!(
             "{}process p (src: buffer in item_t, dst: buffer out item_t)\n",
-            "  let (it, got) = @try_rcv(src)\n",
-            "  let _ok = @try_send(dst, it)\n",
+            "  loop\n",
+            "    let (it, got) = @try_rcv(src)\n",
+            "    let _ok = @try_send(dst, it)\n",
         ),
         PIPE
     ));
     assert!(v.contains("always @(posedge clk)"), "{}", v);
-    assert!(
-        v.contains("dst_busy <= (src_xfer ? 1'b1 : (dst_ready ? 1'b0 : dst_busy));"),
-        "{}",
-        v
-    );
+    // The head keeps its item unless the consumer takes it; when it does, the
+    // skid moves down rather than the item being lost.
+    assert!(v.contains("wire dst_pop = dst_busy & dst_ready;"), "{}", v);
+    assert!(v.contains("dst_busy <= "), "{}", v);
+    assert!(v.contains("dst_hold <= "), "{}", v);
+    // An offer can only land while the skid is free, so "push into the skid as
+    // the skid drains into the head" is unreachable by construction.
+    assert!(v.contains("dst_skid_busy <= "), "{}", v);
 }
 
 #[test]

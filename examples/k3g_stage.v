@@ -18,9 +18,11 @@ module k3g_stage (
 
   reg uops_busy;
   reg [48:0] uops_hold;
+  reg uops_skid_busy;
+  reg [48:0] uops_skid;
 
-  wire _taken = (!uops_busy) | uops_ready;
-  wire iops_xfer = iops_valid & _taken;
+  wire uops_room = !uops_skid_busy;
+  wire iops_xfer = iops_valid & uops_room;
   wire [48:0] out = 49'd0;
   wire [48:0] n14 = {iops_data[31:29], out[45:0]};
   wire [48:0] n19 = {n14[48:46], iops_data[28:26], n14[42:0]};
@@ -29,6 +31,11 @@ module k3g_stage (
   wire [48:0] n33 = {n27[48:33], {16'd0, iops_data[15:0]}, n27[0]};
   wire [2:0] n35 = iops_data[28:26];
   reg [48:0] n42;
+  wire uops_pop = uops_busy & uops_ready;
+  wire n49 = !uops_pop;
+  wire n52 = iops_xfer & ((!uops_busy) | uops_pop);
+  wire n53 = uops_pop & uops_skid_busy;
+  wire n60 = iops_xfer & (uops_busy & n49);
 
   always @* begin
     case (n35)
@@ -37,7 +44,7 @@ module k3g_stage (
     endcase
   end
 
-  assign iops_ready = _taken;
+  assign iops_ready = uops_room;
   assign uops_valid = uops_busy;
   assign uops_data = uops_hold;
 
@@ -45,9 +52,13 @@ module k3g_stage (
     if (!rst_n) begin
       uops_busy <= 1'b0;
       uops_hold <= 49'd0;
+      uops_skid_busy <= 1'b0;
+      uops_skid <= 49'd0;
     end else begin
-      uops_busy <= (iops_xfer ? 1'b1 : (uops_ready ? 1'b0 : uops_busy));
-      uops_hold <= (iops_xfer ? n42 : uops_hold);
+      uops_busy <= (((uops_busy & n49) | n53) | n52);
+      uops_hold <= (n53 ? uops_skid : (n52 ? n42 : uops_hold));
+      uops_skid_busy <= ((uops_skid_busy & n49) | n60);
+      uops_skid <= (n60 ? n42 : uops_skid);
     end
   end
 

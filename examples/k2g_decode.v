@@ -45,9 +45,11 @@ module k2g_decode (
   reg [15:0] llc_hi;
   reg uop_busy;
   reg [126:0] uop_hold;
+  reg uop_skid_busy;
+  reg [126:0] uop_skid;
 
-  wire n17 = (!uop_busy) | uop_ready;
-  wire cps_xfer = cps_valid & n17;
+  wire uop_room = !uop_skid_busy;
+  wire cps_xfer = cps_valid & uop_room;
   wire [15:0] cp = cps_data[16:1];
   wire flushing = cps_xfer & cps_data[0];
   wire [31:0] bytes_held = pfx[31:0];
@@ -197,8 +199,14 @@ module k2g_decode (
   wire [126:0] n977 = {n973[126:76], n793[65:61], n973[70:0]};
   wire n995 = cps_xfer ? (n797 ? (is_prefix ? (n800 ? 1'b1 : (pfx_xc ? (n141 ? 1'b0 : 1'b1) : 1'b0)) : (n782 ? 1'b0 : 1'b1)) : (n947 ? 1'b0 : 1'b1)) : 1'b0;
   wire [126:0] n999 = cps_xfer ? (n797 ? (is_prefix ? (n800 ? {n808[126:112], {16'd0, cp}, n808[79:0]} : (pfx_xc ? (n141 ? n787 : {n866[126:112], {16'd0, cp}, n866[79:0]}) : n787)) : (n782 ? n787 : n784)) : (n947 ? n787 : {n977[126:71], n793[60], n977[69:0]})) : n787;
+  wire [126:0] n1005 = {n999[126:32], (bytes_held + 32'd2)};
   wire n1011 = !cps_xfer;
   wire n1028 = cps_xfer & n995;
+  wire uop_pop = uop_busy & uop_ready;
+  wire n1033 = !uop_pop;
+  wire n1036 = n1028 & ((!uop_busy) | uop_pop);
+  wire n1037 = uop_pop & uop_skid_busy;
+  wire n1044 = n1028 & (uop_busy & n1033);
 
   always @* begin
     case (cc)
@@ -255,7 +263,7 @@ module k2g_decode (
     endcase
   end
 
-  assign cps_ready = n17;
+  assign cps_ready = uop_room;
   assign uop_valid = uop_busy;
   assign uop_data = uop_hold;
 
@@ -268,14 +276,18 @@ module k2g_decode (
       llc_hi <= 16'd0;
       uop_busy <= 1'b0;
       uop_hold <= 127'd0;
+      uop_skid_busy <= 1'b0;
+      uop_skid <= 127'd0;
     end else begin
       pfx <= (flushing ? 103'd0 : (n1011 ? pfx : (n995 ? 103'd0 : (cps_xfer ? (n797 ? (is_prefix ? (n800 ? n793 : (pfx_order ? {n916[102:37], 1'b1, n916[35:0]} : n916)) : n793) : n793) : pfx))));
       state <= (flushing ? 2'd0 : (n1011 ? state : (n995 ? 2'd0 : (cps_xfer ? (n797 ? (is_prefix ? state : (n782 ? ((n783 == 3'd2) ? 2'd1 : 2'd2) : state)) : (n947 ? 2'd2 : 2'd0)) : state))));
       llc_dst <= (flushing ? 5'd0 : (n1011 ? llc_dst : (cps_xfer ? (n797 ? (is_prefix ? llc_dst : (n782 ? arg1 : llc_dst)) : llc_dst) : llc_dst)));
       llc_kind <= (flushing ? 3'd2 : (n1011 ? llc_kind : (cps_xfer ? (n797 ? (is_prefix ? llc_kind : (n782 ? n783 : llc_kind)) : llc_kind) : llc_kind)));
       llc_hi <= (flushing ? 16'd0 : (n1011 ? llc_hi : (cps_xfer ? (n797 ? llc_hi : (n947 ? cp : llc_hi)) : llc_hi)));
-      uop_busy <= (n1028 ? 1'b1 : (uop_ready ? 1'b0 : uop_busy));
-      uop_hold <= (n1028 ? {n999[126:32], (bytes_held + 32'd2)} : uop_hold);
+      uop_busy <= (((uop_busy & n1033) | n1037) | n1036);
+      uop_hold <= (n1037 ? uop_skid : (n1036 ? n1005 : uop_hold));
+      uop_skid_busy <= ((uop_skid_busy & n1033) | n1044);
+      uop_skid <= (n1044 ? n1005 : uop_skid);
     end
   end
 

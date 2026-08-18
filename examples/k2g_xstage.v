@@ -155,6 +155,8 @@ module k2g_xstage (
   reg [45:0] w;
   reg wb_busy;
   reg [45:0] wb_hold;
+  reg wb_skid_busy;
+  reg [45:0] wb_skid;
 
   reg [31:0] values [0:31];
   integer values_ix;
@@ -165,8 +167,8 @@ module k2g_xstage (
   reg flagbit [0:31];
   integer flagbit_ix;
 
-  wire n25 = (!wb_busy) | wb_ready;
-  wire uops_xfer = uops_valid & n25;
+  wire wb_room = !wb_skid_busy;
+  wire uops_xfer = uops_valid & wb_room;
   wire [4:0] ra = uops_data[121:117];
   wire [4:0] rb = uops_data[116:112];
   wire [31:0] ra_value = values[ra];
@@ -254,6 +256,11 @@ module k2g_xstage (
   wire [45:0] n327 = {n324[45:37], access_addr, n324[4:0]};
   reg [45:0] n334;
   wire n341 = w[44];
+  wire wb_pop = wb_busy & wb_ready;
+  wire n374 = !wb_pop;
+  wire n377 = uops_xfer & ((!wb_busy) | wb_pop);
+  wire n378 = wb_pop & wb_skid_busy;
+  wire n385 = uops_xfer & (wb_busy & n374);
 
   always @* begin
     case (n117)
@@ -312,7 +319,7 @@ module k2g_xstage (
     endcase
   end
 
-  assign uops_ready = n25;
+  assign uops_ready = wb_room;
   assign wb_valid = wb_busy;
   assign wb_data = wb_hold;
 
@@ -321,10 +328,14 @@ module k2g_xstage (
       w <= 46'd0;
       wb_busy <= 1'b0;
       wb_hold <= 46'd0;
+      wb_skid_busy <= 1'b0;
+      wb_skid <= 46'd0;
     end else begin
       w <= n334;
-      wb_busy <= (uops_xfer ? 1'b1 : (wb_ready ? 1'b0 : wb_busy));
-      wb_hold <= (uops_xfer ? n334 : wb_hold);
+      wb_busy <= (((wb_busy & n374) | n378) | n377);
+      wb_hold <= (n378 ? wb_skid : (n377 ? n334 : wb_hold));
+      wb_skid_busy <= ((wb_skid_busy & n374) | n385);
+      wb_skid <= (n385 ? n334 : wb_skid);
     end
   end
 
