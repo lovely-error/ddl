@@ -29,11 +29,10 @@ fn builtins_the_compiler_knows() -> BTreeSet<String> {
         if !line.contains("AnumResolution::Builtin(") {
             continue;
         }
-        if let Some(rest) = line.strip_prefix('"') {
-            if let Some(end) = rest.find('"') {
+        if let Some(rest) = line.strip_prefix('"')
+            && let Some(end) = rest.find('"') {
                 found.insert(rest[..end].to_string());
             }
-        }
     }
     found
 }
