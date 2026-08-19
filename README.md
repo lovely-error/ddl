@@ -196,6 +196,20 @@ It instantiates each generated module beside its reference, drives both with
 the same stimulus, and compares primitive counts after synthesis. Modules
 whose reference lives in another repository are skipped when it is absent.
 
+## Formatting
+
+```bash
+ddl fmt examples/*.ddl          # in place
+ddl fmt --check examples/*.ddl  # exit 1 if any needs it
+```
+
+Whitespace hygiene only: trailing space, line endings, runs of blank lines, the
+final newline. **It does not touch indentation.** A DDL block is delimited by
+indentation, and only the parser knows which deeper lines are blocks -- it
+discards that as trivia, so nothing downstream can tell a nested block from the
+continuation line of a wrapped parameter list. Every file it writes is parsed
+before and after and refused if the syntax tree changed.
+
 ## Reading a design
 
 ```bash

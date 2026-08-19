@@ -18,9 +18,13 @@ ddl -- a dataflow description language
 USAGE:
     ddl build <input.ddl>... [-o <output.v>]
     ddl check <input.ddl>...
+    ddl fmt   <input.ddl>... [--check]
 
     build   compile to Verilog-2005; writes to stdout without -o
     check   parse and type-check only, emitting nothing
+    fmt     tidy whitespace in place; --check reports without writing.
+            Indentation is never touched -- only the parser knows which
+            deeper lines are blocks, and it discards that
 
 Several inputs compile as one program, as does one input that names others
 with `import \"path.ddl\"`. There are no namespaces: every declaration is
@@ -49,6 +53,7 @@ fn main() -> ExitCode {
     match args[0].as_str() {
         "build" => run_build(&args[1..]),
         "check" => run_check(&args[1..]),
+        "fmt" => run_fmt(&args[1..]),
         "-h" | "--help" | "help" => {
             print!("{}", USAGE);
             ExitCode::SUCCESS
@@ -206,6 +211,72 @@ fn run_build(args: &[String]) -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// `ddl fmt` -- whitespace hygiene, in place.
+///
+/// Each file is formatted on its own. There is no `-I` and no import
+/// resolution: formatting is per-file, and the verification blanks import
+/// lines the way the parser does.
+fn run_fmt(args: &[String]) -> ExitCode {
+    let mut check_only = false;
+    let mut inputs: Vec<String> = Vec::new();
+    for arg in args {
+        match arg.as_str() {
+            "--check" => check_only = true,
+            other if other.starts_with('-') => {
+                eprintln!("error: unknown option `{}`", other);
+                return ExitCode::FAILURE;
+            }
+            other => inputs.push(other.to_string()),
+        }
+    }
+    if inputs.is_empty() {
+        eprintln!("error: no input file given");
+        return ExitCode::FAILURE;
+    }
+
+    let mut needs_formatting = 0usize;
+    let mut failed = false;
+    for path in &inputs {
+        // Read raw. Normalising the line endings before comparing would make a
+        // CRLF file report as already formatted while still being CRLF on
+        // disk -- the formatter would have quietly decided it was fine.
+        let text = match std::fs::read_to_string(path) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("error: cannot read `{}`: {}", path, e);
+                failed = true;
+                continue;
+            }
+        };
+        match ddl::fmt::format_source(&text) {
+            ddl::fmt::Outcome::Unchanged => {}
+            ddl::fmt::Outcome::Changed(formatted) => {
+                needs_formatting += 1;
+                if check_only {
+                    eprintln!("{}: needs formatting", path);
+                } else if let Err(e) = std::fs::write(path, &formatted) {
+                    eprintln!("error: cannot write `{}`: {}", path, e);
+                    failed = true;
+                }
+            }
+            // Declining is not a failure of the file. Reported so it is not
+            // silent, and does not set the exit code, so `--check` in a hook
+            // does not fail a build over a file the formatter chose to leave.
+            ddl::fmt::Outcome::Refused(why) => {
+                eprintln!("{}: left alone, because {}", path, why);
+            }
+        }
+    }
+
+    if failed {
+        return ExitCode::FAILURE;
+    }
+    if check_only && needs_formatting > 0 {
+        return ExitCode::FAILURE;
+    }
+    ExitCode::SUCCESS
 }
 
 /// The command that reproduces this build, for the banner in the generated

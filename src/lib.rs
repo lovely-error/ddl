@@ -11,6 +11,7 @@
 pub mod diag;
 pub mod dot;
 pub mod driver;
+pub mod fmt;
 
 #[allow(unsafe_op_in_unsafe_fn)]
 pub mod lex;

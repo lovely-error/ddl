@@ -200,6 +200,16 @@ struct Import {
     len: u32,
 }
 
+/// The text as the PARSER sees it: import lines blanked, nothing else changed.
+///
+/// For anything that has to parse one file on its own -- `ddl fmt` verifying
+/// it did not change the syntax tree, say. Without this the parser meets a
+/// line beginning `import` and has no such keyword, so a file that compiles
+/// perfectly well reads as broken.
+pub fn as_the_parser_sees_it(text: &str) -> String {
+    strip_imports(text).0
+}
+
 /// Replaces every top-level `import "path"` line with a comment of the same
 /// length, and reports what was imported.
 ///
