@@ -159,6 +159,17 @@ cargo test
 cargo clippy --all-targets
 ```
 
+The suite runs under Miri, which checks the parser's pointer arithmetic for
+undefined behaviour rather than merely for crashing -- a read one past the end
+usually does not crash:
+
+```bash
+MIRIFLAGS=-Zmiri-disable-isolation cargo miri test --test fuzz
+```
+
+Tests that touch the filesystem are skipped there; Miri has no Windows path
+shims.
+
 The suite includes a fuzzer, seeded so a failure is reproducible. It runs a
 short pass on every `cargo test`; the soak is an environment variable:
 

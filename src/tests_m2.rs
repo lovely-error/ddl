@@ -423,6 +423,7 @@ fn the_banner_appears_once_for_a_multi_module_file() {
 /// The k2g_* ports need `k2g_pkg.ddl`, which is generated into the consumer's
 /// tree by emu/src/ddl_gen.rs and is not part of this repository. Those are
 /// skipped when it is absent.
+#[cfg_attr(miri, ignore = "reads files; Miri has no Windows path shims")]
 #[test]
 fn the_examples_still_compile() {
     let k2g = std::path::PathBuf::from("../KAMASUTRA2G/rtl");
@@ -474,6 +475,7 @@ fn the_examples_still_compile() {
 /// The comparison is against the banner the file already carries, because the
 /// banner has to be the command that reproduces the file -- which is what
 /// makes running it from anywhere give the same bytes.
+#[cfg_attr(miri, ignore = "reads files; Miri has no Windows path shims")]
 #[test]
 fn the_checked_in_verilog_is_up_to_date() {
     let k2g = std::path::PathBuf::from("../KAMASUTRA2G/rtl");
@@ -2471,6 +2473,7 @@ fn a_multi_output_call_cannot_recurse() {
     assert!(text.contains("calls itself"), "{}", text);
 }
 
+#[cfg_attr(miri, ignore = "reads files; Miri has no Windows path shims")]
 #[test]
 fn the_verified_alu_and_shifter_can_be_called() {
     // The reason this feature exists: k2g_alu has five `out` parameters and

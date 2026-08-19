@@ -79,6 +79,7 @@ const WORDS: &[&str] = &[
 /// deeper than random bytes ever do -- past the parser, into lowering, which is
 /// where most of the compiler is.
 fn corpus() -> Vec<String> {
+    #[cfg_attr(miri, allow(unused_mut))]
     let mut seeds: Vec<String> = vec![
         "fun f (a: i8, o: out i8)\n  o = a\n".into(),
         "sequence s (src: buffer in i16, dst: buffer out i16)\n  let a = @rcv(src)\n  |||\n  @send(dst, a)\n".into(),
@@ -89,6 +90,13 @@ fn corpus() -> Vec<String> {
     ];
     // The examples too, when they are beside us -- they are the largest real
     // programs there are, and the k2g_* ones need a package we may not have.
+    //
+    // Not under Miri, which has no `GetFullPathNameW` and aborts rather than
+    // handing back an error. The built-in seeds above cover every declaration
+    // kind, so a Miri run loses breadth of corpus and none of the coverage
+    // that matters -- and the point of a Miri run is the pointer arithmetic,
+    // which does not care how realistic the input was.
+    #[cfg(not(miri))]
     if let Ok(dir) = std::fs::read_dir("examples") {
         for entry in dir.flatten() {
             let path = entry.path();
@@ -285,7 +293,12 @@ fn env_u64(name: &str, default: u64) -> u64 {
 #[test]
 fn the_compiler_answers_or_diagnoses_but_never_panics() {
     let seed = env_u64("DDL_FUZZ_SEED", 0x5DD1_F0FF);
-    let iters = env_u64("DDL_FUZZ_ITERS", 20_000);
+    // Miri interprets rather than executes, at roughly a hundredth of the
+    // speed. Fewer cases, but every one of them checked for undefined
+    // behaviour rather than merely for not crashing -- which is the whole
+    // reason to run it: a read one past the end usually does not crash.
+    let default_iters = if cfg!(miri) { 150 } else { 20_000 };
+    let iters = env_u64("DDL_FUZZ_ITERS", default_iters);
 
     let corpus = corpus();
     assert!(corpus.len() >= 6, "the built-in seeds are missing");
