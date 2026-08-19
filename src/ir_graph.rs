@@ -1,0 +1,481 @@
+// `graph` lowered to structural Verilog.
+//
+// Everywhere else in this compiler, hierarchy is removed: a `fun` call is
+// inlined, and one declaration becomes one flat module. A graph is the
+// opposite and the only place instances come from. It computes nothing --
+// there is no expression in a graph body -- so its module has no values, no
+// registers and no memories. It has wires and instances.
+//
+// WHAT IT CHECKS, and why each one is worth checking here rather than leaving
+// to the synthesizer:
+//
+//   * every pipe has exactly one producer and exactly one consumer. Verilog
+//     would take two drivers on one net and resolve them to `x`; a pipe with
+//     no producer would sit at `z` and read as an intermittent hang.
+//   * both ends agree on the payload type. A width mismatch is a silent
+//     truncation at an instance port, and it is silent in every tool.
+//   * both ends agree on `buffer` versus `stream`. They differ in whether a
+//     `ready` exists at all, so mixing them leaves a port unconnected -- which
+//     in Verilog means the producer never stalls and quietly drops items.
+//
+// Cycles are fine and need no handling: a net is a net whichever order the
+// instances appear in. desc.md:88 asks for that explicitly, and it is what
+// makes a feedback path -- a retry queue, a credit return -- expressible.
+
+use std::collections::BTreeMap;
+
+use crate::diag::{Diag, DiagSink, SourceMap};
+use crate::ir::{Instance, Module, Net, Port, PortDir};
+use crate::lex::{AlphanumSpan, ArgTypeQualifier};
+use crate::parse::{GraphDecl, GraphStmt, PrecArgDefTuple, anumspan_to_str};
+use crate::symbols::Symbols;
+use crate::ty::{Ty, resolve_type_expr};
+
+/// One pipe parameter of something a graph can instantiate.
+#[derive(Debug, Clone)]
+pub struct PipeSig {
+    pub name: String,
+    pub is_input: bool,
+    pub is_stream: bool,
+    pub ty: Ty,
+}
+
+/// The pipe interface of a `process` or `sequence`, which is all a graph can
+/// see of it. Constant parameters are folded inside the callee and are not
+/// ports, so they do not appear here and are not connected.
+#[derive(Debug, Clone)]
+pub struct BlockSig {
+    pub name: String,
+    pub kind: &'static str,
+    pub pipes: Vec<PipeSig>,
+}
+
+/// Reads the pipe interface off a declaration's parameter list.
+///
+/// Errors are not reported here: this runs over every process and sequence
+/// before any of them is lowered, and a parameter that cannot be resolved will
+/// be reported against the declaration itself when its turn comes. Reporting
+/// twice, once without the context of the body, helps nobody.
+pub fn signature_of(name: &str, kind: &'static str, args: &PrecArgDefTuple, syms: &Symbols) -> BlockSig {
+    let mut pipes = Vec::new();
+    for arg in &args.entries {
+        let (is_input, is_stream) = match arg.qualifier {
+            ArgTypeQualifier::BufferIn => (true, false),
+            ArgTypeQualifier::BufferOut => (false, false),
+            ArgTypeQualifier::StreamIn => (true, true),
+            ArgTypeQualifier::StreamOut => (false, true),
+            // A constant parameter, or an error the callee will report.
+            _ => continue,
+        };
+        let ty = match resolve_type_expr(&arg.type_expr, syms) {
+            Ok(t) => t,
+            Err(_) => continue,
+        };
+        pipes.push(PipeSig {
+            name: anumspan_to_str(&arg.arg_name).to_string(),
+            is_input,
+            is_stream,
+            ty,
+        });
+    }
+    BlockSig { name: name.to_string(), kind, pipes }
+}
+
+/// One pipe inside the graph: a port of the graph, or a `pipe` declaration.
+struct GraphPipeInfo {
+    ty: Ty,
+    is_stream: bool,
+    /// A port of the enclosing graph rather than an internal wire. A graph
+    /// input is produced from outside and a graph output consumed outside, so
+    /// the endpoint that is missing inside the graph is not missing.
+    external: Option<bool>,
+    producers: Vec<AlphanumSpan>,
+    consumers: Vec<AlphanumSpan>,
+}
+
+impl GraphPipeInfo {
+    fn kind(&self) -> &'static str {
+        if self.is_stream { "stream" } else { "buffer" }
+    }
+}
+
+pub fn lower_graph(
+    map: &SourceMap,
+    syms: &Symbols,
+    sigs: &BTreeMap<String, BlockSig>,
+    decl: &GraphDecl,
+    sink: &mut DiagSink,
+) -> Option<Module> {
+    let graph_name = anumspan_to_str(&decl.name).to_string();
+    let mut ports = Vec::new();
+    let mut nets = Vec::new();
+    let mut pipes: BTreeMap<String, GraphPipeInfo> = BTreeMap::new();
+
+    // Clock and reset first, in the same positions a process puts them, so a
+    // graph can itself be an instance in another graph.
+    for implicit in ["clk", "rst_n"] {
+        ports.push(Port { name: implicit.to_string(), dir: PortDir::In, ty: Ty::BOOL });
+    }
+
+    // ---- the graph's own ports ------------------------------------------
+    for arg in &decl.args.entries {
+        let name = anumspan_to_str(&arg.arg_name).to_string();
+        if name == "clk" || name == "rst_n" {
+            sink.err_at(&arg.arg_name, format!("`{}` is implicit on a graph", name));
+            return None;
+        }
+        let (is_input, is_stream) = match arg.qualifier {
+            ArgTypeQualifier::BufferIn => (true, false),
+            ArgTypeQualifier::BufferOut => (false, false),
+            ArgTypeQualifier::StreamIn => (true, true),
+            ArgTypeQualifier::StreamOut => (false, true),
+            _ => {
+                sink.push(
+                    Diag::error(
+                        map.span_of(&arg.arg_name),
+                        format!("`{}` is not a pipe, and a graph connects nothing else", name),
+                    )
+                    .with_note("a graph parameter is `buffer in`, `buffer out`, `stream in` or `stream out`"),
+                );
+                return None;
+            }
+        };
+        let ty = match resolve_type_expr(&arg.type_expr, syms) {
+            Ok(t) => t,
+            Err(e) => {
+                sink.err_at(&arg.arg_name, e.message());
+                return None;
+            }
+        };
+        if pipes.contains_key(&name) {
+            sink.err_at(&arg.arg_name, format!("`{}` is declared twice", name));
+            return None;
+        }
+
+        let (vd, rd, dd) = if is_input {
+            (PortDir::In, PortDir::Out, PortDir::In)
+        } else {
+            (PortDir::Out, PortDir::In, PortDir::Out)
+        };
+        ports.push(Port { name: format!("{}_valid", name), dir: vd, ty: Ty::BOOL });
+        if !is_stream {
+            ports.push(Port { name: format!("{}_ready", name), dir: rd, ty: Ty::BOOL });
+        }
+        ports.push(Port { name: format!("{}_data", name), dir: dd, ty: ty.clone() });
+
+        pipes.insert(
+            name,
+            GraphPipeInfo {
+                ty,
+                is_stream,
+                external: Some(is_input),
+                producers: Vec::new(),
+                consumers: Vec::new(),
+            },
+        );
+    }
+
+    // ---- internal pipes --------------------------------------------------
+    for stmt in &decl.body {
+        let pipe = match stmt {
+            GraphStmt::Pipe(p) => p,
+            GraphStmt::Instance(_) => continue,
+        };
+        let name = anumspan_to_str(&pipe.name).to_string();
+        if pipes.contains_key(&name) {
+            sink.err_at(&pipe.name, format!("`{}` is declared twice", name));
+            return None;
+        }
+        let ty = match resolve_type_expr(&pipe.ty, syms) {
+            Ok(t) => t,
+            Err(e) => {
+                sink.err_at(&pipe.name, e.message());
+                return None;
+            }
+        };
+        // Which kind it is decides whether there is a `ready` leg at all, so
+        // it cannot be defaulted. `let mid: i16` is the shape of a mistake
+        // people will make now that the keyword is `let`.
+        let is_stream = match pipe.is_stream {
+            Some(k) => k,
+            None => {
+                sink.push(
+                    Diag::error(
+                        map.span_of(&pipe.name),
+                        format!("`{}` does not say whether it is a buffer or a stream", name),
+                    )
+                    .with_note(
+                        "write `let <name>: buffer <T>`, whose producer stalls when it is full, or `let <name>: stream <T>`, where the oldest item is overwritten instead",
+                    ),
+                );
+                return None;
+            }
+        };
+        nets.push(Net { name: format!("{}_valid", name), ty: Ty::BOOL });
+        if !is_stream {
+            nets.push(Net { name: format!("{}_ready", name), ty: Ty::BOOL });
+        }
+        nets.push(Net { name: format!("{}_data", name), ty: ty.clone() });
+
+        pipes.insert(
+            name,
+            GraphPipeInfo {
+                ty,
+                is_stream,
+                external: None,
+                producers: Vec::new(),
+                consumers: Vec::new(),
+            },
+        );
+    }
+
+    // ---- instances -------------------------------------------------------
+    let mut instances: Vec<Instance> = Vec::new();
+    let mut used_names: BTreeMap<String, u32> = BTreeMap::new();
+
+    for stmt in &decl.body {
+        let inst = match stmt {
+            GraphStmt::Instance(i) => i,
+            GraphStmt::Pipe(_) => continue,
+        };
+        let module = anumspan_to_str(&inst.module).to_string();
+        if module == graph_name {
+            sink.err_at(&inst.module, format!("`{}` cannot instantiate itself", module));
+            return None;
+        }
+        let sig = match sigs.get(&module) {
+            Some(s) => s,
+            None => {
+                let mut known: Vec<&str> = sigs.keys().map(|k| k.as_str()).collect();
+                known.retain(|k| *k != graph_name);
+                let note = if known.is_empty() {
+                    "a graph instantiates a `process`, a `sequence` or another `graph`".to_string()
+                } else {
+                    format!("declared here: {}", known.join(", "))
+                };
+                sink.push(
+                    Diag::error(
+                        map.span_of(&inst.module),
+                        format!("`{}` is not a process, sequence or graph", module),
+                    )
+                    .with_note(note),
+                );
+                return None;
+            }
+        };
+
+        if inst.args.len() != sig.pipes.len() {
+            sink.push(
+                Diag::error(
+                    map.span_of(&inst.module),
+                    format!(
+                        "`{}` has {} pipe parameter{}, but {} {} given",
+                        module,
+                        sig.pipes.len(),
+                        if sig.pipes.len() == 1 { "" } else { "s" },
+                        inst.args.len(),
+                        if inst.args.len() == 1 { "was" } else { "were" }
+                    ),
+                )
+                .with_note(format!(
+                    "its pipes are: {}",
+                    sig.pipes
+                        .iter()
+                        .map(|p| format!(
+                            "{}: {} {} {}",
+                            p.name,
+                            if p.is_stream { "stream" } else { "buffer" },
+                            if p.is_input { "in" } else { "out" },
+                            p.ty.display()
+                        ))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )),
+            );
+            return None;
+        }
+
+        // `mul3`, then `mul3_1`, `mul3_2` -- stable, and readable in a
+        // waveform, which a bare `u0` is not.
+        let seen = used_names.entry(module.clone()).or_insert(0);
+        let inst_name = if *seen == 0 {
+            format!("u_{}", module)
+        } else {
+            format!("u_{}_{}", module, seen)
+        };
+        *seen += 1;
+
+        let mut conns = vec![
+            ("clk".to_string(), "clk".to_string()),
+            ("rst_n".to_string(), "rst_n".to_string()),
+        ];
+
+        for (formal, actual) in sig.pipes.iter().zip(inst.args.iter()) {
+            let actual_name = anumspan_to_str(actual).to_string();
+            let info = match pipes.get_mut(&actual_name) {
+                Some(i) => i,
+                None => {
+                    sink.push(
+                        Diag::error(
+                            map.span_of(actual),
+                            format!("`{}` is not a pipe of this graph", actual_name),
+                        )
+                        .with_note("declare it with `let <name>: buffer <T>`, or make it a parameter"),
+                    );
+                    return None;
+                }
+            };
+
+            if info.ty != formal.ty {
+                sink.push(
+                    Diag::error(
+                        map.span_of(actual),
+                        format!(
+                            "`{}` carries `{}`, but `{}.{}` carries `{}`",
+                            actual_name,
+                            info.ty.display(),
+                            module,
+                            formal.name,
+                            formal.ty.display()
+                        ),
+                    )
+                    .with_note("a pipe and the port it connects to must carry the same type"),
+                );
+                return None;
+            }
+            if info.is_stream != formal.is_stream {
+                sink.push(
+                    Diag::error(
+                        map.span_of(actual),
+                        format!(
+                            "`{}` is a `{}` and `{}.{}` is a `{}`",
+                            actual_name,
+                            info.kind(),
+                            module,
+                            formal.name,
+                            if formal.is_stream { "stream" } else { "buffer" }
+                        ),
+                    )
+                    .with_note(
+                        "a `buffer` stalls its producer and a `stream` overwrites; only one of \
+                         them has a `ready`, so the two cannot meet on one pipe",
+                    ),
+                );
+                return None;
+            }
+
+            // An instance whose port is an input CONSUMES the pipe.
+            if formal.is_input {
+                info.consumers.push(*actual);
+            } else {
+                info.producers.push(*actual);
+            }
+
+            conns.push((format!("{}_valid", formal.name), format!("{}_valid", actual_name)));
+            if !formal.is_stream {
+                conns.push((format!("{}_ready", formal.name), format!("{}_ready", actual_name)));
+            }
+            conns.push((format!("{}_data", formal.name), format!("{}_data", actual_name)));
+        }
+
+        instances.push(Instance { module, name: inst_name, conns });
+    }
+
+    if instances.is_empty() {
+        sink.push(
+            Diag::error(
+                map.span_of(&decl.name),
+                format!("`{}` instantiates nothing", graph_name),
+            )
+            .with_note("a graph is its instances; an empty one would emit an unconnected module"),
+        );
+        return None;
+    }
+
+    if !check_endpoints(map, &graph_name, &pipes, sink) {
+        return None;
+    }
+
+    Some(Module {
+        name: graph_name,
+        ports,
+        values: Vec::new(),
+        drivers: Vec::new(),
+        regs: Vec::new(),
+        mems: Vec::new(),
+        asserts: Vec::new(),
+        params: Vec::new(),
+        nets,
+        instances,
+    })
+}
+
+/// Exactly one producer and exactly one consumer for every pipe.
+///
+/// desc.md:81 allows one producer and several consumers, by duplicating the
+/// sink. That duplication is real work -- each consumer needs its own copy of
+/// the data with its own `ready` -- and until it exists, saying so beats
+/// emitting a net with two drivers on its `ready` leg and letting the
+/// simulator resolve it to `x`.
+fn check_endpoints(
+    map: &SourceMap,
+    graph_name: &str,
+    pipes: &BTreeMap<String, GraphPipeInfo>,
+    sink: &mut DiagSink,
+) -> bool {
+    let mut ok = true;
+    for (name, info) in pipes {
+        // A graph input arrives already produced; a graph output leaves to be
+        // consumed outside. Either way the outside end is not missing.
+        let (mut producers, mut consumers) = (info.producers.len(), info.consumers.len());
+        match info.external {
+            Some(true) => producers += 1,
+            Some(false) => consumers += 1,
+            None => {}
+        }
+
+        let where_to_blame = info
+            .producers
+            .iter()
+            .chain(info.consumers.iter())
+            .next()
+            .copied();
+        let mut report = |msg: String, note: &str| {
+            ok = false;
+            let diag = match where_to_blame {
+                Some(at) => Diag::error(map.span_of(&at), msg),
+                None => Diag::error(map.span_of(&crate::lex::AlphanumSpan {
+                    byte_ptr: map.base_ptr(),
+                    len: 0,
+                }), msg),
+            };
+            sink.push(diag.with_note(note.to_string()));
+        };
+
+        if producers == 0 {
+            report(
+                format!("nothing sends to `{}`", name),
+                "every pipe needs a producer; an unconnected one reads as an intermittent hang",
+            );
+        } else if producers > 1 {
+            report(
+                format!("`{}` has {} producers", name, producers),
+                "a pipe has one producer. Two drivers on one net resolve to `x`",
+            );
+        }
+
+        if consumers == 0 {
+            report(
+                format!("nothing receives from `{}` in `{}`", name, graph_name),
+                "every pipe needs a consumer, or its producer stalls forever once the slot fills",
+            );
+        } else if consumers > 1 {
+            report(
+                format!("`{}` has {} consumers", name, consumers),
+                "desc.md allows several, by duplicating the sink so each gets its own copy. \
+                 That duplication is not built yet",
+            );
+        }
+    }
+    ok
+}

@@ -218,12 +218,18 @@ pub fn lower_sequence(
     let valid_base = 0usize;
     let v_last = low.emit(Ty::BOOL, Op::RegRead((valid_base + n - 1) as u32));
     low.name_value(v_last, format!("v{}", n - 1));
-    let out_ready = match low.pipes[out_ix].ready_port {
-        Some(p) => low.emit(Ty::BOOL, Op::Port(p)),
+    let en = match low.pipes[out_ix].ready_port {
+        Some(p) => {
+            let out_ready = low.emit(Ty::BOOL, Op::Port(p));
+            let not_last = low.emit(Ty::BOOL, Op::Un { op: UnOp::LogNot, arg: v_last });
+            low.emit(Ty::BOOL, Op::Bin { op: BinOp::Or, lhs: not_last, rhs: out_ready })
+        }
+        // A `stream` sink never refuses, so the pipeline never stalls -- which
+        // is the point of choosing one. Written as a constant rather than
+        // `(!v_last) | 1'b1`, which is the same thing and reads as an
+        // oversight.
         None => low.emit(Ty::BOOL, Op::Const(1)),
     };
-    let not_last = low.emit(Ty::BOOL, Op::Un { op: UnOp::LogNot, arg: v_last });
-    let en = low.emit(Ty::BOOL, Op::Bin { op: BinOp::Or, lhs: not_last, rhs: out_ready });
     low.name_value(en, "shift".to_string());
 
     // ---- stage bodies -----------------------------------------------------
@@ -365,6 +371,8 @@ pub fn lower_sequence(
         values,
         drivers,
         regs,
+        nets: Vec::new(),
+        instances: Vec::new(),
     })
 }
 

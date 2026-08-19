@@ -191,7 +191,7 @@ fn live_values(module: &Module) -> Vec<bool> {
 /// How many times each live value is read.
 fn use_counts(module: &Module, live: &[bool]) -> Vec<u32> {
     let mut counts = vec![0u32; module.values.len()];
-    let mut bump = |id: &ValueId, counts: &mut Vec<u32>| counts[id.0 as usize] += 1;
+    let bump = |id: &ValueId, counts: &mut Vec<u32>| counts[id.0 as usize] += 1;
 
     for def in &module.values {
         if !live[def.id.0 as usize] {
@@ -417,6 +417,20 @@ fn emit_body(out: &mut String, module: &Module, names: &NameTable) {
     let live = live_values(module);
     let fold = foldable(module, &live);
 
+    // A graph's wires. Declared before anything else because the instances
+    // that drive them follow, and a Verilog-2005 net must be declared before
+    // it is used.
+    for net in &module.nets {
+        out.push_str(&format!(
+            "  wire {}{};\n",
+            signed_and_range(&net.ty),
+            sanitize(&net.name)
+        ));
+    }
+    if !module.nets.is_empty() {
+        out.push('\n');
+    }
+
     for reg in &module.regs {
         out.push_str(&format!(
             "  reg {}{};\n",
@@ -501,7 +515,46 @@ fn emit_body(out: &mut String, module: &Module, names: &NameTable) {
     for mem in &module.mems {
         emit_memory_block(out, module, names, &fold, mem);
     }
+    emit_instances(out, module);
     emit_assertions(out, module, names, &fold);
+}
+
+/// A graph's submodules, connected by name.
+///
+/// By name and never by position: the port order of a lowered process is three
+/// ports per pipe in an order ir.rs chose, and a positional connection would
+/// turn a change there into a silently miswired design rather than a compile
+/// error.
+fn emit_instances(out: &mut String, module: &Module) {
+    for inst in &module.instances {
+        // One blank line between instances, and none doubled up against the
+        // one the net declarations already left behind.
+        if !out.is_empty() && !out.ends_with("\n\n") {
+            out.push('\n');
+        }
+        out.push_str(&format!(
+            "  {} {} (\n",
+            sanitize(&inst.module),
+            sanitize(&inst.name)
+        ));
+        let width = inst
+            .conns
+            .iter()
+            .map(|(formal, _)| formal.len())
+            .max()
+            .unwrap_or(0);
+        for (ix, (formal, actual)) in inst.conns.iter().enumerate() {
+            let comma = if ix + 1 == inst.conns.len() { "" } else { "," };
+            out.push_str(&format!(
+                "    .{:<width$} ({}){}\n",
+                sanitize(formal),
+                sanitize(actual),
+                comma,
+                width = width
+            ));
+        }
+        out.push_str("  );\n");
+    }
 }
 
 /// Immediate assertions, and nothing of them in synthesis.

@@ -12,7 +12,7 @@ use crate::ir::{lower_function, lower_process};
 use crate::lex::{find_tab, parse_top_level, TopLevelDecl};
 use crate::parse::{
     FunctionDecl, anumspan_to_str, resolve_precedence_for_enum, resolve_precedence_for_function,
-    resolve_precedence_for_process, resolve_precedence_for_sequence,
+    resolve_precedence_for_graph, resolve_precedence_for_process, resolve_precedence_for_sequence,
     resolve_precedence_for_struct,
 };
 use crate::symbols;
@@ -62,7 +62,7 @@ pub fn parse_source(map: &SourceMap) -> Result<Parsed, Vec<Diag>> {
                 }
             };
             Err(vec![Diag::error(span, msg).with_note(
-                "expected a top-level `process`, `sequence`, `fun`, `struct` or `enum` declaration",
+                "expected a top-level `process`, `sequence`, `graph`, `fun`, `struct` or `enum` declaration",
             )])
         }
     }
@@ -108,6 +108,7 @@ pub fn compile(map: &SourceMap, opts: &EmitOptions, emit: Emit) -> Result<String
     let mut funcs = Vec::new();
     let mut procs = Vec::new();
     let mut seqs = Vec::new();
+    let mut graphs = Vec::new();
 
     for decl in &parsed.decls {
         match decl {
@@ -139,6 +140,12 @@ pub fn compile(map: &SourceMap, opts: &EmitOptions, emit: Emit) -> Result<String
                 match unsafe { resolve_precedence_for_sequence(base, sq) } {
                     Ok(r) => seqs.push(r),
                     Err(_) => sink.err_at(&sq.name, "could not resolve this sequence"),
+                }
+            }
+            TopLevelDecl::GraphDecl(g) => {
+                match unsafe { resolve_precedence_for_graph(base, g) } {
+                    Ok(r) => graphs.push(r),
+                    Err(_) => sink.err_at(&g.name, "could not resolve this graph"),
                 }
             }
         }
@@ -183,7 +190,7 @@ pub fn compile(map: &SourceMap, opts: &EmitOptions, emit: Emit) -> Result<String
     let dumping_ir = emit == Emit::Ir;
     let mut out = if dumping_ir { String::new() } else { emit_banner(opts) };
     let mut emitted = 0usize;
-    let mut render = |out: &mut String, module: &crate::ir::Module| {
+    let render = |out: &mut String, module: &crate::ir::Module| {
         out.push('\n');
         if dumping_ir {
             out.push_str(&crate::ir::render_module(module));
@@ -210,11 +217,39 @@ pub fn compile(map: &SourceMap, opts: &EmitOptions, emit: Emit) -> Result<String
         }
     }
 
+    // Graphs last, and after their contents: a graph is the only declaration
+    // that emits an instantiation, so everything it names has to have been
+    // emitted above it for the file to be readable top to bottom.
+    if !graphs.is_empty() {
+        let mut sigs: std::collections::BTreeMap<String, crate::ir_graph::BlockSig> =
+            std::collections::BTreeMap::new();
+        for seq in &seqs {
+            let name = anumspan_to_str(&seq.name).to_string();
+            sigs.insert(name.clone(), crate::ir_graph::signature_of(&name, "sequence", &seq.args, &syms));
+        }
+        for proc in &procs {
+            let name = anumspan_to_str(&proc.name).to_string();
+            sigs.insert(name.clone(), crate::ir_graph::signature_of(&name, "process", &proc.args, &syms));
+        }
+        for graph in &graphs {
+            let name = anumspan_to_str(&graph.name).to_string();
+            sigs.insert(name.clone(), crate::ir_graph::signature_of(&name, "graph", &graph.args, &syms));
+        }
+        for graph in &graphs {
+            if let Some(module) = crate::ir_graph::lower_graph(map, &syms, &sigs, graph, &mut sink) {
+                render(&mut out, &module);
+                emitted += 1;
+            }
+        }
+    }
+
     if sink.has_errors() {
         return Err(sink.into_diags());
     }
     if emitted == 0 {
-        return Err(vec![Diag::error_no_span("nothing to emit: no `fun`, `process` or `sequence` declarations found")]);
+        return Err(vec![Diag::error_no_span(
+            "nothing to emit: no `fun`, `process`, `sequence` or `graph` declarations found",
+        )]);
     }
     Ok(out)
 }
@@ -485,12 +520,29 @@ mod emit_tests {
     }
 
     #[test]
-    fn a_stream_pipe_in_a_sequence_is_still_refused() {
-        let text = compile_err(concat!(
+    fn a_stream_in_a_sequence_has_no_ready_on_that_side() {
+        // A stream's producer is never told to wait: the oldest item is
+        // overwritten instead. So the pipeline samples whatever is there, and
+        // an item it missed rides through as an invalid one.
+        let v = compile(concat!(
             "sequence s (a: stream in i16, dst: buffer out i16)\n",
             "  let x = @rcv(a)\n",
             "  @send(dst, x)\n",
         ));
-        assert!(text.contains("`stream` pipes are not supported yet"), "{}", text);
+        assert!(v.contains("input         a_valid,"), "{}", v);
+        assert!(v.contains("input  [15:0] a_data"), "{}", v);
+        assert!(!v.contains("a_ready"), "{}", v);
+    }
+
+    #[test]
+    fn a_stream_sink_never_stalls_the_pipeline() {
+        let v = compile(concat!(
+            "sequence s (src: buffer in i16, dst: stream out i16)\n",
+            "  let x = @rcv(src)\n",
+            "  @send(dst, x)\n",
+        ));
+        assert!(!v.contains("dst_ready"), "{}", v);
+        // Nothing can refuse an item, so the input is always accepted.
+        assert!(v.contains("assign src_ready = 1'b1;"), "{}", v);
     }
 }

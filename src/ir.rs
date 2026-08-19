@@ -219,11 +219,41 @@ pub struct Module {
     /// the emitted file can say what they were: a module whose shape depends
     /// on a number that appears nowhere in it is hard to read.
     pub params: Vec<(String, Ty, u128)>,
+    /// Wires between instances. A `graph` has these and nothing else -- no
+    /// values, no registers -- because a graph computes nothing.
+    pub nets: Vec<Net>,
+    /// Submodules, in source order. Empty for everything but a `graph`: a
+    /// `fun` call is inlined, so this is the only place hierarchy comes from.
+    pub instances: Vec<Instance>,
+}
+
+/// One wire in a `graph`, carrying one leg of an internal pipe.
+#[derive(Debug, Clone)]
+pub struct Net {
+    pub name: String,
+    pub ty: Ty,
+}
+
+/// One instantiated `process` or `sequence`.
+#[derive(Debug, Clone)]
+pub struct Instance {
+    /// The module being instantiated.
+    pub module: String,
+    /// The instance's own name, unique within the graph.
+    pub name: String,
+    /// `(formal, actual)`, connected by name. By name rather than by position
+    /// because the port order of a process is an implementation detail of the
+    /// lowering -- three ports per pipe, in an order this file chose.
+    pub conns: Vec<(String, String)>,
 }
 
 impl Module {
+    /// Whether the module needs `clk` and `rst_n`.
+    ///
+    /// A graph has no registers of its own and still needs both: every
+    /// instance in it does.
     pub fn is_clocked(&self) -> bool {
-        !self.regs.is_empty() || !self.mems.is_empty()
+        !self.regs.is_empty() || !self.mems.is_empty() || !self.instances.is_empty()
     }
 }
 
@@ -253,6 +283,15 @@ pub fn render_module(m: &Module) -> String {
             PortDir::Out => "out",
         };
         out.push_str(&format!("  port  #{} {} {} : {}\n", ix, dir, p.name, p.ty.display()));
+    }
+    for net in &m.nets {
+        out.push_str(&format!("  net   {} : {}\n", net.name, net.ty.display()));
+    }
+    for inst in &m.instances {
+        out.push_str(&format!("  inst  {} : {}\n", inst.name, inst.module));
+        for (formal, actual) in &inst.conns {
+            out.push_str(&format!("          .{} = {}\n", formal, actual));
+        }
     }
     for mem in &m.mems {
         let reset = match mem.reset {
@@ -545,16 +584,16 @@ impl<'a> Lowerer<'a> {
         for arg in &args.entries {
             let name = anumspan_to_str(&arg.arg_name).to_string();
             let kind = classify_param(self, arg, sink)?;
+            let stream;
             let is_input = match kind {
                 ParamKind::Constant => {
                     self.declare_constant(arg, env, sink)?;
                     continue;
                 }
-                ParamKind::Pipe { is_stream: true, .. } => {
-                    sink.err_at(&arg.arg_name, "`stream` pipes are not supported yet; `buffer` is");
-                    return None;
+                ParamKind::Pipe { is_input, is_stream } => {
+                    stream = is_stream;
+                    is_input
                 }
-                ParamKind::Pipe { is_input, .. } => is_input,
             };
             let ty = match resolve_type_expr(&arg.type_expr, self.syms) {
                 Ok(t) => t,
@@ -568,13 +607,21 @@ impl<'a> Lowerer<'a> {
             } else {
                 (PortDir::Out, PortDir::In, PortDir::Out)
             };
-            let mut mk = |low: &mut Self, suffix: &str, dir: PortDir, t: Ty| {
+            let mk = |low: &mut Self, suffix: &str, dir: PortDir, t: Ty| {
                 let id = PortId(low.ports.len() as u32);
                 low.ports.push(Port { name: format!("{}_{}", name, suffix), dir, ty: t });
                 id
             };
             let valid_port = mk(self, "valid", vd, Ty::BOOL);
-            let ready_port = Some(mk(self, "ready", rd, Ty::BOOL));
+            // A stream has no `ready`. Its sink never refuses an item -- the
+            // oldest is overwritten instead -- so there is nothing for a
+            // `ready` to say, and emitting one tied high would invite someone
+            // to wire it up.
+            let ready_port = if stream {
+                None
+            } else {
+                Some(mk(self, "ready", rd, Ty::BOOL))
+            };
             let data_port = mk(self, "data", dd, ty.clone());
             let data_value = if is_input {
                 let v = self.emit(ty.clone(), Op::Port(data_port));
@@ -589,7 +636,7 @@ impl<'a> Lowerer<'a> {
                 is_input,
                 valid_port,
                 ready_port,
-                is_stream: false,
+                is_stream: stream,
                 data_port,
                 data_value,
                 used: false,
@@ -788,7 +835,7 @@ impl<'a> Lowerer<'a> {
     /// data are don't-cares -- but only when the mux is selected by exactly
     /// that enable, which is why this compares value ids rather than trying to
     /// prove an implication.
-    fn drop_gated_mux(&self, mut value: ValueId, gate: ValueId) -> ValueId {
+    pub fn drop_gated_mux(&self, mut value: ValueId, gate: ValueId) -> ValueId {
         loop {
             match &self.values[value.0 as usize].op {
                 Op::Mux { cond, then_val, .. } if *cond == gate => value = *then_val,
@@ -820,6 +867,12 @@ impl<'a> Lowerer<'a> {
             return Some(idx);
         }
         if w < want {
+            // A constant address is re-materialised at the address width, so
+            // an unrolled `for` reads `mem[2'd1]` rather than
+            // `mem[{{1{1'b0}}, 1'b1}]`.
+            if let Op::Const(k) = self.values[idx.0 as usize].op {
+                return Some(self.emit(Ty::UInt(want), Op::Const(k)));
+            }
             return Some(self.emit(Ty::UInt(want), Op::ZExt { arg: idx, to: want }));
         }
         sink.push(
@@ -1046,6 +1099,21 @@ impl<'a> Lowerer<'a> {
         if have == *want {
             return value;
         }
+
+        // A constant is re-materialised at the wanted width rather than
+        // concatenated with zeros. Both are correct; only one is readable.
+        // `mem[i]` inside an unrolled `for` is the case that made it worth
+        // doing -- the index is a constant whose natural width is one bit, and
+        // the address port wants two, so without this the output reads
+        // `mem[{{1{1'b0}}, 1'b1}]` where it should read `mem[2'd1]`.
+        if !have.is_signed() && !want.is_signed() {
+            if let Op::Const(k) = self.values[value.0 as usize].op {
+                if literal_fits(k, want) {
+                    return self.emit(want.clone(), Op::Const(k));
+                }
+            }
+        }
+
         let to = want.bit_width();
         let width_already_matches = have.bit_width() == to;
         let widened = if width_already_matches {
@@ -1090,16 +1158,16 @@ pub fn lower_function(
                 return None;
             }
         };
+        // `inout` is by reference and readable, so at a module boundary it is
+        // two ports: the value that came in, and the value going back. Named
+        // `x` and `x_out` rather than a Verilog `inout`, which is a tri-state
+        // and not what this means. Inside a call it is neither -- the call is
+        // inlined and the caller's own variable is updated in place.
+        let is_inout = matches!(arg.qualifier, ArgTypeQualifier::Inout);
         let dir = match arg.qualifier {
             ArgTypeQualifier::In => PortDir::In,
             ArgTypeQualifier::Out => PortDir::Out,
-            ArgTypeQualifier::Inout => {
-                sink.err_at(
-                    &arg.arg_name,
-                    "`inout` parameters are not supported in a combinational function",
-                );
-                return None;
-            }
+            ArgTypeQualifier::Inout => PortDir::In,
             _ => {
                 sink.err_at(
                     &arg.arg_name,
@@ -1111,6 +1179,25 @@ pub fn lower_function(
 
         let port_id = PortId(low.ports.len() as u32);
         low.ports.push(Port { name: name.clone(), dir, ty: ty.clone() });
+
+        if is_inout {
+            let back = PortId(low.ports.len() as u32);
+            low.ports.push(Port {
+                name: format!("{}_out", name),
+                dir: PortDir::Out,
+                ty: ty.clone(),
+            });
+            let v = low.emit(ty.clone(), Op::Port(port_id));
+            low.values[v.0 as usize].name = Some(name.clone());
+            out_ports.push((back, name.clone()));
+            // Readable because it arrived with a value, assignable because the
+            // caller sees what it leaves.
+            env.insert(
+                name,
+                Binding { value: Some(v), ty, is_output: true, is_mutable: false },
+            );
+            continue;
+        }
 
         match dir {
             PortDir::In => {
@@ -1165,6 +1252,8 @@ pub fn lower_function(
 
     Some(Module {
         params: low.params,
+        nets: Vec::new(),
+        instances: Vec::new(),
         asserts: low.asserts,
         mems: Vec::new(),
         name: anumspan_to_str(&decl.name).to_string(),
@@ -1186,6 +1275,138 @@ pub fn lower_function(
 /// A conditional assignment therefore becomes a clock enable for free: an
 /// unassigned register keeps its value, so `if go then c = c + 1` lowers to
 /// `c <= go ? c + 1 : c`, which is what synthesis wants to see.
+/// Whether a process body contains a blocking operation, looking through the
+/// `loop` that usually wraps it.
+///
+/// Needed before the body is lowered, because whether a `bram` has anywhere to
+/// put its read cycle is decided by whether there are states at all.
+fn blocks_somewhere(body: &[PrecResInnerStmt]) -> bool {
+    body.iter().any(|stmt| match stmt {
+        PrecResInnerStmt::Loop(l) => match &l.repeat_expr {
+            PrecResExpr::StmtBlock(b) => b.components.iter().any(crate::ir_fsm::contains_barrier),
+            other => crate::ir_fsm::contains_barrier(&PrecResInnerStmt::TailVal(other.clone())),
+        },
+        other => crate::ir_fsm::contains_barrier(other),
+    })
+}
+
+/// The half-open range a `for` runs over.
+///
+/// Two spellings, from desc.md:56. `0..n` is the range itself. `for k in arr`
+/// iterates a memory, and means `0..len` -- the binding is the INDEX, because
+/// a memory element is reached by subscript and handing back a copy would hide
+/// that every read is a port.
+fn for_bounds(
+    low: &mut Lowerer,
+    target: &PrecResExpr,
+    at: &crate::lex::AlphanumSpan,
+    env: &Env,
+    sink: &mut DiagSink,
+) -> Option<(u128, u128)> {
+    if let PrecResExpr::Span(span) = target {
+        let lo = const_operand(low, &span.left, at, "the start of this range", env, sink)?;
+        let hi = const_operand(low, &span.right, at, "the end of this range", env, sink)?;
+        if hi < lo {
+            sink.push(
+                Diag::error(
+                    low.span(at),
+                    format!("this range runs backwards: `{}..{}`", lo, hi),
+                )
+                .with_note("a `for` range is half-open and counts up"),
+            );
+            return None;
+        }
+        return Some((lo, hi));
+    }
+
+    if let PrecResExpr::Ref(n) = target {
+        let name = anumspan_to_str(n);
+        if let Some(Ty::Mem { len, .. }) = env.get(name).map(|b| b.ty.clone()) {
+            return Some((0, len as u128));
+        }
+    }
+
+    sink.push(
+        Diag::error(low.span(at), "a `for` iterates a range or an array")
+            .with_note("write `for i in 0..n`, or name an array to walk its indices"),
+    );
+    None
+}
+
+/// An expression that has to be known at compile time.
+///
+/// Lowered rather than folded syntactically, so a constant parameter counts:
+/// by the time a body is lowered, `n: i8 = 4` is already an `Op::Const` in the
+/// environment, and refusing it would make every parameterised design write
+/// its sizes twice.
+fn const_operand(
+    low: &mut Lowerer,
+    expr: &PrecResExpr,
+    at: &crate::lex::AlphanumSpan,
+    what: &str,
+    env: &Env,
+    sink: &mut DiagSink,
+) -> Option<u128> {
+    let v = lower_expr(low, expr, env, sink)?;
+    match low.values[v.0 as usize].op {
+        Op::Const(k) => Some(k),
+        _ => {
+            sink.push(
+                Diag::error(
+                    low.span(at),
+                    format!("{} is not known at compile time", what),
+                )
+                .with_note(
+                    "a `for` is unrolled, so its trip count has to be a literal or a constant \
+                     parameter",
+                ),
+            );
+            None
+        }
+    }
+}
+
+/// The binary operator behind a compound assignment.
+///
+/// `~=` is absent on purpose: `~` is unary inversion, so `x ~= y` has no
+/// reading that is not a guess between "invert" and "not equal". The lexer
+/// accepts it, and lowering says it is not supported rather than picking one.
+fn compound_op(kind: crate::lex::AssignStmtKind) -> Option<BuiltinOp> {
+    use crate::lex::AssignStmtKind as K;
+    Some(match kind {
+        K::AddAssign => BuiltinOp::Add,
+        K::SubAssign => BuiltinOp::Sub,
+        K::MulAssign => BuiltinOp::Mul,
+        K::DivAssign => BuiltinOp::Div,
+        K::ModAssign => BuiltinOp::Mod,
+        K::ShlAssign => BuiltinOp::Shl,
+        K::ShrAssign => BuiltinOp::Shr,
+        K::AndAssign => BuiltinOp::And,
+        K::OrAssign => BuiltinOp::Or,
+        K::XorAssign => BuiltinOp::Xor,
+        K::PlainAssign | K::InvertAssign => return None,
+    })
+}
+
+/// How the author wrote it, for the diagnostic.
+fn compound_spelling(kind: crate::lex::AssignStmtKind) -> &'static str {
+    use crate::lex::AssignStmtKind as K;
+    match kind {
+        K::AddAssign => "+=",
+        K::SubAssign => "-=",
+        K::MulAssign => "*=",
+        K::DivAssign => "/=",
+        K::ModAssign => "%=",
+        K::ShlAssign => "<<=",
+        K::ShrAssign => ">>=",
+        K::AndAssign => "&=",
+        K::OrAssign => "|=",
+        K::XorAssign => "^=",
+        K::InvertAssign => "~=",
+        K::PlainAssign => "=",
+    }
+}
+
 pub fn lower_process(
     map: &SourceMap,
     syms: &Symbols,
@@ -1324,23 +1545,36 @@ pub fn lower_process(
         // register slot nor a reset value of its own -- the reset, if there is
         // one, applies to every element.
         if let Ty::Mem { elem, len, kind } = ty.clone() {
-            // A block RAM reads SYNCHRONOUSLY: the value arrives a cycle after
-            // the address. Accepting the annotation and then emitting an
-            // asynchronous read would quietly give the caller distributed RAM
-            // under a `bram` label, and accepting it with a real block RAM
-            // needs a scheduling model that does not exist yet.
-            let read_is_synchronous = kind != MemKind::LutRam;
-            if read_is_synchronous {
+            // A block RAM reads SYNCHRONOUSLY: the value arrives a cycle
+            // after the address. That cycle has to go somewhere the source can
+            // point at, and the only place in this language that can hold one
+            // is a state of a blocking `process` -- so a `bram` read is a
+            // statement of its own, `let x = mem[i]`, and costs a state. Where
+            // there are no states there is nowhere to put it.
+            //
+            // `bkram` is a different thing again: banked, with conflict
+            // minimisation, which is a placement problem rather than a
+            // scheduling one.
+            if kind == MemKind::BankedRam {
                 sink.push(
                     Diag::error(
                         map.span_of(&var_decl.name),
-                        format!(
-                            "`#[impl({})]` is not supported yet; only `lutram` is",
-                            kind.display()
-                        ),
+                        "`#[impl(bkram)]` is not supported yet",
                     )
                     .with_note(
-                        "its read takes a cycle, and there is no way yet to say where that cycle goes",
+                        "banking needs a conflict model; `lutram` and `bram` are available",
+                    ),
+                );
+                return None;
+            }
+            if kind == MemKind::BlockRam && !blocks_somewhere(&decl.body) {
+                sink.push(
+                    Diag::error(
+                        map.span_of(&var_decl.name),
+                        "a `bram` read takes a cycle, and this process has no state to put it in",
+                    )
+                    .with_note(
+                        "a `bram` belongs in a process that blocks, where `let x = mem[i]` is a state of its own; use `lutram` for an asynchronous read",
                     ),
                 );
                 return None;
@@ -1366,6 +1600,24 @@ pub fn lower_process(
                     }
                 }
             };
+            // A block RAM has no reset. The reset a `lutram` gets is a loop
+            // over every element in the clocked block, which for distributed
+            // RAM is what it already is -- but a block RAM that is written on
+            // reset is not a block RAM at all: the synthesizer cannot infer
+            // one, and what comes out is 8192 flip-flops for a 256x32 table.
+            // Refusing beats silently producing that.
+            if kind == MemKind::BlockRam && reset.is_some() {
+                sink.push(
+                    Diag::error(
+                        map.span_of(&var_decl.name),
+                        format!("`{}` is a block RAM, which cannot be reset", name),
+                    )
+                    .with_note(
+                        "leave the initialiser off; a block RAM powers up from the bitstream, and resetting one costs a flip-flop per bit",
+                    ),
+                );
+                return None;
+            }
             low.declare_memory(name, *elem, len, kind, reset, &mut env);
             body_start += 1;
             continue;
@@ -1449,18 +1701,6 @@ pub fn lower_process(
 
     if blocks {
         let loop_body = body_stmts.clone();
-        if !low.mems.is_empty() {
-            sink.push(
-                Diag::error(
-                    map.span_of(&decl.name),
-                    "a memory in a process that blocks is not supported yet",
-                )
-                .with_note(
-                    "the accesses would have to be scheduled into the states; keep the memory in a process without `@rcv`/`@send`",
-                ),
-            );
-            return None;
-        }
         return crate::ir_fsm::lower_blocking(
             map, decl, low, env, Vec::new(), reg_names, reg_tys, reg_resets, &loop_body,
             repeats, sink,
@@ -1764,6 +2004,8 @@ pub fn lower_process(
 
     Some(Module {
         params: low.params,
+        nets: Vec::new(),
+        instances: Vec::new(),
         asserts: low.asserts,
         mems: low.mems,
         name: anumspan_to_str(&decl.name).to_string(),
@@ -1907,6 +2149,27 @@ fn lower_stmt(
                 }
                 return lower_try_rcv_binding(low, decl, env, sink);
             }
+
+            // A single-name binding of a call that also has `inout`
+            // parameters needs the statement form: the expression form has no
+            // way to write the argument back, because it never sees the
+            // caller's environment mutably.
+            if let Some(PrecResExpr::Call { base, args }) = &decl.assign_val {
+                if let PrecResExpr::Ref(callee) = &**base {
+                    let has_inouts = low
+                        .syms
+                        .funcs
+                        .get(anumspan_to_str(callee))
+                        .is_some_and(|sig| sig.inouts().next().is_some());
+                    if has_inouts {
+                        let names = vec![decl.name];
+                        return crate::ir_match::inline_call_multi(
+                            low, callee, args, &names, env, sink,
+                        );
+                    }
+                }
+            }
+
             let declared = match &decl.ty_expr {
                 Some(t) => match resolve_type_expr(t, low.syms) {
                     Ok(t) => Some(t),
@@ -2042,13 +2305,38 @@ fn lower_stmt(
                 sink.push(diag);
                 return None;
             }
-            // Compound assignment (`x += y`) is not desugared yet; the parser
-            // records the kind, so reject it explicitly rather than silently
-            // treating it as a plain assignment.
-            if assign.kind != crate::lex::AssignStmtKind::PlainAssign {
-                sink.err_at(&target, "compound assignment is not supported yet");
-                return None;
-            }
+            // `x += y` is `x = x + y`, and desc.md's own `fun` example writes
+            // `arg2[0] += arg1`.
+            //
+            // Desugared here rather than in the parser for two reasons: the
+            // read of `x` then goes through the same field-path lowering as
+            // the write, so `uop.cond_reg += 1` splices bits exactly the way
+            // the plain form does; and an operator with no support yet can
+            // still be named in the diagnostic as the author spelled it.
+            let desugared;
+            let rvalue = if assign.kind == crate::lex::AssignStmtKind::PlainAssign {
+                &assign.rvalue
+            } else {
+                match compound_op(assign.kind) {
+                    Some(op) => {
+                        desugared = PrecResExpr::Call {
+                            base: Box::new(PrecResExpr::Builtin(op)),
+                            args: vec![assign.lvalue.clone(), assign.rvalue.clone()],
+                        };
+                        &desugared
+                    }
+                    None => {
+                        sink.err_at(
+                            &target,
+                            format!(
+                                "`{}` is not supported yet",
+                                compound_spelling(assign.kind)
+                            ),
+                        );
+                        return None;
+                    }
+                }
+            };
 
             // Resolve the field chain to one absolute bit range.
             let mut want = base_ty.clone();
@@ -2087,7 +2375,7 @@ fn lower_stmt(
                 offset += lo;
             }
 
-            let mut value = lower_expr_expecting(low, &assign.rvalue, Some(&want), env, sink)?;
+            let mut value = lower_expr_expecting(low, rvalue, Some(&want), env, sink)?;
             let have = low.ty_of(value);
             if have != want {
                 match low.coerce_const(value, &want) {
@@ -2245,16 +2533,19 @@ fn lower_stmt(
                 PrecResExpr::Builtin(BuiltinOp::Fatal) => Some(true),
                 _ => None,
             };
-            match checking {
-                Some(is_fatal) => lower_assert(low, &call.args, is_fatal, env, sink),
-                None => {
-                    sink.err_span(
-                        crate::driver::nowhere(),
-                        "this statement has no effect in combinational logic",
-                    );
-                    None
-                }
+            if let Some(is_fatal) = checking {
+                return lower_assert(low, &call.args, is_fatal, env, sink);
             }
+            // `f(a, acc)` where `acc` is `inout`: the call has no result to
+            // bind because its result went back into its argument.
+            if let PrecResExpr::Ref(callee) = &call.base {
+                return crate::ir_match::inline_call_effect(low, callee, &call.args, env, sink);
+            }
+            sink.err_span(
+                crate::driver::nowhere(),
+                "this statement has no effect in combinational logic",
+            );
+            None
         }
 
         PrecResInnerStmt::TailVal(_) => {
@@ -2273,25 +2564,87 @@ fn lower_stmt(
 
         PrecResInnerStmt::MatchStmt(m) => crate::ir_match::lower_match(low, m, env, sink),
 
+        // Reached only where there are no states to break out of. A `break`
+        // in a blocking `loop` never gets here: the scheduler turns it into an
+        // edge to the terminal state.
         PrecResInnerStmt::Break => {
             sink.push(
-                Diag::error(
-                    crate::driver::nowhere(),
-                    "`break` is not scheduled yet",
-                )
-                .with_note(
-                    "it needs a control-flow graph: a `break` inside a conditional has to stop the statements after it on that path only, and the statements in a state are joined by muxes rather than ordered. A linear process body already runs once and stops.",
-                ),
+                Diag::error(crate::driver::nowhere(), "there is nothing here to `break` out of")
+                    .with_note(
+                        "`break` stops a `loop` that blocks, by leaving its state machine. A loop with no `@rcv` or `@send` is the per-cycle form and has no states; a linear body already runs once and stops",
+                    ),
             );
             None
         }
 
-        PrecResInnerStmt::Loop(_) | PrecResInnerStmt::ForLoop(_) => {
+        PrecResInnerStmt::Loop(_) => {
             sink.err_span(
                 crate::driver::nowhere(),
                 "a `loop` belongs at the top of a `process` body, not nested inside it",
             );
             None
+        }
+
+        // `for i in 0..n` unrolls. There is no loop counter in hardware unless
+        // something asks for one, and a `for` with a static trip count is not
+        // asking -- it is a way to write the same wiring n times without
+        // writing it n times.
+        //
+        // The bound is folded rather than parsed, so `0..N` with `N` a
+        // constant parameter works: a constant parameter is already an
+        // `Op::Const` by the time a body is lowered.
+        PrecResInnerStmt::ForLoop(f) => {
+            let name = anumspan_to_str(&f.binding).to_string();
+            let body = match &f.body {
+                PrecResExpr::StmtBlock(b) => &b.components,
+                _ => {
+                    sink.err_at(&f.binding, "expected an indented body after this `for`");
+                    return None;
+                }
+            };
+
+            let (lo, hi) = for_bounds(low, &f.target, &f.binding, env, sink)?;
+
+            // A trip count that is a mistake rather than a design: unrolling
+            // it would build the logic before anyone noticed, and the report
+            // would be a compiler that stopped responding.
+            const MAX_TRIP: u128 = 4096;
+            if hi.saturating_sub(lo) > MAX_TRIP {
+                sink.push(
+                    Diag::error(
+                        low.span(&f.binding),
+                        format!("this `for` would unroll {} times", hi - lo),
+                    )
+                    .with_note(format!(
+                        "a `for` is unrolled, so every iteration is its own logic; the limit is {}",
+                        MAX_TRIP
+                    )),
+                );
+                return None;
+            }
+
+            let shadowed = env.get(&name).cloned();
+            for i in lo..hi {
+                // Typed as narrowly as the value allows, which is what an
+                // unsized literal does -- so `acc + i` adopts `acc`'s width
+                // rather than demanding a cast at every use.
+                let ty = Ty::UInt(ty::bits_for(i));
+                let v = low.emit(ty.clone(), Op::Const(i));
+                // Deliberately unnamed: a named value gets its own `wire`, and
+                // eight wires holding the numbers 0 to 7 is not what anybody
+                // wants to read in the output.
+                env.insert(name.clone(), Binding::constant(v, ty));
+                lower_stmts(low, body, env, sink)?;
+            }
+            match shadowed {
+                Some(b) => {
+                    env.insert(name, b);
+                }
+                None => {
+                    env.remove(&name);
+                }
+            }
+            Some(())
         }
     }
 }
@@ -2618,8 +2971,28 @@ fn lower_subscript(
         return Some(low.emit(Ty::BOOL, Op::Slice { arg: base, hi: k, lo: k }));
     }
 
-    // `x[i]` with a computed index -- a one-bit `+:` part-select.
     let idx = lower_expr(low, &sub.index, env, sink)?;
+
+    // An index that folded to a constant is still a single bit. `const_eval`
+    // above works on the syntax, so it misses a constant parameter and misses
+    // the induction variable of an unrolled `for`; both arrive here as a
+    // `Ref` and leave lowering as an `Op::Const`. Without this, `v[i]` inside
+    // a `for` becomes `v[i_3 +: 1]` -- a part-select with a constant base,
+    // which is correct and is also the construct this backend exists to avoid
+    // handing GowinSynthesis.
+    if let Op::Const(k) = low.values[idx.0 as usize].op {
+        if k >= base_w as u128 {
+            sink.err_span(
+                crate::driver::nowhere(),
+                format!("bit {} is out of bounds for `{}`", k, base_ty.display()),
+            );
+            return None;
+        }
+        let k = k as u32;
+        return Some(low.emit(Ty::BOOL, Op::Slice { arg: base, hi: k, lo: k }));
+    }
+
+    // `x[i]` with a computed index -- a one-bit `+:` part-select.
     Some(low.emit(Ty::BOOL, Op::DynSlice { arg: base, base: idx, width: 1 }))
 }
 
@@ -2692,6 +3065,19 @@ fn lower_mem_read(
             return None;
         }
     };
+    if low.mems[ix].kind != MemKind::LutRam {
+        sink.push(
+            Diag::error(
+                low.span(&mem_name),
+                format!("a read of `{}` takes a cycle, so it cannot sit inside an expression", name),
+            )
+            .with_note(format!(
+                "bind it on its own line -- `let x = {}[i]` -- which makes the cycle a state",
+                name
+            )),
+        );
+        return None;
+    }
     let (elem, addr_width) = (low.mems[ix].elem.clone(), low.mems[ix].addr_width);
     let raw = lower_expr(low, index, env, sink)?;
     let addr = low.fit_address(raw, addr_width, &mem_name, sink)?;

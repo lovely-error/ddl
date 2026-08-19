@@ -1,0 +1,7 @@
+# The compiler uses `decl_macro`, `str_from_raw_parts` and `coroutines`, so it
+# needs nightly. Pinned rather than floating: an unstable feature can be
+# renamed or removed between nightlies, and "it stopped building today" is not
+# a diagnosis anyone should have to make twice.
+[toolchain]
+channel = "nightly-2025-08-01"
+components = ["rustfmt", "clippy"]

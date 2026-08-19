@@ -78,17 +78,47 @@ impl StructDef {
 #[derive(Debug, Clone)]
 pub struct FuncSig {
     pub name: String,
-    /// `(name, is_output, ty)` in declaration order.
-    pub params: Vec<(String, bool, Ty)>,
+    /// `(name, direction, ty)` in declaration order.
+    pub params: Vec<(String, ParamDir, Ty)>,
+}
+
+/// How a parameter passes, from desc.md:60-63.
+///
+/// `In` is by value. `Out` is by reference, write-only -- which is how a
+/// function returns more than one thing. `InOut` is by reference and readable:
+/// it takes an argument like an input AND updates the caller's variable like
+/// an output, so it appears in both lists below.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParamDir {
+    In,
+    Out,
+    InOut,
+}
+
+impl ParamDir {
+    pub fn takes_an_argument(self) -> bool {
+        matches!(self, ParamDir::In | ParamDir::InOut)
+    }
+
+    pub fn produces_a_value(self) -> bool {
+        matches!(self, ParamDir::Out | ParamDir::InOut)
+    }
 }
 
 impl FuncSig {
-    pub fn inputs(&self) -> impl Iterator<Item = &(String, bool, Ty)> {
-        self.params.iter().filter(|(_, is_out, _)| !is_out)
+    /// Parameters that an argument is written for, in declaration order.
+    pub fn inputs(&self) -> impl Iterator<Item = &(String, ParamDir, Ty)> {
+        self.params.iter().filter(|(_, dir, _)| dir.takes_an_argument())
     }
 
-    pub fn outputs(&self) -> impl Iterator<Item = &(String, bool, Ty)> {
-        self.params.iter().filter(|(_, is_out, _)| *is_out)
+    /// Parameters that carry a result back out.
+    pub fn outputs(&self) -> impl Iterator<Item = &(String, ParamDir, Ty)> {
+        self.params.iter().filter(|(_, dir, _)| dir.produces_a_value())
+    }
+
+    /// Just the `inout` ones, which are written back to the caller's variable.
+    pub fn inouts(&self) -> impl Iterator<Item = &(String, ParamDir, Ty)> {
+        self.params.iter().filter(|(_, dir, _)| *dir == ParamDir::InOut)
     }
 }
 
@@ -297,13 +327,10 @@ fn build_func(decl: &FunctionDecl, syms: &Symbols, sink: &mut DiagSink) -> Optio
                 return None;
             }
         };
-        let is_output = match arg.qualifier {
-            ArgTypeQualifier::In => false,
-            ArgTypeQualifier::Out => true,
-            ArgTypeQualifier::Inout => {
-                sink.err_at(&arg.arg_name, "`inout` parameters are not supported yet");
-                return None;
-            }
+        let dir = match arg.qualifier {
+            ArgTypeQualifier::In => ParamDir::In,
+            ArgTypeQualifier::Out => ParamDir::Out,
+            ArgTypeQualifier::Inout => ParamDir::InOut,
             _ => {
                 sink.err_at(
                     &arg.arg_name,
@@ -312,7 +339,7 @@ fn build_func(decl: &FunctionDecl, syms: &Symbols, sink: &mut DiagSink) -> Optio
                 return None;
             }
         };
-        params.push((pname, is_output, ty));
+        params.push((pname, dir, ty));
     }
     Some(FuncSig { name, params })
 }

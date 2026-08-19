@@ -24,6 +24,8 @@
 -- two copies of an opcode map is the exact failure this project already paid
 -- for once, so there is one copy now.
 
+import "k2g_types.ddl"
+
 fun rdt_is_signed (t: rdt_e, signed_: out i1)
   signed_ = t[2]
 

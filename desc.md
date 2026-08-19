@@ -80,6 +80,12 @@ Two aspects:
 9.  `graph`
    1.  to specify connectivity between seqvs and processes
    2.  cycles are ok
+10. `import "path.ddl"`
+   1. names another file that is part of the same program
+   2. no namespaces: every declaration is visible to every other one, so an
+      import says which files to compile, not what to bring into scope
+   3. resolved against the importing file's directory, then the `-I` path
+   4. a file reached twice is included once, so diamonds and cycles are fine
 
 ### types
 1. `iN`
@@ -112,6 +118,13 @@ Two aspects:
          4. `@send` non blocking send (ok in proc, banned in seq)
    6. `<X> in T` read only pipe of Ts (X can be either buffer or stream)
    7. `<X> out T` write only pipe of Ts (X can be either buffer or stream)
+
+### implemented so far
+The compiler in this repository accepts: `fun`, `sequence`, `process`,
+`graph`, `struct`, `enum` (without payloads), `import`, `for in` (unrolled),
+`break`, compound assignment, `inout` parameters, `buffer` and `stream` pipes,
+and `lutram` and `bram` memories. README.md is the current list; what follows
+is the design, including the parts that are not built.
 
 ### unresolved issues
 1. io procs

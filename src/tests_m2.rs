@@ -415,39 +415,229 @@ fn the_banner_appears_once_for_a_multi_module_file() {
     assert_eq!(v.matches("endmodule").count(), 2, "{}", v);
 }
 
-/// The ported modules must keep compiling. Their bit-exactness is proven by
-/// examples/verify.sh against Questa; this only catches a compiler change that
+/// Every example must keep compiling, from its own path, resolving its own
+/// imports -- which is how a person compiles it. Bit-exactness is proven by
+/// examples/verify.sh against Questa; this catches a compiler change that
 /// stops them building at all.
 ///
-/// `k2g_alu` is compiled with `k2g_types.ddl` in front of it, the same way
-/// `verify.sh` does: it used to carry its own copy of the operation enums, and
-/// two copies of an opcode map is the failure this project already paid for.
+/// The k2g_* ports need `k2g_pkg.ddl`, which is generated into the consumer's
+/// tree by emu/src/ddl_gen.rs and is not part of this repository. Those are
+/// skipped when it is absent.
 #[test]
-fn the_ported_modules_still_compile() {
-    let pkg = std::fs::read_to_string("../KAMASUTRA2G/rtl/k2g_pkg.ddl").unwrap_or_default();
-    let types = format!(
-        "{}{}",
-        pkg,
-        std::fs::read_to_string("examples/k2g_types.ddl").unwrap_or_default()
-    );
-    if types.is_empty() {
-        return;
-    }
-    for (path, needs_types) in [
-        ("examples/k2g_shift.ddl", true),
-        ("examples/k2g_alu.ddl", true),
-    ] {
-        let text = match std::fs::read_to_string(path) {
-            Ok(t) => t,
-            // Tests may run from elsewhere; skip rather than fail spuriously.
-            Err(_) => continue,
-        };
-        let text = if needs_types { format!("{}{}", types, text) } else { text };
-        let map = SourceMap::new(path, text);
-        if let Err(diags) = compile_to_verilog(&map, &EmitOptions::default()) {
-            panic!("{} stopped compiling:\n{}", path, map.render_all(&diags));
+fn the_examples_still_compile() {
+    let k2g = std::path::PathBuf::from("../KAMASUTRA2G/rtl");
+    let have_pkg = k2g.join("k2g_pkg.ddl").is_file();
+
+    let mut compiled = 0;
+    for entry in std::fs::read_dir("examples").expect("examples/ is beside Cargo.toml") {
+        let path = entry.expect("readable entry").path();
+        if path.extension().is_none_or(|e| e != "ddl") {
+            continue;
         }
+        let name = path.file_name().expect("a file").to_string_lossy().to_string();
+        // A types-only file emits no module, and "nothing to emit" is a real
+        // error for a build but not for this one.
+        if name == "k2g_types.ddl" {
+            continue;
+        }
+        if name.starts_with("k2g_") && !have_pkg {
+            continue;
+        }
+
+        let search = if have_pkg { vec![k2g.clone()] } else { Vec::new() };
+        let (map, load_diags) =
+            crate::source::load_program(&[path.display().to_string()], search)
+                .expect("the example is readable");
+        assert!(
+            load_diags.is_empty(),
+            "{} has an unresolved import:
+{}",
+            name,
+            map.render_all(&load_diags)
+        );
+        if let Err(diags) = compile_to_verilog(&map, &EmitOptions::default()) {
+            panic!("{} stopped compiling:
+{}", name, map.render_all(&diags));
+        }
+        compiled += 1;
     }
+
+    // An anti-vacuous guard: the standalone examples need nothing external, so
+    // a run that compiled none of them found no examples at all.
+    assert!(compiled >= 3, "only {} examples compiled", compiled);
+}
+
+/// The checked-in Verilog is generated, so it can go stale. `ddl build
+/// --check` exists for exactly that and was only ever run by hand, on the one
+/// machine with Questa on it.
+///
+/// The comparison is against the banner the file already carries, because the
+/// banner has to be the command that reproduces the file -- which is what
+/// makes running it from anywhere give the same bytes.
+#[test]
+fn the_checked_in_verilog_is_up_to_date() {
+    let k2g = std::path::PathBuf::from("../KAMASUTRA2G/rtl");
+    let have_pkg = k2g.join("k2g_pkg.ddl").is_file();
+
+    let mut checked = 0;
+    for name in [
+        "mul3", "fsm_adder", "k3g_stage", "pipeline_graph", "reg_port", "k2g_shift", "k2g_alu",
+        "k2g_decode",
+        "k2g_xstage",
+    ] {
+        if name.starts_with("k2g_") && !have_pkg {
+            continue;
+        }
+        let src = format!("examples/{}.ddl", name);
+        let out = format!("examples/{}.v", name);
+        let search = if name.starts_with("k2g_") { vec![k2g.clone()] } else { Vec::new() };
+        let (map, load_diags) = crate::source::load_program(&[src.clone()], search)
+            .expect("the example is readable");
+        assert!(load_diags.is_empty(), "{}", map.render_all(&load_diags));
+
+        let current = std::fs::read_to_string(&out)
+            .unwrap_or_else(|e| panic!("cannot read {}: {}", out, e))
+            .replace("
+", "
+");
+        let opts = EmitOptions { regenerate_cmd: banner_cmd(&current) };
+        let fresh = match compile_to_verilog(&map, &opts) {
+            Ok(v) => v,
+            Err(diags) => panic!("{} stopped compiling:
+{}", src, map.render_all(&diags)),
+        };
+        assert_eq!(
+            current, fresh,
+            "{} is out of date; regenerate with `{}`",
+            out, opts.regenerate_cmd
+        );
+        checked += 1;
+    }
+    assert!(checked >= 3, "only {} generated files checked", checked);
+}
+
+/// The command out of a generated file's banner.
+fn banner_cmd(verilog: &str) -> String {
+    verilog
+        .lines()
+        .find_map(|l| l.trim_start().strip_prefix("// Regenerate with: "))
+        .unwrap_or_default()
+        .to_string()
+}
+
+// ---- compound assignment -------------------------------------------------
+
+#[test]
+fn a_compound_assignment_reads_then_writes() {
+    let v = compile(concat!(
+        "fun bump (a: i8, o: out i8)
+",
+        "  var acc: i8 = a
+",
+        "  acc += 8'd3
+",
+        "  acc <<= 8'd1
+",
+        "  acc ^= 8'hF0
+",
+        "  o = acc
+",
+    ));
+    assert!(v.contains("(((a + 8'd3) << 8'd1) ^ 8'hF0)"), "{}", v);
+}
+
+#[test]
+fn a_compound_assignment_to_a_field_splices_the_same_bits() {
+    // The whole reason to desugar in lowering rather than in the parser: the
+    // read of `r.lo` and the write of it go through one field-path resolution,
+    // so this is the plain form's splice with an adder in the middle.
+    let v = compile(&format!(
+        "{}{}",
+        REQ,
+        concat!(
+            "fun bump (r: req_t, o: out req_t)
+",
+            "  var q: req_t = r
+",
+            "  q.data += 8'd1
+",
+            "  o = q
+",
+        )
+    ));
+    assert!(v.contains("r[7:0] + 8'd1"), "{}", v);
+    assert!(v.contains("{r[25:8],"), "{}", v);
+}
+
+#[test]
+fn every_arithmetic_and_bitwise_operator_has_a_compound_form() {
+    for (op, verilog) in [
+        ("+=", " + "),
+        ("-=", " - "),
+        ("&=", " & "),
+        ("|=", " | "),
+        ("^=", " ^ "),
+        ("<<=", " << "),
+        (">>=", " >> "),
+    ] {
+        let v = compile(&format!(
+            "fun f (a: i8, o: out i8)
+  var x: i8 = a
+  x {} 8'd1
+  o = x
+",
+            op
+        ));
+        assert!(v.contains(verilog), "`{}` did not lower to `{}`:
+{}", op, verilog, v);
+    }
+}
+
+#[test]
+fn a_compound_assignment_is_width_checked_like_a_plain_one() {
+    let text = compile_err(concat!(
+        "fun bad (a: i8, b: i32, o: out i8)
+",
+        "  var x: i8 = a
+",
+        "  x += b
+",
+        "  o = x
+",
+    ));
+    assert!(text.contains("width mismatch"), "{}", text);
+}
+
+#[test]
+fn tilde_assign_is_refused_by_name() {
+    // `~` is unary inversion, so `x ~= y` is a guess between "invert" and
+    // "not equal". The diagnostic says so rather than picking one.
+    let text = compile_err(concat!(
+        "fun bad (a: i8, o: out i8)
+",
+        "  var x: i8 = a
+",
+        "  x ~= 8'd1
+",
+        "  o = x
+",
+    ));
+    assert!(text.contains("`~=` is not supported yet"), "{}", text);
+}
+
+#[test]
+fn a_let_binding_still_cannot_be_compound_assigned() {
+    let text = compile_err(concat!(
+        "fun bad (a: i8, o: out i8)
+",
+        "  let x: i8 = a
+",
+        "  x += 8'd1
+",
+        "  o = x
+",
+    ));
+    assert!(text.contains("cannot be assigned"), "{}", text);
 }
 
 // ---- structs -------------------------------------------------------------
@@ -1541,15 +1731,18 @@ fn a_value_crossing_a_state_becomes_a_register() {
 }
 
 #[test]
-fn a_barrier_inside_a_conditional_is_rejected_rather_than_mis_scheduled() {
-    let text = compile_err(concat!(
+fn a_barrier_inside_a_conditional_gets_its_own_state() {
+    let v = compile(concat!(
         "process p (go: i1 = 1'b1, src: buffer in i32, dst: buffer out i32)\n",
         "  loop\n",
         "    if go then\n",
         "      let a = @rcv(src)\n",
         "    @send(dst, 32'd0)\n",
     ));
-    assert!(text.contains("inside a conditional is not scheduled yet"), "{}", text);
+    // Three states: the branch, the guarded receive, and the send.
+    assert!(v.contains("in_s0"), "{}", v);
+    assert!(v.contains("in_s2"), "{}", v);
+    assert!(v.contains("assign src_ready ="), "{}", v);
 }
 
 #[test]
@@ -1603,7 +1796,9 @@ fn a_linear_body_with_barriers_ends_in_a_terminal_state() {
 }
 
 #[test]
-fn break_says_what_it_needs() {
+fn break_in_a_per_cycle_loop_has_nothing_to_leave() {
+    // A `loop` with no blocking operation is the per-cycle form: it has no
+    // states, so there is no state machine to leave.
     let text = compile_err(concat!(
         "process p (src: buffer in i32, dst: buffer out i32)\n",
         "  loop\n",
@@ -1611,20 +1806,40 @@ fn break_says_what_it_needs() {
         "    @try_send(dst, x)\n",
         "    break\n",
     ));
-    assert!(text.contains("`break` is not scheduled yet"), "{}", text);
-    assert!(text.contains("control-flow graph"), "{}", text);
+    assert!(text.contains("nothing here to `break` out of"), "{}", text);
 }
 
 #[test]
-fn a_blocking_loop_must_end_on_a_barrier() {
-    let text = compile_err(concat!(
+fn break_leaves_a_blocking_loop_for_its_terminal_state() {
+    let v = compile(concat!(
+        "process until_zero (src: buffer in i32, dst: buffer out i32)\n",
+        "  loop\n",
+        "    let a = @rcv(src)\n",
+        "    if a == 32'd0 then\n",
+        "      break\n",
+        "    @send(dst, a)\n",
+    ));
+    // Two states of the program plus the terminal one it breaks to. Nothing
+    // drives a handshake there, so the machine parks.
+    assert!(v.contains("branch_s0 ? 2'd2 : 2'd1"), "{}", v);
+    assert!(!v.contains("in_s2"), "{}", v);
+}
+
+#[test]
+fn statements_after_the_last_barrier_run_when_it_fires() {
+    // They used to be an error ("the last statement must be an `@rcv` or
+    // `@send`"). They are the send state's post scope now: the same place a
+    // statement between a receive and a branch goes, and the same cycle.
+    let v = compile(concat!(
         "process p (src: buffer in i32, dst: buffer out i32)\n",
+        "  var n: i32 = @zeroed()\n",
         "  loop\n",
         "    let a = @rcv(src)\n",
         "    @send(dst, a)\n",
-        "    let x = 32'd1\n",
+        "    n = n + 32'd1\n",
     ));
-    assert!(text.contains("must be an `@rcv` or `@send`"), "{}", text);
+    // Two states, and the counter advances only when the send completes.
+    assert!(v.contains("n <= (fire_s1 ? (n + 32'd1) : n);"), "{}", v);
 }
 
 #[test]
@@ -1857,17 +2072,22 @@ fn a_memory_needs_a_constant_reset() {
 }
 
 #[test]
-fn a_memory_in_a_blocking_process_is_rejected() {
-    // The accesses would have to be scheduled into the states, and saying so
-    // beats dropping the array silently.
-    let text = compile_err(concat!(
+fn a_memory_in_a_blocking_process_writes_only_in_the_state_that_writes_it() {
+    // The accesses are scheduled into the states now. A write is gated by the
+    // firing of the state that performs it, which is what makes a scratchpad
+    // in a blocking process mean what it reads as: written once per item, not
+    // once per clock.
+    let v = compile(concat!(
         "process p (src: buffer in i32, dst: buffer out i32)\n",
         "  var vals: #[impl(lutram)] [i32; 32] = @zeroed()\n",
         "  loop\n",
         "    let a = @rcv(src)\n",
-        "    @send(dst, a)\n",
+        "    vals[5'd0] = a\n",
+        "    @send(dst, vals[5'd1])\n",
     ));
-    assert!(text.contains("blocks is not supported yet"), "{}", text);
+    assert!(v.contains("reg [31:0] vals [0:31];"), "{}", v);
+    assert!(v.contains("end else if (fire_s0) begin"), "{}", v);
+    assert!(v.contains("vals[5'd0] <= a_r;") || v.contains("vals[5'd0] <= src_data;"), "{}", v);
 }
 
 #[test]
@@ -2021,17 +2241,35 @@ fn emit_ast_prints_names_rather_than_pointers() {
 
 
 #[test]
-fn bram_is_recognised_and_refused_rather_than_quietly_made_lutram() {
+fn a_bram_in_a_process_with_no_states_has_nowhere_to_put_its_cycle() {
     // Accepting the annotation and emitting an asynchronous read would hand
-    // back distributed RAM under a `bram` label.
+    // back distributed RAM under a `bram` label. A per-cycle process has no
+    // state to spend, so the answer is `lutram` or a process that blocks.
     let text = compile_err(concat!(
         "process rf (addr: buffer in i5, rd: buffer out i32)\n",
-        "  var vals: #[impl(bram)] [i32; 32] = @zeroed()\n",
+        "  var vals: #[impl(bram)] [i32; 32]\n",
         "  let (a, got) = @try_rcv(addr)\n",
         "  let _s = @try_send(rd, vals[a])\n",
     ));
-    assert!(text.contains("`#[impl(bram)]` is not supported yet"), "{}", text);
-    assert!(text.contains("read takes a cycle"), "{}", text);
+    assert!(text.contains("no state to put it in"), "{}", text);
+    assert!(text.contains("use `lutram`"), "{}", text);
+}
+
+#[test]
+fn a_bram_cannot_be_reset() {
+    // The reset a `lutram` gets is a loop over every element. A block RAM
+    // written on reset cannot be inferred as one: 256x32 would come out as
+    // 8192 flip-flops, which is a silent disaster rather than a loud one.
+    let text = compile_err(concat!(
+        "process p (req: buffer in i8, resp: buffer out i32)\n",
+        "  var table: #[impl(bram)] [i32; 256] = @zeroed()\n",
+        "  loop\n",
+        "    let a = @rcv(req)\n",
+        "    let v = table[a]\n",
+        "    @send(resp, v)\n",
+    ));
+    assert!(text.contains("cannot be reset"), "{}", text);
+    assert!(text.contains("flip-flop per bit"), "{}", text);
 }
 
 
@@ -2238,16 +2476,22 @@ fn a_multi_output_call_cannot_recurse() {
 fn the_verified_alu_and_shifter_can_be_called() {
     // The reason this feature exists: k2g_alu has five `out` parameters and
     // k2g_shift has three, so neither was reachable from DDL until now.
-    let pkg = match std::fs::read_to_string("../KAMASUTRA2G/rtl/k2g_pkg.ddl") {
-        Ok(t) => t,
-        // The generated package lives in the consumer's tree; skip when it is
-        // not beside us rather than fail spuriously.
-        Err(_) => return,
-    };
-    let src = pkg
-        + &std::fs::read_to_string("examples/k2g_types.ddl").expect("types")
-        + &std::fs::read_to_string("examples/k2g_alu.ddl").expect("alu")
-        + &std::fs::read_to_string("examples/k2g_shift.ddl").expect("shift")
+    let k2g = std::path::PathBuf::from("../KAMASUTRA2G/rtl");
+    // The generated package lives in the consumer's tree; skip when it is not
+    // beside us rather than fail spuriously.
+    if !k2g.join("k2g_pkg.ddl").is_file() {
+        return;
+    }
+    // The imports in k2g_alu.ddl and k2g_shift.ddl pull in the types and the
+    // package, so naming those two files is the whole dependency list.
+    let (imported, load_diags) = crate::source::load_program(
+        &["examples/k2g_alu.ddl".into(), "examples/k2g_shift.ddl".into()],
+        vec![k2g],
+    )
+    .expect("the examples are readable");
+    assert!(load_diags.is_empty(), "{}", imported.render_all(&load_diags));
+
+    let src = imported.text().to_string()
         + concat!(
             "\nfun both (a: i32, b: i32, t: rdt_e, n: i5, ra: out i32, rs: out i32)\n",
             "  let (arith, ovf, log_r, cmp_r, un) = k2g_alu(a, b, t, t, ARITH_ADD, LOGIC_AND, CMP_EQ, UNARY_NEG)\n",

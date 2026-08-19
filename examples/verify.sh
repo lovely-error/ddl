@@ -18,6 +18,10 @@ set -uo pipefail
 
 DDL_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 K2G="${K2G:-/e/Code/KAMASUTRA2G}"
+# Used for the compiler's `-I`, and so it lands in the generated file's
+# "Regenerate with:" banner. Relative on purpose: a banner naming
+# /e/Code/... is a command only this machine can run.
+K2G_INC="${K2G_INC:-../KAMASUTRA2G/rtl}"
 QUESTA="${QUESTA:-/e/Quartus/questa_fse/win64}"
 GW_SH="${GW_SH:-/c/Gowin/Gowin_V1.9.12.02_SP2_x64/IDE/bin/gw_sh.exe}"
 WORK="${WORK:-$DDL_ROOT/target/verify}"
@@ -44,29 +48,19 @@ rm -rf "$WORK"
 for m in "${MODULES[@]}"; do
   echo
   echo "== $m =="
-  src="$DDL_ROOT/examples/$m.ddl"
+  src="examples/$m.ddl"
   gen="$DDL_ROOT/examples/$m.v"
   tb="$DDL_ROOT/examples/tb_${m}_equiv.sv"
 
-  # DDL has no import mechanism yet, so a module needing the shared types is
-  # compiled from a concatenation. k2g_pkg.ddl is generated from the emulator
-  # by emu/src/ddl_gen.rs -- the same source as k2g_pkg.sv.
-  case "$m" in
-    k2g_alu | k2g_decode | k2g_shift | k2g_xstage)
-      mkdir -p "$WORK/$m"
-      src="$WORK/$m/src.ddl"
-      helpers=""
-      if [ "$m" = "k2g_xstage" ]; then
-        # The slice CALLS the verified ALU and shifter rather than repeating
-        # them, so they are part of its source.
-        helpers="$DDL_ROOT/examples/k2g_alu.ddl $DDL_ROOT/examples/k2g_shift.ddl"
-      fi
-      cat "$K2G/rtl/k2g_pkg.ddl" "$DDL_ROOT/examples/k2g_types.ddl" $helpers "$DDL_ROOT/examples/$m.ddl" > "$src"
-      ;;
-  esac
-
-  [ -f "$src" ] || { fail "no $src"; continue; }
-  "$DDL_BIN" build "$src" -o "$gen" || { fail "ddl build"; continue; }
+  # Each module names its own dependencies with `import`, so the whole build
+  # is the one file. k2g_pkg.ddl is generated from the emulator by
+  # emu/src/ddl_gen.rs -- the same source as k2g_pkg.sv -- and lives in the
+  # consumer's tree, which is what -I is for.
+  #
+  # Run from DDL_ROOT with relative paths: the command ends up verbatim in the
+  # generated file's banner, and it has to be one anybody can run.
+  [ -f "$DDL_ROOT/$src" ] || { fail "no $src"; continue; }
+  ( cd "$DDL_ROOT" && "$DDL_BIN" build "$src" -I "$K2G_INC" -o "examples/$m.v" )       || { fail "ddl build"; continue; }
   note "generated $(basename "$gen")"
 
   # A module with a *_ref.sv beside it is checked against that hand-written

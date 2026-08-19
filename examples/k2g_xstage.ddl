@@ -34,6 +34,11 @@
 -- What X computed, which becomes the register file's write port at the next
 -- edge. k2g_core.sv:1111 -- "X computes a writeback packet; W is what actually
 -- drives the register file's write port. That is the split."
+import "k2g_types.ddl"
+-- The slice CALLS the verified ALU and shifter rather than repeating them.
+import "k2g_alu.ddl"
+import "k2g_shift.ddl"
+
 struct wb_t
   we_value: i1
   we_tag: i1

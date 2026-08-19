@@ -1,6 +1,6 @@
 use crate::lex::{
     AlphanumSpan, AssignStmtKind, BasicInfixOp, BindingPattern, InfixExprComponent, InnerStmt,
-    PostfixOp, RawArgDefTuple as RawArgTuple, RawExpr, RawProcessDecl, RawTypeExpr, StrLiteral, ArgTypeQualifier, RawFunctionDecl, RawSequenceDecl, RawSeqInnerStmt, RawStructDecl, RawEnumDecl, RawNum, UnaryOp
+    PostfixOp, RawArgDefTuple as RawArgTuple, RawExpr, RawProcessDecl, RawTypeExpr, StrLiteral, ArgTypeQualifier, RawFunctionDecl, RawSequenceDecl, RawSeqInnerStmt, RawStructDecl, RawEnumDecl, RawNum, UnaryOp, RawGraphDecl, RawGraphStmt
 };
 
 
@@ -20,6 +20,34 @@ pub struct PrecArgTupleEntry {
     pub type_expr: PrecTypeExpr,
     pub default: Option<PrecResExpr>,
 }
+/// `graph Name (ports)`, after type resolution.
+#[derive(Debug, Clone)]
+pub struct GraphDecl {
+    pub name: AlphanumSpan,
+    pub args: PrecArgDefTuple,
+    pub body: Vec<GraphStmt>,
+}
+
+#[derive(Debug, Clone)]
+pub enum GraphStmt {
+    Pipe(GraphPipe),
+    Instance(GraphInstance),
+}
+
+#[derive(Debug, Clone)]
+pub struct GraphPipe {
+    pub name: AlphanumSpan,
+    /// `None` when neither `buffer` nor `stream` was written; lowering says so.
+    pub is_stream: Option<bool>,
+    pub ty: PrecTypeExpr,
+}
+
+#[derive(Debug, Clone)]
+pub struct GraphInstance {
+    pub module: AlphanumSpan,
+    pub args: Vec<AlphanumSpan>,
+}
+
 #[derive(Debug, Clone)]
 pub struct PrecArgDefTuple {
     pub entries: Vec<PrecArgTupleEntry>,
@@ -875,6 +903,31 @@ pub unsafe fn resolve_precedence_for_sequence(
         args: args,
         body: items,
     });
+}
+
+/// A graph body holds no expressions, so this only turns raw type
+/// expressions into resolved ones.
+pub unsafe fn resolve_precedence_for_graph(
+    char_ptr: *const u8,
+    graph_decl: &RawGraphDecl,
+) -> Result<GraphDecl, ()> {
+    let mut body = Vec::new();
+    for item in &graph_decl.body {
+        let item = match item {
+            RawGraphStmt::Pipe(pipe) => GraphStmt::Pipe(GraphPipe {
+                name: pipe.name,
+                is_stream: pipe.is_stream,
+                ty: resolve_type(char_ptr, &pipe.type_expr)?,
+            }),
+            RawGraphStmt::Instance(inst) => GraphStmt::Instance(GraphInstance {
+                module: inst.module,
+                args: inst.args.clone(),
+            }),
+        };
+        body.push(item);
+    }
+    let args = resolve_arg_tuple(char_ptr, &graph_decl.args)?;
+    Ok(GraphDecl { name: graph_decl.name, args, body })
 }
 
 pub unsafe fn resolve_precedence_for_struct(

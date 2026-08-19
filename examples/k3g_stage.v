@@ -1,6 +1,6 @@
 // GENERATED FILE -- DO NOT EDIT BY HAND
 //
-// Regenerate with: ddl build E:/Code/ddl/examples/k3g_stage.ddl -o E:/Code/ddl/examples/k3g_stage.v
+// Regenerate with: ddl build examples/k3g_stage.ddl -o examples/k3g_stage.v
 //
 // Verilog-2005. No `$clog2`, no width casts in expressions and no
 // function calls: all three make GowinSynthesis exit with an empty log.

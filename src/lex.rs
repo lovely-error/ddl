@@ -13,7 +13,6 @@ mod Letters {
     pub const ZERO: u8 = 48;
     pub const NINE: u8 = 57;
     pub const AT_SIGN: u8 = '@' as u8;
-    pub const TILDA: u8 = '~' as u8;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -360,6 +359,51 @@ pub enum TopLevelDecl {
     SequenceDecl(RawSequenceDecl),
     StructDecl(RawStructDecl),
     EnumDecl(RawEnumDecl),
+    GraphDecl(RawGraphDecl),
+}
+
+/// `graph Name (ports)` -- structural composition and nothing else.
+///
+/// A graph body holds no expressions, because a graph computes nothing. It
+/// declares internal pipes and instantiates processes and sequences on them,
+/// which is why it has its own tiny statement parser rather than reusing the
+/// one that knows about arithmetic.
+#[derive(Debug)]
+pub struct RawGraphDecl {
+    pub name: AlphanumSpan,
+    pub args: RawArgDefTuple,
+    pub body: Vec<RawGraphStmt>,
+}
+
+#[derive(Debug)]
+pub enum RawGraphStmt {
+    /// `let name: buffer T`
+    Pipe(RawGraphPipe),
+    /// `Name(a, b, c)`
+    Instance(RawGraphInstance),
+}
+
+#[derive(Debug)]
+pub struct RawGraphPipe {
+    pub name: AlphanumSpan,
+    /// `stream` rather than `buffer`; the two differ in whether the producer
+    /// stalls, and a pipe's two ends have to agree.
+    ///
+    /// `None` when neither word was written. Parsed rather than rejected so
+    /// that lowering can say which word is missing and point at the line --
+    /// the parser has no diagnostics, and failing here blames the whole
+    /// `graph` declaration for a typo on one line of it.
+    pub is_stream: Option<bool>,
+    pub type_expr: RawTypeExpr,
+}
+
+#[derive(Debug)]
+pub struct RawGraphInstance {
+    /// The `process` or `sequence` being instantiated.
+    pub module: AlphanumSpan,
+    /// One name per pipe parameter, in declaration order. Each names either a
+    /// port of the enclosing graph or a pipe declared in it.
+    pub args: Vec<AlphanumSpan>,
 }
 
 fn deref<T>(ptr: *const T) -> T where T:Copy {
@@ -2214,6 +2258,160 @@ pub unsafe fn try_parse_sequence_decl(
     return Ok((res, char_ptr));
 }
 
+/// `graph Name (ports)` and its body.
+///
+/// Shaped like `try_parse_sequence_decl`: header, then statements indented
+/// past the header's own column.
+pub unsafe fn try_parse_graph_decl(
+    mut char_ptr: *const u8,
+    char_end_ptr: *const u8,
+    anchor_depth: u32,
+) -> Result<(RawGraphDecl, *const u8), ()> {
+    let (matched, tail) = strip_prefix_on_match(char_ptr, char_end_ptr, "graph ");
+    if !matched {
+        return Err(());
+    }
+    char_ptr = tail;
+    let (_, tail) = skip_whitespaces(char_ptr, char_end_ptr);
+    char_ptr = tail;
+    let (graph_name, tail) = try_parse_alphanum(char_ptr, char_end_ptr)?;
+    char_ptr = tail;
+    let (_, tail) = skip_whitespaces(char_ptr, char_end_ptr);
+    char_ptr = tail;
+    let (args, tail) = parse_arg_tuple(char_ptr, char_end_ptr)?;
+    char_ptr = tail;
+
+    let (body_depth, _) = skip_trivia(char_ptr, char_end_ptr);
+    if anchor_depth >= body_depth {
+        return Err(());
+    }
+
+    let mut body = Vec::new();
+    loop {
+        let (stmt_depth, tail) = skip_trivia(char_ptr, char_end_ptr);
+        if stmt_depth != body_depth {
+            break;
+        }
+        char_ptr = tail;
+        let (stmt, tail) = try_parse_graph_stmt(char_ptr, char_end_ptr)?;
+        body.push(stmt);
+        char_ptr = tail;
+    }
+
+    Ok((RawGraphDecl { name: graph_name, args, body }, char_ptr))
+}
+
+/// One line of a graph body: a pipe declaration or an instantiation.
+unsafe fn try_parse_graph_stmt(
+    char_ptr: *const u8,
+    char_end_ptr: *const u8,
+) -> Result<(RawGraphStmt, *const u8), ()> {
+    if let Ok((pipe, tail)) = try_parse_graph_pipe(char_ptr, char_end_ptr) {
+        return Ok((RawGraphStmt::Pipe(pipe), tail));
+    }
+    let (inst, tail) = try_parse_graph_instance(char_ptr, char_end_ptr)?;
+    Ok((RawGraphStmt::Instance(inst), tail))
+}
+
+/// `let name: buffer T` or `let name: stream T`.
+///
+/// No direction: an internal pipe has both ends inside the graph, and which
+/// end is which is decided by the instances wired to it.
+///
+/// `let` rather than a keyword of its own. A graph body holds two kinds of
+/// line and they are already distinguishable -- one ends in a type and the
+/// other in an argument list -- so a third word would say nothing the parser
+/// or the reader did not already have.
+unsafe fn try_parse_graph_pipe(
+    mut char_ptr: *const u8,
+    char_end_ptr: *const u8,
+) -> Result<(RawGraphPipe, *const u8), ()> {
+    let (matched, tail) = strip_prefix_on_match(char_ptr, char_end_ptr, "let ");
+    if !matched {
+        return Err(());
+    }
+    char_ptr = tail;
+    let (_, tail) = skip_whitespaces(char_ptr, char_end_ptr);
+    char_ptr = tail;
+    let (name, tail) = try_parse_alphanum(char_ptr, char_end_ptr)?;
+    char_ptr = tail;
+    let (_, tail) = skip_whitespaces(char_ptr, char_end_ptr);
+    char_ptr = tail;
+    let (matched, tail) = strip_prefix_on_match(char_ptr, char_end_ptr, ":");
+    if !matched {
+        return Err(());
+    }
+    char_ptr = tail;
+    let (_, tail) = skip_whitespaces(char_ptr, char_end_ptr);
+    char_ptr = tail;
+
+    let (stream, tail) = strip_prefix_on_match(char_ptr, char_end_ptr, "stream ");
+    char_ptr = tail;
+    let is_stream = if stream {
+        Some(true)
+    } else {
+        let (is_buffer, tail) = strip_prefix_on_match(char_ptr, char_end_ptr, "buffer ");
+        if is_buffer {
+            char_ptr = tail;
+            Some(false)
+        } else {
+            None
+        }
+    };
+    let (_, tail) = skip_whitespaces(char_ptr, char_end_ptr);
+    char_ptr = tail;
+    let (type_expr, tail) = try_parse_type_expr(char_ptr, char_end_ptr)?;
+    char_ptr = tail;
+
+    Ok((RawGraphPipe { name, is_stream, type_expr }, char_ptr))
+}
+
+/// `Name(a, b, c)`.
+unsafe fn try_parse_graph_instance(
+    mut char_ptr: *const u8,
+    char_end_ptr: *const u8,
+) -> Result<(RawGraphInstance, *const u8), ()> {
+    let (module, tail) = try_parse_alphanum(char_ptr, char_end_ptr)?;
+    char_ptr = tail;
+    let (_, tail) = skip_whitespaces(char_ptr, char_end_ptr);
+    char_ptr = tail;
+    let (matched, tail) = strip_prefix_on_match(char_ptr, char_end_ptr, "(");
+    if !matched {
+        return Err(());
+    }
+    char_ptr = tail;
+
+    let mut args = Vec::new();
+    // `Name()` is accepted here and rejected in lowering, where the arity it
+    // should have had is known.
+    let (_, tail) = skip_trivia(char_ptr, char_end_ptr);
+    let (empty, tail) = strip_prefix_on_match(tail, char_end_ptr, ")");
+    if empty {
+        return Ok((RawGraphInstance { module, args }, tail));
+    }
+    loop {
+        let (_, tail) = skip_trivia(char_ptr, char_end_ptr);
+        char_ptr = tail;
+        let (arg, tail) = try_parse_alphanum(char_ptr, char_end_ptr)?;
+        args.push(arg);
+        char_ptr = tail;
+        let (_, tail) = skip_whitespaces(char_ptr, char_end_ptr);
+        char_ptr = tail;
+        let (is_comma, tail) = strip_prefix_on_match(char_ptr, char_end_ptr, ",");
+        if is_comma {
+            char_ptr = tail;
+            continue;
+        }
+        let (is_rparen, tail) = strip_prefix_on_match(char_ptr, char_end_ptr, ")");
+        if is_rparen {
+            char_ptr = tail;
+            break;
+        }
+        return Err(());
+    }
+    Ok((RawGraphInstance { module, args }, char_ptr))
+}
+
 pub unsafe fn try_parse_process_decl(
     mut char_ptr: *const u8,
     char_end_ptr: *const u8,
@@ -2383,6 +2581,12 @@ pub unsafe fn parse_top_level(
         if let Ok((enum_decl, tail)) = try_parse_enum_decl(tail, end, depth) {
             char_ptr = tail;
             items.push(TopLevelDecl::EnumDecl(enum_decl));
+            continue;
+        }
+
+        if let Ok((graph_decl, tail)) = try_parse_graph_decl(tail, end, depth) {
+            char_ptr = tail;
+            items.push(TopLevelDecl::GraphDecl(graph_decl));
             continue;
         }
 

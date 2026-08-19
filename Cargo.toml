@@ -3,4 +3,12 @@ name = "ddl"
 version = "0.1.0"
 edition = "2024"
 
+[lib]
+name = "ddl"
+path = "src/lib.rs"
+
+[[bin]]
+name = "ddl"
+path = "src/main.rs"
+
 [dependencies]

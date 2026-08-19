@@ -8,6 +8,8 @@
 -- until then the encoding is written out, and an SV `shift_e` signal connects
 -- to a `[1:0]` port without a cast.
 
+import "k2g_types.ddl"
+
 fun k2g_shift (
     value: i32,          -- shift operand, and the BINS destination
     src: i32,            -- BEXT source, and the BINS insert source

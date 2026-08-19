@@ -9,6 +9,8 @@
 -- declaration rather than the narrowest tag that would hold the variants. A
 -- struct field's width is part of the layout, not an implementation detail.
 
+import "k2g_pkg.ddl"   -- generated from the emulator; -I $K2G/rtl to find it
+
 enum fault_e: i5
   FAULT_NONE                  = 5'h00
   FAULT_ILLEGAL_OPCODE        = 5'h01

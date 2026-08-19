@@ -3,7 +3,6 @@
 // Both live here rather than in ir.rs only to keep that file readable; they
 // are part of the same lowering pass and share its `Lowerer` and `Env`.
 
-use std::collections::HashMap;
 
 use crate::diag::{Diag, DiagSink};
 use crate::lex::{AlphanumSpan, BindingPattern};
@@ -414,6 +413,44 @@ pub fn inline_call(
 /// producing several values has nowhere to sit inside a larger expression --
 /// which is also why the two verified helpers this exists for, `k2g_alu` with
 /// five outputs and `k2g_shift` with three, were unreachable until now.
+/// `f(a, b)` as a statement, for a function whose only results are `inout`.
+///
+/// There is nothing to bind -- the results went back into the arguments -- so
+/// this is a call made for its effect on them.
+pub fn inline_call_effect(
+    low: &mut Lowerer,
+    callee: &AlphanumSpan,
+    args: &[PrecResExpr],
+    env: &mut Env,
+    sink: &mut DiagSink,
+) -> Option<()> {
+    let name = anumspan_to_str(callee).to_string();
+    let sig = signature_of(low, callee, sink)?;
+    let has_plain_outputs = sig.outputs().any(|(_, d, _)| *d == crate::symbols::ParamDir::Out);
+    if has_plain_outputs {
+        sink.push(
+            Diag::error(
+                low.span_of(callee),
+                format!("`{}` has `out` parameters, so its results need binding", name),
+            )
+            .with_note("write `let (a, b) = f(..)`, or make the parameters `inout`"),
+        );
+        return None;
+    }
+    if sig.inouts().next().is_none() {
+        sink.push(
+            Diag::error(
+                low.span_of(callee),
+                format!("`{}` produces nothing, so calling it does nothing", name),
+            )
+            .with_note("give it an `out` parameter to return a value, or an `inout` one to update its argument"),
+        );
+        return None;
+    }
+    let callee_env = inline_body(low, callee, args, &sig, env, sink)?;
+    write_back_inouts(low, callee, args, &sig, &callee_env, env, sink)
+}
+
 pub fn inline_call_multi(
     low: &mut Lowerer,
     callee: &AlphanumSpan,
@@ -436,6 +473,12 @@ pub fn inline_call_multi(
         );
         return None;
     }
+    let bound_outputs: Vec<_> = outputs
+        .iter()
+        .filter(|(_, d, _)| *d == crate::symbols::ParamDir::Out)
+        .cloned()
+        .collect();
+    let outputs = bound_outputs;
     let names_match_outputs = results.len() == outputs.len();
     if !names_match_outputs {
         let out_names: Vec<&str> = outputs.iter().map(|(n, _, _)| n.as_str()).collect();
@@ -471,7 +514,7 @@ pub fn inline_call_multi(
         low.name_value_safe(v, bound.clone());
         env.insert(bound, Binding::constant(v, out_ty.clone()));
     }
-    Some(())
+    write_back_inouts(low, callee, args, &sig, &callee_env, env, sink)
 }
 
 fn signature_of(
@@ -494,6 +537,80 @@ fn signature_of(
 ///
 /// The caller decides what to do with the outputs; everything before that is
 /// the same whether one value is wanted or five.
+/// Copies each `inout` result back into the caller's variable.
+///
+/// This is what "by reference" means here: the call is inlined, so there is no
+/// pointer to write through -- the caller's binding is simply replaced with
+/// what the callee left. The argument therefore has to be a name; an
+/// expression has nowhere for the answer to go, and saying so beats silently
+/// discarding it.
+fn write_back_inouts(
+    low: &mut Lowerer,
+    callee: &AlphanumSpan,
+    args: &[PrecResExpr],
+    sig: &crate::symbols::FuncSig,
+    callee_env: &Env,
+    env: &mut Env,
+    sink: &mut DiagSink,
+) -> Option<()> {
+    let name = anumspan_to_str(callee).to_string();
+    for (ix, (param_name, dir, _)) in sig.inputs().enumerate() {
+        if *dir != crate::symbols::ParamDir::InOut {
+            continue;
+        }
+        let target = match args.get(ix) {
+            Some(PrecResExpr::Ref(n)) => *n,
+            _ => {
+                sink.push(
+                    Diag::error(
+                        low.span_of(callee),
+                        format!(
+                            "argument {} of `{}` is `inout`, so it has to be a variable",
+                            ix + 1,
+                            name
+                        ),
+                    )
+                    .with_note(format!(
+                        "`{}` is written back to whatever is passed for it",
+                        param_name
+                    )),
+                );
+                return None;
+            }
+        };
+        let target_name = anumspan_to_str(&target).to_string();
+        let produced = match callee_env.get(param_name).and_then(|b| b.value) {
+            Some(v) => v,
+            None => {
+                sink.err_at(callee, format!("`{}` never assigns `{}`", name, param_name));
+                return None;
+            }
+        };
+        let binding = match env.get(&target_name) {
+            Some(b) => b.clone(),
+            None => {
+                sink.err_at(&target, format!("`{}` is not declared", target_name));
+                return None;
+            }
+        };
+        if !(binding.is_mutable || binding.is_output) {
+            sink.push(
+                Diag::error(
+                    low.span_of(&target),
+                    format!("`{}` is a `let` binding and cannot be assigned", target_name),
+                )
+                .with_note("an `inout` argument is written to; declare it `var`"),
+            );
+            return None;
+        }
+        env.insert(
+            target_name,
+            Binding { value: Some(produced), ty: binding.ty, ..binding },
+        );
+    }
+    Some(())
+}
+
 fn inline_body(
     low: &mut Lowerer,
     callee: &AlphanumSpan,
@@ -569,7 +686,15 @@ fn inline_body(
         }
         callee_env.insert(param_name.clone(), Binding::constant(value, param_ty.clone()));
     }
-    for (out_name, _, out_ty) in &outputs {
+    // An `inout` was just bound from its argument, which is what makes it
+    // readable; the loop below must not overwrite that with `None`.
+    for (out_name, dir, out_ty) in &outputs {
+        if *dir == crate::symbols::ParamDir::InOut {
+            if let Some(b) = callee_env.get_mut(out_name) {
+                b.is_output = true;
+            }
+            continue;
+        }
         callee_env.insert(
             out_name.clone(),
             Binding { value: None, ty: out_ty.clone(), is_output: true, is_mutable: false },

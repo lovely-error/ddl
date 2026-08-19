@@ -1,49 +1,34 @@
-#![feature(decl_macro)]
-#![feature(str_from_raw_parts)]
-#![feature(iter_from_coroutine)]
-#![feature(coroutines)]
-
-mod diag;
-mod driver;
-
-#[allow(unsafe_op_in_unsafe_fn)]
-mod lex;
-#[allow(unsafe_op_in_unsafe_fn)]
-mod parse;
-
-mod sema;
-
-mod lin;
-
-mod symbols;
-mod ty;
-mod ir;
-mod ir_fsm;
-mod ir_match;
-mod ir_pipe;
-mod verilog;
-
-#[cfg(test)]
-mod tests_m2;
+// The `ddl` command line: argument parsing, file IO, and exit codes.
+//
+// The compiler itself is in the library; this file is what turns its result
+// into something a shell can read.
 
 use std::process::ExitCode;
 
-use diag::SourceMap;
-use driver::Emit;
-use verilog::EmitOptions;
+use std::path::PathBuf;
+
+use ddl::diag::{Diag, SourceMap};
+use ddl::driver::{self, Emit};
+use ddl::source;
+use ddl::verilog::EmitOptions;
 
 const USAGE: &str = "\
 ddl -- a dataflow description language
 
 USAGE:
-    ddl build <input.ddl> [-o <output.v>]
-    ddl check <input.ddl>
+    ddl build <input.ddl>... [-o <output.v>]
+    ddl check <input.ddl>...
 
     build   compile to Verilog-2005; writes to stdout without -o
     check   parse and type-check only, emitting nothing
 
+Several inputs compile as one program, as does one input that names others
+with `import \"path.ddl\"`. There are no namespaces: every declaration is
+visible to every other, whichever file it is in.
+
 OPTIONS:
     -o <path>       write the output here
+    -I <dir>        also look here when resolving an import
     --check         with `build`, verify that <output.v> is up to date and exit
                     1 if it is not, without writing. Mirrors
                     `gen_defs --check`.
@@ -76,14 +61,16 @@ fn main() -> ExitCode {
 }
 
 struct BuildArgs {
-    input: String,
+    inputs: Vec<String>,
+    include: Vec<PathBuf>,
     output: Option<String>,
     check_only: bool,
     emit: Emit,
 }
 
 fn parse_build_args(args: &[String]) -> Result<BuildArgs, String> {
-    let mut input = None;
+    let mut inputs = Vec::new();
+    let mut include = Vec::new();
     let mut output = None;
     let mut check_only = false;
     let mut emit = Emit::Verilog;
@@ -95,6 +82,13 @@ fn parse_build_args(args: &[String]) -> Result<BuildArgs, String> {
                 match args.get(ix) {
                     Some(p) => output = Some(p.clone()),
                     None => return Err("-o needs a path".to_string()),
+                }
+            }
+            "-I" => {
+                ix += 1;
+                match args.get(ix) {
+                    Some(p) => include.push(PathBuf::from(p)),
+                    None => return Err("-I needs a directory".to_string()),
                 }
             }
             "--check" => check_only = true,
@@ -114,26 +108,23 @@ fn parse_build_args(args: &[String]) -> Result<BuildArgs, String> {
             other if other.starts_with('-') => {
                 return Err(format!("unknown option `{}`", other));
             }
-            other => {
-                if input.is_some() {
-                    return Err("more than one input file given".to_string());
-                }
-                input = Some(other.to_string());
-            }
+            other => inputs.push(other.to_string()),
         }
         ix += 1;
     }
-    match input {
-        Some(input) => Ok(BuildArgs { input, output, check_only, emit }),
-        None => Err("no input file given".to_string()),
+    if inputs.is_empty() {
+        return Err("no input file given".to_string());
     }
+    Ok(BuildArgs { inputs, include, output, check_only, emit })
 }
 
-fn load(path: &str) -> Result<SourceMap, String> {
-    match std::fs::read_to_string(path) {
-        Ok(text) => Ok(SourceMap::new(path, text)),
-        Err(e) => Err(format!("cannot read `{}`: {}", path, e)),
-    }
+/// Loads the inputs and everything they import.
+///
+/// Unresolved imports come back as diagnostics rather than as an `Err`,
+/// because they have a location worth rendering; only a root that cannot be
+/// read at all fails before there is a `SourceMap` to render against.
+fn load(inputs: &[String], include: &[PathBuf]) -> Result<(SourceMap, Vec<Diag>), String> {
+    source::load_program(inputs, include.to_vec())
 }
 
 fn run_build(args: &[String]) -> ExitCode {
@@ -144,20 +135,19 @@ fn run_build(args: &[String]) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let map = match load(&args.input) {
+    let (map, load_diags) = match load(&args.inputs, &args.include) {
         Ok(m) => m,
         Err(e) => {
             eprintln!("error: {}", e);
             return ExitCode::FAILURE;
         }
     };
+    if !load_diags.is_empty() {
+        driver::report(&map, &load_diags);
+        return ExitCode::FAILURE;
+    }
 
-    let opts = EmitOptions {
-        regenerate_cmd: match &args.output {
-            Some(out) => format!("ddl build {} -o {}", args.input, out),
-            None => format!("ddl build {}", args.input),
-        },
-    };
+    let opts = EmitOptions { regenerate_cmd: regenerate_cmd(&args) };
 
     // `--check` compares against a checked-in generated file, and only the
     // Verilog is ever checked in. Failing here beats silently comparing an IR
@@ -216,21 +206,45 @@ fn run_build(args: &[String]) -> ExitCode {
     }
 }
 
+/// The command that reproduces this build, for the banner in the generated
+/// file. It has to be runnable as printed, so every input and every `-I` is in
+/// it -- a banner naming one of three inputs is worse than no banner.
+fn regenerate_cmd(args: &BuildArgs) -> String {
+    let mut cmd = String::from("ddl build");
+    for input in &args.inputs {
+        cmd.push(' ');
+        cmd.push_str(input);
+    }
+    for dir in &args.include {
+        cmd.push_str(" -I ");
+        cmd.push_str(&dir.display().to_string());
+    }
+    if let Some(out) = &args.output {
+        cmd.push_str(" -o ");
+        cmd.push_str(out);
+    }
+    cmd
+}
+
 fn run_check(args: &[String]) -> ExitCode {
-    let path = match args.first() {
-        Some(p) => p,
-        None => {
-            eprintln!("error: no input file given");
+    let args = match parse_build_args(args) {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("error: {}", e);
             return ExitCode::FAILURE;
         }
     };
-    let map = match load(path) {
+    let (map, load_diags) = match load(&args.inputs, &args.include) {
         Ok(m) => m,
         Err(e) => {
             eprintln!("error: {}", e);
             return ExitCode::FAILURE;
         }
     };
+    if !load_diags.is_empty() {
+        driver::report(&map, &load_diags);
+        return ExitCode::FAILURE;
+    }
     match driver::compile_to_verilog(&map, &EmitOptions::default()) {
         Ok(_) => ExitCode::SUCCESS,
         Err(diags) => {

@@ -17,6 +17,8 @@
 -- line has no counterpart here -- that is what the shadow variable was for.
 
 -- Accumulated prefix state. Field order matches pfx_t in k2g_decode.sv.
+import "k2g_types.ddl"
+
 struct pfx_t
   xi_valid: i1
   xi_zext: i1              -- XIZEXT rather than XI (spec 4.1)
