@@ -47,7 +47,7 @@ pub fn lower_match(
     let scrutinee = crate::ir::lower_expr(low, &stmt.scrutinees[0], env, sink)?;
     let scrutinee_ty = low.ty_of(scrutinee);
 
-    let (enum_name, tag_width) = match &scrutinee_ty {
+    let (enum_name, total_width) = match &scrutinee_ty {
         Ty::Enum { name, width } => (name.clone(), *width),
         other => {
             sink.push(
@@ -61,6 +61,25 @@ pub fn lower_match(
         }
     };
     let variants = low.enum_variants(&enum_name)?;
+    let (tag_width, payload_width) = match low.syms.enums.get(&enum_name) {
+        Some(def) => (def.tag_width, def.payload_width),
+        None => (total_width, 0),
+    };
+
+    // A tagged union is matched on its TAG, not on the whole value: the
+    // payload is different from one item to the next and comparing it would
+    // mean no arm ever fired. The tag sits in the high bits, so this is a
+    // slice, and for an enum with no payloads it is the value itself.
+    let tag = if payload_width > 0 {
+        let t = low.emit(
+            Ty::UInt(tag_width),
+            Op::Slice { arg: scrutinee, hi: total_width - 1, lo: payload_width },
+        );
+        low.name_value_safe(t, format!("{}_tag", enum_name));
+        t
+    } else {
+        scrutinee
+    };
 
     // Each arm becomes (selector, environment-after-the-arm). A `None`
     // selector is a catch-all and ends the chain.
@@ -140,14 +159,15 @@ pub fn lower_match(
 
         let mut catch_all_binding: Option<AlphanumSpan> = None;
         let mut named: Vec<AlphanumSpan> = Vec::new();
+        // `Read(a) =>` -- the variant, and the name its payload takes.
+        let mut payload_bind: Option<(AlphanumSpan, AlphanumSpan)> = None;
         for alt in &alternatives {
             match alt {
                 BindingPattern::EnumCase { base, subbinding } => {
-                    if subbinding.is_some() {
-                        sink.err_at(base, "enum variants carry no payload to bind");
-                        return None;
-                    }
                     named.push(*base);
+                    if let Some(bind) = subbinding {
+                        payload_bind = Some((*base, *bind));
+                    }
                 }
                 BindingPattern::Alphanum(name) => catch_all_binding = Some(*name),
                 // The parser never nests one inside another.
@@ -222,6 +242,55 @@ pub fn lower_match(
             labels
         };
 
+        // The payload, if the arm asked for it. It is the low bits of the
+        // scrutinee -- the whole point of a fixed layout is that the arm knows
+        // where to look once the tag has told it what is there.
+        if let Some((variant_span, bind_span)) = payload_bind {
+            if named.len() != 1 {
+                sink.err_at(
+                    &bind_span,
+                    "an alternative with several variants cannot bind a payload",
+                );
+                return None;
+            }
+            let variant = anumspan_to_str(&variant_span).to_string();
+            let payload_ty = low
+                .syms
+                .enums
+                .get(&enum_name)
+                .and_then(|d| d.payload_of(&variant))
+                .cloned();
+            let payload_ty = match payload_ty {
+                Some(t) => t,
+                None => {
+                    sink.push(
+                        Diag::error(
+                            low.span_of(&variant_span),
+                            format!("`{}` carries no payload to bind", variant),
+                        )
+                        .with_note(format!("match it as `{} =>`", variant)),
+                    );
+                    return None;
+                }
+            };
+            let bits = payload_ty.bit_width();
+            let raw = low.emit(
+                Ty::UInt(bits),
+                Op::Slice { arg: scrutinee, hi: bits - 1, lo: 0 },
+            );
+            // The slice is a bag of bits; give it back the payload's own type
+            // so a struct payload keeps its fields and a signed one stays
+            // signed. Same reason a struct field is retyped after its slice.
+            let value = if low.ty_of(raw) == payload_ty {
+                raw
+            } else {
+                low.emit(payload_ty.clone(), Op::Cast { arg: raw })
+            };
+            let bound = anumspan_to_str(&bind_span).to_string();
+            low.name_value_safe(value, bound.clone());
+            arm_env.insert(bound, Binding::constant(value, payload_ty));
+        }
+
         // An arm runs when the scrutinee carries one of its labels. The
         // catch-all arm runs when no EARLIER arm claimed the value, which is
         // what the `case` default does, so its guard is the negation of every
@@ -229,9 +298,9 @@ pub fn lower_match(
         let depth = if labels.is_empty() {
             let claimed: Vec<u128> =
                 arms.iter().flat_map(|a: &Arm| a.labels.iter().copied()).collect();
-            low.push_labels(scrutinee, claimed, false)
+            low.push_labels(tag, claimed, false)
         } else {
-            low.push_labels(scrutinee, labels.clone(), true)
+            low.push_labels(tag, labels.clone(), true)
         };
         lower_branch(low, &case.rhs, &mut arm_env, sink)?;
         low.pop_path(depth);
@@ -346,7 +415,7 @@ pub fn lower_match(
         let ty = low.ty_of(fallback);
         let joined = low.emit(
             ty,
-            Op::Case { scrutinee, arms: case_arms, default: fallback },
+            Op::Case { scrutinee: tag, arms: case_arms, default: fallback },
         );
         if let Some(b) = env.get_mut(&name) {
             b.value = Some(joined);

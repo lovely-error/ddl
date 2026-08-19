@@ -2117,16 +2117,30 @@ unsafe fn try_parse_enum_field(
     let (_, tail) = skip_whitespaces(char_ptr, char_end_ptr);
     char_ptr = tail;
 
-    let (has_payload, tail) = strip_prefix_on_match(char_ptr, char_end_ptr, ":");
-    if has_payload {
+    // `Read(addr_t)` -- parenthesised, because that is how the value is built
+    // (`Read(a)`) and how the pattern reads (`Read(a) =>`). A colon here would
+    // be a third spelling of one idea, and would look like the tag width in
+    // the line above it.
+    let (has_payload, tail) = strip_prefix_on_match(char_ptr, char_end_ptr, "(");
+    let payload = if has_payload {
         char_ptr = tail;
         let (_, tail) = skip_whitespaces(char_ptr, char_end_ptr);
         char_ptr = tail;
         let (ty, tail) = try_parse_type_expr(char_ptr, char_end_ptr)?;
         char_ptr = tail;
-        let f = RawEnumField { name: field_name, discriminant: None, payload: Some(ty) };
-        return Ok((f, char_ptr));
-    }
+        let (_, tail) = skip_whitespaces(char_ptr, char_end_ptr);
+        char_ptr = tail;
+        let (closed, tail) = strip_prefix_on_match(char_ptr, char_end_ptr, ")");
+        if !closed {
+            return Err(());
+        }
+        char_ptr = tail;
+        let (_, tail) = skip_whitespaces(char_ptr, char_end_ptr);
+        char_ptr = tail;
+        Some(ty)
+    } else {
+        None
+    };
 
     // `==` is a comparison, not a discriminant, so it must not match here.
     let (is_eq_eq, _) = strip_prefix_on_match(char_ptr, char_end_ptr, "==");
@@ -2142,7 +2156,7 @@ unsafe fn try_parse_enum_field(
         None
     };
 
-    let f = RawEnumField { name: field_name, discriminant, payload: None };
+    let f = RawEnumField { name: field_name, discriminant, payload };
     return Ok((f, char_ptr))
 }
 pub unsafe fn try_parse_struct_decl(

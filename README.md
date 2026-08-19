@@ -72,11 +72,26 @@ together). `struct` and `enum` lay out the same way SystemVerilog packs them,
 so a DDL type and its `.svh` counterpart meet at a module boundary without a
 cast.
 
-**Types.** `iN` and `sN` at any width, structs, enums, and arrays backed by
-`lutram` (asynchronous reads) or `bram` (a read costs a state). Widths are
-checked and never silently adjusted: mixed widths are an error naming the
-`@zext`/`@trunc` that fixes them, and an unsized literal takes its width from
-the other operand.
+**Types.** `iN` and `sN` at any width, structs, enums — including tagged
+unions, where a variant carries a payload and `match` is the only way to reach
+it — and arrays backed by `lutram` (asynchronous reads) or `bram` (a read costs
+a state). Widths are checked and never silently adjusted: mixed widths are an
+error naming the `@zext`/`@trunc` that fixes them, and an unsized literal takes
+its width from the other operand.
+
+```
+enum req_e
+  Nop
+  Read(addr_t)
+  Write(i8)
+  Halt
+```
+
+Laid out as `{tag, payload}` with the tag in the high bits, every variant the
+same width. A tagged union's width is derived, not declared -- `enum e: iN`
+sets the width of an enum whose variants carry nothing, and would name only the
+tag here while reading as the whole value. See
+[examples/tagged.ddl](examples/tagged.ddl).
 
 **Statements.** `let`, `var`, assignment (plain and compound: `+=`, `<<=`,
 `^=`, …), `if`/`else` — including with a blocking `@rcv`/`@send` inside, which
@@ -116,7 +131,11 @@ Deliberately, with a diagnostic rather than a wrong answer:
   a cycle in; and a `bram` with a reset, which cannot be inferred as one
 - a `for` whose trip count is not known at compile time
 - a blocking `@rcv`/`@send` inside a `match` (an `if` works)
-- enum payloads, `bkram` memories, `~=`
+- `==` on an enum that carries payloads, which would compare the padding too
+- a width annotation on an enum that carries payloads, which would name the tag
+  and read as the value
+- reading a variant's payload without matching on its tag first
+- `bkram` memories, `~=`
 
 `desc.md` lists more that is designed but not built — `io process`, `pin`,
 `clock`.

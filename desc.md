@@ -121,7 +121,7 @@ Two aspects:
 
 ### implemented so far
 The compiler in this repository accepts: `fun`, `sequence`, `process`,
-`graph`, `struct`, `enum` (without payloads), `import`, `for in` (unrolled),
+`graph`, `struct`, `enum` (with payloads), `import`, `for in` (unrolled),
 `break`, compound assignment, `inout` parameters, `buffer` and `stream` pipes,
 and `lutram` and `bram` memories. README.md is the current list; what follows
 is the design, including the parts that are not built.

@@ -168,6 +168,18 @@ impl TyError {
             ),
         }
     }
+
+    /// The name this failed to find, when it failed to find one.
+    ///
+    /// The symbol table resolves enums and structs together and retries what
+    /// does not resolve, so it has to tell "waiting for a declaration that has
+    /// not been finished yet" apart from "waiting forever".
+    pub fn missing_type_name(&self) -> Option<String> {
+        match self {
+            TyError::UnknownType(n) => Some(n.clone()),
+            _ => None,
+        }
+    }
 }
 
 /// Parses `iN` / `sN`.

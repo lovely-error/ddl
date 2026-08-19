@@ -13,19 +13,50 @@
 use std::collections::HashMap;
 
 use crate::diag::{Diag, DiagSink};
-use crate::lex::ArgTypeQualifier;
+use crate::lex::{AlphanumSpan, ArgTypeQualifier};
 use crate::parse::{EnumDecl, FunctionDecl, StructDecl, anumspan_to_str};
 use crate::ty::{Ty, bits_for, const_eval};
 
 #[derive(Debug, Clone)]
 pub struct EnumDef {
     pub name: String,
+    /// Tag plus payload. A variant's bits are `{tag, payload}` -- the tag in
+    /// the HIGH bits, matching the way a struct puts its first field there, so
+    /// the layout is the one a reader already knows.
     pub width: u32,
+    /// Declared by `enum Name: iN` when no variant carries a payload, and
+    /// derived from the largest discriminant when one does -- a tagged union
+    /// may not be annotated, because the number would name the tag while
+    /// reading as the width of the whole value.
+    pub tag_width: u32,
+    /// The widest payload any variant carries, and zero when none does. A
+    /// variant with a narrower payload leaves the spare bits undefined; only
+    /// the tag says which reading is the live one.
+    pub payload_width: u32,
     /// In declaration order, which is also the order a `match` must cover.
     pub variants: Vec<(String, u128)>,
+    /// Payload type by variant name, for the variants that carry one.
+    pub payloads: HashMap<String, Ty>,
 }
 
 impl EnumDef {
+    /// Whether any variant carries a payload, which is what decides whether a
+    /// value of this enum is its own tag or has one inside it.
+    pub fn is_tagged_union(&self) -> bool {
+        self.payload_width > 0
+    }
+
+    /// The payload a variant carries, if it carries one.
+    pub fn payload_of(&self, variant: &str) -> Option<&Ty> {
+        self.payloads.get(variant)
+    }
+
+    /// The whole value a payload-free variant is: the tag, shifted up over the
+    /// payload field it does not use.
+    pub fn bare_value(&self, discriminant: u128) -> u128 {
+        discriminant << self.payload_width
+    }
+
     pub fn discriminant_of(&self, variant: &str) -> Option<u128> {
         self.variants
             .iter()
@@ -152,8 +183,23 @@ impl Symbols {
 
 /// Collects every top-level declaration into one table.
 ///
-/// Enums and structs are registered first so that a function signature may
-/// name either, in any order.
+/// Enums and structs resolve TOGETHER rather than one kind then the other,
+/// because a payload may name a struct and a struct field may name an enum:
+///
+/// ```text
+/// struct addr_t
+///   page: i8
+///   off:  i8
+/// enum req_e
+///   Read(addr_t)
+/// ```
+///
+/// A fixed order cannot serve both directions. This walks a worklist instead,
+/// finishing whatever can be finished and going round again until a pass makes
+/// no progress. What is left after that is either a name nobody declared or a
+/// cycle -- an enum whose payload contains itself has no finite width -- and
+/// the two are told apart by whether the missing name is one of the
+/// declarations still waiting.
 pub fn build(
     enums: &[EnumDecl],
     structs: &[StructDecl],
@@ -162,23 +208,149 @@ pub fn build(
 ) -> Symbols {
     let mut syms = Symbols::default();
 
+    // Tags first. A discriminant is a constant and a tag width is either
+    // written down or implied by the largest one, so neither waits on a type.
+    let mut shells: Vec<Option<EnumShell>> = Vec::with_capacity(enums.len());
     for decl in enums {
-        if let Some(def) = build_enum(decl, sink) {
-            register_enum(&mut syms, decl, def, sink);
+        let shell = build_enum_shell(decl, sink);
+        if let Some(shell) = &shell {
+            register_variants(&mut syms, decl, shell, sink);
+        }
+        shells.push(shell);
+    }
+
+    // A declaration still waiting for a type it names.
+    enum Pending {
+        Enum(usize),
+        Struct(usize),
+    }
+    let mut pending: Vec<Pending> = Vec::new();
+    for ix in 0..enums.len() {
+        if shells[ix].is_some() {
+            pending.push(Pending::Enum(ix));
         }
     }
-    // A second pass, because a struct field may name an enum or another struct.
-    for decl in structs {
-        if let Some(def) = build_struct(decl, &syms, sink) {
-            let name_is_taken =
-                syms.structs.contains_key(&def.name) || syms.enums.contains_key(&def.name);
-            if name_is_taken {
-                sink.err_at(&decl.name, format!("`{}` is declared more than once", def.name));
-                continue;
+    for ix in 0..structs.len() {
+        pending.push(Pending::Struct(ix));
+    }
+
+    loop {
+        let mut progress = false;
+        let mut still: Vec<Pending> = Vec::new();
+        for item in pending {
+            let finished = match &item {
+                Pending::Enum(ix) => {
+                    let shell = shells[*ix].as_ref().expect("only present shells are pending");
+                    match finish_enum(&enums[*ix], shell, &syms) {
+                        Ok(def) => {
+                            register_named(&mut syms, &enums[*ix].name, Named::Enum(def), sink);
+                            true
+                        }
+                        Err(_) => false,
+                    }
+                }
+                Pending::Struct(ix) => match build_struct_quiet(&structs[*ix], &syms) {
+                    Ok(def) => {
+                        register_named(&mut syms, &structs[*ix].name, Named::Struct(def), sink);
+                        true
+                    }
+                    Err(_) => false,
+                },
+            };
+            if finished {
+                progress = true;
+            } else {
+                still.push(item);
             }
-            syms.structs.insert(def.name.clone(), def);
+        }
+        pending = still;
+        if pending.is_empty() || !progress {
+            break;
         }
     }
+
+    // A width annotation on a tagged union would say one thing and mean
+    // another: `enum req_e: i2` reads as "two bits wide" and the value is 18,
+    // because the payload sits under the tag. Reinterpreting the number as the
+    // TAG width is worse still -- the same syntax would mean the whole value
+    // for one enum and part of it for the next, and a struct field budgeted
+    // from the declaration would be wrong by the width of the payload.
+    //
+    // So a tagged union is sized by the compiler and the annotation is
+    // refused. Reported here rather than from the worklist, which retries and
+    // would say it more than once, and after the enum is registered so that
+    // everything naming it still resolves and this is the only complaint.
+    for decl in enums {
+        let name = anumspan_to_str(&decl.name);
+        let def = match syms.enums.get(name) {
+            Some(d) if d.is_tagged_union() => d,
+            _ => continue,
+        };
+        if decl.tag_type.is_none() {
+            continue;
+        }
+        let natural_tag = bits_for(def.variants.iter().map(|(_, d)| *d).max().unwrap_or(0));
+        sink.push(
+            Diag::error(
+                sink.map().span_of(&decl.name),
+                format!("`{}` carries a payload, so its width is not a choice", name),
+            )
+            .with_note(format!(
+                "drop the `:` annotation -- {} variant(s) need a {}-bit tag and the widest payload is {} bits, so a value is {}",
+                def.variants.len(),
+                natural_tag,
+                def.payload_width,
+                natural_tag + def.payload_width
+            )),
+        );
+    }
+
+    // Whatever is left cannot be resolved. Report the error each one actually
+    // hit, so a typo reads as a typo; a name that IS declared and still will
+    // not resolve is a cycle, and says so.
+    let stuck: Vec<String> = pending
+        .iter()
+        .map(|item| match item {
+            Pending::Enum(ix) => anumspan_to_str(&enums[*ix].name).to_string(),
+            Pending::Struct(ix) => anumspan_to_str(&structs[*ix].name).to_string(),
+        })
+        .collect();
+    for item in &pending {
+        let (at, err) = match item {
+            Pending::Enum(ix) => {
+                let shell = shells[*ix].as_ref().expect("only present shells are pending");
+                (
+                    enums[*ix].name,
+                    finish_enum(&enums[*ix], shell, &syms).err().expect("it did not finish"),
+                )
+            }
+            Pending::Struct(ix) => (
+                structs[*ix].name,
+                build_struct_quiet(&structs[*ix], &syms).err().expect("it did not finish"),
+            ),
+        };
+        let (span, message, missing) = err;
+        let names_a_stuck_declaration = missing.as_ref().is_some_and(|m| stuck.contains(m));
+        // A name that IS declared and still will not resolve is a cycle, not a
+        // typo, and "`s_t` is not a type" would send the reader looking for a
+        // spelling mistake in a declaration that is right there.
+        let diag = if names_a_stuck_declaration {
+            let missing = missing.expect("checked");
+            let mine = anumspan_to_str(&at).to_string();
+            Diag::error(
+                sink.map().span_of(&span),
+                format!("`{}` cannot be sized", mine),
+            )
+            .with_note(format!(
+                "it contains `{}`, which needs `{}`'s size to know its own -- one of them has to hold the other behind a tag or a fixed width",
+                missing, mine
+            ))
+        } else {
+            Diag::error(sink.map().span_of(&span), message)
+        };
+        sink.push(diag);
+    }
+
     for decl in funcs {
         if let Some(sig) = build_func(decl, &syms, sink) {
             let name_is_taken = syms.funcs.contains_key(&sig.name);
@@ -192,14 +364,47 @@ pub fn build(
     syms
 }
 
-fn register_enum(syms: &mut Symbols, decl: &EnumDecl, def: EnumDef, sink: &mut DiagSink) {
-    let name_is_taken = syms.enums.contains_key(&def.name);
+/// An enum's tag, before its payloads are known.
+struct EnumShell {
+    name: String,
+    variants: Vec<(String, u128)>,
+    tag_width: u32,
+}
+
+enum Named {
+    Enum(EnumDef),
+    Struct(StructDef),
+}
+
+fn register_named(syms: &mut Symbols, at: &AlphanumSpan, def: Named, sink: &mut DiagSink) {
+    let name = match &def {
+        Named::Enum(e) => e.name.clone(),
+        Named::Struct(s) => s.name.clone(),
+    };
+    let name_is_taken = syms.enums.contains_key(&name) || syms.structs.contains_key(&name);
     if name_is_taken {
-        sink.err_at(&decl.name, format!("`{}` is declared more than once", def.name));
+        sink.err_at(at, format!("`{}` is declared more than once", name));
         return;
     }
-    for (variant, _) in &def.variants {
-        let previous = syms.variant_owner.insert(variant.clone(), def.name.clone());
+    match def {
+        Named::Enum(e) => {
+            syms.enums.insert(name, e);
+        }
+        Named::Struct(s) => {
+            syms.structs.insert(name, s);
+        }
+    }
+}
+
+/// Variant names are visible unqualified, and that does not wait on a payload.
+fn register_variants(
+    syms: &mut Symbols,
+    decl: &EnumDecl,
+    shell: &EnumShell,
+    sink: &mut DiagSink,
+) {
+    for (variant, _) in &shell.variants {
+        let previous = syms.variant_owner.insert(variant.clone(), shell.name.clone());
         if let Some(other) = previous {
             sink.err_at(
                 &decl.name,
@@ -207,20 +412,79 @@ fn register_enum(syms: &mut Symbols, decl: &EnumDecl, def: EnumDef, sink: &mut D
             );
         }
     }
-    syms.enums.insert(def.name.clone(), def);
 }
 
-fn build_enum(decl: &EnumDecl, sink: &mut DiagSink) -> Option<EnumDef> {
+/// What a declaration could not resolve: where to blame, what to say, and the
+/// type name it was missing if it was missing one.
+type ResolveFailure = (AlphanumSpan, String, Option<String>);
+
+/// The payload types, and the width they add.
+fn finish_enum(
+    decl: &EnumDecl,
+    shell: &EnumShell,
+    syms: &Symbols,
+) -> Result<EnumDef, ResolveFailure> {
+    let mut payloads: HashMap<String, Ty> = HashMap::new();
+    let mut payload_width = 0u32;
+
+    for variant in &decl.variants {
+        let payload = match &variant.payload {
+            Some(p) => p,
+            None => continue,
+        };
+        let ty = crate::ty::resolve_type_expr(payload, syms).map_err(|e| {
+            (variant.name, e.message(), e.missing_type_name())
+        })?;
+        if ty.is_memory() {
+            return Err((
+                variant.name,
+                "a memory cannot be an enum payload: it is storage rather than a value"
+                    .to_string(),
+                None,
+            ));
+        }
+        payload_width = payload_width.max(ty.bit_width());
+        payloads.insert(anumspan_to_str(&variant.name).to_string(), ty);
+    }
+
+    Ok(EnumDef {
+        name: shell.name.clone(),
+        width: shell.tag_width + payload_width,
+        tag_width: shell.tag_width,
+        payload_width,
+        variants: shell.variants.clone(),
+        payloads,
+    })
+}
+
+fn build_struct_quiet(decl: &StructDecl, syms: &Symbols) -> Result<StructDef, ResolveFailure> {
+    let name = anumspan_to_str(&decl.name).to_string();
+    let mut fields: Vec<(String, Ty)> = Vec::new();
+
+    for field in &decl.fields {
+        let fname = anumspan_to_str(&field.name).to_string();
+        let is_duplicate = fields.iter().any(|(n, _)| *n == fname);
+        if is_duplicate {
+            return Err((field.name, format!("field `{}` is declared twice", fname), None));
+        }
+        let ty = crate::ty::resolve_type_expr(&field.field_type, syms)
+            .map_err(|e| (field.name, e.message(), e.missing_type_name()))?;
+        fields.push((fname, ty));
+    }
+
+    if fields.is_empty() {
+        return Err((decl.name, "a struct needs at least one field".to_string(), None));
+    }
+    Ok(StructDef { name, fields })
+}
+
+fn build_enum_shell(decl: &EnumDecl, sink: &mut DiagSink) -> Option<EnumShell> {
     let name = anumspan_to_str(&decl.name).to_string();
     let mut variants: Vec<(String, u128)> = Vec::new();
     let mut next_discriminant: u128 = 0;
 
     for variant in &decl.variants {
         let vname = anumspan_to_str(&variant.name).to_string();
-        if variant.payload.is_some() {
-            sink.err_at(&variant.name, "enum variants cannot carry a payload yet");
-            return None;
-        }
         let discriminant = match &variant.discriminant {
             None => next_discriminant,
             Some(expr) => match const_eval(expr) {
@@ -283,35 +547,7 @@ fn build_enum(decl: &EnumDecl, sink: &mut DiagSink) -> Option<EnumDef> {
         }
     };
 
-    Some(EnumDef { name, width, variants })
-}
-
-fn build_struct(decl: &StructDecl, syms: &Symbols, sink: &mut DiagSink) -> Option<StructDef> {
-    let name = anumspan_to_str(&decl.name).to_string();
-    let mut fields: Vec<(String, Ty)> = Vec::new();
-
-    for field in &decl.fields {
-        let fname = anumspan_to_str(&field.name).to_string();
-        let is_duplicate = fields.iter().any(|(n, _)| *n == fname);
-        if is_duplicate {
-            sink.err_at(&field.name, format!("field `{}` is declared twice", fname));
-            return None;
-        }
-        let ty = match crate::ty::resolve_type_expr(&field.field_type, syms) {
-            Ok(t) => t,
-            Err(e) => {
-                sink.err_at(&field.name, e.message());
-                return None;
-            }
-        };
-        fields.push((fname, ty));
-    }
-
-    if fields.is_empty() {
-        sink.err_at(&decl.name, "a struct needs at least one field");
-        return None;
-    }
-    Some(StructDef { name, fields })
+    Some(EnumShell { name, variants, tag_width: width })
 }
 
 fn build_func(decl: &FunctionDecl, syms: &Symbols, sink: &mut DiagSink) -> Option<FuncSig> {

@@ -2792,8 +2792,27 @@ pub fn lower_expr(
             let is_local = env.contains_key(name);
             if !is_local {
                 if let Some((def, discriminant)) = low.syms.lookup_variant(name) {
+                    // A variant that carries something is not a value until it
+                    // is given one. `Read` alone would be `Read` with an
+                    // undefined address, which is exactly the bug the payload
+                    // exists to prevent.
+                    if let Some(payload) = def.payload_of(name) {
+                        let (enum_name, payload) = (def.name.clone(), payload.display());
+                        sink.push(
+                            Diag::error(
+                                low.span_of(span),
+                                format!("`{}` carries a `{}`, so it needs one", name, payload),
+                            )
+                            .with_note(format!(
+                                "write `{}(<{}>)`; a bare `{}` would leave the payload undefined and `{}` gives no way to say it is",
+                                name, payload, name, enum_name
+                            )),
+                        );
+                        return None;
+                    }
                     let ty = def.ty();
-                    return Some(low.emit(ty, Op::Const(discriminant)));
+                    let whole = def.bare_value(discriminant);
+                    return Some(low.emit(ty, Op::Const(whole)));
                 }
             }
             match env.get(name) {
@@ -2892,6 +2911,14 @@ pub fn lower_expr(
                     // so the grammar needs no separate literal form, and a
                     // struct name cannot also be a function name because the
                     // symbol table rejects duplicates.
+                    // `Read(addr)` builds an enum value: the tag in the high
+                    // bits, the payload below it. Call syntax again, for the
+                    // same reason, and a variant name cannot also be a
+                    // function name because the symbol table rejects that too.
+                    let is_variant = low.syms.lookup_variant(anumspan_to_str(name)).is_some();
+                    if is_variant {
+                        return build_enum_value(low, name, args, env, sink);
+                    }
                     let is_struct = low
                         .syms
                         .structs
@@ -3382,6 +3409,28 @@ fn lower_builtin(
 
     // Comparisons widen internally and never report a mismatch.
     if let Some(cmp) = cmp_of(op) {
+        // Except against a tagged union, where a comparison would take in the
+        // payload as well as the tag. `r == Nop` reads as "is it a Nop" and
+        // is not: it is "is it a Nop AND are the payload bits all zero", which
+        // is true for a value this compiler built and says nothing about one
+        // that arrived through a port. `match` reads the tag and only the tag.
+        for side in [lhs, rhs] {
+            if let Ty::Enum { name, .. } = low.ty_of(side) {
+                let is_union = low.syms.enums.get(&name).is_some_and(|d| d.is_tagged_union());
+                if is_union {
+                    sink.push(
+                        Diag::error(
+                            crate::driver::nowhere(),
+                            format!("`{}` carries payloads, so comparing it compares those too", name),
+                        )
+                        .with_note(
+                            "use `match`, which reads the tag; a comparison would also have to agree on bits that mean nothing for the variant it is not",
+                        ),
+                    );
+                    return None;
+                }
+            }
+        }
         let (l, r) = low.extend_for_compare(lhs, rhs);
         return Some(low.emit(Ty::BOOL, Op::Cmp { op: cmp, lhs: l, rhs: r }));
     }
@@ -3496,6 +3545,102 @@ fn cmp_of(op: BuiltinOp) -> Option<CmpOp> {
 #[allow(dead_code)]
 fn _assert_op_ty_error_is_used(e: &OpTyError) -> String {
     e.message()
+}
+
+/// `Read(addr)` -- an enum value with its payload.
+///
+/// The layout is `{tag, payload}`, the tag in the high bits, matching the way
+/// a struct puts its first field there. A variant whose payload is narrower
+/// than the widest one is padded below it, so every variant is the same width
+/// and the tag always sits in the same place -- which is what lets a `match`
+/// read the tag without knowing which variant it is looking at.
+fn build_enum_value(
+    low: &mut Lowerer,
+    name: &AlphanumSpan,
+    args: &[PrecResExpr],
+    env: &Env,
+    sink: &mut DiagSink,
+) -> Option<ValueId> {
+    let variant = anumspan_to_str(name).to_string();
+    let (def, discriminant) = match low.syms.lookup_variant(&variant) {
+        Some(hit) => hit,
+        None => {
+            sink.err_at(name, format!("`{}` is not an enum variant", variant));
+            return None;
+        }
+    };
+    let (enum_ty, enum_name) = (def.ty(), def.name.clone());
+    let (tag_width, payload_width) = (def.tag_width, def.payload_width);
+    let payload_ty = def.payload_of(&variant).cloned();
+
+    let want = match payload_ty {
+        Some(t) => t,
+        None => {
+            sink.push(
+                Diag::error(
+                    low.span_of(name),
+                    format!("`{}` carries no payload, so it takes no arguments", variant),
+                )
+                .with_note(format!("write `{}` on its own", variant)),
+            );
+            return None;
+        }
+    };
+    if args.len() != 1 {
+        sink.push(
+            Diag::error(
+                low.span_of(name),
+                format!(
+                    "`{}` carries one `{}`, but {} arguments were given",
+                    variant,
+                    want.display(),
+                    args.len()
+                ),
+            )
+            .with_note("a variant carries at most one value; group several in a struct"),
+        );
+        return None;
+    }
+
+    let mut value = lower_expr_expecting(low, &args[0], Some(&want), env, sink)?;
+    let have = low.ty_of(value);
+    if have != want {
+        match low.coerce_const(value, &want) {
+            Some(v) => value = v,
+            None => {
+                sink.push(
+                    Diag::error(
+                        low.span_of(name),
+                        format!(
+                            "`{}` carries a `{}` but a `{}` was given",
+                            variant,
+                            want.display(),
+                            have.display()
+                        ),
+                    )
+                    .with_note(cast_hint(&have, &want)),
+                );
+                return None;
+            }
+        }
+    }
+
+    // Tag, payload, and the padding a narrow payload leaves under it.
+    let tag = low.emit(Ty::UInt(tag_width), Op::Const(discriminant));
+    let mut parts = vec![tag];
+    let bits = want.bit_width();
+    if bits != payload_width {
+        let payload_bits = low.emit(Ty::UInt(bits), Op::Cast { arg: value });
+        parts.push(payload_bits);
+        // Zero rather than left undefined: `x` propagates through a comparison
+        // in simulation and reads as a bug somewhere else entirely.
+        parts.push(low.emit(Ty::UInt(payload_width - bits), Op::Const(0)));
+    } else {
+        parts.push(low.emit(Ty::UInt(bits), Op::Cast { arg: value }));
+    }
+    let packed = low.emit(Ty::UInt(tag_width + payload_width), Op::Concat(parts));
+    let _ = enum_name;
+    Some(low.emit(enum_ty, Op::Cast { arg: packed }))
 }
 
 /// `MyStruct(field0, field1, ...)` -- fields in declaration order.
