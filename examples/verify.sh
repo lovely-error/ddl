@@ -27,7 +27,10 @@ GW_SH="${GW_SH:-/c/Gowin/Gowin_V1.9.12.02_SP2_x64/IDE/bin/gw_sh.exe}"
 WORK="${WORK:-$DDL_ROOT/target/verify}"
 RTL="$K2G/rtl"
 
-ALL_MODULES=(k2g_shift k2g_alu k2g_decode k2g_xstage k3g_stage fsm_adder mul3)
+# bram_lookup has no SystemVerilog counterpart and no equivalence testbench.
+# It is here for the RAM primitive count alone: `bram` picks a physical
+# primitive, and the netlist is the only thing that can say whether it got one.
+ALL_MODULES=(k2g_shift k2g_alu k2g_decode k2g_xstage k3g_stage fsm_adder mul3 bram_lookup)
 MODULES=("$@")
 [ ${#MODULES[@]} -eq 0 ] && MODULES=("${ALL_MODULES[@]}")
 
@@ -60,7 +63,12 @@ for m in "${MODULES[@]}"; do
   # Run from DDL_ROOT with relative paths: the command ends up verbatim in the
   # generated file's banner, and it has to be one anybody can run.
   [ -f "$DDL_ROOT/$src" ] || { fail "no $src"; continue; }
-  ( cd "$DDL_ROOT" && "$DDL_BIN" build "$src" -I "$K2G_INC" -o "examples/$m.v" )       || { fail "ddl build"; continue; }
+  # `-I` only when the module actually imports something. The command ends up
+  # verbatim in the banner, and a search path that is never consulted is a
+  # command that reads as though it needs a tree it does not.
+  inc=()
+  grep -q '^import ' "$DDL_ROOT/$src" && inc=(-I "$K2G_INC")
+  ( cd "$DDL_ROOT" && "$DDL_BIN" build "$src" "${inc[@]}" -o "examples/$m.v" )       || { fail "ddl build"; continue; }
   note "generated $(basename "$gen")"
 
   # A module with a *_ref.sv beside it is checked against that hand-written
@@ -84,6 +92,15 @@ for m in "${MODULES[@]}"; do
     ref_srcs=("${parts[@]}" "$ref_sv")
   fi
 
+  # A module with no counterpart anywhere is synthesis-only. bram_lookup is
+  # the case: there is nothing to prove it equivalent TO, and the reason it
+  # exists is the primitive its netlist contains.
+  no_reference=0
+  if [ ! -f "$ref_sv" ]; then
+    no_reference=1
+    note "no reference: synthesis only"
+  fi
+
   eq="$WORK/$m/equiv"
   mkdir -p "$eq"
   if [ "$standalone" = "1" ]; then
@@ -93,7 +110,9 @@ for m in "${MODULES[@]}"; do
     sed "s/module $m (/module ${m}_ddl (/" "$gen" > "$eq/${m}_ddl.v"
   fi
 
-  if [ ! -x "$QUESTA/vlog.exe" ]; then
+  if [ "$no_reference" = "1" ]; then
+    note "SKIP equivalence: nothing to compare against"
+  elif [ ! -x "$QUESTA/vlog.exe" ]; then
     note "SKIP equivalence: no Questa at $QUESTA"
   elif [ ! -f "$tb" ]; then
     fail "no testbench $tb"
@@ -136,7 +155,9 @@ set_option -verilog_std sysv2017
 set_option -include_path {.}
 run syn
 TCL
-  if [ ${#parts[@]} -gt 0 ]; then
+  if [ "$no_reference" = "1" ]; then
+    : # nothing on the other side to synthesize
+  elif [ ${#parts[@]} -gt 0 ]; then
     cp "${parts[@]}" "$syn/ref/"
     cp "$ref_sv" "$syn/ref/$m.sv"
     ref_top="${m}_ref"
@@ -153,6 +174,7 @@ add_file -type verilog {k2g_shift.sv}"
     ref_top="$m"
     pkg_line="add_file -type verilog {k2g_pkg.sv}"
   fi
+  if [ "$no_reference" != "1" ]; then
   cat > "$syn/ref/syn.tcl" <<TCL
 set_device -name GW1NR-9C GW1NR-LV9QN88PC6/I5
 $pkg_line
@@ -162,6 +184,7 @@ set_option -verilog_std sysv2017
 set_option -include_path {.}
 run syn
 TCL
+  fi
 
   count_cells() {
     # THE NETLIST IS THE VERDICT, not gw_sh's exit code: it exits 1 on runs
@@ -182,7 +205,9 @@ TCL
     ( cd "$dir" && "$GW_SH" syn.tcl > syn.log 2>&1 )
     [ -f "$dir/impl/gwsynthesis/project.vg" ]
   }
-  for d in ddl ref; do
+  sides=(ddl ref)
+  [ "$no_reference" = "1" ] && sides=(ddl)
+  for d in "${sides[@]}"; do
     attempt=1
     until synth_once "$syn/$d"; do
       attempt=$((attempt + 1))
@@ -193,15 +218,22 @@ TCL
   ddl_cells=$(count_cells "$syn/ddl")
   ref_cells=$(count_cells "$syn/ref")
 
-  if [ "$ddl_cells" -lt 0 ] || [ "$ref_cells" -lt 0 ]; then
+  missing_netlist=0
+  [ "$ddl_cells" -lt 0 ] && missing_netlist=1
+  [ "$no_reference" != "1" ] && [ "$ref_cells" -lt 0 ] && missing_netlist=1
+  if [ "$missing_netlist" = "1" ]; then
     fail "synthesis produced no netlist"
   elif [ "$ddl_cells" -lt 3 ]; then
     # An anti-vacuous guard, as rtl/sv-probe/run_pkg_check.sh has: a design
     # that optimized away proves nothing.
     fail "DDL design optimized away ($ddl_cells cells)"
   else
-    note "$(awk -v a="$ddl_cells" -v b="$ref_cells" \
-        'BEGIN { printf "area: ddl %d, ref %d, delta %+d (%+.1f%%)", a, b, a-b, 100*(a-b)/b }')"
+    if [ "$no_reference" = "1" ]; then
+      note "area: ddl $ddl_cells cells (nothing to compare against)"
+    else
+      note "$(awk -v a="$ddl_cells" -v b="$ref_cells" \
+          'BEGIN { printf "area: ddl %d, ref %d, delta %+d (%+.1f%%)", a, b, a-b, 100*(a-b)/b }')"
+    fi
     # GowinSynthesis emits SP00018 "error bus name set" once per BIT of some
     # named intermediate buses its optimizer eliminates. Measured spurious: the
     # netlist is produced, the cell count is unchanged, and equivalence passes.
@@ -220,6 +252,13 @@ TCL
       if [ "$ref_rams" -gt 0 ] && [ "$ddl_rams" -eq 0 ]; then
         fail "the reference inferred RAM and the DDL version did not"
       fi
+    fi
+    # `bram` picks a physical primitive, and the netlist is the only thing that
+    # can say whether it got one. A block RAM that infers no RAM primitive is
+    # distributed RAM wearing the wrong label, which is what this module exists
+    # to catch and what nothing else can.
+    if [ "$m" = "bram_lookup" ] && [ "$ddl_rams" -eq 0 ]; then
+      fail "bram_lookup inferred no RAM primitive: it is not a block RAM"
     fi
     gw_errors=$(grep -c 'ERROR' "$syn/ddl/syn.log" 2>/dev/null)
     ref_errors=$(grep -c 'ERROR' "$syn/ref/syn.log" 2>/dev/null)

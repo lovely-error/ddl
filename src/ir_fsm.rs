@@ -910,18 +910,12 @@ pub fn lower_blocking(
         }
     }
 
-    // One register per read state: the value the array hands back at that
-    // state's clock edge.
-    let mut read_slot_of: Vec<Option<usize>> = vec![None; n_states];
-    for (k, st) in states_sched.iter().enumerate() {
-        if st.mem_read.is_some() {
-            read_slot_of[k] = Some(next_slot);
-            next_slot += 1;
-        }
-    }
-    let mut read_writes: Vec<(usize, Ty, usize, ValueId, ValueId)> = Vec::new();
-    let mut read_names: std::collections::HashMap<usize, String> =
-        std::collections::HashMap::new();
+    // The read port's register belongs to the MEMORY, not to the state that
+    // reads it, because that is what the hardware has: one output register per
+    // port. Collected here and settled onto the memory once every state has
+    // been lowered, so several read states share one port with a muxed address
+    // -- which is also what the hardware has.
+    let mut mem_reads: Vec<(usize, usize, ValueId)> = Vec::new();
 
     let mut send_values: Vec<(usize, usize, ValueId)> = Vec::new();
     // Several states may define the same name, one per arm of a branch, so
@@ -987,13 +981,12 @@ pub fn lower_blocking(
             let elem = low.mems[read.mem_ix].elem.clone();
             let raw = crate::ir::lower_expr(&mut low, read.addr, &env, sink)?;
             let addr = low.fit_address(raw, addr_width, &decl.name, sink)?;
-            let fetched = low.emit(elem.clone(), Op::MemRead { mem: read.mem_ix as u32, addr });
-            let slot = read_slot_of[k].expect("a read state has a slot");
-            let cur = low.emit(elem.clone(), Op::RegRead(slot as u32));
-            low.name_value(cur, format!("{}_q", read.bind));
-            read_names.insert(slot, format!("{}_q", read.bind));
-            read_writes.push((slot, elem.clone(), k, fetched, cur));
-            env.insert(read.bind.clone(), Binding::constant(cur, elem));
+            mem_reads.push((read.mem_ix, k, addr));
+            // The name means the memory's output register from here on. Not a
+            // value computed from the array -- the array is read inside the
+            // memory's own clocked block, and this is the only way to see it.
+            let q = low.emit(elem.clone(), Op::MemReadReg { mem: read.mem_ix as u32 });
+            env.insert(read.bind.clone(), Binding::constant(q, elem));
         }
         if let Some(bind) = st.barrier.as_ref().and_then(|b| b.bind.as_ref()) {
             let pipe = low.pipes[st.barrier.as_ref().expect("a bind implies a barrier").pipe_ix]
@@ -1247,13 +1240,26 @@ pub fn lower_blocking(
         generated.push(Reg { name: format!("{}_r", name), ty, reset: 0, next });
     }
 
-    for (slot, ty, k, fetched, cur) in &read_writes {
-        let next = low.emit(
-            ty.clone(),
-            Op::Mux { cond: in_st[*k], then_val: *fetched, else_val: *cur },
-        );
-        let name = read_names[slot].clone();
-        generated.push(Reg { name, ty: ty.clone(), reset: 0, next });
+    // Settle each memory's read port: enabled in any state that reads it, with
+    // the address muxed by which one. One port however many states use it,
+    // because that is what a block RAM has.
+    for ix in 0..low.mems.len() {
+        let mine: Vec<(usize, ValueId)> = mem_reads
+            .iter()
+            .filter(|(m, _, _)| *m == ix)
+            .map(|(_, k, addr)| (*k, *addr))
+            .collect();
+        let Some((first_state, first_addr)) = mine.first().copied() else {
+            continue;
+        };
+        let mut en = in_st[first_state];
+        let mut addr = first_addr;
+        for (k, a) in mine.iter().skip(1) {
+            en = low.emit(Ty::BOOL, Op::Bin { op: BinOp::Or, lhs: en, rhs: in_st[*k] });
+            let addr_ty = low.ty_of(addr);
+            addr = low.emit(addr_ty, Op::Mux { cond: in_st[*k], then_val: *a, else_val: addr });
+        }
+        low.mems[ix].read = Some(crate::ir::ReadPort { addr, en });
     }
 
     for (port_id, name) in &out_ports {

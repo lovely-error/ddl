@@ -97,11 +97,31 @@ fn a_bram_read_costs_a_state_and_the_state_is_visible() {
 }
 
 #[test]
-fn the_fetched_value_is_a_register_read_in_the_next_state() {
+fn the_read_happens_inside_the_memorys_own_clocked_block() {
+    // This is the whole difference between `bram` and `lutram`, and it is the
+    // difference a synthesizer looks for. A `wire q = mem[addr];` with the
+    // flop in some other always block is a combinational array read plus a
+    // register, and infers what `lutram` already gives you plus the flop.
     let v = compile(LOOKUP);
-    assert!(v.contains("reg [31:0] v_q;"), "{}", v);
-    assert!(v.contains("v_q <= (in_s1 ? "), "{}", v);
-    assert!(v.contains("assign resp_data = v_q;"), "{}", v);
+    assert!(v.contains("reg [31:0] table__q;"), "{}", v);
+    assert!(v.contains("if (in_s1) table__q <= table_[a_r];"), "{}", v);
+    // The array is never read outside that block.
+    assert!(!v.contains("wire [31:0] n"), "{}", v);
+    assert!(v.contains("assign resp_data = table__q;"), "{}", v);
+}
+
+#[test]
+fn the_read_register_belongs_to_the_memory_not_to_the_state() {
+    // One output register per port, however many states read it, because that
+    // is what the hardware has.
+    let v = compile(LOOKUP);
+    assert_eq!(v.matches("table__q <=").count(), 1, "{}", v);
+    // And it is declared with the array, not with the state machine's
+    // registers.
+    let decl = v.find("reg [31:0] table_ [0:255];").expect("the array");
+    let q = v.find("reg [31:0] table__q;").expect("the read register");
+    assert!(q > decl, "the read register should follow the array it belongs to:
+{}", v);
 }
 
 #[test]
@@ -132,8 +152,12 @@ fn a_bram_takes_reads_and_writes_on_different_paths() {
         "      @send(dout, v)\n",
     ));
     assert!(v.contains("block RAM"), "{}", v);
+    // Both ports in one clocked block, which is the simple-dual-port template.
     assert!(v.contains("table_[addr_r] <= din_data;"), "{}", v);
-    assert!(v.contains("v_q <= (in_s2 ? "), "{}", v);
+    assert!(v.contains("table__q <= table_["), "{}", v);
+    let block = v.split("// table_ [0:255]").nth(1).expect("the memory block");
+    let block = block.split("endmodule").next().expect("the end");
+    assert_eq!(block.matches("always @(posedge clk)").count(), 1, "{}", block);
 }
 
 #[test]

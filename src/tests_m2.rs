@@ -483,7 +483,8 @@ fn the_checked_in_verilog_is_up_to_date() {
 
     let mut checked = 0;
     for name in [
-        "mul3", "fsm_adder", "k3g_stage", "pipeline_graph", "reg_port", "tagged", "k2g_shift",
+        "mul3", "fsm_adder", "k3g_stage", "pipeline_graph", "reg_port", "tagged",
+        "bram_lookup", "k2g_shift",
         "k2g_alu",
         "k2g_decode",
         "k2g_xstage",

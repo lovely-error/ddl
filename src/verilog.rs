@@ -153,7 +153,9 @@ fn live_values(module: &Module) -> Vec<bool> {
         live[ix] = true;
         let mut push = |v: &ValueId| stack.push(*v);
         match &module.values[ix].op {
-            Op::Port(_) | Op::RegRead(_) | Op::Const(_) => {}
+            // Leaves. A memory's read register is driven by the memory's own
+            // clocked block, so nothing in the value graph computes it.
+            Op::Port(_) | Op::RegRead(_) | Op::Const(_) | Op::MemReadReg { .. } => {}
             Op::Bin { lhs, rhs, .. } | Op::Cmp { lhs, rhs, .. } => {
                 push(lhs);
                 push(rhs);
@@ -198,7 +200,7 @@ fn use_counts(module: &Module, live: &[bool]) -> Vec<u32> {
             continue;
         }
         match &def.op {
-            Op::Port(_) | Op::RegRead(_) | Op::Const(_) => {}
+            Op::Port(_) | Op::RegRead(_) | Op::Const(_) | Op::MemReadReg { .. } => {}
             Op::Bin { lhs, rhs, .. } | Op::Cmp { lhs, rhs, .. } => {
                 bump(lhs, &mut counts);
                 bump(rhs, &mut counts);
@@ -348,7 +350,15 @@ fn operand(module: &Module, names: &NameTable, fold: &[bool], id: ValueId) -> St
     // Self-delimiting forms need no parentheses and read worse with them.
     let is_self_delimiting = matches!(
         def.op,
-        Op::Const(_) | Op::Concat(_) | Op::Repeat { .. } | Op::Slice { .. } | Op::DynSlice { .. }
+        Op::Const(_)
+            | Op::Concat(_)
+            | Op::Repeat { .. }
+            | Op::Slice { .. }
+            | Op::DynSlice { .. }
+            // A memory's read register renders as a bare identifier, exactly
+            // like the register read it is.
+            | Op::MemReadReg { .. }
+            | Op::MemRead { .. }
     );
     if is_self_delimiting {
         rendered
@@ -449,6 +459,16 @@ fn emit_body(out: &mut String, module: &Module, names: &NameTable) {
             sanitize(&mem.name),
             mem.len - 1
         ));
+        // The read port's register belongs to the memory and is declared
+        // with it, so the two read as one thing.
+        if mem.read.is_some() {
+            out.push_str(&format!(
+                "  reg {}{}_q;
+",
+                signed_and_range(&mem.elem),
+                sanitize(&mem.name)
+            ));
+        }
         // Verilog-2005 has no `for (integer i = ...)`, so the loop variable is
         // a module-level `integer`. It is touched only in the reset branch.
         if mem.reset.is_some() {
@@ -631,6 +651,16 @@ fn escape_message(msg: &str) -> String {
 /// primitives. It is usually worth paying, because without it the array powers
 /// up undefined and cosimulation cannot compare a register until something
 /// writes it -- but that is the source's call, not this backend's.
+/// The name of a memory's read-port register.
+///
+/// Derived from the SANITIZED array name, so the two always agree and the
+/// register visibly belongs to the array: a memory called `table` escapes to
+/// `table_`, and its read register is `table__q` rather than `table_q`, which
+/// would read as a different memory's.
+pub fn read_reg_name(module: &Module, mem: u32) -> String {
+    format!("{}_q", sanitize(&module.mems[mem as usize].name))
+}
+
 fn emit_memory_block(
     out: &mut String,
     module: &Module,
@@ -640,9 +670,11 @@ fn emit_memory_block(
 ) {
     let name = sanitize(&mem.name);
     // A memory nothing writes is a lookup table. Emitting `if (1'b0)` around a
-    // dead assignment would only give synthesis something to warn about.
+    // dead assignment would only give synthesis something to warn about -- but
+    // a synchronous read still needs its block, because that is where its
+    // register is driven from.
     let never_written = matches!(module.value(mem.we).op, Op::Const(0));
-    if never_written && mem.reset.is_none() {
+    if never_written && mem.reset.is_none() && mem.read.is_none() {
         return;
     }
     let we = operand(module, names, fold, mem.we);
@@ -652,6 +684,8 @@ fn emit_memory_block(
     out.push('\n');
     out.push_str(&format!("  // {} [0:{}] -- {}\n", name, mem.len - 1, mem_note(mem.kind)));
     out.push_str("  always @(posedge clk) begin\n");
+
+    let mut write_open = false;
     match mem.reset {
         Some(k) => {
             out.push_str("    if (!rst_n) begin\n");
@@ -664,17 +698,44 @@ fn emit_memory_block(
             ));
             if never_written {
                 out.push_str("    end\n");
-                out.push_str("  end\n");
-                return;
+            } else {
+                out.push_str(&format!("    end else if ({}) begin\n", we));
+                write_open = true;
             }
-            out.push_str(&format!("    end else if ({}) begin\n", we));
         }
         None => {
-            out.push_str(&format!("    if ({}) begin\n", we));
+            if !never_written {
+                out.push_str(&format!("    if ({}) begin\n", we));
+                write_open = true;
+            }
         }
     }
-    out.push_str(&format!("      {}[{}] <= {};\n", name, addr, data));
-    out.push_str("    end\n");
+    if write_open {
+        out.push_str(&format!("      {}[{}] <= {};\n", name, addr, data));
+        out.push_str("    end\n");
+    }
+
+    // THE READ, INSIDE THE SAME BLOCK. This is what makes it a block RAM
+    // rather than a distributed one with a flop bolted on: the array is read
+    // on the clock edge, in the block that owns the array, and the value lands
+    // in a register nothing outside can see unregistered.
+    //
+    // A `wire q = mem[addr];` with the flop in some other always block is a
+    // combinational array read plus a register, and infers exactly what
+    // `lutram` already gives you, plus the flop.
+    //
+    // The enable holds the value rather than letting the read free-run,
+    // because the state that consumes it may wait any number of cycles on a
+    // handshake. A read enable is part of the template synthesizers recognise.
+    if let Some(r) = &mem.read {
+        out.push_str(&format!(
+            "    if ({}) {}_q <= {}[{}];\n",
+            operand(module, names, fold, r.en),
+            name,
+            name,
+            operand(module, names, fold, r.addr)
+        ));
+    }
     out.push_str("  end\n");
 }
 
@@ -750,6 +811,7 @@ fn signed_and_range(ty: &Ty) -> String {
 
 fn render_op(module: &Module, names: &NameTable, fold: &[bool], op: &Op, ty: &Ty) -> String {
     match op {
+        Op::MemReadReg { mem } => read_reg_name(module, *mem),
         Op::MemRead { mem, addr } => {
             let m = &module.mems[*mem as usize];
             format!("{}[{}]", sanitize(&m.name), operand(module, names, fold, *addr))

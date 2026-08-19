@@ -135,6 +135,11 @@ pub enum Op {
     /// be bypassed -- a write-first bypass there closes a combinational loop
     /// through the register file and hangs simulation.
     MemRead { mem: u32, addr: ValueId },
+    /// The output register of a memory's synchronous read port.
+    ///
+    /// A leaf: it is driven by the memory's own clocked block, not by anything
+    /// in the value graph, so nothing here computes it.
+    MemReadReg { mem: u32 },
 }
 
 #[derive(Debug, Clone)]
@@ -186,6 +191,29 @@ pub struct Memory {
     pub we: ValueId,
     pub addr: ValueId,
     pub data: ValueId,
+    /// The synchronous read port, for a memory that has one.
+    ///
+    /// `None` for a `lutram`, whose reads are combinational and need no port
+    /// -- that is the whole difference between the two kinds, and it is the
+    /// difference the backend has to emit for a synthesizer to infer the right
+    /// primitive.
+    pub read: Option<ReadPort>,
+}
+
+/// A synchronous read: an address, an enable, and the register the value
+/// lands in.
+///
+/// The register belongs to the MEMORY and is driven from inside the memory's
+/// own clocked block, because that is the shape block RAM is inferred from. A
+/// read written as `wire q = mem[addr];` with the flop somewhere else is a
+/// combinational array read plus a register, and infers distributed RAM --
+/// which is what `lutram` already gives you, with a wasted flop on top.
+#[derive(Debug, Clone)]
+pub struct ReadPort {
+    pub addr: ValueId,
+    /// When to capture. Held rather than free-running: the value has to
+    /// survive however long the state that consumes it waits.
+    pub en: ValueId,
 }
 
 /// An immediate assertion: a condition that must hold, checked in simulation.
@@ -385,6 +413,7 @@ fn render_op_ir(m: &Module, op: &Op) -> String {
             text.push_str(&format!(" [_ -> %{}]", default.0));
             text
         }
+        Op::MemReadReg { mem } => format!("memq #{}", mem),
         Op::MemRead { mem, addr } => {
             format!("memread {}[%{}]", m.mems[*mem as usize].name, addr.0)
         }
@@ -815,6 +844,7 @@ impl<'a> Lowerer<'a> {
             we,
             addr,
             data,
+            read: None,
         });
         ix
     }
