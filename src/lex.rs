@@ -1,18 +1,18 @@
 #[allow(nonstandard_style)]
 mod Letters {
-    pub const A: u8 = 'A' as u8;
-    pub const Z: u8 = 'Z' as u8;
-    pub const a: u8 = 'a' as u8;
-    pub const z: u8 = 'z' as u8;
-    pub const Underscore: u8 = '_' as u8;
-    pub const Whitespace: u8 = ' ' as u8;
-    pub const NewLine: u8 = '\n' as u8;
-    pub const CarriageReturn: u8 = '\r' as u8;
-    pub const Tab: u8 = '\t' as u8;
-    pub const Dash: u8 = '-' as u8;
+    pub const A: u8 = b'A';
+    pub const Z: u8 = b'Z';
+    pub const a: u8 = b'a';
+    pub const z: u8 = b'z';
+    pub const Underscore: u8 = b'_';
+    pub const Whitespace: u8 = b' ';
+    pub const NewLine: u8 = b'\n';
+    pub const CarriageReturn: u8 = b'\r';
+    pub const Tab: u8 = b'\t';
+    pub const Dash: u8 = b'-';
     pub const ZERO: u8 = 48;
     pub const NINE: u8 = 57;
-    pub const AT_SIGN: u8 = '@' as u8;
+    pub const AT_SIGN: u8 = b'@';
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -454,7 +454,7 @@ fn skip_to_line_end(char_ptr: *const u8, char_end_ptr: *const u8) -> *const u8 {
         }
         ptr = unsafe { ptr.add(1) };
     }
-    return ptr;
+    ptr
 }
 
 // LF and CRLF. A lone CR is deliberately NOT a line break: it is a stray byte,
@@ -468,7 +468,7 @@ fn strip_line_break(char_ptr: *const u8, char_end_ptr: *const u8) -> (bool, *con
     if is_lf {
         return (true, after);
     }
-    return (false, char_ptr);
+    (false, char_ptr)
 }
 
 // Horizontal trivia: spaces, plus a `--` comment running to end of line.
@@ -499,7 +499,7 @@ fn skip_whitespaces(char_ptr: *const u8, char_end_ptr: *const u8) -> (u32, *cons
         }
         break;
     }
-    return (depth, local_char_ptr);
+    (depth, local_char_ptr)
 }
 
 pub fn skip_trivia(char_ptr: *const u8, char_end_ptr: *const u8) -> (u32, *const u8) {
@@ -525,7 +525,7 @@ pub fn skip_trivia(char_ptr: *const u8, char_end_ptr: *const u8) -> (u32, *const
             break;
         }
     }
-    return (depth, ptr);
+    (depth, ptr)
 }
 
 // Scans for a tab anywhere in the source. DDL is indentation-sensitive and
@@ -571,10 +571,10 @@ fn try_parse_alphanum(
             break;
         }
         let ch = deref(ptr);
-        let is_lower_case_ascii = Letters::a <= ch && ch <= Letters::z;
-        let is_upper_case_ascii = Letters::A <= ch && ch <= Letters::Z;
+        let is_lower_case_ascii = (Letters::a..=Letters::z).contains(&ch);
+        let is_upper_case_ascii = (Letters::A..=Letters::Z).contains(&ch);
         let is_under_score = ch == Letters::Underscore;
-        let is_number = Letters::ZERO <= ch && ch <= Letters::NINE;
+        let is_number = (Letters::ZERO..=Letters::NINE).contains(&ch);
         let is_at_sign = ch == Letters::AT_SIGN;
         let valid_char =
             is_lower_case_ascii || is_upper_case_ascii || is_under_score || is_number || is_at_sign;
@@ -589,9 +589,9 @@ fn try_parse_alphanum(
     }
     let ns = AlphanumSpan {
         byte_ptr: char_ptr,
-        len: len,
+        len,
     };
-    return Ok((ns, ptr));
+    Ok((ns, ptr))
 }
 
 fn digit_value(ch: u8) -> Option<u32> {
@@ -636,7 +636,7 @@ fn scan_digits(
             _ => break,
         }
     }
-    return (value, count, ptr);
+    (value, count, ptr)
 }
 
 fn radix_of(ch: u8) -> Option<u32> {
@@ -730,8 +730,8 @@ fn try_parse_number(
     // Float: `<whole>.<frac>`, and only when a digit actually follows the dot,
     // so that tuple access like `x.0` and ranges like `1..8` are unaffected.
     let (is_dot, after_dot) = strip_prefix_on_match(after_lead, char_end_ptr, ".");
-    if is_dot && after_dot != char_end_ptr {
-        if digit_value(deref(after_dot)).filter(|d| *d < 10).is_some() {
+    if is_dot && after_dot != char_end_ptr
+        && digit_value(deref(after_dot)).filter(|d| *d < 10).is_some() {
             let (frac, _, tail) = scan_digits(after_dot, char_end_ptr, 10);
             return Ok((
                 RawNum::Float {
@@ -742,12 +742,11 @@ fn try_parse_number(
                 tail,
             ));
         }
-    }
 
-    return Ok((
+    Ok((
         RawNum::Int { span: span_between(char_ptr, after_lead), width: None, value: lead },
         after_lead,
-    ));
+    ))
 }
 
 fn span_between(start: *const u8, end: *const u8) -> AlphanumSpan {
@@ -759,28 +758,31 @@ fn try_parse_arg_type_qualifier(
     mut char_ptr: *const u8,
     char_end_ptr: *const u8,
 ) -> Result<(ArgTypeQualifier, *const u8), ()> {
-    let qualifier = loop {
+    // A labelled block rather than a `loop` that always breaks. The two
+    // compile the same and only one says what it is; the `loop` spelling
+    // predates labelled blocks being stable.
+    let qualifier = 'qualifier: {
         let (is_out, new_ptr) = strip_prefix_on_match(char_ptr, char_end_ptr, "inout ");
         if is_out {
             char_ptr = new_ptr;
-            break ArgTypeQualifier::Inout
+            break 'qualifier ArgTypeQualifier::Inout
         }
         let (is_in, new_ptr) = strip_prefix_on_match(char_ptr, char_end_ptr, "out ");
         if is_in {
             char_ptr = new_ptr;
-            break ArgTypeQualifier::Out
+            break 'qualifier ArgTypeQualifier::Out
         }
         let (is_stream, new_ptr) = strip_prefix_on_match(new_ptr, char_end_ptr, "stream ");
         if is_stream {
             let (is_in, ptr) = strip_prefix_on_match(new_ptr, char_end_ptr, "in ");
             if is_in {
                 char_ptr = ptr;
-                break ArgTypeQualifier::StreamIn
+                break 'qualifier ArgTypeQualifier::StreamIn
             }
             let (is_out, ptr) = strip_prefix_on_match(new_ptr, char_end_ptr, "out ");
             if is_out {
                 char_ptr = ptr;
-                break ArgTypeQualifier::StreamOut
+                break 'qualifier ArgTypeQualifier::StreamOut
             }
             return Err(());
         }
@@ -789,19 +791,19 @@ fn try_parse_arg_type_qualifier(
             let (is_in, ptr) = strip_prefix_on_match(new_ptr, char_end_ptr, "in ");
             if is_in {
                 char_ptr = ptr;
-                break ArgTypeQualifier::BufferIn
+                break 'qualifier ArgTypeQualifier::BufferIn
             }
             let (is_out, ptr) = strip_prefix_on_match(new_ptr, char_end_ptr, "out ");
             if is_out {
                 char_ptr = ptr;
-                break ArgTypeQualifier::BufferOut
+                break 'qualifier ArgTypeQualifier::BufferOut
             }
             return Err(());
         }
         char_ptr = new_ptr;
-        break ArgTypeQualifier::In
+        break 'qualifier ArgTypeQualifier::In;
     };
-    return Ok((qualifier, char_ptr))
+    Ok((qualifier, char_ptr))
 }
 
 unsafe fn try_parse_type_expr(
@@ -879,7 +881,7 @@ unsafe fn try_parse_type_expr(
     let (name_span, new_ptr) = try_parse_alphanum(char_ptr, char_end_ptr)?;
     char_ptr = new_ptr;
     let ty_expr = RawTypeExpr::Ident(name_span);
-    return Ok((ty_expr, char_ptr));
+    Ok((ty_expr, char_ptr))
 }
 
 unsafe fn parse_arg_tuple(
@@ -946,7 +948,7 @@ unsafe fn parse_arg_tuple(
         return Err(());
     }
     let args = RawArgDefTuple { entries };
-    return Ok((args, char_ptr));
+    Ok((args, char_ptr))
 }
 
 unsafe fn try_parse_inner_stmt(
@@ -1014,7 +1016,7 @@ unsafe fn try_parse_inner_stmt(
         return Ok((InnerStmt::ExprStmt(expr), tail));
     }
 
-    return Err(());
+    Err(())
 }
 
 unsafe fn try_parse_return_stmt(
@@ -1033,8 +1035,8 @@ unsafe fn try_parse_return_stmt(
     let (_, tail) = skip_whitespaces(char_ptr, char_end_ptr);
     char_ptr = tail;
     match try_parse_expr(char_ptr, char_end_ptr, scope_depth) {
-        Ok((ret_expr, tail)) => return Ok((Some(ret_expr), tail)),
-        Err(_) => return Ok((None, char_ptr)),
+        Ok((ret_expr, tail)) => Ok((Some(ret_expr), tail)),
+        Err(_) => Ok((None, char_ptr)),
     }
 }
 
@@ -1079,14 +1081,14 @@ unsafe fn try_parse_for_loop(
         Err(_) => return Err(true),
     };
     char_ptr = tail;
-    return Ok((
+    Ok((
         ForLoopStmt {
             binding,
             target,
             body,
         },
         char_ptr,
-    ));
+    ))
 }
 
 fn try_parse_break_stmt(char_ptr: *const u8, char_end_ptr: *const u8) -> Result<*const u8, ()> {
@@ -1096,7 +1098,7 @@ fn try_parse_break_stmt(char_ptr: *const u8, char_end_ptr: *const u8) -> Result<
     if is_break && any_delimiter_present(tail, char_end_ptr) {
         return Ok(tail);
     }
-    return Err(());
+    Err(())
 }
 
 unsafe fn try_parse_loop_stmt(
@@ -1120,7 +1122,7 @@ unsafe fn try_parse_loop_stmt(
     };
     char_ptr = tail;
     let rs = LoopStmt { repeat_expr: body };
-    return Ok((rs, char_ptr));
+    Ok((rs, char_ptr))
 }
 
 unsafe fn try_parse_ite_stmt(
@@ -1215,7 +1217,7 @@ unsafe fn try_parse_ite_stmt(
         then_case: true_case,
         else_case: false_case,
     };
-    return Ok((rs, char_ptr));
+    Ok((rs, char_ptr))
 }
 
 unsafe fn parse_proc_inner_stmt(
@@ -1285,7 +1287,7 @@ unsafe fn try_parse_match_stmt(
         scrutinees: scruts,
         cases: arms,
     };
-    return Ok((rs, char_ptr));
+    Ok((rs, char_ptr))
 }
 
 unsafe fn try_parse_match_arm(
@@ -1311,7 +1313,7 @@ unsafe fn try_parse_match_arm(
         binding_patterns: bindings,
         rhs,
     };
-    return Ok((rs, char_ptr));
+    Ok((rs, char_ptr))
 }
 
 fn try_parse_match_arm_lhs(
@@ -1363,7 +1365,7 @@ fn try_parse_match_arm_lhs(
         }
         break;
     }
-    return Ok((bindings, char_ptr));
+    Ok((bindings, char_ptr))
 }
 
 fn try_parse_case_pattern(
@@ -1400,7 +1402,7 @@ fn try_parse_case_pattern(
 
     // gotta be alpha num then
     let (case_name, tail) = try_parse_alphanum(char_ptr, char_end_ptr)?;
-    return Ok((BindingPattern::Alphanum(case_name), tail));
+    Ok((BindingPattern::Alphanum(case_name), tail))
 }
 
 unsafe fn try_parse_var_decl_stmt(
@@ -1513,7 +1515,7 @@ unsafe fn try_parse_var_decl_stmt(
         ty_expr,
         assign_val,
     };
-    return Ok((result, char_ptr));
+    Ok((result, char_ptr))
 }
 
 unsafe fn try_parse_invocation_tuple(
@@ -1573,7 +1575,7 @@ unsafe fn try_parse_invocation_tuple(
             }
         }
     }
-    return Ok((args, char_ptr));
+    Ok((args, char_ptr))
 }
 
 unsafe fn parse_indent_guided_block(
@@ -1600,7 +1602,7 @@ unsafe fn parse_indent_guided_block(
         stmts.push(stmt);
     }
     let rs = StmtBlock { components: stmts };
-    return Ok((rs, char_ptr));
+    Ok((rs, char_ptr))
 }
 
 unsafe fn try_parse_multiline_string(
@@ -1637,7 +1639,7 @@ unsafe fn try_parse_multiline_string(
     if pieces.is_empty() {
         return Err(false);
     }
-    return Ok((StrLiteral { pieces }, char_ptr));
+    Ok((StrLiteral { pieces }, char_ptr))
 }
 unsafe fn try_parse_line_string(
     char_ptr: *const u8,
@@ -1655,7 +1657,7 @@ unsafe fn try_parse_line_string(
         if text_ended {
             return Err(true);
         }
-        let str_ended = deref(ptr) == '\"' as _;
+        let str_ended = deref(ptr) == b'\"';
         let len = ptr as usize - bytes_start_addr as usize;
         ptr = ptr.add(1);
         if str_ended {
@@ -1666,7 +1668,7 @@ unsafe fn try_parse_line_string(
             break;
         }
     }
-    return Ok((out, ptr));
+    Ok((out, ptr))
 }
 
 #[derive(Debug, Clone)]
@@ -1747,7 +1749,7 @@ unsafe fn try_parse_ternary(
         then_e: Box::new(then_e),
         else_e: Box::new(else_e),
     };
-    return Ok((rs, char_ptr));
+    Ok((rs, char_ptr))
 }
 
 
@@ -1854,7 +1856,7 @@ unsafe fn try_parse_expr_1(
     char_ptr = tail;
 
     let result = RawExpr::AnumSpan(ident);
-    return Ok((result, char_ptr));
+    Ok((result, char_ptr))
 }
 
 unsafe fn try_parse_expr_2(
@@ -1877,7 +1879,7 @@ unsafe fn try_parse_expr_2(
             let (args, tail) = try_parse_invocation_tuple(char_ptr, char_end_ptr, parent_depth)?;
             expr = RawExpr::Call {
                 base: Box::new(expr),
-                args: args,
+                args,
             };
             char_ptr = tail;
             continue 'inner;
@@ -1924,7 +1926,7 @@ unsafe fn try_parse_expr_2(
             char_ptr = tail;
             expr = RawExpr::SubscriptAccess(Box::new(SubscriptAccess {
                 base: expr,
-                index: index,
+                index,
             }));
             continue 'inner;
         }
@@ -1932,7 +1934,7 @@ unsafe fn try_parse_expr_2(
         break 'inner;
     }
 
-    return Ok((expr, char_ptr));
+    Ok((expr, char_ptr))
 }
 
 unsafe fn try_parse_expr(
@@ -2026,7 +2028,7 @@ unsafe fn try_parse_expr(
         break;
     }
 
-    return Ok((RawExpr::InfixExpr { pieces }, char_ptr));
+    Ok((RawExpr::InfixExpr { pieces }, char_ptr))
 }
 
 unsafe fn try_parse_sequence_inner_stmt(
@@ -2036,12 +2038,18 @@ unsafe fn try_parse_sequence_inner_stmt(
 ) -> Result<(RawSeqInnerStmt, *const u8), ()> {
     let (separator, tail) = strip_prefix_on_match(char_ptr, char_end_ptr, "|||");
     if separator {
-        return Ok((RawSeqInnerStmt::SegmentSeparator, tail))
+        Ok((RawSeqInnerStmt::SegmentSeparator, tail))
     } else {
         let (stmt, tail) = try_parse_inner_stmt(char_ptr, char_end_ptr, anchor_depth)?;
-        return Ok((RawSeqInnerStmt::Stmt(stmt), tail))
+        Ok((RawSeqInnerStmt::Stmt(stmt), tail))
     }
 }
+/// # Safety
+///
+/// `char_ptr` and `char_end_ptr` must bracket one live buffer, and the
+/// returned pointer is into that same buffer -- so it must not outlive the
+/// `SourceMap` holding it. Every caller reaches this through
+/// `driver::parse_source`, which owns that buffer for as long as the AST.
 pub unsafe fn try_parse_enum_decl(
     mut char_ptr: *const u8,
     char_end_ptr: *const u8,
@@ -2109,7 +2117,7 @@ pub unsafe fn try_parse_enum_decl(
         tag_type,
         fields,
     };
-    return Ok((rs, char_ptr))
+    Ok((rs, char_ptr))
 }
 /// One enum variant. Three forms:
 ///
@@ -2168,8 +2176,14 @@ unsafe fn try_parse_enum_field(
     };
 
     let f = RawEnumField { name: field_name, discriminant, payload };
-    return Ok((f, char_ptr))
+    Ok((f, char_ptr))
 }
+/// # Safety
+///
+/// `char_ptr` and `char_end_ptr` must bracket one live buffer, and the
+/// returned pointer is into that same buffer -- so it must not outlive the
+/// `SourceMap` holding it. Every caller reaches this through
+/// `driver::parse_source`, which owns that buffer for as long as the AST.
 pub unsafe fn try_parse_struct_decl(
     mut char_ptr: *const u8,
     char_end_ptr: *const u8,
@@ -2221,7 +2235,7 @@ pub unsafe fn try_parse_struct_decl(
         name: struct_name,
         fields,
     };
-    return Ok((rs, char_ptr))
+    Ok((rs, char_ptr))
 }
 unsafe fn try_parse_struct_field(
     mut char_ptr: *const u8,
@@ -2241,9 +2255,15 @@ unsafe fn try_parse_struct_field(
     let (ty, tail) = try_parse_type_expr(char_ptr, char_end_ptr)?;
     char_ptr = tail;
     let f = RawStructField { name: field_name, field_type: ty };
-    return Ok((f, char_ptr))
+    Ok((f, char_ptr))
 }
 
+/// # Safety
+///
+/// `char_ptr` and `char_end_ptr` must bracket one live buffer, and the
+/// returned pointer is into that same buffer -- so it must not outlive the
+/// `SourceMap` holding it. Every caller reaches this through
+/// `driver::parse_source`, which owns that buffer for as long as the AST.
 pub unsafe fn try_parse_sequence_decl(
     mut char_ptr: *const u8,
     char_end_ptr: *const u8,
@@ -2296,10 +2316,10 @@ pub unsafe fn try_parse_sequence_decl(
     }
     let res = RawSequenceDecl {
         name: proc_name,
-        args: args,
+        args,
         body: stmts,
     };
-    return Ok((res, char_ptr));
+    Ok((res, char_ptr))
 }
 
 /// `graph Name (ports)` and its body.
@@ -2369,6 +2389,12 @@ fn note_body_fail(slot: &mut Option<BodyFail>, at: *const u8, kind: &'static str
     }
 }
 
+/// # Safety
+///
+/// `char_ptr` and `char_end_ptr` must bracket one live buffer, and the
+/// returned pointer is into that same buffer -- so it must not outlive the
+/// `SourceMap` holding it. Every caller reaches this through
+/// `driver::parse_source`, which owns that buffer for as long as the AST.
 pub unsafe fn try_parse_graph_decl(
     mut char_ptr: *const u8,
     char_end_ptr: *const u8,
@@ -2530,6 +2556,12 @@ unsafe fn try_parse_graph_instance(
     Ok((RawGraphInstance { module, args }, char_ptr))
 }
 
+/// # Safety
+///
+/// `char_ptr` and `char_end_ptr` must bracket one live buffer, and the
+/// returned pointer is into that same buffer -- so it must not outlive the
+/// `SourceMap` holding it. Every caller reaches this through
+/// `driver::parse_source`, which owns that buffer for as long as the AST.
 pub unsafe fn try_parse_process_decl(
     mut char_ptr: *const u8,
     char_end_ptr: *const u8,
@@ -2581,12 +2613,18 @@ pub unsafe fn try_parse_process_decl(
     }
     let res = RawProcessDecl {
         name: proc_name,
-        args: args,
+        args,
         body: stmts,
     };
-    return Ok((res, char_ptr));
+    Ok((res, char_ptr))
 }
 
+/// # Safety
+///
+/// `char_ptr` and `char_end_ptr` must bracket one live buffer, and the
+/// returned pointer is into that same buffer -- so it must not outlive the
+/// `SourceMap` holding it. Every caller reaches this through
+/// `driver::parse_source`, which owns that buffer for as long as the AST.
 pub unsafe fn try_parse_function_decl(
     mut char_ptr: *const u8,
     char_end_ptr: *const u8,
@@ -2656,13 +2694,19 @@ pub unsafe fn try_parse_function_decl(
     }
     let res = RawFunctionDecl {
         name: func_name,
-        args: args,
-        return_type: return_type,
+        args,
+        return_type,
         body: stmts,
     };
-    return Ok((res, char_ptr));
+    Ok((res, char_ptr))
 }
 
+/// # Safety
+///
+/// `char_ptr` and `char_end_ptr` must bracket one live buffer, and the
+/// returned pointer is into that same buffer -- so it must not outlive the
+/// `SourceMap` holding it. Every caller reaches this through
+/// `driver::parse_source`, which owns that buffer for as long as the AST.
 pub unsafe fn parse_top_level(
     char_ptr: *const u8,
     length: u32,
@@ -2739,7 +2783,7 @@ pub unsafe fn parse_top_level(
         }
         return Err(ParseError { at: stuck_at, inside: None });
     }
-    return Ok(items);
+    Ok(items)
 }
 
 #[test]

@@ -492,15 +492,13 @@ fn the_checked_in_verilog_is_up_to_date() {
         let src = format!("examples/{}.ddl", name);
         let out = format!("examples/{}.v", name);
         let search = if name.starts_with("k2g_") { vec![k2g.clone()] } else { Vec::new() };
-        let (map, load_diags) = crate::source::load_program(&[src.clone()], search)
+        let (map, load_diags) = crate::source::load_program(std::slice::from_ref(&src), search)
             .expect("the example is readable");
         assert!(load_diags.is_empty(), "{}", map.render_all(&load_diags));
 
         let current = std::fs::read_to_string(&out)
             .unwrap_or_else(|e| panic!("cannot read {}: {}", out, e))
-            .replace("
-", "
-");
+            .replace("\r\n", "\n");
         let opts = EmitOptions { regenerate_cmd: banner_cmd(&current) };
         let fresh = match compile_to_verilog(&map, &opts) {
             Ok(v) => v,

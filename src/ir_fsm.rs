@@ -737,6 +737,30 @@ pub fn state_width(n: usize) -> u32 {
     w
 }
 
+/// A memory's write port as the environment holds it: three bindings, and
+/// what each was before any state ran.
+///
+/// A struct rather than the six-tuple this was, which needed a comment to say
+/// which field was which and had `entry.3` at every use.
+struct MemPortStart {
+    we_key: String,
+    addr_key: String,
+    data_key: String,
+    we: Option<ValueId>,
+    addr: Option<ValueId>,
+    data: Option<ValueId>,
+}
+
+impl MemPortStart {
+    fn keys(&self) -> [(&String, &Option<ValueId>); 3] {
+        [
+            (&self.we_key, &self.we),
+            (&self.addr_key, &self.addr),
+            (&self.data_key, &self.data),
+        ]
+    }
+}
+
 /// Finishes a process whose body is a blocking `loop`.
 pub fn lower_blocking(
     map: &crate::diag::SourceMap,
@@ -922,20 +946,17 @@ pub fn lower_blocking(
     // Without the reset between states, a write in one state would be the
     // write port's value in every state, and a scratchpad updated once per
     // item would be rewritten every cycle.
-    let mem_port_start: Vec<(String, String, String, Option<ValueId>, Option<ValueId>, Option<ValueId>)> =
-        low.mems
-            .iter()
-            .map(|m| {
-                let (we, addr, data) = Lowerer::mem_port_keys(&m.name);
-                (we, addr, data, None, None, None)
-            })
-            .collect();
-    let mut mem_port_start = mem_port_start;
-    for entry in mem_port_start.iter_mut() {
-        entry.3 = env.get(&entry.0).and_then(|b| b.value);
-        entry.4 = env.get(&entry.1).and_then(|b| b.value);
-        entry.5 = env.get(&entry.2).and_then(|b| b.value);
-    }
+    let mem_port_start: Vec<MemPortStart> = low
+        .mems
+        .iter()
+        .map(|m| {
+            let (we_key, addr_key, data_key) = Lowerer::mem_port_keys(&m.name);
+            let we = env.get(&we_key).and_then(|b| b.value);
+            let addr = env.get(&addr_key).and_then(|b| b.value);
+            let data = env.get(&data_key).and_then(|b| b.value);
+            MemPortStart { we_key, addr_key, data_key, we, addr, data }
+        })
+        .collect();
     // Per memory: which states wrote, and with what.
     let mut mem_writes: Vec<Vec<(usize, ValueId, ValueId, ValueId)>> =
         vec![Vec::new(); low.mems.len()];
@@ -946,8 +967,8 @@ pub fn lower_blocking(
                 b.value = Some(v);
             }
         }
-        for (we_key, addr_key, data_key, we0, addr0, data0) in &mem_port_start {
-            for (key, start) in [(we_key, we0), (addr_key, addr0), (data_key, data0)] {
+        for port in &mem_port_start {
+            for (key, start) in port.keys() {
                 if let (Some(v), Some(b)) = (start, env.get_mut(key)) {
                     b.value = Some(*v);
                 }
@@ -1004,30 +1025,28 @@ pub fn lower_blocking(
 
         // What this state leaves behind for the others.
         for name in &cross[k] {
-            if let Some(b) = env.get(name).cloned() {
-                if let Some(v) = b.value {
+            if let Some(b) = env.get(name).cloned()
+                && let Some(v) = b.value {
                     cross_writes.push((name.clone(), k, v, b.ty.clone()));
                 }
-            }
         }
         for (ix, name) in reg_names.iter().enumerate() {
             let now = env.get(name).and_then(|b| b.value);
-            if now != var_start[ix] {
-                if let Some(v) = now {
+            if now != var_start[ix]
+                && let Some(v) = now {
                     var_writes[ix].push((k, v));
                 }
-            }
         }
-        for (ix, (we_key, addr_key, data_key, we0, _, _)) in mem_port_start.iter().enumerate() {
-            let we = env.get(we_key).and_then(|b| b.value);
-            let wrote = we.is_some() && we != *we0;
+        for (ix, port) in mem_port_start.iter().enumerate() {
+            let we = env.get(&port.we_key).and_then(|b| b.value);
+            let wrote = we.is_some() && we != port.we;
             if !wrote {
                 continue;
             }
             let (we, addr, data) = (
                 we.expect("checked"),
-                env.get(addr_key).and_then(|b| b.value),
-                env.get(data_key).and_then(|b| b.value),
+                env.get(&port.addr_key).and_then(|b| b.value),
+                env.get(&port.data_key).and_then(|b| b.value),
             );
             if let (Some(addr), Some(data)) = (addr, data) {
                 mem_writes[ix].push((k, we, addr, data));
@@ -1131,10 +1150,10 @@ pub fn lower_blocking(
         if writes.is_empty() {
             continue;
         }
-        let (_, _, _, _, addr0, data0) = &mem_port_start[ix];
+        let port = &mem_port_start[ix];
         let mut we: Option<ValueId> = None;
-        let mut addr = addr0.expect("a declared memory has an address port");
-        let mut data = data0.expect("a declared memory has a data port");
+        let mut addr = port.addr.expect("a declared memory has an address port");
+        let mut data = port.data.expect("a declared memory has a data port");
         for (k, we_k, addr_k, data_k) in &writes {
             let gated = low.emit(
                 Ty::BOOL,

@@ -41,7 +41,7 @@ impl Scratch {
 }
 
 fn build(roots: &[String], search: Vec<PathBuf>) -> Result<String, String> {
-    let (map, load_diags) = load_program(roots, search).map_err(|e| e)?;
+    let (map, load_diags) = load_program(roots, search)?;
     if !load_diags.is_empty() {
         return Err(map.render_all(&load_diags));
     }
@@ -93,7 +93,7 @@ fn a_search_directory_is_the_fallback() {
         "import \"lib.ddl\"\n\nfun use_it (a: i8, o: out i8)\n  o = adder(a, 8'd1)\n",
     );
 
-    let err = build(&[main.clone()], Vec::new()).expect_err("not findable yet");
+    let err = build(std::slice::from_ref(&main), Vec::new()).expect_err("not findable yet");
     assert!(err.contains("cannot find `lib.ddl`"), "{}", err);
     assert!(err.contains("main.ddl:1:8"), "{}", err);
 
@@ -249,7 +249,7 @@ fn a_single_file_program_is_unchanged_by_all_of_this() {
     let s = Scratch::new("plain");
     let a = s.write("a.ddl", ADDER);
 
-    let through_loader = build(&[a.clone()], Vec::new()).expect("should compile");
+    let through_loader = build(std::slice::from_ref(&a), Vec::new()).expect("should compile");
     let direct = {
         let map = SourceMap::new(a, ADDER);
         compile_to_verilog(&map, &EmitOptions::default()).expect("should compile")

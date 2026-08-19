@@ -155,6 +155,14 @@ without writing it.
 cargo test
 ```
 
+```bash
+cargo clippy --all-targets
+```
+
+Clippy is clean. The two lints this codebase deliberately does not follow are
+in `Cargo.toml` with a reason each; rustfmt is deliberately NOT used, because
+the house style predates it and adopting it would rewrite every file.
+
 Unit and integration tests: the compiler's own behaviour, `import` against
 real files on disk, that every example still compiles, and that the checked-in
 `.v` files match what the compiler produces now.

@@ -253,8 +253,8 @@ pub fn lower_sequence(
     let mut next_slot = n; // validity bits occupy 0..n
     let mut pending: Vec<(String, Ty, ValueId, usize)> = Vec::new();
 
-    for k in 0..n {
-        for stmt in &plain[k] {
+    for (k, stage) in plain.iter().enumerate() {
+        for stmt in stage {
             crate::ir::lower_stmt_pub(&mut low, stmt, &mut env, sink)?;
         }
         let is_last = k + 1 == n;
@@ -338,8 +338,8 @@ pub fn lower_sequence(
         let feed = if k == 0 {
             in_valid
         } else {
-            let prev = low.emit(Ty::BOOL, Op::RegRead((valid_base + k - 1) as u32));
-            prev
+            
+            low.emit(Ty::BOOL, Op::RegRead((valid_base + k - 1) as u32))
         };
         let next = low.emit(Ty::BOOL, Op::Mux { cond: en, then_val: feed, else_val: cur });
         valid_regs.push(Reg { name: format!("v{}", k), ty: Ty::BOOL, reset: 0, next });

@@ -12,3 +12,24 @@ name = "ddl"
 path = "src/main.rs"
 
 [dependencies]
+
+# `cargo clippy` is clean apart from these two, which are choices rather than
+# oversights. An allow with no reason beside it is worse than not running
+# clippy at all: the next person cannot tell which of them anybody thought
+# about.
+[lints.clippy]
+
+# The parser answers `Result<T, ()>` about two hundred times. An error type
+# would be better and is not a small change -- every `?` in 2600 lines of
+# pointer parsing is on this -- and the thing it costs, a parse failure with no
+# location, is already paid for elsewhere: `lex::BodyFail` records where a
+# declaration's body stopped making sense and `driver` reports THAT rather than
+# the keyword above it. Revisit when the AST moves off raw pointers.
+result_unit_err = "allow"
+
+# `ir_fsm::lower_blocking` takes eleven. It is the seam between the two halves
+# of lowering a process: everything `lower_process` worked out about the
+# parameters and registers, handed to the half that schedules the body. A
+# struct would move the arguments rather than remove them, and would put a
+# layer between the two halves that only exists to satisfy a count.
+too_many_arguments = "allow"

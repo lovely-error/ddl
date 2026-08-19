@@ -311,7 +311,7 @@ unsafe fn resolve_anum_span(anum_span: &AlphanumSpan) -> Result<AnumResolution, 
     // let mut ptr = anum_span.byte_ptr;
     // let end_ptr = ptr.add(anum_span.len as _);
     let str = core::str::from_raw_parts(anum_span.byte_ptr, anum_span.len as _);
-    let iden_is_builtin = str.as_bytes()[0] == '@' as _;
+    let iden_is_builtin = str.as_bytes()[0] == b'@';
     if iden_is_builtin {
         match &str[1..] {
             "map" => return Ok(AnumResolution::Builtin(BuiltinOp::Simd)),
@@ -340,7 +340,7 @@ unsafe fn resolve_anum_span(anum_span: &AlphanumSpan) -> Result<AnumResolution, 
     }
     let (ats_past_head, only_nums) = str.as_bytes().iter().fold((false, true), |acc, el| {
         (
-            (*el == '@' as _) || acc.0,
+            (*el == b'@') || acc.0,
             (*el as char).is_numeric() && acc.1,
         )
     });
@@ -351,32 +351,25 @@ unsafe fn resolve_anum_span(anum_span: &AlphanumSpan) -> Result<AnumResolution, 
         return Ok(AnumResolution::IntLiteral);
     }
     //
-    return Ok(AnumResolution::Ref);
+    Ok(AnumResolution::Ref)
 }
 
 unsafe fn resolve_stmt(char_ptr: *const u8, stmt: &InnerStmt) -> Result<PrecResInnerStmt, ()> {
     // this flattener is horrid! do better?
     fn flatten(expr: &RawExpr) -> &RawExpr {
         let mut expr = expr;
-        loop {
-            match expr {
-                RawExpr::InfixExpr { pieces } => match &pieces[..] {
-                    [InfixExprComponent::Subexpr(_expr)] => {
-                        expr = _expr;
-                        continue;
-                    }
-                    _ => break,
-                },
+        // Peel `((x))` down to `x`: an infix node holding one subexpression
+        // and no operator is parentheses that survived precedence resolution.
+        while let RawExpr::InfixExpr { pieces } = expr {
+            match &pieces[..] {
+                [InfixExprComponent::Subexpr(inner)] => expr = inner,
                 _ => break,
             }
         }
         expr
     }
     fn is_assign_smtm(expr: &InfixExprComponent) -> bool {
-        match expr {
-            InfixExprComponent::Basic(BasicInfixOp::Assign(_)) => true,
-            _ => false,
-        }
+        matches!(expr, InfixExprComponent::Basic(BasicInfixOp::Assign(_)))
     }
     fn get_assign_stmt(expr: &InfixExprComponent) -> AssignStmtKind {
         match expr {
@@ -388,18 +381,18 @@ unsafe fn resolve_stmt(char_ptr: *const u8, stmt: &InnerStmt) -> Result<PrecResI
         char_ptr: *const u8,
         pieces: &[InfixExprComponent],
     ) -> Result<AssignStmt, ()> {
-        match &pieces[..] {
+        match pieces {
             [InfixExprComponent::Subexpr(lhs), op, tail @ ..] if is_assign_smtm(op) => {
                 let left = resolve_precedence(char_ptr, lhs)?;
                 let right = resolve_many(char_ptr, tail)?;
                 let kind = get_assign_stmt(op);
-                return Ok(AssignStmt {
+                Ok(AssignStmt {
                     lvalue: left,
                     rvalue: right,
                     kind,
-                });
+                })
             }
-            _ => return Err(()),
+            _ => Err(()),
         }
     }
     unsafe fn wrap_in_block_if_standalone(
@@ -408,13 +401,13 @@ unsafe fn resolve_stmt(char_ptr: *const u8, stmt: &InnerStmt) -> Result<PrecResI
     ) -> Result<PrecResExpr, ()> {
         match flatten(expr) {
             RawExpr::InfixExpr { pieces } => {
-                let stmt = try_mk_assign_stmt(char_ptr, &pieces)?;
+                let stmt = try_mk_assign_stmt(char_ptr, pieces)?;
                 let rs = PrecResInnerStmt::AssignStmt(stmt);
-                return Ok(PrecResExpr::StmtBlock(StmtBlock {
+                Ok(PrecResExpr::StmtBlock(StmtBlock {
                     components: vec![rs],
-                }));
+                }))
             }
-            expr => return resolve_precedence(char_ptr, expr),
+            expr => resolve_precedence(char_ptr, expr),
         }
     }
     match stmt {
@@ -429,13 +422,13 @@ unsafe fn resolve_stmt(char_ptr: *const u8, stmt: &InnerStmt) -> Result<PrecResI
             } else {
                 None
             };
-            return Ok(PrecResInnerStmt::VarDecl(VarDeclStmt {
+            Ok(PrecResInnerStmt::VarDecl(VarDeclStmt {
                 is_mutable: var_decl_stmt.is_mutable,
                 name: var_decl_stmt.name,
                 rest: var_decl_stmt.rest.clone(),
                 ty_expr: tyval,
                 assign_val: aval,
-            }));
+            }))
         }
         InnerStmt::MatchStmt(match_stmt) => {
             let mut scruts = Vec::new();
@@ -451,16 +444,16 @@ unsafe fn resolve_stmt(char_ptr: *const u8, stmt: &InnerStmt) -> Result<PrecResI
                     rhs,
                 })
             }
-            return Ok(PrecResInnerStmt::MatchStmt(MatchStmt {
+            Ok(PrecResInnerStmt::MatchStmt(MatchStmt {
                 scrutinees: scruts,
                 cases,
-            }));
+            }))
         }
         InnerStmt::ExprStmt(raw_expr) => {
             // only valid as call or combined assign
             let flatten_expr = flatten(raw_expr);
             if let RawExpr::Call { base, args } = flatten_expr {
-                let base = resolve_precedence(char_ptr, &base)?;
+                let base = resolve_precedence(char_ptr, base)?;
                 let mut argsp = Vec::new();
                 for arg in args {
                     let arg = resolve_precedence(char_ptr, arg)?;
@@ -468,13 +461,12 @@ unsafe fn resolve_stmt(char_ptr: *const u8, stmt: &InnerStmt) -> Result<PrecResI
                 }
                 return Ok(PrecResInnerStmt::CallStmt(CallStmt { base, args: argsp }));
             }
-            if let RawExpr::InfixExpr { pieces } = flatten_expr {
-                if let Ok(stmt) = try_mk_assign_stmt(char_ptr, &pieces) {
+            if let RawExpr::InfixExpr { pieces } = flatten_expr
+                && let Ok(stmt) = try_mk_assign_stmt(char_ptr, pieces) {
                     return Ok(PrecResInnerStmt::AssignStmt(stmt));
                 }
-            }
             let expr = resolve_precedence(char_ptr, flatten_expr)?;
-            return Ok(PrecResInnerStmt::TailVal(expr));
+            Ok(PrecResInnerStmt::TailVal(expr))
         }
         InnerStmt::IfThenElse(ite) => {
             // ite can have inline arms
@@ -488,32 +480,32 @@ unsafe fn resolve_stmt(char_ptr: *const u8, stmt: &InnerStmt) -> Result<PrecResI
             } else {
                 None
             };
-            return Ok(PrecResInnerStmt::IfThenElse(ITEStmt {
+            Ok(PrecResInnerStmt::IfThenElse(ITEStmt {
                 condition: cond,
                 then_case: then_arm,
                 else_case: else_arm,
-            }));
+            }))
         }
         InnerStmt::Loop(loop_stmt) => {
             let lstmt = wrap_in_block_if_standalone(char_ptr, &loop_stmt.repeat_expr)?;
-            return Ok(PrecResInnerStmt::Loop(LoopStmt { repeat_expr: lstmt }));
+            Ok(PrecResInnerStmt::Loop(LoopStmt { repeat_expr: lstmt }))
         }
-        InnerStmt::Break => return Ok(PrecResInnerStmt::Break),
+        InnerStmt::Break => Ok(PrecResInnerStmt::Break),
         InnerStmt::ForLoopStmt(stmt) => {
             let tar = resolve_precedence(char_ptr, &stmt.target)?;
             let body = resolve_precedence(char_ptr, &stmt.body)?;
-            return Ok(PrecResInnerStmt::ForLoop(Box::new(ForLoopStmt {
+            Ok(PrecResInnerStmt::ForLoop(Box::new(ForLoopStmt {
                 binding: stmt.binding,
                 target: tar,
-                body: body,
-            })));
+                body,
+            })))
         }
         InnerStmt::ReturnStmt(expr) => {
             let expr = match expr {
                 Some(expr) => Some(resolve_precedence(char_ptr, expr)?),
                 None => None,
             };
-            return Ok(PrecResInnerStmt::ReturnStmt(expr));
+            Ok(PrecResInnerStmt::ReturnStmt(expr))
         }
     }
 }
@@ -528,6 +520,11 @@ pub fn int_literal_to_int(anum_span: &AlphanumSpan) -> Result<usize, <usize as c
 }
 
 // resolve precedence and locally flatten the tree
+/// # Safety
+///
+/// `char_ptr` must be the base of the same buffer the raw AST was parsed
+/// from: the spans in it are pointers into that buffer, and resolving one
+/// dereferences them.
 pub unsafe fn resolve_precedence(char_ptr: *const u8, expr: &RawExpr) -> Result<PrecResExpr, ()> {
     match expr {
         // `if c then a else b` desugars to a three-operand select, so the
@@ -536,10 +533,10 @@ pub unsafe fn resolve_precedence(char_ptr: *const u8, expr: &RawExpr) -> Result<
             let c = resolve_precedence(char_ptr, cond)?;
             let t = resolve_precedence(char_ptr, then_e)?;
             let e = resolve_precedence(char_ptr, else_e)?;
-            return Ok(PrecResExpr::Call {
+            Ok(PrecResExpr::Call {
                 base: Box::new(PrecResExpr::Builtin(BuiltinOp::Select)),
                 args: vec![c, t, e],
-            });
+            })
         }
 
         RawExpr::StmtBlock(stmt_block) => {
@@ -551,25 +548,25 @@ pub unsafe fn resolve_precedence(char_ptr: *const u8, expr: &RawExpr) -> Result<
             for component in components {
                 checked_components.push(component?)
             }
-            return Ok(PrecResExpr::StmtBlock(StmtBlock {
+            Ok(PrecResExpr::StmtBlock(StmtBlock {
                 components: checked_components,
-            }));
+            }))
         }
         RawExpr::InfixExpr { pieces } => match &pieces[..] {
-            [InfixExprComponent::Subexpr(subexpr)] => return resolve_precedence(char_ptr, subexpr),
-            pieces => return resolve_many(char_ptr, pieces),
+            [InfixExprComponent::Subexpr(subexpr)] => resolve_precedence(char_ptr, subexpr),
+            pieces => resolve_many(char_ptr, pieces),
         },
         RawExpr::Call { base, args } => {
-            let base = resolve_precedence(char_ptr, &base)?;
+            let base = resolve_precedence(char_ptr, base)?;
             let mut proced = Vec::new();
             for item in args {
                 let item = resolve_precedence(char_ptr, item)?;
                 proced.push(item)
             }
-            return Ok(PrecResExpr::Call {
+            Ok(PrecResExpr::Call {
                 base: Box::new(base),
                 args: proced,
-            });
+            })
         }
         RawExpr::NumLiteral(num) => {
             let lit = match num {
@@ -582,7 +579,7 @@ pub unsafe fn resolve_precedence(char_ptr: *const u8, expr: &RawExpr) -> Result<
                     frac: *frac,
                 },
             };
-            return Ok(PrecResExpr::Literal(lit));
+            Ok(PrecResExpr::Literal(lit))
         }
         RawExpr::Unary { op, operand } => {
             let operand = resolve_precedence(char_ptr, operand)?;
@@ -591,48 +588,48 @@ pub unsafe fn resolve_precedence(char_ptr: *const u8, expr: &RawExpr) -> Result<
                 UnaryOp::BitNot => BuiltinOp::BitInvert,
                 UnaryOp::LogNot => BuiltinOp::LogNot,
             };
-            return Ok(PrecResExpr::Call {
+            Ok(PrecResExpr::Call {
                 base: Box::new(PrecResExpr::Builtin(builtin)),
                 args: vec![operand],
-            });
+            })
         }
         RawExpr::AnumSpan(anum_span) => match resolve_anum_span(anum_span)? {
-            AnumResolution::Builtin(bio) => return Ok(PrecResExpr::Builtin(bio)),
+            AnumResolution::Builtin(bio) => Ok(PrecResExpr::Builtin(bio)),
             AnumResolution::IntLiteral => {
                 // Reachable only for digit runs that the numeric lexer did not
                 // claim -- notably a tuple/field index after a dot.
                 let outcome = int_literal_to_int(anum_span);
                 match outcome {
                     Ok(int) => {
-                        return Ok(PrecResExpr::Literal(Literal::IntLiteral {
+                        Ok(PrecResExpr::Literal(Literal::IntLiteral {
                             value: int as u128,
                             width: None,
-                        }));
+                        }))
                     },
                     Err(_) => {
-                        return Err(())
+                        Err(())
                     },
                 }
             }
-            AnumResolution::Ref => return Ok(PrecResExpr::Ref(*anum_span)),
+            AnumResolution::Ref => Ok(PrecResExpr::Ref(*anum_span)),
         },
         RawExpr::MemberAccess { base, field_name } => {
             // The `<int>.<int>` reassembly that used to live here is gone:
             // try_parse_number recognises floats directly, so `0.717` never
             // reaches this point as a member access.
             let base = resolve_precedence(char_ptr, base)?;
-            return Ok(PrecResExpr::FieldAccess {
+            Ok(PrecResExpr::FieldAccess {
                 base: Box::new(base),
                 field_name: *field_name,
-            });
+            })
         }
         RawExpr::SubscriptAccess(val) => {
             let base = resolve_precedence(char_ptr, &val.base)?;
             let index = resolve_precedence(char_ptr, &val.index)?;
-            return Ok(PrecResExpr::SubscriptAccess(Box::new(SubscriptAccess {
+            Ok(PrecResExpr::SubscriptAccess(Box::new(SubscriptAccess {
                 base,
                 index,
-            })));
+            })))
         }
         RawExpr::Splice(raw_exprs) => {
             let mut proced = Vec::new();
@@ -640,28 +637,28 @@ pub unsafe fn resolve_precedence(char_ptr: *const u8, expr: &RawExpr) -> Result<
                 let item = resolve_precedence(char_ptr, item)?;
                 proced.push(item)
             }
-            return Ok(PrecResExpr::Splice(proced));
+            Ok(PrecResExpr::Splice(proced))
         }
         RawExpr::Postfix { base, op } => {
             let base = resolve_precedence(char_ptr, base)?;
             let op = match op {
                 PostfixOp::Tilda => BuiltinOp::BitInvert,
             };
-            return Ok(PrecResExpr::Call {
+            Ok(PrecResExpr::Call {
                 base: Box::new(PrecResExpr::Builtin(op)),
                 args: vec![base],
-            });
+            })
         }
         RawExpr::StrLiteral(str) => {
-            return Ok(PrecResExpr::Literal(Literal::StrLiteral(str.clone())));
+            Ok(PrecResExpr::Literal(Literal::StrLiteral(str.clone())))
         }
         RawExpr::Span(span) => {
             let left = resolve_precedence(char_ptr, &span.left)?;
             let right = resolve_precedence(char_ptr, &span.right)?;
-            return Ok(PrecResExpr::SubscriptAccess(Box::new(SubscriptAccess {
+            Ok(PrecResExpr::SubscriptAccess(Box::new(SubscriptAccess {
                 base: left,
                 index: right,
-            })));
+            })))
         }
     }
 }
@@ -672,10 +669,7 @@ unsafe fn resolve_many(
 ) -> Result<PrecResExpr, ()> {
     // any assign ops are invalid here
 
-    match pieces {
-        [InfixExprComponent::Subexpr(expr)] => return resolve_precedence(char_ptr, expr),
-        _ => (),
-    }
+    if let [InfixExprComponent::Subexpr(expr)] = pieces { return resolve_precedence(char_ptr, expr) }
 
     // Precedence groups, LOOSEST FIRST.
     //
@@ -792,7 +786,7 @@ unsafe fn resolve_many(
         });
     }
 
-    return Err(());
+    Err(())
 }
 
 unsafe fn resolve_type(
@@ -804,7 +798,7 @@ unsafe fn resolve_type(
             Ok(PrecTypeExpr::Ident(*alphanum_span))
         },
         RawTypeExpr::Array(item_type, count) => {
-            let resolved_ty = resolve_type(char_ptr, &item_type)?;
+            let resolved_ty = resolve_type(char_ptr, item_type)?;
             let resolved_count = resolve_precedence(char_ptr, count)?;
             Ok(PrecTypeExpr::Array(Box::new(resolved_ty), resolved_count))
         },
@@ -841,9 +835,14 @@ unsafe fn resolve_arg_tuple(
         };
         result.push(x);
     }
-    return Ok(PrecArgDefTuple { entries: result })
+    Ok(PrecArgDefTuple { entries: result })
 }
 
+/// # Safety
+///
+/// `char_ptr` must be the base of the same buffer the raw AST was parsed
+/// from: the spans in it are pointers into that buffer, and resolving one
+/// dereferences them.
 pub unsafe fn resolve_precedence_for_process(
     char_ptr: *const u8,
     proc_decl: &RawProcessDecl,
@@ -854,13 +853,18 @@ pub unsafe fn resolve_precedence_for_process(
         items.push(x?)
     }
     let args = resolve_arg_tuple(char_ptr, &proc_decl.args)?;
-    return Ok(ProcessDecl {
+    Ok(ProcessDecl {
         name: proc_decl.name,
-        args: args,
+        args,
         body: items,
-    });
+    })
 }
 
+/// # Safety
+///
+/// `char_ptr` must be the base of the same buffer the raw AST was parsed
+/// from: the spans in it are pointers into that buffer, and resolving one
+/// dereferences them.
 pub unsafe fn resolve_precedence_for_function(
     char_ptr: *const u8,
     proc_decl: &RawFunctionDecl,
@@ -874,13 +878,18 @@ pub unsafe fn resolve_precedence_for_function(
         items.push(x?)
     }
     let args = resolve_arg_tuple(char_ptr, &proc_decl.args)?;
-    return Ok(FunctionDecl {
+    Ok(FunctionDecl {
         name: proc_decl.name,
-        args: args,
+        args,
         body: items,
-    });
+    })
 }
 
+/// # Safety
+///
+/// `char_ptr` must be the base of the same buffer the raw AST was parsed
+/// from: the spans in it are pointers into that buffer, and resolving one
+/// dereferences them.
 pub unsafe fn resolve_precedence_for_sequence(
     char_ptr: *const u8,
     proc_decl: &RawSequenceDecl,
@@ -898,13 +907,18 @@ pub unsafe fn resolve_precedence_for_sequence(
         items.push(item);
     }
     let args = resolve_arg_tuple(char_ptr, &proc_decl.args)?;
-    return Ok(SequenceDecl {
+    Ok(SequenceDecl {
         name: proc_decl.name,
-        args: args,
+        args,
         body: items,
-    });
+    })
 }
 
+/// # Safety
+///
+/// `char_ptr` must be the base of the same buffer the raw AST was parsed
+/// from: the spans in it are pointers into that buffer, and resolving one
+/// dereferences them.
 /// A graph body holds no expressions, so this only turns raw type
 /// expressions into resolved ones.
 pub unsafe fn resolve_precedence_for_graph(
@@ -930,6 +944,11 @@ pub unsafe fn resolve_precedence_for_graph(
     Ok(GraphDecl { name: graph_decl.name, args, body })
 }
 
+/// # Safety
+///
+/// `char_ptr` must be the base of the same buffer the raw AST was parsed
+/// from: the spans in it are pointers into that buffer, and resolving one
+/// dereferences them.
 pub unsafe fn resolve_precedence_for_struct(
     char_ptr: *const u8,
     struct_decl: &RawStructDecl,
@@ -943,9 +962,14 @@ pub unsafe fn resolve_precedence_for_struct(
         };
         fields.push(x);
     }
-    return Ok(StructDecl { name: struct_decl.name, fields })
+    Ok(StructDecl { name: struct_decl.name, fields })
 }
 
+/// # Safety
+///
+/// `char_ptr` must be the base of the same buffer the raw AST was parsed
+/// from: the spans in it are pointers into that buffer, and resolving one
+/// dereferences them.
 pub unsafe fn resolve_precedence_for_enum(
     char_ptr: *const u8,
     enum_decl: &RawEnumDecl,
@@ -966,7 +990,7 @@ pub unsafe fn resolve_precedence_for_enum(
         };
         variants.push(EnumVariant { name: field.name, discriminant, payload });
     }
-    return Ok(EnumDecl { name: enum_decl.name, tag_type, variants })
+    Ok(EnumDecl { name: enum_decl.name, tag_type, variants })
 }
 
 #[test]

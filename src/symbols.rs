@@ -225,8 +225,8 @@ pub fn build(
         Struct(usize),
     }
     let mut pending: Vec<Pending> = Vec::new();
-    for ix in 0..enums.len() {
-        if shells[ix].is_some() {
+    for (ix, shell) in shells.iter().enumerate() {
+        if shell.is_some() {
             pending.push(Pending::Enum(ix));
         }
     }
@@ -321,12 +321,12 @@ pub fn build(
                 let shell = shells[*ix].as_ref().expect("only present shells are pending");
                 (
                     enums[*ix].name,
-                    finish_enum(&enums[*ix], shell, &syms).err().expect("it did not finish"),
+                    finish_enum(&enums[*ix], shell, &syms).expect_err("it did not finish"),
                 )
             }
             Pending::Struct(ix) => (
                 structs[*ix].name,
-                build_struct_quiet(&structs[*ix], &syms).err().expect("it did not finish"),
+                build_struct_quiet(&structs[*ix], &syms).expect_err("it did not finish"),
             ),
         };
         let (span, message, missing) = err;

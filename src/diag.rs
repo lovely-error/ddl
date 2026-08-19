@@ -215,6 +215,13 @@ impl SourceMap {
         self.text.len() as u32
     }
 
+    /// Always false in practice -- `from_files` substitutes a placeholder for
+    /// an empty input list -- but a `len` without one is a trap for anyone who
+    /// writes the obvious thing.
+    pub fn is_empty(&self) -> bool {
+        self.text.is_empty()
+    }
+
     pub fn base_ptr(&self) -> *const u8 {
         self.text.as_bytes().as_ptr()
     }

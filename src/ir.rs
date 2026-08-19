@@ -1139,13 +1139,11 @@ impl<'a> Lowerer<'a> {
         // doing -- the index is a constant whose natural width is one bit, and
         // the address port wants two, so without this the output reads
         // `mem[{{1{1'b0}}, 1'b1}]` where it should read `mem[2'd1]`.
-        if !have.is_signed() && !want.is_signed() {
-            if let Op::Const(k) = self.values[value.0 as usize].op {
-                if literal_fits(k, want) {
+        if !have.is_signed() && !want.is_signed()
+            && let Op::Const(k) = self.values[value.0 as usize].op
+                && literal_fits(k, want) {
                     return self.emit(want.clone(), Op::Const(k));
                 }
-            }
-        }
 
         let to = want.bit_width();
         let width_already_matches = have.bit_width() == to;
@@ -1470,10 +1468,7 @@ pub fn lower_process(
             sink.err_at(&arg.arg_name, format!("`{}` is implicit on a process", name));
             return None;
         }
-        let kind = match classify_param(&low, arg, sink) {
-            Some(k) => k,
-            None => return None,
-        };
+        let kind = classify_param(&low, arg, sink)?;
         // A plain parameter is configuration, folded here and gone. Everything
         // that changes cycle to cycle is a pipe.
         let (is_input, is_stream) = match kind {
@@ -2208,10 +2203,7 @@ fn lower_stmt(
     env: &mut Env,
     sink: &mut DiagSink,
 ) -> Option<()> {
-    let depth = match stmt_anchor(stmt) {
-        Some(at) => Some(low.push_anchor(low.span_of(&at))),
-        None => None,
-    };
+    let depth = stmt_anchor(stmt).map(|at| low.push_anchor(low.span_of(&at)));
     let result = lower_stmt_at(low, stmt, env, sink);
     if let Some(depth) = depth {
         low.pop_anchor(depth);
@@ -2258,8 +2250,8 @@ fn lower_stmt_at(
             // parameters needs the statement form: the expression form has no
             // way to write the argument back, because it never sees the
             // caller's environment mutably.
-            if let Some(PrecResExpr::Call { base, args }) = &decl.assign_val {
-                if let PrecResExpr::Ref(callee) = &**base {
+            if let Some(PrecResExpr::Call { base, args }) = &decl.assign_val
+                && let PrecResExpr::Ref(callee) = &**base {
                     let has_inouts = low
                         .syms
                         .funcs
@@ -2272,7 +2264,6 @@ fn lower_stmt_at(
                         );
                     }
                 }
-            }
 
             let declared = match &decl.ty_expr {
                 Some(t) => match resolve_type_expr(t, low.syms) {
@@ -2345,8 +2336,8 @@ fn lower_stmt_at(
             // 28-field struct, so a bare name is not enough.
             // `m[addr] = v` is a memory write, and the only assignment whose
             // target is not a path.
-            if let PrecResExpr::SubscriptAccess(sub) = &assign.lvalue {
-                if let PrecResExpr::Ref(mem_name) = &sub.base {
+            if let PrecResExpr::SubscriptAccess(sub) = &assign.lvalue
+                && let PrecResExpr::Ref(mem_name) = &sub.base {
                     let is_memory = env
                         .get(anumspan_to_str(mem_name))
                         .is_some_and(|b| b.ty.is_memory());
@@ -2362,7 +2353,6 @@ fn lower_stmt_at(
                         );
                     }
                 }
-            }
 
             let path = match lvalue_path(&assign.lvalue) {
                 Some(p) => p,
@@ -2615,11 +2605,10 @@ fn lower_stmt_at(
                     }
                     (None, None) => None,
                 };
-                if let Some(v) = merged {
-                    if let Some(b) = env.get_mut(&name) {
+                if let Some(v) = merged
+                    && let Some(b) = env.get_mut(&name) {
                         b.value = Some(v);
                     }
-                }
             }
             Some(())
         }
@@ -2825,8 +2814,8 @@ pub fn lower_expr_expecting(
     env: &Env,
     sink: &mut DiagSink,
 ) -> Option<ValueId> {
-    if let PrecResExpr::Call { base, args } = expr {
-        if let PrecResExpr::Builtin(b) = &**base {
+    if let PrecResExpr::Call { base, args } = expr
+        && let PrecResExpr::Builtin(b) = &**base {
             match b {
                 BuiltinOp::Zeroed if args.is_empty() => {
                     return match want {
@@ -2879,7 +2868,6 @@ pub fn lower_expr_expecting(
                 _ => {}
             }
         }
-    }
     lower_expr(low, expr, env, sink)
 }
 
@@ -2894,8 +2882,8 @@ pub fn lower_expr(
             let name = anumspan_to_str(span);
             // A local shadows a variant, so the environment is consulted first.
             let is_local = env.contains_key(name);
-            if !is_local {
-                if let Some((def, discriminant)) = low.syms.lookup_variant(name) {
+            if !is_local
+                && let Some((def, discriminant)) = low.syms.lookup_variant(name) {
                     // A variant that carries something is not a value until it
                     // is given one. `Read` alone would be `Read` with an
                     // undefined address, which is exactly the bug the payload
@@ -2918,7 +2906,6 @@ pub fn lower_expr(
                     let whole = def.bare_value(discriminant);
                     return Some(low.emit(ty, Op::Const(whole)));
                 }
-            }
             match env.get(name) {
                 Some(Binding { value: Some(v), .. }) => Some(*v),
                 Some(Binding { is_output: true, .. }) => {
@@ -2943,15 +2930,14 @@ pub fn lower_expr(
                 // rules re-materialise it at the width of its partner.
                 None => Ty::UInt(ty::bits_for(*value)),
             };
-            if let Some(w) = width {
-                if !literal_fits(*value, &Ty::UInt(*w)) {
+            if let Some(w) = width
+                && !literal_fits(*value, &Ty::UInt(*w)) {
                     sink.err_span(
                         low.here(),
                         format!("literal {} does not fit in {} bits", value, w),
                     );
                     return None;
                 }
-            }
             Some(low.emit(ty, Op::Const(*value)))
         }
 
