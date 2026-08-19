@@ -22,7 +22,7 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
-use crate::diag::{Diag, SourceMap, Span};
+use crate::diag::{Diag, SourceMap};
 
 /// Where a file's text came from, and what it looks like after import lines
 /// have been blanked out.
@@ -163,13 +163,19 @@ impl Loader {
             .bad
             .iter()
             .map(|b| {
-                let span = map
-                    .span_in_file(&b.in_file, b.line_no, b.col, b.len)
-                    .unwrap_or(Span::at(0));
-                Diag::error(span, b.msg.clone()).with_note(
-                    "an import is resolved against the importing file's directory, then \
-                     against each `-I` directory",
-                )
+                let note = "an import is resolved against the importing file's directory, \
+                            then against each `-I` directory";
+                // No span rather than a made-up one. `Span::at(0)` renders as
+                // line 1 of the first file, which is a place a reader will go
+                // and look at, and every byte of it will be innocent. This
+                // should be unreachable -- the file and the line both come
+                // from our own scan of it -- and if it ever is reached, saying
+                // nothing is the honest answer.
+                match map.span_in_file(&b.in_file, b.line_no, b.col, b.len) {
+                    Some(span) => Diag::error(span, b.msg.clone()).with_note(note),
+                    None => Diag::error_no_span(format!("{}: {}", b.in_file, b.msg))
+                        .with_note(note),
+                }
             })
             .collect();
         (map, diags)
