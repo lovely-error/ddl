@@ -2046,6 +2046,7 @@ pub unsafe fn try_parse_enum_decl(
     mut char_ptr: *const u8,
     char_end_ptr: *const u8,
     anchor_depth: u32,
+    fail: &mut Option<BodyFail>,
 ) -> Result<(RawEnumDecl, *const u8), ()> {
     let (matched, tail) = strip_prefix_on_match(char_ptr, char_end_ptr, "enum");
     if !matched {
@@ -2089,7 +2090,17 @@ pub unsafe fn try_parse_enum_decl(
             break;
         }
         char_ptr = tail;
-        let (f, tail) = try_parse_enum_field(char_ptr, char_end_ptr, body_ancore_depth)?;
+        let (f, tail) = match try_parse_enum_field(char_ptr, char_end_ptr, body_ancore_depth) {
+            Ok(v) => v,
+            Err(()) => {
+                note_body_fail(fail, char_ptr, "enum");
+                return Err(());
+            }
+        };
+        if !line_is_finished(tail, char_end_ptr) {
+            note_body_fail(fail, tail, "enum");
+            return Err(());
+        }
         char_ptr = tail;
         fields.push(f);
     }
@@ -2163,6 +2174,7 @@ pub unsafe fn try_parse_struct_decl(
     mut char_ptr: *const u8,
     char_end_ptr: *const u8,
     anchor_depth: u32,
+    fail: &mut Option<BodyFail>,
 ) -> Result<(RawStructDecl, *const u8), ()> {
     let (matched, tail) = strip_prefix_on_match(char_ptr, char_end_ptr, "struct ");
     if !matched {
@@ -2191,7 +2203,17 @@ pub unsafe fn try_parse_struct_decl(
             break;
         }
         char_ptr = tail;
-        let (f, tail) = try_parse_struct_field(char_ptr, char_end_ptr)?;
+        let (f, tail) = match try_parse_struct_field(char_ptr, char_end_ptr) {
+            Ok(v) => v,
+            Err(()) => {
+                note_body_fail(fail, char_ptr, "struct");
+                return Err(());
+            }
+        };
+        if !line_is_finished(tail, char_end_ptr) {
+            note_body_fail(fail, tail, "struct");
+            return Err(());
+        }
         char_ptr = tail;
         fields.push(f);
     }
@@ -2226,6 +2248,7 @@ pub unsafe fn try_parse_sequence_decl(
     mut char_ptr: *const u8,
     char_end_ptr: *const u8,
     anchor_depth: u32,
+    fail: &mut Option<BodyFail>,
 ) -> Result<(RawSequenceDecl, *const u8), ()> {
     let (matched, tail) = strip_prefix_on_match(char_ptr, char_end_ptr, "sequence ");
     if !matched {
@@ -2260,7 +2283,14 @@ pub unsafe fn try_parse_sequence_decl(
         }
         char_ptr = tail;
 
-        let (inner_stmt, tail) = try_parse_sequence_inner_stmt(char_ptr, char_end_ptr, body_ancore_depth)?;
+        let (inner_stmt, tail) =
+            match try_parse_sequence_inner_stmt(char_ptr, char_end_ptr, body_ancore_depth) {
+                Ok(v) => v,
+                Err(()) => {
+                    note_body_fail(fail, char_ptr, "sequence");
+                    return Err(());
+                }
+            };
         stmts.push(inner_stmt);
         char_ptr = tail;
     }
@@ -2276,10 +2306,74 @@ pub unsafe fn try_parse_sequence_decl(
 ///
 /// Shaped like `try_parse_sequence_decl`: header, then statements indented
 /// past the header's own column.
+/// Whether the rest of this line is blank or a comment.
+///
+/// A body item that parses but does not reach the end of its line has left
+/// something behind: `B ~~ C` in an enum parses `B`, stops, and the leftover
+/// falls out of the declaration to be reported as top-level garbage with a
+/// note about top-level declarations. Checking here keeps the complaint where
+/// the reader is looking.
+///
+/// Only for line-oriented bodies -- enums, structs, graphs. A statement may
+/// legitimately span lines, and this would call the second one leftovers.
+unsafe fn line_is_finished(mut char_ptr: *const u8, char_end_ptr: *const u8) -> bool {
+    let (_, tail) = skip_whitespaces(char_ptr, char_end_ptr);
+    char_ptr = tail;
+    if char_ptr >= char_end_ptr {
+        return true;
+    }
+    let (is_comment, _) = strip_prefix_on_match(char_ptr, char_end_ptr, "--");
+    if is_comment {
+        return true;
+    }
+    let here = deref(char_ptr);
+    here == 10 || here == 13
+}
+
+/// Where a declaration's body stopped making sense, and what kind of
+/// declaration it was.
+///
+/// The parsers answer `Result<T, ()>`: a failure says nothing about why or
+/// where. So a declaration whose HEADER parsed and whose body had one bad line
+/// failed whole, `parse_top_level` tried every other parser on the same
+/// keyword, and the error came out as ``unexpected `fun` `` pointing at the
+/// declaration -- which is the one line that was fine.
+///
+/// Recording the failure at the body-item loop is enough to fix that, because
+/// that loop is where a bad line stops the parse. The header is on the
+/// declaration's own line, so a failure there already points where it should.
+/// What `parse_top_level` could not get past.
+pub struct ParseError {
+    pub at: *const u8,
+    /// The kind of declaration whose body it was, when the failure was inside
+    /// one. `None` means nothing matched at the top level at all.
+    pub inside: Option<&'static str>,
+}
+
+pub struct BodyFail {
+    pub at: *const u8,
+    pub kind: &'static str,
+}
+
+/// Keeps the furthest failure. Several parsers are tried on the same text and
+/// only the one whose keyword matched gets into a body at all, but "furthest
+/// wins" needs no coordination between them and does the right thing when a
+/// construct nests.
+fn note_body_fail(slot: &mut Option<BodyFail>, at: *const u8, kind: &'static str) {
+    let is_further = match slot {
+        None => true,
+        Some(f) => at as usize > f.at as usize,
+    };
+    if is_further {
+        *slot = Some(BodyFail { at, kind });
+    }
+}
+
 pub unsafe fn try_parse_graph_decl(
     mut char_ptr: *const u8,
     char_end_ptr: *const u8,
     anchor_depth: u32,
+    fail: &mut Option<BodyFail>,
 ) -> Result<(RawGraphDecl, *const u8), ()> {
     let (matched, tail) = strip_prefix_on_match(char_ptr, char_end_ptr, "graph ");
     if !matched {
@@ -2307,7 +2401,17 @@ pub unsafe fn try_parse_graph_decl(
             break;
         }
         char_ptr = tail;
-        let (stmt, tail) = try_parse_graph_stmt(char_ptr, char_end_ptr)?;
+        let (stmt, tail) = match try_parse_graph_stmt(char_ptr, char_end_ptr) {
+            Ok(v) => v,
+            Err(()) => {
+                note_body_fail(fail, char_ptr, "graph");
+                return Err(());
+            }
+        };
+        if !line_is_finished(tail, char_end_ptr) {
+            note_body_fail(fail, tail, "graph");
+            return Err(());
+        }
         body.push(stmt);
         char_ptr = tail;
     }
@@ -2430,6 +2534,7 @@ pub unsafe fn try_parse_process_decl(
     mut char_ptr: *const u8,
     char_end_ptr: *const u8,
     anchor_depth: u32,
+    fail: &mut Option<BodyFail>,
 ) -> Result<(RawProcessDecl, *const u8), ()> {
     let (matched, tail) = strip_prefix_on_match(char_ptr, char_end_ptr, "process ");
     if !matched {
@@ -2463,7 +2568,14 @@ pub unsafe fn try_parse_process_decl(
             break;
         }
         char_ptr = tail;
-        let (inner_stmt, tail) = parse_proc_inner_stmt(char_ptr, char_end_ptr, body_ancore_depth)?;
+        let (inner_stmt, tail) =
+            match parse_proc_inner_stmt(char_ptr, char_end_ptr, body_ancore_depth) {
+                Ok(v) => v,
+                Err(()) => {
+                    note_body_fail(fail, char_ptr, "process");
+                    return Err(());
+                }
+            };
         stmts.push(inner_stmt);
         char_ptr = tail;
     }
@@ -2479,6 +2591,7 @@ pub unsafe fn try_parse_function_decl(
     mut char_ptr: *const u8,
     char_end_ptr: *const u8,
     anchor_depth: u32,
+    fail: &mut Option<BodyFail>,
 ) -> Result<(RawFunctionDecl, *const u8), ()> {
     let (matched, tail) = strip_prefix_on_match(char_ptr, char_end_ptr, "fun ");
     if !matched {
@@ -2530,7 +2643,14 @@ pub unsafe fn try_parse_function_decl(
             break;
         }
         char_ptr = tail;
-        let (inner_stmt, tail) = parse_proc_inner_stmt(char_ptr, char_end_ptr, body_ancore_depth)?;
+        let (inner_stmt, tail) =
+            match parse_proc_inner_stmt(char_ptr, char_end_ptr, body_ancore_depth) {
+                Ok(v) => v,
+                Err(()) => {
+                    note_body_fail(fail, char_ptr, "fun");
+                    return Err(());
+                }
+            };
         stmts.push(inner_stmt);
         char_ptr = tail;
     }
@@ -2546,7 +2666,7 @@ pub unsafe fn try_parse_function_decl(
 pub unsafe fn parse_top_level(
     char_ptr: *const u8,
     length: u32,
-) -> Result<Vec<TopLevelDecl>, *const u8> {
+) -> Result<Vec<TopLevelDecl>, ParseError> {
     let mut items = Vec::new();
     let mut char_ptr = char_ptr;
     let end = unsafe { char_ptr.add(length as usize) };
@@ -2556,6 +2676,10 @@ pub unsafe fn parse_top_level(
     // would point at the end of the PREVIOUS declaration; the offending token
     // starts after the trivia.
     let mut stuck_at = char_ptr;
+    // Where a declaration's body stopped making sense, if one of them got that
+    // far. Reported in preference to `stuck_at`, which is the declaration
+    // keyword and is the one place that was fine.
+    let mut fail: Option<BodyFail> = None;
 
     loop {
         let (depth, tail) = skip_trivia(char_ptr, end);
@@ -2565,19 +2689,19 @@ pub unsafe fn parse_top_level(
         }
         stuck_at = tail;
 
-        if let Ok((proc_decl, tail)) = try_parse_process_decl(tail, end, depth) {
+        if let Ok((proc_decl, tail)) = try_parse_process_decl(tail, end, depth, &mut fail) {
             char_ptr = tail;
             items.push(TopLevelDecl::ProcessStmt(proc_decl));
             continue;
         }
 
-        if let Ok((func_decl, tail)) = try_parse_function_decl(tail, end, depth) {
+        if let Ok((func_decl, tail)) = try_parse_function_decl(tail, end, depth, &mut fail) {
             char_ptr = tail;
             items.push(TopLevelDecl::FunctionStmt(func_decl));
             continue;
         }
 
-        if let Ok((func_decl, tail)) = try_parse_sequence_decl(tail, end, depth) {
+        if let Ok((func_decl, tail)) = try_parse_sequence_decl(tail, end, depth, &mut fail) {
             char_ptr = tail;
             items.push(TopLevelDecl::SequenceDecl(func_decl));
             continue;
@@ -2586,19 +2710,19 @@ pub unsafe fn parse_top_level(
         // `tail`, not `char_ptr`. Probing the pre-trivia pointer meant a
         // struct could only ever parse as the very first item in a file --
         // after any other declaration, char_ptr sits on a newline.
-        if let Ok((struct_decl, tail)) = try_parse_struct_decl(tail, end, depth) {
+        if let Ok((struct_decl, tail)) = try_parse_struct_decl(tail, end, depth, &mut fail) {
             char_ptr = tail;
             items.push(TopLevelDecl::StructDecl(struct_decl));
             continue;
         }
 
-        if let Ok((enum_decl, tail)) = try_parse_enum_decl(tail, end, depth) {
+        if let Ok((enum_decl, tail)) = try_parse_enum_decl(tail, end, depth, &mut fail) {
             char_ptr = tail;
             items.push(TopLevelDecl::EnumDecl(enum_decl));
             continue;
         }
 
-        if let Ok((graph_decl, tail)) = try_parse_graph_decl(tail, end, depth) {
+        if let Ok((graph_decl, tail)) = try_parse_graph_decl(tail, end, depth, &mut fail) {
             char_ptr = tail;
             items.push(TopLevelDecl::GraphDecl(graph_decl));
             continue;
@@ -2608,7 +2732,12 @@ pub unsafe fn parse_top_level(
     }
     let consumed_whole_input = char_ptr == end;
     if !consumed_whole_input {
-        return Err(stuck_at);
+        // A body failure is always the better location: `stuck_at` is the
+        // declaration keyword, which is the one line that parsed.
+        if let Some(f) = fail {
+            return Err(ParseError { at: f.at, inside: Some(f.kind) });
+        }
+        return Err(ParseError { at: stuck_at, inside: None });
     }
     return Ok(items);
 }
@@ -2617,20 +2746,20 @@ pub unsafe fn parse_top_level(
 fn enum_parsing_test() {
     let str = concat!(
         "enum IntOr\n",
-        "  left: i1\n",
-        "  right: i1\n",
+        "  left(i1)\n",
+        "  right(i1)\n",
     );
 
     let inp_str = str.as_bytes().as_ptr_range();
     let end_ptr = inp_str.end;
     let (depth, new_ptr) = skip_trivia(inp_str.start, end_ptr);
-    let outcome = unsafe { try_parse_enum_decl(new_ptr, end_ptr, depth) };
+    let outcome = unsafe { try_parse_enum_decl(new_ptr, end_ptr, depth, &mut None) };
 
     match outcome {
         Ok((func, _ptr_)) => {
             println!("{:#?}", func);
         }
-        Err(_) => panic!("Failed to parse struct"),
+        Err(_) => panic!("Failed to parse enum"),
     }
 }
 
@@ -2645,7 +2774,7 @@ fn struct_parsing_test() {
     let inp_str = str.as_bytes().as_ptr_range();
     let end_ptr = inp_str.end;
     let (depth, new_ptr) = skip_trivia(inp_str.start, end_ptr);
-    let outcome = unsafe { try_parse_struct_decl(new_ptr, end_ptr, depth) };
+    let outcome = unsafe { try_parse_struct_decl(new_ptr, end_ptr, depth, &mut None) };
 
     match outcome {
         Ok((func, _ptr_)) => {
@@ -2669,7 +2798,7 @@ fn function_parsing_test() {
     let inp_str = str.as_bytes().as_ptr_range();
     let end_ptr = inp_str.end;
     let (depth, new_ptr) = skip_trivia(inp_str.start, end_ptr);
-    let outcome = unsafe { try_parse_function_decl(new_ptr, end_ptr, depth) };
+    let outcome = unsafe { try_parse_function_decl(new_ptr, end_ptr, depth, &mut None) };
 
     match outcome {
         Ok((func, _ptr_)) => {
@@ -2694,7 +2823,7 @@ fn seqv_parsing_test() {
     let inp_str = str.as_bytes().as_ptr_range();
     let end_ptr = inp_str.end;
     let (depth, new_ptr) = skip_trivia(inp_str.start, end_ptr);
-    let outcome = unsafe { try_parse_sequence_decl(new_ptr, end_ptr, depth) };
+    let outcome = unsafe { try_parse_sequence_decl(new_ptr, end_ptr, depth, &mut None) };
 
     let (decl, _) = outcome.expect("sequence should parse");
     assert_eq!(crate::parse::anumspan_to_str(&decl.name), "MyFunc");
@@ -2723,7 +2852,7 @@ fn basic_stuff() {
     let inp_str = str.as_bytes().as_ptr_range();
     let end_ptr = inp_str.end;
     let (depth, new_ptr) = skip_trivia(inp_str.start, end_ptr);
-    let outcome = unsafe { try_parse_process_decl(new_ptr, end_ptr, depth) };
+    let outcome = unsafe { try_parse_process_decl(new_ptr, end_ptr, depth, &mut None) };
 
     // This used to print "naaah" on failure and pass regardless, so it was
     // not a test.

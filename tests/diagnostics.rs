@@ -215,3 +215,106 @@ fn nothing_reports_at_line_one_by_accident() {
         assert!(line > 1, "reported at line 1:\n{}", text);
     }
 }
+
+// ---- parse errors --------------------------------------------------------
+//
+// A declaration whose header parsed and whose body had one bad line used to
+// fail whole, so the top-level loop reported ``unexpected `fun` `` against the
+// declaration keyword -- the one line that was fine.
+
+#[test]
+fn a_bad_statement_blames_its_own_line_not_the_declaration() {
+    let (line, text) = first_error(concat!(
+        "fun f (a: i8, o: out i8)
+",
+        "  let x = a
+",
+        "  ??? broken
+",
+        "  o = x
+",
+    ));
+    assert_eq!(line, 3, "{}", text);
+    assert!(text.contains("does not belong in a `fun` body"), "{}", text);
+}
+
+#[test]
+fn each_kind_of_body_says_what_it_holds() {
+    let cases = [
+        (
+            concat!("struct s_t
+", "  a: i8
+", "  ??? junk
+"),
+            "a struct body names one field per line",
+        ),
+        (
+            concat!(
+                "graph g (src: buffer in i16, dst: buffer out i16)
+",
+                "  ??? junk
+",
+            ),
+            "a graph body declares a pipe",
+        ),
+        (
+            concat!("enum e_t: i2
+", "  A
+", "  ??? junk
+"),
+            "an enum body names one variant per line",
+        ),
+    ];
+    for (src, hint) in cases {
+        let (line, text) = first_error(src);
+        assert!(line > 1, "reported at line 1:
+{}", text);
+        assert!(text.contains(hint), "expected {:?} in:
+{}", hint, text);
+    }
+}
+
+#[test]
+fn leftovers_on_a_body_line_are_caught_there() {
+    // `B ~~ C` parses `B` and stops. The remainder used to fall out of the
+    // declaration and be reported as top-level garbage, with a note about
+    // top-level declarations, three lines away from the problem.
+    let (line, text) = first_error(concat!(
+        "enum e_t: i2
+",
+        "  A
+",
+        "  B ~~ C
+",
+        "  D
+",
+    ));
+    assert_eq!(line, 3, "{}", text);
+    assert!(text.contains("an `enum` body"), "{}", text);
+}
+
+#[test]
+fn genuine_top_level_garbage_still_reads_as_that() {
+    let (line, text) = first_error("gibberish Bad
+");
+    assert_eq!(line, 1, "{}", text);
+    assert!(text.contains("unexpected `gibberish`"), "{}", text);
+    assert!(text.contains("expected a top-level"), "{}", text);
+}
+
+#[test]
+fn a_trailing_comment_on_a_body_line_is_not_leftovers() {
+    let map = SourceMap::new("t.ddl", concat!(
+        "enum e_t: i2
+",
+        "  A       -- the quiet one
+",
+        "  B
+",
+        "fun f (x: e_t, o: out i1)
+",
+        "  o = x == B
+",
+    ));
+    compile_to_verilog(&map, &EmitOptions::default()).expect("should compile");
+}

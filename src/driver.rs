@@ -43,28 +43,63 @@ pub fn parse_source(map: &SourceMap) -> Result<Parsed, Vec<Diag>> {
 
     match unsafe { parse_top_level(base, map.len()) } {
         Ok(decls) => Ok(Parsed { decls }),
-        Err(at) => {
-            let span = map.span_at_ptr(at);
-            let offset = map.offset_of(at);
-            let msg = if offset >= map.len() {
-                "unexpected end of input".to_string()
+        Err(err) => {
+            let span = map.span_at_ptr(err.at);
+            let offset = map.offset_of(err.at);
+            let word: String = if offset >= map.len() {
+                String::new()
             } else {
-                let rest = &map.text()[offset as usize..];
-                let word: String = rest
+                map.text()[offset as usize..]
                     .chars()
                     .take_while(|c| !c.is_whitespace())
                     .take(24)
-                    .collect();
-                if word.is_empty() {
-                    "unexpected input here".to_string()
-                } else {
-                    format!("unexpected `{}`", word)
-                }
+                    .collect()
             };
-            Err(vec![Diag::error(span, msg).with_note(
-                "expected a top-level `process`, `sequence`, `graph`, `fun`, `struct` or `enum` declaration",
-            )])
+
+            // Inside a declaration the keyword is not the problem -- the line
+            // is -- so the message names the line and the note says what a
+            // body of that kind holds. Reporting `unexpected \`fun\`` at the
+            // declaration, which is what this did, blames the one line that
+            // parsed.
+            let (msg, note) = match err.inside {
+                Some(kind) => (
+                    if word.is_empty() {
+                        format!("this does not belong in {} body", a_kind(kind))
+                    } else {
+                        format!("`{}` does not belong in {} body", word, a_kind(kind))
+                    },
+                    body_hint(kind).to_string(),
+                ),
+                None => (
+                    if offset >= map.len() {
+                        "unexpected end of input".to_string()
+                    } else if word.is_empty() {
+                        "unexpected input here".to_string()
+                    } else {
+                        format!("unexpected `{}`", word)
+                    },
+                    "expected a top-level `process`, `sequence`, `graph`, `fun`, `struct` or `enum` declaration".to_string(),
+                ),
+            };
+            Err(vec![Diag::error(span, msg).with_note(note)])
         }
+    }
+}
+
+/// `a \`graph\``, `an \`enum\`` -- the article that reads correctly.
+fn a_kind(kind: &str) -> String {
+    let article = if kind.starts_with('e') { "an" } else { "a" };
+    format!("{} `{}`", article, kind)
+}
+
+/// What each kind of declaration holds, for the note under a body error.
+fn body_hint(kind: &str) -> &'static str {
+    match kind {
+        "graph" => "a graph body declares a pipe with `let <name>: buffer <T>`, or instantiates one with `Name(a, b)`",
+        "enum" => "an enum body names one variant per line, optionally with `(<payload type>)` or `= <discriminant>`",
+        "struct" => "a struct body names one field per line, as `<name>: <type>`",
+        "sequence" => "a sequence body holds statements and `|||` stage cuts",
+        _ => "a body holds one statement per line, indented past the declaration",
     }
 }
 
