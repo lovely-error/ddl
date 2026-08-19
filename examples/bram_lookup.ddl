@@ -1,4 +1,4 @@
--- A block RAM, and the cycle its read costs.
+-- A block RAM, the cycle its read costs, and the port that fills it.
 --
 -- `lutram` and `bram` are not two names for storage. They are two primitives
 -- with different timing, and the annotation picks which one the synthesizer
@@ -16,38 +16,66 @@
 -- WHERE THE CYCLE GOES has to be somewhere the source can point at, and the
 -- only place in this language that holds one is a state of a blocking
 -- `process`. So a `bram` read is a statement of its own -- `let v = t[a]` --
--- and it costs a state. Three states below, and `--emit=ir` will show them:
--- receive the address, fetch, send. A read written inside an expression is
--- refused, because there is no way to say that the rest of the expression
--- waits.
+-- and it costs a state. A read written inside an expression is refused,
+-- because there is no way to say the rest of the expression waits.
 --
--- WHAT THE BACKEND HAS TO EMIT for this to be a block RAM at all is the read
--- INSIDE the memory's own clocked block:
+-- IT HAS A FILL PORT, and that is not decoration. A `bram` cannot have a
+-- reset -- the reset loop is a write to every element, and 256x32 comes out as
+-- 8192 flip-flops, so the compiler refuses the initialiser. A table with no
+-- reset AND no write port has no drivers at all: every synthesizer deletes it,
+-- and the version of this file without a fill port synthesized to six cells
+-- and inferred nothing. Storage you cannot write is not storage.
+--
+-- WHAT THE ANNOTATION ACTUALLY DECIDES, measured on GowinSynthesis for the
+-- GW1NR-9C rather than assumed:
+--
+--   this file, 256x32, read registered      -> 1 SDPB (block RAM)
+--   this file with `lutram` instead         -> 1 SDPB, the same
+--   k2g_xstage, 32x32, read used in the
+--     same cycle it is addressed            -> 20 RAM16SDP1 + 32 RAM16SDP4
+--                                              (distributed)
+--
+-- So the annotation does not pick the cell. It decides what the PROGRAM is
+-- allowed to do, and the tool picks the cell from that. `bram` forbids using
+-- the value in the cycle you addressed it, which is what leaves the
+-- synthesizer free to choose a block RAM; `lutram` permits it, and where a
+-- design actually depends on it -- k2g_xstage reads the register file,
+-- forwards, and adds an address in one cycle -- distributed RAM is the only
+-- thing that can do the job, so that is what comes out.
+--
+-- The backend emits both ports inside the memory's own clocked block, which is
+-- the canonical template:
 --
 --     always @(posedge clk) begin
---       if (in_s1) t_q <= t[a_r];
+--       if (fire_s1) t[addr_r] <= din_data;
+--       if (in_s2)   t_q       <= t[addr_r];
 --     end
 --
--- and not a `wire q = t[a];` with the flop somewhere else. That second shape
--- is a combinational array read plus a register, and a synthesizer infers
--- distributed RAM from it -- exactly what `lutram` already gives you, with a
--- wasted flop on top and a `bram` label on the front. This file exists so that
--- examples/verify.sh counts the RAM primitives and says which one it got.
+-- The earlier shape -- `wire q = t[a];` with the flop in the state machine --
+-- infers the same SDPB and the same cell count, because GowinSynthesis retimes
+-- the flop into the RAM's output register itself. The template above does not
+-- depend on it being willing to.
 --
--- NO RESET. A block RAM written on reset cannot be inferred as one: the reset
--- loop is a write to every element, and 256x32 comes out as 8192 flip-flops.
--- The compiler refuses the initialiser rather than emitting that.
+-- examples/verify.sh counts the RAM primitives in the netlist, because that is
+-- the only place the answer exists.
 
-process bram_lookup (req: buffer in i8, resp: buffer out i32)
+process bram_lookup (cmd: buffer in i16, din: buffer in i32, resp: buffer out i32)
   var t: #[impl(bram)] [i32; 256]
 
   loop
-    let a = @rcv(req)
+    let c = @rcv(cmd)
 
-    -- The address is registered across the state boundary on its way here:
-    -- the fetch happens a cycle after the receive, and `req_data` belongs to
-    -- whatever the source is offering now, not to the request that was
-    -- accepted.
-    let v = t[a]
+    -- Decoded once, in the cycle the command's handshake completes, so the
+    -- branch below costs no cycle of its own.
+    let addr: i8 = c[7..0]
+    let is_write: i1 = c[15]
 
-    @send(resp, v)
+    if is_write then
+      let d = @rcv(din)
+      t[addr] = d
+    else
+      -- The address is registered on its way here: the fetch happens a cycle
+      -- after the command was accepted, and `cmd_data` by then belongs to
+      -- whatever the source is offering next.
+      let v = t[addr]
+      @send(resp, v)

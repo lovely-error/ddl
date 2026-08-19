@@ -780,8 +780,16 @@ pub fn lower_blocking(
     // A `bram` read is a state, and the value it fetches is a register: the
     // address is presented while the state is current, the array is read at
     // that state's clock edge, and the name is that register from the next
-    // state on. This is the shape a synthesizer infers block RAM from, and it
-    // is also the honest one -- the cycle is visible in the state count.
+    // state on, which makes the cycle visible in the state count.
+    //
+    // What the ANNOTATION guarantees is that contract, not a primitive.
+    // Measured on GowinSynthesis for the GW1NR-9C: examples/bram_lookup at
+    // 256x32 infers one SDPB whether it is declared `bram` or `lutram`,
+    // because its read is registered either way and the tool is free to
+    // choose. k2g_xstage's 32x32 file infers RAM16SDP1/RAM16SDP4 because its
+    // read feeds an adder in the same cycle and distributed RAM is the only
+    // thing that can do that. The annotation decides which of those a program
+    // is ALLOWED to be; the tool picks the cell.
     let sync_mems: Vec<usize> = (0..low.mems.len())
         .filter(|ix| low.mems[*ix].kind != crate::ty::MemKind::LutRam)
         .collect();

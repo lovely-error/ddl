@@ -715,14 +715,18 @@ fn emit_memory_block(
         out.push_str("    end\n");
     }
 
-    // THE READ, INSIDE THE SAME BLOCK. This is what makes it a block RAM
-    // rather than a distributed one with a flop bolted on: the array is read
-    // on the clock edge, in the block that owns the array, and the value lands
-    // in a register nothing outside can see unregistered.
+    // THE READ, INSIDE THE SAME BLOCK. The array is read on the clock edge, in
+    // the block that owns it, and the value lands in a register nothing
+    // outside can see unregistered.
     //
-    // A `wire q = mem[addr];` with the flop in some other always block is a
-    // combinational array read plus a register, and infers exactly what
-    // `lutram` already gives you, plus the flop.
+    // This is the canonical template rather than a fix for a measured bug.
+    // The previous shape -- `wire q = mem[addr];` with the flop in the state
+    // machine's block -- infers the same SDPB and the same cell count on
+    // GowinSynthesis, which retimes the external flop into the RAM's output
+    // register by itself. This form does not depend on the tool being willing
+    // to do that, and it costs one register fewer in the IR because the
+    // memory's output register and the state machine's were the same flop
+    // described twice.
     //
     // The enable holds the value rather than letting the read free-run,
     // because the state that consumes it may wait any number of cycles on a
