@@ -84,6 +84,10 @@ pub fn signature_of(name: &str, kind: &'static str, args: &PrecArgDefTuple, syms
 /// One pipe inside the graph: a port of the graph, or a `pipe` declaration.
 struct GraphPipeInfo {
     ty: Ty,
+    /// Where it was declared -- the `let` line, or the parameter it is. A pipe
+    /// nothing connects to has no instance to blame, and its declaration is
+    /// the only place a reader can act on.
+    declared_at: AlphanumSpan,
     is_stream: bool,
     /// A port of the enclosing graph rather than an internal wire. A graph
     /// input is produced from outside and a graph output consumed outside, so
@@ -167,6 +171,7 @@ pub fn lower_graph(
             name,
             GraphPipeInfo {
                 ty,
+                declared_at: arg.arg_name,
                 is_stream,
                 external: Some(is_input),
                 producers: Vec::new(),
@@ -221,6 +226,7 @@ pub fn lower_graph(
             name,
             GraphPipeInfo {
                 ty,
+                declared_at: pipe.name,
                 is_stream,
                 external: None,
                 producers: Vec::new(),
@@ -434,22 +440,22 @@ fn check_endpoints(
             None => {}
         }
 
+        // An instance that named it, if any did; otherwise the declaration,
+        // which is where a reader can act. Fabricating a span at the start of
+        // the buffer -- which this did -- points at whatever declaration
+        // happens to be first in the file.
         let where_to_blame = info
             .producers
             .iter()
             .chain(info.consumers.iter())
             .next()
-            .copied();
+            .copied()
+            .unwrap_or(info.declared_at);
         let mut report = |msg: String, note: &str| {
             ok = false;
-            let diag = match where_to_blame {
-                Some(at) => Diag::error(map.span_of(&at), msg),
-                None => Diag::error(map.span_of(&crate::lex::AlphanumSpan {
-                    byte_ptr: map.base_ptr(),
-                    len: 0,
-                }), msg),
-            };
-            sink.push(diag.with_note(note.to_string()));
+            sink.push(
+                Diag::error(map.span_of(&where_to_blame), msg).with_note(note.to_string()),
+            );
         };
 
         if producers == 0 {

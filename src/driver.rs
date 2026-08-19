@@ -18,8 +18,19 @@ use crate::parse::{
 use crate::symbols;
 use crate::verilog::{EmitOptions, emit_banner, emit_module};
 
-pub struct Parsed {
+/// One file's declarations, borrowed from the buffer they point into.
+///
+/// The `PhantomData` is the whole point. `AlphanumSpan` is a `*const u8` with
+/// no lifetime, so nothing stopped a caller from dropping the `SourceMap` and
+/// keeping the AST -- every span in it would then be dangling, and reading one
+/// is undefined behaviour rather than a wrong answer. The rule was written in
+/// a doc comment and enforced by nothing.
+///
+/// This makes the borrow checker enforce it: `Parsed` cannot outlive the map
+/// it was parsed from, so neither can the declarations inside it.
+pub struct Parsed<'a> {
     pub decls: Vec<TopLevelDecl>,
+    _buffer: std::marker::PhantomData<&'a SourceMap>,
 }
 
 /// Parses one source file.
@@ -28,7 +39,7 @@ pub struct Parsed {
 /// pointers into its text. That is enforced here by the borrow on `map`, which
 /// is the closest thing to a lifetime the pointer-based AST can currently
 /// carry.
-pub fn parse_source(map: &SourceMap) -> Result<Parsed, Vec<Diag>> {
+pub fn parse_source<'a>(map: &'a SourceMap) -> Result<Parsed<'a>, Vec<Diag>> {
     let base = map.base_ptr();
     let end = map.end_ptr();
 
@@ -42,7 +53,7 @@ pub fn parse_source(map: &SourceMap) -> Result<Parsed, Vec<Diag>> {
     }
 
     match unsafe { parse_top_level(base, map.len()) } {
-        Ok(decls) => Ok(Parsed { decls }),
+        Ok(decls) => Ok(Parsed { decls, _buffer: std::marker::PhantomData }),
         Err(err) => {
             let span = map.span_at_ptr(err.at);
             let offset = map.offset_of(err.at);
