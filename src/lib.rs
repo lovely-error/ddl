@@ -9,6 +9,7 @@
 #![feature(coroutines)]
 
 pub mod diag;
+pub mod dot;
 pub mod driver;
 
 #[allow(unsafe_op_in_unsafe_fn)]

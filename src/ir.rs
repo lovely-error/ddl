@@ -204,7 +204,7 @@ pub struct Assertion {
     pub is_fatal: bool,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Module {
     pub name: String,
     pub ports: Vec<Port>,
@@ -245,6 +245,14 @@ pub struct Instance {
     /// because the port order of a process is an implementation detail of the
     /// lowering -- three ports per pipe, in an order this file chose.
     pub conns: Vec<(String, String)>,
+    /// The pipes this instance drives, by the graph's name for them.
+    ///
+    /// Kept rather than re-derived from the connection list, because which end
+    /// an instance is on is decided by the CALLEE's parameter direction, and
+    /// that is known here and nowhere downstream. It is also the same fact
+    /// `check_endpoints` counts, so a picture drawn from it cannot disagree
+    /// with the design that was checked.
+    pub produces: Vec<String>,
 }
 
 impl Module {

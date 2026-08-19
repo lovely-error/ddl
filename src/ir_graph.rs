@@ -315,6 +315,7 @@ pub fn lower_graph(
             ("clk".to_string(), "clk".to_string()),
             ("rst_n".to_string(), "rst_n".to_string()),
         ];
+        let mut produces: Vec<String> = Vec::new();
 
         for (formal, actual) in sig.pipes.iter().zip(inst.args.iter()) {
             let actual_name = anumspan_to_str(actual).to_string();
@@ -375,6 +376,7 @@ pub fn lower_graph(
                 info.consumers.push(*actual);
             } else {
                 info.producers.push(*actual);
+                produces.push(actual_name.clone());
             }
 
             conns.push((format!("{}_valid", formal.name), format!("{}_valid", actual_name)));
@@ -384,7 +386,7 @@ pub fn lower_graph(
             conns.push((format!("{}_data", formal.name), format!("{}_data", actual_name)));
         }
 
-        instances.push(Instance { module, name: inst_name, conns });
+        instances.push(Instance { module, name: inst_name, conns, produces });
     }
 
     if instances.is_empty() {

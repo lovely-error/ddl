@@ -148,6 +148,8 @@ pub enum Emit {
     Ir,
     /// The generated Verilog-2005.
     Verilog,
+    /// Graphviz of the `graph` declarations: what is connected to what.
+    Dot,
 }
 
 pub fn compile_to_verilog(map: &SourceMap, opts: &EmitOptions) -> Result<String, Vec<Diag>> {
@@ -282,9 +284,18 @@ fn compile_on_this_stack(
         .collect();
 
     let dumping_ir = emit == Emit::Ir;
-    let mut out = if dumping_ir { String::new() } else { emit_banner(opts) };
+    let drawing = emit == Emit::Dot;
+    let mut out = if dumping_ir || drawing { String::new() } else { emit_banner(opts) };
     let mut emitted = 0usize;
-    let render = |out: &mut String, module: &crate::ir::Module| {
+    // `--emit=dot` needs every module at once -- a graph's picture is drawn
+    // from what it instantiates -- so they are collected rather than rendered
+    // one at a time.
+    let mut drawn: Vec<crate::ir::Module> = Vec::new();
+    let mut render = |out: &mut String, module: &crate::ir::Module| {
+        if drawing {
+            drawn.push(module.clone());
+            return;
+        }
         out.push('\n');
         if dumping_ir {
             out.push_str(&crate::ir::render_module(module));
@@ -339,6 +350,9 @@ fn compile_on_this_stack(
 
     if sink.has_errors() {
         return Err(sink.into_diags());
+    }
+    if drawing {
+        return Ok(crate::dot::render(&drawn));
     }
     if emitted == 0 {
         return Err(vec![Diag::error_no_span(

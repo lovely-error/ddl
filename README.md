@@ -196,6 +196,18 @@ It instantiates each generated module beside its reference, drives both with
 the same stimulus, and compares primitive counts after synthesis. Modules
 whose reference lives in another repository are skipped when it is absent.
 
+## Reading a design
+
+```bash
+ddl build examples/pipeline_graph.ddl --emit=dot | dot -Tsvg > scaler.svg
+```
+
+A `graph` is the one declaration whose meaning is its shape, and neither the
+source nor the Verilog shows it: one lists instances and leaves the reader to
+match pipe names, the other lists them again with three wires per pipe in
+between. `--emit=dot` draws one edge per pipe, with the graph's own parameters
+as the boundary, so a feedback path looks like one.
+
 ## Editor support
 
 `editors/vscode/` is a syntax-highlighting extension for `.ddl`. To use it

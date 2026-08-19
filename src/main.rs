@@ -33,8 +33,9 @@ OPTIONS:
                     1 if it is not, without writing. Mirrors
                     `gen_defs --check`.
     --emit=<what>   what to produce: `v` (default) the Verilog-2005, `ir` the
-                    lowered modules before the backend folds anything, or
-                    `ast` the declarations after precedence resolution.
+                    lowered modules before the backend folds anything, `ast`
+                    the declarations after precedence resolution, or `dot`
+                    Graphviz of what each `graph` connects to what.
                     `--check` applies to `v` only.
 ";
 
@@ -97,9 +98,10 @@ fn parse_build_args(args: &[String]) -> Result<BuildArgs, String> {
                     "v" | "verilog" => Emit::Verilog,
                     "ir" => Emit::Ir,
                     "ast" => Emit::Ast,
+                    "dot" => Emit::Dot,
                     what => {
                         return Err(format!(
-                            "unknown --emit target `{}`; expected `v`, `ir` or `ast`",
+                            "unknown --emit target `{}`; expected `v`, `ir`, `ast` or `dot`",
                             what
                         ));
                     }
