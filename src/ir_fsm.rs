@@ -221,6 +221,19 @@ fn as_sync_read<'a>(
     })
 }
 
+/// Where to blame a statement the scheduler refuses.
+///
+/// The scheduler runs before lowering, so it has no `Lowerer` and no anchor
+/// stack -- but it does have the statement in front of it, which is the same
+/// place the anchor would have come from.
+fn anchor_of(stmt: &PrecResInnerStmt, sink: &DiagSink) -> crate::diag::Span {
+    anchor_span(stmt, sink).unwrap_or_else(crate::driver::nowhere)
+}
+
+fn anchor_span(stmt: &PrecResInnerStmt, sink: &DiagSink) -> Option<crate::diag::Span> {
+    crate::ir::stmt_anchor(stmt).map(|at| sink.map().span_of(&at))
+}
+
 /// The `if` that a statement is, when its arms need states of their own.
 ///
 /// Three things need them: a blocking operation, a `break`, and a synchronous
@@ -346,7 +359,7 @@ fn schedule<'a>(
         if let Some(ite) = as_branching_if(stmt, sync_mem_of) {
             if contains_barrier_in_expr(&ite.condition) {
                 sink.err_span(
-                    crate::driver::nowhere(),
+                    anchor_of(stmt, sink),
                     "an `if` condition cannot contain a blocking `@rcv` or `@send`",
                 );
                 return None;
@@ -354,7 +367,7 @@ fn schedule<'a>(
             let then_stmts = match arm_stmts(&ite.then_case) {
                 Some(s) => s,
                 None => {
-                    sink.err_span(crate::driver::nowhere(), "expected statements in this branch");
+                    sink.err_span(anchor_of(stmt, sink), "expected statements in this branch");
                     return None;
                 }
             };
@@ -366,7 +379,7 @@ fn schedule<'a>(
                         Some(s) => s,
                         None => {
                             sink.err_span(
-                                crate::driver::nowhere(),
+                                anchor_of(stmt, sink),
                                 "expected statements in this branch",
                             );
                             return None;
@@ -397,7 +410,7 @@ fn schedule<'a>(
 
         if needs_states(stmt, sync_mem_of) {
             sink.err_span(
-                crate::driver::nowhere(),
+                anchor_of(stmt, sink),
                 "only an `if` can hold a blocking `@rcv`, a `@send`, a `break` or a `bram` read; a `match` cannot yet",
             );
             return None;
@@ -462,7 +475,7 @@ fn as_barrier(
         })),
         None => {
             sink.err_span(
-                crate::driver::nowhere(),
+                anchor_of(stmt, sink),
                 format!("`{}` is not a pipe of this process", pipe),
             );
             None
@@ -495,7 +508,7 @@ pub fn schedule_body<'a>(
         // `break`, which is a process that stops before it starts.
         Target::Exit | Target::Halt => {
             sink.err_span(
-                crate::driver::nowhere(),
+                body.first().and_then(|s| anchor_span(s, sink)).unwrap_or_else(crate::driver::nowhere),
                 "a `loop` with no blocking operation would never advance",
             );
             return None;
@@ -553,7 +566,7 @@ pub fn schedule_body<'a>(
 
     if states.iter().all(|s| s.barrier.is_none() && s.mem_read.is_none()) {
         sink.err_span(
-            crate::driver::nowhere(),
+            body.first().and_then(|s| anchor_span(s, sink)).unwrap_or_else(crate::driver::nowhere),
             "a `loop` with no blocking operation would never advance",
         );
         return None;
@@ -768,7 +781,7 @@ pub fn lower_blocking(
         if barrier.is_recv != pipe.is_input {
             let what = if pipe.is_input { "received from" } else { "sent to" };
             sink.err_span(
-                crate::driver::nowhere(),
+                low.here(),
                 format!("`{}` can only be {}", pipe.name, what),
             );
             return None;
@@ -977,7 +990,7 @@ pub fn lower_blocking(
             let v = crate::ir::lower_expr(&mut low, cond, &env, sink)?;
             if low.ty_of(v) != Ty::BOOL {
                 sink.err_span(
-                    crate::driver::nowhere(),
+                    low.here(),
                     format!(
                         "an `if` condition must be `i1`, found `{}`",
                         low.ty_of(v).display()
@@ -1024,11 +1037,18 @@ pub fn lower_blocking(
         if let Some(expr) = st.barrier.as_ref().and_then(|b| b.value.as_ref()) {
             let pipe =
                 low.pipes[st.barrier.as_ref().expect("a value implies a barrier").pipe_ix].clone();
+            // The send is not a statement as far as lowering is concerned --
+            // the scheduler took it apart -- so its anchor has to be pushed
+            // here or the type error lands at line 1.
+            let depth = crate::ir::expr_anchor(expr).map(|at| {
+                let span = low.span_of(&at);
+                low.push_anchor(span)
+            });
             let v = crate::ir::lower_expr(&mut low, expr, &env, sink)?;
             let have = low.ty_of(v);
             if have != pipe.ty {
                 sink.err_span(
-                    crate::driver::nowhere(),
+                    low.here(),
                     format!(
                         "`{}` carries `{}` but `{}` was sent",
                         pipe.name,
@@ -1043,6 +1063,9 @@ pub fn lower_blocking(
                 k,
                 v,
             ));
+            if let Some(depth) = depth {
+                low.pop_anchor(depth);
+            }
         }
         // From here on the name means its registered copy.
         for name in &cross[k] {

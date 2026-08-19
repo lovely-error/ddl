@@ -35,7 +35,7 @@ pub fn lower_match(
     let has_one_scrutinee = stmt.scrutinees.len() == 1;
     if !has_one_scrutinee {
         sink.err_span(
-            crate::driver::nowhere(),
+            low.here(),
             format!(
                 "`match` takes one scrutinee here, found {}",
                 stmt.scrutinees.len()
@@ -52,7 +52,7 @@ pub fn lower_match(
         other => {
             sink.push(
                 Diag::error(
-                    crate::driver::nowhere(),
+                    low.here(),
                     format!("`match` needs an enum, found `{}`", other.display()),
                 )
                 .with_note("compare with `==` instead, or give the value an enum type"),
@@ -98,7 +98,7 @@ pub fn lower_match(
     let mut saw_unreachable = false;
     // `match` itself carries no span, so the first pattern stands in for it.
     // Pointing at line 1 of the file was useless when a module had three.
-    let mut match_span = crate::driver::nowhere();
+    let mut match_span = low.here();
     for case in &stmt.cases {
         let first_named = case.binding_patterns.first().and_then(first_variant_span);
         if let Some(base) = first_named {
@@ -111,7 +111,7 @@ pub fn lower_match(
         let has_one_pattern = case.binding_patterns.len() == 1;
         if !has_one_pattern {
             sink.err_span(
-                crate::driver::nowhere(),
+                low.here(),
                 "this arm has the wrong number of patterns for one scrutinee",
             );
             return None;
@@ -308,7 +308,7 @@ pub fn lower_match(
     }
 
     if arms.is_empty() {
-        sink.err_span(crate::driver::nowhere(), "`match` needs at least one arm");
+        sink.err_span(low.here(), "`match` needs at least one arm");
         return None;
     }
 
@@ -392,7 +392,7 @@ pub fn lower_match(
             let acc_ty = low.ty_of(fallback);
             if arm_ty != acc_ty {
                 sink.err_span(
-                    crate::driver::nowhere(),
+                    low.here(),
                     format!(
                         "`{}` is `{}` on one arm and `{}` on another",
                         name,

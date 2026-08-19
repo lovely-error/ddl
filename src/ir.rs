@@ -545,6 +545,14 @@ pub struct Lowerer<'a> {
     /// every match arm in the program -- dead, stripped by the backend, and
     /// still enough to renumber every generated wire in every module.
     path: Vec<PathTerm>,
+    /// Where the statement being lowered right now is, innermost last.
+    ///
+    /// Lowering has no other idea where it is. The AST carries a span on every
+    /// identifier and on nothing else -- there is no statement node to hang
+    /// one on -- so a diagnostic raised from the middle of a lowering pass had
+    /// no location at all and rendered at line 1 of the file, whichever line
+    /// it was actually about.
+    anchors: Vec<Span>,
     values: Vec<ValueDef>,
     ports: Vec<Port>,
 }
@@ -566,6 +574,7 @@ impl<'a> Lowerer<'a> {
             params: Vec::new(),
             stop_writes: None,
             path: Vec::new(),
+            anchors: Vec::new(),
             values: Vec::new(),
             ports: Vec::new(),
         }
@@ -1049,6 +1058,30 @@ impl<'a> Lowerer<'a> {
     pub fn span_of(&self, at: &AlphanumSpan) -> Span {
         self.map.span_of(at)
     }
+
+    /// Where the diagnostic being raised right now belongs.
+    ///
+    /// The innermost statement being lowered, or nowhere if lowering has not
+    /// entered one yet -- a parameter list, say, where the caller has a better
+    /// span of its own and passes it.
+    pub fn here(&self) -> Span {
+        match self.anchors.last() {
+            Some(s) => *s,
+            None => crate::driver::nowhere(),
+        }
+    }
+
+    /// Enters a statement. The answer is the depth to hand back to
+    /// `pop_anchor`, matching how `push_cond` and `pop_path` pair up.
+    pub fn push_anchor(&mut self, at: Span) -> usize {
+        self.anchors.push(at);
+        self.anchors.len() - 1
+    }
+
+    pub fn pop_anchor(&mut self, depth: usize) {
+        self.anchors.truncate(depth);
+    }
+
 
     /// Variant list of a named enum, or a diagnostic-free `None` if the table
     /// does not have it (which the caller has already reported).
@@ -2115,7 +2148,78 @@ pub fn lower_stmts(
     if all_ok { Some(()) } else { None }
 }
 
+/// The identifier a statement should be blamed on.
+///
+/// There is no span on a statement node, so this picks the one that reads as
+/// the subject: the name being declared, the target being assigned, the
+/// function being called. Failing that, the first identifier anywhere inside
+/// it -- which is not always the ideal column but is reliably the right LINE,
+/// and the line is what a reader needs to find the statement.
+pub fn stmt_anchor(stmt: &PrecResInnerStmt) -> Option<AlphanumSpan> {
+    match stmt {
+        PrecResInnerStmt::VarDecl(d) => Some(d.name),
+        PrecResInnerStmt::AssignStmt(a) => expr_anchor(&a.lvalue).or_else(|| expr_anchor(&a.rvalue)),
+        PrecResInnerStmt::CallStmt(c) => {
+            expr_anchor(&c.base).or_else(|| c.args.iter().find_map(expr_anchor))
+        }
+        PrecResInnerStmt::IfThenElse(i) => expr_anchor(&i.condition),
+        PrecResInnerStmt::MatchStmt(m) => m.scrutinees.iter().find_map(expr_anchor),
+        PrecResInnerStmt::ForLoop(f) => Some(f.binding),
+        PrecResInnerStmt::TailVal(e) => expr_anchor(e),
+        PrecResInnerStmt::ReturnStmt(e) => e.as_ref().and_then(expr_anchor),
+        PrecResInnerStmt::Loop(l) => expr_anchor(&l.repeat_expr),
+        // `break` is one keyword and no identifier. The enclosing statement's
+        // anchor is still on the stack, so this keeps that rather than
+        // replacing it with nothing.
+        PrecResInnerStmt::Break => None,
+    }
+}
+
+/// The first identifier in an expression, left to right.
+///
+/// A builtin is skipped when it has arguments: `@zext(x, 32)` should point at
+/// `x`, not at a `@zext` that has no span of its own anyway.
+pub fn expr_anchor(expr: &PrecResExpr) -> Option<AlphanumSpan> {
+    match expr {
+        PrecResExpr::Ref(n) => Some(*n),
+        PrecResExpr::FieldAccess { base, field_name } => {
+            expr_anchor(base).or(Some(*field_name))
+        }
+        PrecResExpr::SubscriptAccess(s) => expr_anchor(&s.base).or_else(|| expr_anchor(&s.index)),
+        PrecResExpr::Call { base, args } => {
+            expr_anchor(base).or_else(|| args.iter().find_map(expr_anchor))
+        }
+        PrecResExpr::Splice(parts) => parts.iter().find_map(expr_anchor),
+        PrecResExpr::Span(sp) => expr_anchor(&sp.left).or_else(|| expr_anchor(&sp.right)),
+        PrecResExpr::StmtBlock(b) => b.components.iter().find_map(stmt_anchor),
+        PrecResExpr::Literal(_) | PrecResExpr::Builtin(_) => None,
+    }
+}
+
+/// Lowers one statement, with its location on the anchor stack for the whole
+/// of it.
+///
+/// A wrapper rather than a push and a pop inside the body: the body returns
+/// early from about forty places, and every one of them would have to remember
+/// to pop.
 fn lower_stmt(
+    low: &mut Lowerer,
+    stmt: &PrecResInnerStmt,
+    env: &mut Env,
+    sink: &mut DiagSink,
+) -> Option<()> {
+    let depth = match stmt_anchor(stmt) {
+        Some(at) => Some(low.push_anchor(low.span_of(&at))),
+        None => None,
+    };
+    let result = lower_stmt_at(low, stmt, env, sink);
+    if let Some(depth) = depth {
+        low.pop_anchor(depth);
+    }
+    result
+}
+
+fn lower_stmt_at(
     low: &mut Lowerer,
     stmt: &PrecResInnerStmt,
     env: &mut Env,
@@ -2264,7 +2368,7 @@ fn lower_stmt(
                 Some(p) => p,
                 None => {
                     sink.err_span(
-                        crate::driver::nowhere(),
+                        low.here(),
                         "only a name or a field of one can be assigned",
                     );
                     return None;
@@ -2445,7 +2549,7 @@ fn lower_stmt(
             let cond_ty = low.ty_of(cond);
             if cond_ty != Ty::BOOL {
                 sink.err_span(
-                    crate::driver::nowhere(),
+                    low.here(),
                     format!(
                         "an `if` condition must be `i1`, found `{}`",
                         cond_ty.display()
@@ -2478,7 +2582,7 @@ fn lower_stmt(
                         let et = low.ty_of(e);
                         if tt != et {
                             sink.err_span(
-                                crate::driver::nowhere(),
+                                low.here(),
                                 format!(
                                     "`{}` is `{}` on one branch and `{}` on the other",
                                     name,
@@ -2497,13 +2601,13 @@ fn lower_stmt(
                     // which combinational hardware cannot express.
                     (Some(_), None) | (None, Some(_)) => {
                         sink.err_span(
-                            crate::driver::nowhere(),
+                            low.here(),
                             format!(
                                 "`{}` is assigned on only one branch of this `if`",
                                 name
                             ),
                         );
-                        sink.push(Diag::error(crate::driver::nowhere(), "incomplete assignment")
+                        sink.push(Diag::error(low.here(), "incomplete assignment")
                             .with_note(
                                 "combinational logic has no memory, so every branch must assign it; add an `else`",
                             ));
@@ -2542,7 +2646,7 @@ fn lower_stmt(
                 return crate::ir_match::inline_call_effect(low, callee, &call.args, env, sink);
             }
             sink.err_span(
-                crate::driver::nowhere(),
+                low.here(),
                 "this statement has no effect in combinational logic",
             );
             None
@@ -2550,7 +2654,7 @@ fn lower_stmt(
 
         PrecResInnerStmt::TailVal(_) => {
             sink.err_span(
-                crate::driver::nowhere(),
+                low.here(),
                 "this statement has no effect in combinational logic",
             );
             None
@@ -2569,7 +2673,7 @@ fn lower_stmt(
         // edge to the terminal state.
         PrecResInnerStmt::Break => {
             sink.push(
-                Diag::error(crate::driver::nowhere(), "there is nothing here to `break` out of")
+                Diag::error(low.here(), "there is nothing here to `break` out of")
                     .with_note(
                         "`break` stops a `loop` that blocks, by leaving its state machine. A loop with no `@rcv` or `@send` is the per-cycle form and has no states; a linear body already runs once and stops",
                     ),
@@ -2579,7 +2683,7 @@ fn lower_stmt(
 
         PrecResInnerStmt::Loop(_) => {
             sink.err_span(
-                crate::driver::nowhere(),
+                low.here(),
                 "a `loop` belongs at the top of a `process` body, not nested inside it",
             );
             None
@@ -2660,7 +2764,7 @@ pub fn lower_branch(
         PrecResExpr::StmtBlock(block) => lower_stmts(low, &block.components, env, sink),
         other => {
             sink.err_span(
-                crate::driver::nowhere(),
+                low.here(),
                 format!("expected assignments in this branch, found {:?}", other),
             );
             None
@@ -2729,7 +2833,7 @@ pub fn lower_expr_expecting(
                         Some(ty) => Some(low.emit(ty.clone(), Op::Const(0))),
                         None => {
                             sink.err_span(
-                                crate::driver::nowhere(),
+                                low.here(),
                                 "`@zeroed()` needs a type from its context",
                             );
                             None
@@ -2745,7 +2849,7 @@ pub fn lower_expr_expecting(
                         Some(t) => t.clone(),
                         None => {
                             sink.err_span(
-                                crate::driver::nowhere(),
+                                low.here(),
                                 "`@cast()` needs a type from its context",
                             );
                             return None;
@@ -2757,7 +2861,7 @@ pub fn lower_expr_expecting(
                     if !widths_agree {
                         sink.push(
                             Diag::error(
-                                crate::driver::nowhere(),
+                                low.here(),
                                 format!(
                                     "`@cast` cannot change width: `{}` is {} bits, `{}` is {}",
                                     have.display(),
@@ -2842,7 +2946,7 @@ pub fn lower_expr(
             if let Some(w) = width {
                 if !literal_fits(*value, &Ty::UInt(*w)) {
                     sink.err_span(
-                        crate::driver::nowhere(),
+                        low.here(),
                         format!("literal {} does not fit in {} bits", value, w),
                     );
                     return None;
@@ -2853,7 +2957,7 @@ pub fn lower_expr(
 
         PrecResExpr::Literal(other) => {
             sink.err_span(
-                crate::driver::nowhere(),
+                low.here(),
                 format!("{:?} cannot be lowered to hardware", other),
             );
             None
@@ -2931,7 +3035,7 @@ pub fn lower_expr(
                 }
                 _ => {
                     sink.err_span(
-                        crate::driver::nowhere(),
+                        low.here(),
                         "this is not something that can be called",
                     );
                     None
@@ -2941,7 +3045,7 @@ pub fn lower_expr(
 
         other => {
             sink.err_span(
-                crate::driver::nowhere(),
+                low.here(),
                 format!("cannot lower {:?} to hardware yet", other),
             );
             None
@@ -2975,7 +3079,7 @@ fn lower_subscript(
         let range_is_in_bounds = hi >= lo && hi < base_w as u128;
         if !range_is_in_bounds {
             sink.err_span(
-                crate::driver::nowhere(),
+                low.here(),
                 format!("bit range [{}..{}] is out of bounds for `{}`", hi, lo, base_ty.display()),
             );
             return None;
@@ -2989,7 +3093,7 @@ fn lower_subscript(
         let bit_is_in_bounds = k < base_w as u128;
         if !bit_is_in_bounds {
             sink.err_span(
-                crate::driver::nowhere(),
+                low.here(),
                 format!("bit {} is out of bounds for `{}`", k, base_ty.display()),
             );
             return None;
@@ -3010,7 +3114,7 @@ fn lower_subscript(
     if let Op::Const(k) = low.values[idx.0 as usize].op {
         if k >= base_w as u128 {
             sink.err_span(
-                crate::driver::nowhere(),
+                low.here(),
                 format!("bit {} is out of bounds for `{}`", k, base_ty.display()),
             );
             return None;
@@ -3039,7 +3143,7 @@ fn lower_assert(
     let arity_is_right = args.len() == 1 || args.len() == 2;
     if !arity_is_right {
         sink.err_span(
-            crate::driver::nowhere(),
+            low.here(),
             format!("{} takes a condition and an optional message", name),
         );
         return None;
@@ -3048,7 +3152,7 @@ fn lower_assert(
     let cond_ty = low.ty_of(cond);
     if cond_ty != Ty::BOOL {
         sink.err_span(
-            crate::driver::nowhere(),
+            low.here(),
             format!("{} needs an `i1` condition, found `{}`", name, cond_ty.display()),
         );
         return None;
@@ -3064,7 +3168,7 @@ fn lower_assert(
         }
         Some(_) => {
             sink.err_span(
-                crate::driver::nowhere(),
+                low.here(),
                 format!("the second argument to {} must be a string literal", name),
             );
             return None;
@@ -3184,13 +3288,13 @@ fn lower_builtin(
     if op == TrySend {
         let arity_is_right = args.len() == 2;
         if !arity_is_right {
-            sink.err_span(crate::driver::nowhere(), "`@try_send` takes a pipe and a value");
+            sink.err_span(low.here(), "`@try_send` takes a pipe and a value");
             return None;
         }
         let pipe_name = match &args[0] {
             PrecResExpr::Ref(n) => anumspan_to_str(n).to_string(),
             _ => {
-                sink.err_span(crate::driver::nowhere(), "`@try_send` needs a pipe name");
+                sink.err_span(low.here(), "`@try_send` needs a pipe name");
                 return None;
             }
         };
@@ -3198,7 +3302,7 @@ fn lower_builtin(
             Some(i) => i,
             None => {
                 sink.err_span(
-                    crate::driver::nowhere(),
+                    low.here(),
                     format!("`{}` is not a pipe of this process", pipe_name),
                 );
                 return None;
@@ -3206,14 +3310,14 @@ fn lower_builtin(
         };
         if low.pipes[ix].is_input {
             sink.err_span(
-                crate::driver::nowhere(),
+                low.here(),
                 format!("`{}` is an `in` pipe; it cannot be sent to", pipe_name),
             );
             return None;
         }
         if low.pipes[ix].used {
             sink.err_span(
-                crate::driver::nowhere(),
+                low.here(),
                 format!("`{}` is sent to more than once in one cycle", pipe_name),
             );
             return None;
@@ -3227,7 +3331,7 @@ fn lower_builtin(
                 None => {
                     sink.push(
                         Diag::error(
-                            crate::driver::nowhere(),
+                            low.here(),
                             format!(
                                 "`{}` carries `{}` but `{}` was sent",
                                 pipe_name,
@@ -3254,7 +3358,7 @@ fn lower_builtin(
     if op == Select {
         let arity_is_right = args.len() == 3;
         if !arity_is_right {
-            sink.err_span(crate::driver::nowhere(), "`if ... then ... else` takes three operands");
+            sink.err_span(low.here(), "`if ... then ... else` takes three operands");
             return None;
         }
         let cond = lower_expr(low, &args[0], env, sink)?;
@@ -3262,7 +3366,7 @@ fn lower_builtin(
         if !cond_is_bool {
             sink.push(
                 Diag::error(
-                    crate::driver::nowhere(),
+                    low.here(),
                     format!(
                         "an `if` condition is `i1`, found `{}`",
                         low.ty_of(cond).display()
@@ -3286,7 +3390,7 @@ fn lower_builtin(
             } else {
                 sink.push(
                     Diag::error(
-                        crate::driver::nowhere(),
+                        low.here(),
                         format!(
                             "the two arms of this `if` are `{}` and `{}`",
                             tt.display(),
@@ -3313,7 +3417,7 @@ fn lower_builtin(
                 Zext => {
                     let would_narrow = want_w < have_w;
                     if would_narrow {
-                        sink.err_span(crate::driver::nowhere(), "`@zext` cannot narrow; use `@trunc`");
+                        sink.err_span(low.here(), "`@zext` cannot narrow; use `@trunc`");
                         return None;
                     }
                     Some(low.emit(Ty::UInt(want_w), Op::ZExt { arg, to: want_w }))
@@ -3321,7 +3425,7 @@ fn lower_builtin(
                 Sext => {
                     let would_narrow = want_w < have_w;
                     if would_narrow {
-                        sink.err_span(crate::driver::nowhere(), "`@sext` cannot narrow; use `@trunc`");
+                        sink.err_span(low.here(), "`@sext` cannot narrow; use `@trunc`");
                         return None;
                     }
                     Some(low.emit(Ty::SInt(want_w), Op::SExt { arg, to: want_w }))
@@ -3330,7 +3434,7 @@ fn lower_builtin(
                     let would_widen = want_w > have_w;
                     if would_widen {
                         sink.err_span(
-                            crate::driver::nowhere(),
+                            low.here(),
                             "`@trunc` cannot widen; use `@zext` or `@sext`",
                         );
                         return None;
@@ -3341,7 +3445,7 @@ fn lower_builtin(
         }
         Signed | Unsigned => {
             if args.len() != 1 {
-                sink.err_span(crate::driver::nowhere(), "this cast takes exactly one argument");
+                sink.err_span(low.here(), "this cast takes exactly one argument");
                 return None;
             }
             let arg = lower_expr(low, &args[0], env, sink)?;
@@ -3351,7 +3455,7 @@ fn lower_builtin(
         }
         Concat => {
             if args.is_empty() {
-                sink.err_span(crate::driver::nowhere(), "`@concat` needs at least one argument");
+                sink.err_span(low.here(), "`@concat` needs at least one argument");
                 return None;
             }
             let mut parts = Vec::new();
@@ -3366,7 +3470,7 @@ fn lower_builtin(
         Rep => {
             let (arg, times) = cast_args(low, args, env, sink)?;
             if times == 0 {
-                sink.err_span(crate::driver::nowhere(), "`@rep` count must be at least 1");
+                sink.err_span(low.here(), "`@rep` count must be at least 1");
                 return None;
             }
             let w = low.ty_of(arg).bit_width() * times;
@@ -3378,7 +3482,7 @@ fn lower_builtin(
     // Unary.
     if matches!(op, BitInvert | Neg | LogNot) {
         if args.len() != 1 {
-            sink.err_span(crate::driver::nowhere(), "this operator takes one operand");
+            sink.err_span(low.here(), "this operator takes one operand");
             return None;
         }
         let arg = lower_expr(low, &args[0], env, sink)?;
@@ -3389,7 +3493,7 @@ fn lower_builtin(
             _ => {
                 if ty != Ty::BOOL {
                     sink.err_span(
-                        crate::driver::nowhere(),
+                        low.here(),
                         format!("`!` needs `i1`, found `{}`", ty.display()),
                     );
                     return None;
@@ -3401,7 +3505,7 @@ fn lower_builtin(
     }
 
     if args.len() != 2 {
-        sink.err_span(crate::driver::nowhere(), "this operator takes two operands");
+        sink.err_span(low.here(), "this operator takes two operands");
         return None;
     }
     let mut lhs = lower_expr(low, &args[0], env, sink)?;
@@ -3420,7 +3524,7 @@ fn lower_builtin(
                 if is_union {
                     sink.push(
                         Diag::error(
-                            crate::driver::nowhere(),
+                            low.here(),
                             format!("`{}` carries payloads, so comparing it compares those too", name),
                         )
                         .with_note(
@@ -3456,7 +3560,7 @@ fn lower_builtin(
     let out_ty = match binop_result(op, &lt, &rt) {
         Ok(t) => t,
         Err(e) => {
-            let mut d = Diag::error(crate::driver::nowhere(), e.message());
+            let mut d = Diag::error(low.here(), e.message());
             if let Some(note) = e.note() {
                 d = d.with_note(note);
             }
@@ -3489,7 +3593,7 @@ fn lower_builtin(
         LogOr => BinOp::Or,
         other => {
             sink.err_span(
-                crate::driver::nowhere(),
+                low.here(),
                 format!("`{:?}` is not available in combinational logic", other),
             );
             return None;
@@ -3507,7 +3611,7 @@ fn cast_args(
 ) -> Option<(ValueId, u32)> {
     if args.len() != 2 {
         sink.err_span(
-            crate::driver::nowhere(),
+            low.here(),
             "expected two arguments: a value and a constant width",
         );
         return None;
@@ -3516,13 +3620,13 @@ fn cast_args(
     let k = match const_eval(&args[1]) {
         Ok(k) => k,
         Err(_) => {
-            sink.err_span(crate::driver::nowhere(), "the second argument must be a constant");
+            sink.err_span(low.here(), "the second argument must be a constant");
             return None;
         }
     };
     let width_is_sane = k > 0 && k <= 65536;
     if !width_is_sane {
-        sink.err_span(crate::driver::nowhere(), "width out of range");
+        sink.err_span(low.here(), "width out of range");
         return None;
     }
     Some((value, k as u32))

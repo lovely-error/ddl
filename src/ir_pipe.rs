@@ -150,10 +150,16 @@ pub fn lower_sequence(
     for (k, stage) in stages.iter().enumerate() {
         let mut keep = Vec::new();
         for stmt in stage {
+            // The stage split runs before lowering, so there is no anchor
+            // stack to read -- the statement in hand is the same place one
+            // would have come from.
+            let at = crate::ir::stmt_anchor(stmt)
+                .map(|a| map.span_of(&a))
+                .unwrap_or_else(crate::driver::nowhere);
             if let Some(r) = as_recv(stmt) {
                 if k != 0 {
                     sink.err_span(
-                        crate::driver::nowhere(),
+                        at,
                         "only the first stage of a sequence may block on a read",
                     );
                     return None;
@@ -163,10 +169,7 @@ pub fn lower_sequence(
             }
             if let Some(s) = as_send(stmt) {
                 if k + 1 != n {
-                    sink.err_span(
-                        crate::driver::nowhere(),
-                        "a sequence sends from its last stage",
-                    );
+                    sink.err_span(at, "a sequence sends from its last stage");
                     return None;
                 }
                 tail_send = Some(s);
@@ -189,7 +192,7 @@ pub fn lower_sequence(
     };
     if recv_pipe != low.pipes[in_ix].name {
         sink.err_span(
-            crate::driver::nowhere(),
+            map.span_of(&decl.name),
             format!("`{}` is not this sequence's `in` pipe", recv_pipe),
         );
         return None;
@@ -206,7 +209,7 @@ pub fn lower_sequence(
     };
     if send_pipe != low.pipes[out_ix].name {
         sink.err_span(
-            crate::driver::nowhere(),
+            map.span_of(&decl.name),
             format!("`{}` is not this sequence's `out` pipe", send_pipe),
         );
         return None;
@@ -302,7 +305,7 @@ pub fn lower_sequence(
     let have = low.ty_of(sent);
     if have != out_ty {
         sink.err_span(
-            crate::driver::nowhere(),
+            low.here(),
             format!(
                 "`{}` carries `{}` but `{}` was sent",
                 low.pipes[out_ix].name,
