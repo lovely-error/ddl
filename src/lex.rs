@@ -1583,6 +1583,10 @@ unsafe fn parse_indent_guided_block(
     char_end_ptr: *const u8,
     parent_depth: u32,
 ) -> Result<(StmtBlock, *const u8), ()> {
+    let _nesting = match enter_nesting() {
+        Some(g) => g,
+        None => return Err(()),
+    };
     // probe depth
     let (anchore_depth, _) = skip_trivia(char_ptr, char_end_ptr);
     let inbound = parent_depth < anchore_depth;
@@ -1942,6 +1946,10 @@ unsafe fn try_parse_expr(
     char_end_ptr: *const u8,
     parent_depth: u32,
 ) -> Result<(RawExpr, *const u8), ()> {
+    let _nesting = match enter_nesting() {
+        Some(g) => g,
+        None => return Err(()),
+    };
     // An expression starting at a line break is a statement block.
     //
     // This probed for a bare LF, so on a CRLF file it saw the CR, decided the
@@ -2350,6 +2358,68 @@ unsafe fn line_is_finished(mut char_ptr: *const u8, char_end_ptr: *const u8) -> 
     here == 10 || here == 13
 }
 
+// ---- recursion depth ------------------------------------------------------
+//
+// The parser is recursive descent, so nesting in the source is nesting on the
+// stack: `((((a))))` recurses once per parenthesis and an indented block
+// recurses once per level. At about 800 levels that overflows the stack, which
+// is not a panic -- it is the process dying with no diagnostic, and
+// `catch_unwind` cannot see it. The fuzzer found it in a minute; no valid
+// program goes anywhere near it, which is why nothing had.
+//
+// A counter rather than a parameter because the recursion runs through
+// twenty-one call sites in two separate cycles (expressions, and statement
+// blocks), and threading a depth through all of them to be checked in two
+// places is a lot of signature for one number.
+
+use std::cell::Cell;
+
+thread_local! {
+    static NESTING: Cell<u32> = const { Cell::new(0) };
+    /// Set when the limit is hit, so the failure reports as what it is rather
+    /// than as whatever token happened to be next.
+    static TOO_DEEP: Cell<bool> = const { Cell::new(false) };
+}
+
+/// How deep the source may nest.
+///
+/// Well under where the stack gives out, and far past anything a person
+/// writes: the deepest expression in examples/ is six.
+pub const NESTING_LIMIT: u32 = 96;
+
+/// Decrements on the way out, which matters because the functions it guards
+/// return early from dozens of places.
+pub struct Nesting;
+
+impl Drop for Nesting {
+    fn drop(&mut self) {
+        NESTING.with(|n| n.set(n.get().saturating_sub(1)));
+    }
+}
+
+/// `None` when the limit is reached; the caller fails the parse.
+fn enter_nesting() -> Option<Nesting> {
+    NESTING.with(|n| {
+        let depth = n.get();
+        if depth >= NESTING_LIMIT {
+            TOO_DEEP.with(|f| f.set(true));
+            return None;
+        }
+        n.set(depth + 1);
+        Some(Nesting)
+    })
+}
+
+fn reset_nesting() {
+    NESTING.with(|n| n.set(0));
+    TOO_DEEP.with(|f| f.set(false));
+}
+
+/// Whether the last parse gave up because the source nested too deeply.
+pub fn nesting_overflowed() -> bool {
+    TOO_DEEP.with(|f| f.get())
+}
+
 /// Where a declaration's body stopped making sense, and what kind of
 /// declaration it was.
 ///
@@ -2711,6 +2781,7 @@ pub unsafe fn parse_top_level(
     char_ptr: *const u8,
     length: u32,
 ) -> Result<Vec<TopLevelDecl>, ParseError> {
+    reset_nesting();
     let mut items = Vec::new();
     let mut char_ptr = char_ptr;
     let end = unsafe { char_ptr.add(length as usize) };

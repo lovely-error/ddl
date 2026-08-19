@@ -159,6 +159,13 @@ cargo test
 cargo clippy --all-targets
 ```
 
+The suite includes a fuzzer, seeded so a failure is reproducible. It runs a
+short pass on every `cargo test`; the soak is an environment variable:
+
+```bash
+DDL_FUZZ_ITERS=1000000 cargo test --release --test fuzz
+```
+
 Clippy is clean. The two lints this codebase deliberately does not follow are
 in `Cargo.toml` with a reason each; rustfmt is deliberately NOT used, because
 the house style predates it and adopting it would rewrite every file.

@@ -55,6 +55,21 @@ pub fn parse_source<'a>(map: &'a SourceMap) -> Result<Parsed<'a>, Vec<Diag>> {
     match unsafe { parse_top_level(base, map.len()) } {
         Ok(decls) => Ok(Parsed { decls, _buffer: std::marker::PhantomData }),
         Err(err) => {
+            // Depth exhaustion is not a syntax error at the token it stopped
+            // on: the source is nested past what the parser will follow, and
+            // saying `unexpected \`(\`` about the ninety-seventh one sends the
+            // reader looking at a parenthesis that is no different from the
+            // ninety-sixth.
+            if crate::lex::nesting_overflowed() {
+                let span = map.span_at_ptr(err.at);
+                return Err(vec![
+                    Diag::error(span, "this nests deeper than the parser will follow")
+                        .with_note(format!(
+                            "the limit is {} levels of brackets or indented blocks; past that the parser runs out of stack, which is a crash rather than a diagnostic",
+                            crate::lex::NESTING_LIMIT
+                        )),
+                ]);
+            }
             let span = map.span_at_ptr(err.at);
             let offset = map.offset_of(err.at);
             let word: String = if offset >= map.len() {
@@ -139,7 +154,40 @@ pub fn compile_to_verilog(map: &SourceMap, opts: &EmitOptions) -> Result<String,
     compile(map, opts, Emit::Verilog)
 }
 
+/// The stack the compiler runs on.
+///
+/// Recursive descent puts source nesting on the stack, and a debug build
+/// spends about eight times as much of it per level as a release build does --
+/// so the depth a program compiles at would otherwise depend on which binary
+/// compiled it. Fifty levels of parentheses was enough to kill the debug
+/// binary, which is not a diagnostic but a dead process.
+///
+/// A thread with a known stack makes the limit a property of the language
+/// rather than of the build profile. `lex::NESTING_LIMIT` is then a rule
+/// somebody chose, and it is enforced identically everywhere.
+const COMPILER_STACK: usize = 64 * 1024 * 1024;
+
 pub fn compile(map: &SourceMap, opts: &EmitOptions, emit: Emit) -> Result<String, Vec<Diag>> {
+    std::thread::scope(|scope| {
+        std::thread::Builder::new()
+            .stack_size(COMPILER_STACK)
+            .name("ddl-compile".to_string())
+            .spawn_scoped(scope, || compile_on_this_stack(map, opts, emit))
+            .expect("a thread for the compiler")
+            .join()
+            .unwrap_or_else(|_| {
+                Err(vec![Diag::error_no_span(
+                    "the compiler panicked; this is a bug in the compiler",
+                )])
+            })
+    })
+}
+
+fn compile_on_this_stack(
+    map: &SourceMap,
+    opts: &EmitOptions,
+    emit: Emit,
+) -> Result<String, Vec<Diag>> {
     let parsed = parse_source(map)?;
     let base = map.base_ptr();
     let mut sink = DiagSink::new(map);
