@@ -1,0 +1,27 @@
+{
+  "name": "ddl",
+  "displayName": "DDL",
+  "description": "Syntax highlighting for the dataflow description language.",
+  "version": "0.1.0",
+  "publisher": "ddl",
+  "private": true,
+  "engines": { "vscode": "^1.70.0" },
+  "categories": ["Programming Languages"],
+  "contributes": {
+    "languages": [
+      {
+        "id": "ddl",
+        "aliases": ["DDL", "ddl"],
+        "extensions": [".ddl"],
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "grammars": [
+      {
+        "language": "ddl",
+        "scopeName": "source.ddl",
+        "path": "./syntaxes/ddl.tmLanguage.json"
+      }
+    ]
+  }
+}

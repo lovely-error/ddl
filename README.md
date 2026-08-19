@@ -196,6 +196,20 @@ It instantiates each generated module beside its reference, drives both with
 the same stimulus, and compares primitive counts after synthesis. Modules
 whose reference lives in another repository are skipped when it is absent.
 
+## Editor support
+
+`editors/vscode/` is a syntax-highlighting extension for `.ddl`. To use it
+without packaging, symlink or copy it into your extensions directory:
+
+```bash
+cp -r editors/vscode ~/.vscode/extensions/ddl
+```
+
+The grammar is checked against the compiler by `tests/editor.rs`: a builtin or
+keyword the compiler resolves and the grammar does not is a test failure. A
+syntax file is otherwise the one part of a toolchain nothing verifies, so it
+goes stale in silence.
+
 ## Layout
 
 | | |

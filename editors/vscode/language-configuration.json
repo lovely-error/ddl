@@ -1,0 +1,20 @@
+{
+  "comments": { "lineComment": "--" },
+  "brackets": [["(", ")"], ["[", "]"]],
+  "autoClosingPairs": [
+    { "open": "(", "close": ")" },
+    { "open": "[", "close": "]" },
+    { "open": "\"", "close": "\"", "notIn": ["string", "comment"] }
+  ],
+  "surroundingPairs": [["(", ")"], ["[", "]"], ["\"", "\""]],
+  "indentationRules": {
+    "increaseIndentPattern": "^\\s*(fun|process|sequence|graph|struct|enum)\\b.*\\)?\\s*$|^\\s*(if\\b.*\\bthen|else|loop|for\\b.*\\bin\\b.*|match\\b.*|.*=>)\\s*$",
+    "decreaseIndentPattern": "^(?!.*)$"
+  },
+  "onEnterRules": [
+    {
+      "beforeText": "^\\s*--.*$",
+      "action": { "indent": "none", "appendText": "-- " }
+    }
+  ]
+}

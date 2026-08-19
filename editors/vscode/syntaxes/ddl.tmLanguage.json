@@ -1,0 +1,115 @@
+{
+  "$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+  "name": "DDL",
+  "scopeName": "source.ddl",
+  "patterns": [
+    { "include": "#comment" },
+    { "include": "#import" },
+    { "include": "#declaration" },
+    { "include": "#stage-cut" },
+    { "include": "#memory-impl" },
+    { "include": "#builtin" },
+    { "include": "#keyword" },
+    { "include": "#pipe-qualifier" },
+    { "include": "#sized-literal" },
+    { "include": "#number" },
+    { "include": "#type" },
+    { "include": "#variant-pattern" },
+    { "include": "#operator" }
+  ],
+  "repository": {
+    "comment": {
+      "comment": "`--` to end of line. The only comment form there is.",
+      "match": "--.*$",
+      "name": "comment.line.double-dash.ddl"
+    },
+    "import": {
+      "comment": "Resolved before parsing, so the path is part of the syntax.",
+      "match": "^(import)\\s+(\"[^\"]*\")",
+      "captures": {
+        "1": { "name": "keyword.control.import.ddl" },
+        "2": { "name": "string.quoted.double.ddl" }
+      }
+    },
+    "declaration": {
+      "comment": "The six things a file can hold. Naming the declaration as an entity is what makes the outline view useful.",
+      "match": "\\b(fun|process|sequence|graph|struct|enum)\\s+([A-Za-z_][A-Za-z0-9_]*)",
+      "captures": {
+        "1": { "name": "storage.type.ddl" },
+        "2": { "name": "entity.name.function.ddl" }
+      }
+    },
+    "stage-cut": {
+      "comment": "`|||` is a pipeline stage boundary, not an operator; it deserves to stand out from `|`.",
+      "match": "\\|\\|\\|",
+      "name": "keyword.operator.stage-cut.ddl"
+    },
+    "memory-impl": {
+      "match": "(#\\[)(impl)(\\()(lutram|bram|bkram)(\\)\\])",
+      "captures": {
+        "1": { "name": "punctuation.definition.annotation.ddl" },
+        "2": { "name": "entity.name.tag.ddl" },
+        "3": { "name": "punctuation.definition.annotation.ddl" },
+        "4": { "name": "support.constant.ddl" },
+        "5": { "name": "punctuation.definition.annotation.ddl" }
+      }
+    },
+    "builtin": {
+      "comment": "Every `@` name the parser resolves. An unknown one is an error, so highlighting only the real set makes a typo visible before compiling.",
+      "match": "@(try_rcv|try_send|rcv|send|zeroed|zext|sext|trunc|signed|unsigned|concat|rep|cast|assert|fatal|unreachable|map)\\b",
+      "name": "support.function.builtin.ddl"
+    },
+    "keyword": {
+      "patterns": [
+        {
+          "match": "\\b(if|then|else|match|loop|break|for|in|return)\\b",
+          "name": "keyword.control.ddl"
+        },
+        {
+          "match": "\\b(let|var)\\b",
+          "name": "storage.modifier.ddl"
+        }
+      ]
+    },
+    "pipe-qualifier": {
+      "comment": "`buffer`/`stream` decide whether the producer stalls; `in`/`out`/`inout` which way it goes.",
+      "match": "\\b(buffer|stream)\\b|\\b(inout|out)\\b",
+      "captures": {
+        "1": { "name": "storage.type.pipe.ddl" },
+        "2": { "name": "storage.modifier.direction.ddl" }
+      }
+    },
+    "sized-literal": {
+      "comment": "`8'd1`, `32'hFF`, `1'b0`. The width is part of the value in this language, so it is highlighted as one token.",
+      "match": "\\b[0-9]+'[bodhBODH][0-9a-fA-F_]+",
+      "name": "constant.numeric.sized.ddl"
+    },
+    "number": {
+      "match": "\\b[0-9][0-9_]*\\b",
+      "name": "constant.numeric.ddl"
+    },
+    "type": {
+      "comment": "`iN` unsigned, `sN` signed, at any width.",
+      "match": "\\b([is][0-9]+)\\b",
+      "name": "support.type.ddl"
+    },
+    "variant-pattern": {
+      "comment": "`.Read a =>` -- the dotted form a match arm uses.",
+      "match": "(\\.)([A-Za-z_][A-Za-z0-9_]*)",
+      "captures": {
+        "1": { "name": "punctuation.accessor.ddl" },
+        "2": { "name": "variable.other.enummember.ddl" }
+      }
+    },
+    "operator": {
+      "patterns": [
+        { "match": "=>", "name": "keyword.operator.arrow.ddl" },
+        { "match": "\\.\\.", "name": "keyword.operator.range.ddl" },
+        {
+          "match": "(<<=|>>=|[-+*/%&|^]=|==|!=|<=|>=|<<|>>|[-+*/%&|^~!<>=])",
+          "name": "keyword.operator.ddl"
+        }
+      ]
+    }
+  }
+}
