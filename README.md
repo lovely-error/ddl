@@ -74,8 +74,10 @@ cast.
 
 **Types.** `iN` and `sN` at any width, structs, enums — including tagged
 unions, where a variant carries a payload and `match` is the only way to reach
-it — and arrays backed by `lutram` (asynchronous reads) or `bram` (a read costs
-a state). Widths are checked and never silently adjusted: mixed widths are an
+it — and arrays backed by `lutram` (asynchronous reads) or `bram` (synchronous:
+the read costs a state, and is emitted inside the memory's own clocked block so
+it infers as a block RAM rather than as distributed RAM with a flop on it).
+Widths are checked and never silently adjusted: mixed widths are an
 error naming the `@zext`/`@trunc` that fixes them, and an unsized literal takes
 its width from the other operand.
 
