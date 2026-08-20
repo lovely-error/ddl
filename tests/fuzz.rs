@@ -67,7 +67,7 @@ impl Rng {
 /// reaches the parser rather than bouncing off the first byte.
 const WORDS: &[&str] = &[
     "fun", "process", "sequence", "graph", "struct", "enum", "let", "var", "loop", "break",
-    "for", "in", "if", "then", "else", "match", "import", "return", "buffer", "stream", "out",
+    "for", "in", "if", "then", "else", "match", "import", "return", "buffer", "out",
     "inout", "@rcv", "@send", "@try_rcv", "@try_send", "@zext", "@sext", "@trunc", "@cast",
     "@concat", "@zeroed", "@assert", "@unreachable", "i1", "i8", "i32", "s32", "|||", "=>", "..",
     "==", "+=", "<<=", "#[impl(lutram)]", "#[impl(bram)]", "(", ")", "[", "]", ",", ":", "=",

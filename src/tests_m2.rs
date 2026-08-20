@@ -1601,16 +1601,17 @@ fn a_buffer_is_two_deep() {
 }
 
 #[test]
-fn a_stream_stays_one_deep() {
-    // A stream overwrites its oldest item, so a second entry would only mean
-    // dropping a newer one instead of an older one.
+fn every_output_pipe_is_two_deep() {
+    // There is one kind of pipe now, so there is one depth: head and skid.
+    // `stream` used to be the exception that stayed one deep, and the reason
+    // it is gone is that the exception was the lossy one.
     let v = compile(concat!(
-        "process p (src: buffer in i32, o: stream out i32)\n",
+        "process p (src: buffer in i32, o: buffer out i32)\n",
         "  let (x, got) = @try_rcv(src)\n",
         "  let _s = @try_send(o, x)\n",
     ));
     assert!(v.contains("reg o_busy;"), "{}", v);
-    assert!(!v.contains("o_skid"), "a stream has no skid:\n{}", v);
+    assert!(v.contains("reg o_skid_busy;"), "{}", v);
 }
 
 #[test]
@@ -1882,11 +1883,53 @@ fn a_stage_cut_becomes_a_register_bank_and_a_validity_bit() {
 #[test]
 fn the_pipeline_shifts_when_its_sink_has_a_slot() {
     let v = compile(PIPE3);
-    assert!(v.contains("wire shift = (!v2) | dst_ready;"), "{}", v);
+    // The slot is two entries deep, so the room it reports is the skid being
+    // empty rather than the sink taking something this cycle.
+    assert!(v.contains("wire shift = !out_skid_busy;"), "{}", v);
     assert!(v.contains("assign src_ready = shift;"), "{}", v);
     // Rule 3: the output valid is the last validity bit, a register.
     assert!(v.contains("assign dst_valid = v2;"), "{}", v);
     assert!(v.contains("v1 <= (shift ? v0 : v1);"), "{}", v);
+}
+
+#[test]
+fn the_producer_side_ready_is_not_a_wire_to_the_sink() {
+    // What the second entry is for. With one entry `shift` was
+    // `(!v2) | dst_ready` and `src_ready` was `shift`, so `scaler` in
+    // examples/pipeline_graph.ddl put one combinational path through three
+    // modules -- rule 3 satisfied and the path there anyway.
+    //
+    // Anti-vacuous: `dst_ready` does appear in this module, in the head's own
+    // drain condition, so a test that merely grepped for it would pass on the
+    // one-entry version too.
+    let v = compile(PIPE3);
+    assert!(v.contains("dst_ready"), "{}", v);
+
+    let ready_line = v
+        .lines()
+        .find(|l| l.contains("assign src_ready"))
+        .expect("a buffer input has a ready");
+    let feeds_ready: Vec<&str> = v
+        .lines()
+        .filter(|l| l.trim_start().starts_with("wire shift ="))
+        .collect();
+    assert!(!ready_line.contains("dst_ready"), "{}", v);
+    for l in &feeds_ready {
+        assert!(!l.contains("dst_ready"), "{}", v);
+    }
+}
+
+#[test]
+fn a_stream_qualifier_is_refused_with_a_note_on_what_it_cost() {
+    // Recognised rather than deleted from the lexer: `dst: stream out i32`
+    // failing as an unrecognised type would blame the wrong word.
+    let text = compile_err(concat!(
+        "sequence s (src: buffer in i16, dst: stream out i32)\n",
+        "  let a = @rcv(src)\n",
+        "  @send(dst, @zext(a, 32))\n",
+    ));
+    assert!(text.contains("`stream out` is not a pipe kind; DDL has `buffer`"), "{}", text);
+    assert!(text.contains("A `buffer` holds two and stalls instead"), "{}", text);
 }
 
 #[test]

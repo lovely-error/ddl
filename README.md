@@ -77,6 +77,10 @@ unions, where a variant carries a payload and `match` is the only way to reach
 it — and arrays backed by `lutram` (asynchronous reads) or `bram` (synchronous:
 the read costs a state, and is emitted inside the memory's own clocked block so
 it infers as a block RAM rather than as distributed RAM with a flop on it).
+A `[T; n]` without an `#[impl(...)]` is not storage but a packed value, so it
+can be a struct field, a pipe payload or a parameter; `a[k]` selects an
+element and `a[hi..lo]` a run of them, laid out the way SystemVerilog packs an
+array, and an index past the end is an error rather than a bit somewhere else.
 Widths are checked and never silently adjusted: mixed widths are an
 error naming the `@zext`/`@trunc` that fixes them, and an unsized literal takes
 its width from the other operand.
@@ -105,8 +109,21 @@ becomes a fork in the state machine — `match` with exhaustiveness checking,
 more than one thing), and `inout` (by reference and readable: it updates the
 caller's variable, and at a module boundary becomes `x` plus `x_out`).
 
-**Pipes.** `buffer` and `stream`, in and out, with `@rcv`, `@send`,
-`@try_rcv`, `@try_send`.
+**Pipes.** `buffer`, in and out, with `@rcv`, `@send`, `@try_rcv`,
+`@try_send`. There is one kind and it never drops anything: the producer waits.
+A `buffer` is two entries deep — a head and a skid — which is what makes
+`ready` a register rather than a wire through to the sink's: the producer
+learns about a stall a cycle late and the second entry is where the item it
+had already committed to goes. A chain of blocks is therefore a chain of
+registers, not one combinational path as long as the chain. The depth cannot
+be changed.
+
+There was a second kind, `stream`, whose producer never waited because the
+oldest item was overwritten instead. It is gone. Overwriting is a dropped
+transfer, and a dropped transfer is not visible where it happens — it surfaces
+later and somewhere else as a machine one item out of step. Where a sink
+genuinely cannot refuse, the sink ties `ready` high and says so at the
+boundary, which puts the claim somewhere a reader can check.
 
 **Multiple files.** Either several inputs on the command line, or one input
 naming the others:
@@ -137,6 +154,7 @@ Deliberately, with a diagnostic rather than a wrong answer:
 - a width annotation on an enum that carries payloads, which would name the tag
   and read as the value
 - reading a variant's payload without matching on its tag first
+- `stream` pipes, which the language had and no longer does
 - `bkram` memories, `~=`
 
 `desc.md` lists more that is designed but not built — `io process`, `pin`,

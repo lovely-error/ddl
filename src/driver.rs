@@ -598,59 +598,54 @@ mod emit_tests {
     }
 
     #[test]
-    fn a_stream_output_has_no_ready_and_strobes_for_one_cycle() {
-        // `stream` is the exception, and this is the shape it exists for: a
-        // running count published for whoever is watching. A reader that
-        // misses a sample loses nothing, because the next one supersedes it --
-        // and the counter must not be stalled by a monitor that stopped
-        // looking, which is exactly what a `buffer` here would allow.
-        //
-        // So there is no `ready` to emit, and `valid` cannot hold: with no
-        // `ready` to say the item was read, holding it would turn "the oldest
-        // is overwritten" into "the newest is dropped".
-        //
-        // Anything whose loss changes the result wants a `buffer`.
-        let v = compile(concat!(
-            "process event_counter (ev: buffer in i1, count: stream out i32)\n",
-            "  var seen: i32 = @zeroed()\n",
-            "  loop\n",
-            "    let (_e, happened) = @try_rcv(ev)\n",
-            "    if happened then\n",
-            "      seen = seen + 32'd1\n",
-            "    @try_send(count, seen)\n",
+    fn a_stream_parameter_is_refused() {
+        // What `stream out` was for -- a running count published for whoever
+        // is watching, where a reader that misses a sample loses nothing --
+        // and what it cost: a sink that fell behind lost a transfer and
+        // nothing said so. Anything whose loss changes the result wanted a
+        // `buffer`, and now everything does.
+        let text = compile_err(concat!(
+            "process event_counter (ev: buffer in i1, count: stream out i32)
+",
+            "  var seen: i32 = @zeroed()
+",
+            "  loop
+",
+            "    let (_e, happened) = @try_rcv(ev)
+",
+            "    if happened then
+",
+            "      seen = seen + 32'd1
+",
+            "    @try_send(count, seen)
+",
         ));
-        assert!(v.contains("output        count_valid"), "{}", v);
-        assert!(!v.contains("count_ready"), "{}", v);
-        assert!(v.contains("count_busy <= ev_valid;"), "{}", v);
-        // A monitor that stops reading cannot stall the counter: its input
-        // stays ready no matter what the sink does.
-        assert!(v.contains("assign ev_ready = 1'b1;"), "{}", v);
+        assert!(text.contains("is not a pipe kind"), "{}", text);
+        assert!(text.contains("overwrote its oldest item"), "{}", text);
     }
 
     #[test]
-    fn a_stream_in_a_sequence_has_no_ready_on_that_side() {
-        // A stream's producer is never told to wait: the oldest item is
-        // overwritten instead. So the pipeline samples whatever is there, and
-        // an item it missed rides through as an invalid one.
-        let v = compile(concat!(
-            "sequence s (a: stream in i16, dst: buffer out i16)\n",
-            "  let x = @rcv(a)\n",
-            "  @send(dst, x)\n",
+    fn a_stream_in_a_sequence_is_refused_too() {
+        // Both ends, and both declaration kinds: the qualifier is gone from
+        // the language rather than from one position in it.
+        let text = compile_err(concat!(
+            "sequence s (a: stream in i16, dst: buffer out i16)
+",
+            "  let x = @rcv(a)
+",
+            "  @send(dst, x)
+",
         ));
-        assert!(v.contains("input         a_valid,"), "{}", v);
-        assert!(v.contains("input  [15:0] a_data"), "{}", v);
-        assert!(!v.contains("a_ready"), "{}", v);
-    }
+        assert!(text.contains("`stream in` is not a pipe kind"), "{}", text);
 
-    #[test]
-    fn a_stream_sink_never_stalls_the_pipeline() {
-        let v = compile(concat!(
-            "sequence s (src: buffer in i16, dst: stream out i16)\n",
-            "  let x = @rcv(src)\n",
-            "  @send(dst, x)\n",
+        let text = compile_err(concat!(
+            "sequence s (src: buffer in i16, dst: stream out i16)
+",
+            "  let x = @rcv(src)
+",
+            "  @send(dst, x)
+",
         ));
-        assert!(!v.contains("dst_ready"), "{}", v);
-        // Nothing can refuse an item, so the input is always accepted.
-        assert!(v.contains("assign src_ready = 1'b1;"), "{}", v);
+        assert!(text.contains("`stream out` is not a pipe kind"), "{}", text);
     }
 }

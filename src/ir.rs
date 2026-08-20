@@ -473,11 +473,7 @@ pub struct PipeInfo {
     pub is_input: bool,
     /// `<name>_valid`, `<name>_ready`, `<name>_data` in that order.
     pub valid_port: PortId,
-    /// `None` on a stream. A stream sink never refuses an item -- the oldest
-    /// is overwritten instead -- so there is nothing for a `ready` to say, and
-    /// emitting one that is tied high would invite someone to wire it up.
-    pub ready_port: Option<PortId>,
-    pub is_stream: bool,
+    pub ready_port: PortId,
     pub data_port: PortId,
     /// The value read from the data port; inputs only.
     pub data_value: Option<ValueId>,
@@ -496,9 +492,8 @@ pub struct PipeInfo {
     /// new item. Both are computed before the body, from registers and the
     /// `ready` inputs only.
     pub fired: Option<ValueId>,
-    /// Outputs only: the `busy` and `hold` registers backing the slot.
-    /// First register of the output slot. A `buffer` takes four -- head
-    /// valid/data and skid valid/data -- and a `stream` takes two.
+    /// Outputs only: the first of the four registers backing the slot --
+    /// head valid/data, then skid valid/data.
     pub slot_reg: Option<usize>,
 }
 
@@ -517,8 +512,25 @@ enum PathTerm {
 /// and hand-roll a protocol over it, because the protocol is the compiler's
 /// job and hand-rolling it is the thing this language exists to stop.
 pub enum ParamKind {
-    Pipe { is_input: bool, is_stream: bool },
+    Pipe { is_input: bool },
     Constant,
+}
+
+/// The one place that says what happened to `stream`.
+///
+/// It overwrote its oldest item when the sink fell behind, which is a dropped
+/// transfer -- and a dropped transfer is not visible where it happens. It
+/// surfaces much later as a machine that is one item out of step, which is the
+/// same class of failure as the response queue in k2g_membus.sv:10 going out
+/// of order. Every pipe carries back-pressure now, and a `buffer` is two
+/// entries deep with a registered `ready`, so declining to have back-pressure
+/// bought nothing that a slot did not.
+pub fn stream_was_removed(span: crate::diag::Span, what: &str) -> Diag {
+    Diag::error(span, format!("`{}` is not a pipe kind; DDL has `buffer`", what)).with_note(
+        "a `stream` overwrote its oldest item rather than making the producer \
+         wait, so a sink that fell behind lost a transfer and nothing said so. \
+         A `buffer` holds two and stalls instead",
+    )
 }
 
 /// Classifies one parameter, or reports why it cannot be one.
@@ -528,10 +540,16 @@ pub fn classify_param(
     sink: &mut DiagSink,
 ) -> Option<ParamKind> {
     match arg.qualifier {
-        ArgTypeQualifier::BufferIn => Some(ParamKind::Pipe { is_input: true, is_stream: false }),
-        ArgTypeQualifier::BufferOut => Some(ParamKind::Pipe { is_input: false, is_stream: false }),
-        ArgTypeQualifier::StreamIn => Some(ParamKind::Pipe { is_input: true, is_stream: true }),
-        ArgTypeQualifier::StreamOut => Some(ParamKind::Pipe { is_input: false, is_stream: true }),
+        ArgTypeQualifier::BufferIn => Some(ParamKind::Pipe { is_input: true }),
+        ArgTypeQualifier::BufferOut => Some(ParamKind::Pipe { is_input: false }),
+        ArgTypeQualifier::StreamIn => {
+            sink.push(stream_was_removed(low.span_of(&arg.arg_name), "stream in"));
+            None
+        }
+        ArgTypeQualifier::StreamOut => {
+            sink.push(stream_was_removed(low.span_of(&arg.arg_name), "stream out"));
+            None
+        }
         ArgTypeQualifier::Inout => {
             sink.err_at(&arg.arg_name, "`inout` parameters are not supported");
             None
@@ -545,7 +563,7 @@ pub fn classify_param(
                         anumspan_to_str(&arg.arg_name)
                     ),
                 )
-                .with_note("results leave through a `buffer out` or `stream out` pipe"),
+                .with_note("results leave through a `buffer out` pipe"),
             );
             None
         }
@@ -630,16 +648,12 @@ impl<'a> Lowerer<'a> {
         for arg in &args.entries {
             let name = anumspan_to_str(&arg.arg_name).to_string();
             let kind = classify_param(self, arg, sink)?;
-            let stream;
             let is_input = match kind {
                 ParamKind::Constant => {
                     self.declare_constant(arg, env, sink)?;
                     continue;
                 }
-                ParamKind::Pipe { is_input, is_stream } => {
-                    stream = is_stream;
-                    is_input
-                }
+                ParamKind::Pipe { is_input } => is_input,
             };
             let ty = match resolve_type_expr(&arg.type_expr, self.syms) {
                 Ok(t) => t,
@@ -659,15 +673,7 @@ impl<'a> Lowerer<'a> {
                 id
             };
             let valid_port = mk(self, "valid", vd, Ty::BOOL);
-            // A stream has no `ready`. Its sink never refuses an item -- the
-            // oldest is overwritten instead -- so there is nothing for a
-            // `ready` to say, and emitting one tied high would invite someone
-            // to wire it up.
-            let ready_port = if stream {
-                None
-            } else {
-                Some(mk(self, "ready", rd, Ty::BOOL))
-            };
+            let ready_port = mk(self, "ready", rd, Ty::BOOL);
             let data_port = mk(self, "data", dd, ty.clone());
             let data_value = if is_input {
                 let v = self.emit(ty.clone(), Op::Port(data_port));
@@ -682,7 +688,6 @@ impl<'a> Lowerer<'a> {
                 is_input,
                 valid_port,
                 ready_port,
-                is_stream: stream,
                 data_port,
                 data_value,
                 used: false,
@@ -733,7 +738,7 @@ impl<'a> Lowerer<'a> {
                         format!("`{}` has no value", name),
                     )
                     .with_note(
-                        "a plain parameter is a compile-time constant and needs `= <value>`; data arrives through a `buffer in` or `stream in` pipe",
+                        "a plain parameter is a compile-time constant and needs `= <value>`; data arrives through a `buffer in` pipe",
                     ),
                 );
                 return None;
@@ -1509,12 +1514,12 @@ pub fn lower_process(
         let kind = classify_param(&low, arg, sink)?;
         // A plain parameter is configuration, folded here and gone. Everything
         // that changes cycle to cycle is a pipe.
-        let (is_input, is_stream) = match kind {
+        let is_input = match kind {
             ParamKind::Constant => {
                 low.declare_constant(arg, &mut env, sink)?;
                 continue;
             }
-            ParamKind::Pipe { is_input, is_stream } => (is_input, is_stream),
+            ParamKind::Pipe { is_input } => is_input,
         };
         let ty = match resolve_type_expr(&arg.type_expr, syms) {
             Ok(t) => t,
@@ -1548,13 +1553,7 @@ pub fn lower_process(
             (PortDir::Out, PortDir::In, PortDir::Out)
         };
         let valid_port = mk(&mut low, "valid", vdir, Ty::BOOL);
-        // A stream has no `ready`: its producer never waits, and its consumer
-        // takes whatever is being offered on the cycle it looks.
-        let ready_port = if is_stream {
-            None
-        } else {
-            Some(mk(&mut low, "ready", rdir, Ty::BOOL))
-        };
+        let ready_port = mk(&mut low, "ready", rdir, Ty::BOOL);
         let data_port = mk(&mut low, "data", ddir, ty.clone());
 
         let data_value = if is_input {
@@ -1570,7 +1569,6 @@ pub fn lower_process(
             is_input,
             valid_port,
             ready_port,
-            is_stream,
             data_port,
             data_value,
             used: false,
@@ -1831,35 +1829,20 @@ pub fn lower_process(
         // The producer now learns about a stall one cycle late and has a place
         // to put the item it already committed to, which is the whole job of
         // the second entry.
-        //
-        // A STREAM keeps one entry and never refuses: the oldest is
-        // overwritten, which is the difference between the two kinds, and it is
-        // why a process feeding only streams never stalls its input.
-        let accept = match low.pipes[ix].ready_port {
-            None => low.emit(Ty::BOOL, Op::Const(1)),
-            Some(_) => {
-                let skid_busy = low.emit(Ty::BOOL, Op::RegRead((base + 2) as u32));
-                low.values[skid_busy.0 as usize].name = Some(format!("{}_skid_busy", pname));
-                let skid = low.emit(ty.clone(), Op::RegRead((base + 3) as u32));
-                low.values[skid.0 as usize].name = Some(format!("{}_skid", pname));
-                generated.push(Reg {
-                    name: format!("{}_skid_busy", pname),
-                    ty: Ty::BOOL,
-                    reset: 0,
-                    next: skid_busy,
-                });
-                generated.push(Reg {
-                    name: format!("{}_skid", pname),
-                    ty,
-                    reset: 0,
-                    next: skid,
-                });
-                let a = low.emit(Ty::BOOL, Op::Un { op: UnOp::LogNot, arg: skid_busy });
-                low.values[a.0 as usize].name = Some(format!("{}_room", pname));
-                accepts.push(a);
-                a
-            }
-        };
+        let skid_busy = low.emit(Ty::BOOL, Op::RegRead((base + 2) as u32));
+        low.values[skid_busy.0 as usize].name = Some(format!("{}_skid_busy", pname));
+        let skid = low.emit(ty.clone(), Op::RegRead((base + 3) as u32));
+        low.values[skid.0 as usize].name = Some(format!("{}_skid", pname));
+        generated.push(Reg {
+            name: format!("{}_skid_busy", pname),
+            ty: Ty::BOOL,
+            reset: 0,
+            next: skid_busy,
+        });
+        generated.push(Reg { name: format!("{}_skid", pname), ty, reset: 0, next: skid });
+        let accept = low.emit(Ty::BOOL, Op::Un { op: UnOp::LogNot, arg: skid_busy });
+        low.values[accept.0 as usize].name = Some(format!("{}_room", pname));
+        accepts.push(accept);
 
         low.pipes[ix].fired = Some(accept);
         low.pipes[ix].slot_reg = Some(base);
@@ -1889,18 +1872,9 @@ pub fn lower_process(
             continue;
         }
         let up_valid = low.emit(Ty::BOOL, Op::Port(low.pipes[ix].valid_port));
-        // A buffer input transfers only when every buffer output can take the
-        // result. A stream input has no such contract -- it is a sample of
-        // whatever is being offered, and it happens whether or not this cycle
-        // produces anything.
-        let fired = if low.pipes[ix].is_stream {
-            match running {
-                None => up_valid,
-                Some(r) => low.emit(Ty::BOOL, Op::Bin { op: BinOp::And, lhs: up_valid, rhs: r }),
-            }
-        } else {
-            low.emit(Ty::BOOL, Op::Bin { op: BinOp::And, lhs: up_valid, rhs: ready_out })
-        };
+        // An input transfers only when every output slot can take the result.
+        let fired =
+            low.emit(Ty::BOOL, Op::Bin { op: BinOp::And, lhs: up_valid, rhs: ready_out });
         low.values[fired.0 as usize].name = Some(format!("{}_xfer", low.pipes[ix].name));
         low.pipes[ix].fired = Some(fired);
     }
@@ -1926,9 +1900,7 @@ pub fn lower_process(
     for ix in 0..low.pipes.len() {
         let pipe = low.pipes[ix].clone();
         if pipe.is_input {
-            if let Some(ready) = pipe.ready_port {
-                drivers.push((ready, ready_out));
-            }
+            drivers.push((pipe.ready_port, ready_out));
             continue;
         }
         let base = pipe.slot_reg.expect("an output pipe has a slot");
@@ -1953,26 +1925,15 @@ pub fn lower_process(
         };
 
         let idx = base - reg_names.len();
-        match pipe.ready_port {
-            // A stream holds nothing. Its `valid` is one cycle per item,
-            // because there is no `ready` to tell it the item was read and
-            // holding it would turn "the oldest is overwritten" into "the
-            // newest is dropped". That strobe is `uop_valid` in k2g_decode.sv.
-            None => {
-                let hold_next = low.emit(
-                    pipe.ty.clone(),
-                    Op::Mux { cond: offering, then_val: sent, else_val: hold },
-                );
-                generated[idx].next = offering;
-                generated[idx + 1].next = hold_next;
-            }
-            // A two-deep buffer: head, then skid.
-            //
-            // An offer can only arrive while the skid is empty, because that is
-            // what `ready` said -- so "push into the skid while the skid is
-            // moving into the head" cannot happen, and the four cases below are
-            // all of them.
-            Some(ready) => {
+        // Two deep: head, then skid.
+        //
+        // An offer can only arrive while the skid is empty, because that is
+        // what `ready` said -- so "push into the skid while the skid is moving
+        // into the head" cannot happen, and the four cases below are all of
+        // them.
+        {
+            let ready = pipe.ready_port;
+            {
                 let skid_busy = low.emit(Ty::BOOL, Op::RegRead((base + 2) as u32));
                 let skid = low.emit(pipe.ty.clone(), Op::RegRead((base + 3) as u32));
                 let ready_in = low.emit(Ty::BOOL, Op::Port(ready));
@@ -2425,7 +2386,7 @@ fn lower_stmt_at(
                         format!("`{}` is a constant parameter and cannot be assigned", name),
                     )
                     .with_note(
-                        "a plain parameter is folded at compile time; per-cycle data arrives through a `buffer in` or `stream in` pipe",
+                        "a plain parameter is folded at compile time; per-cycle data arrives through a `buffer in` pipe",
                     )
                 } else {
                     Diag::error(
@@ -3077,6 +3038,105 @@ pub fn lower_expr(
     }
 }
 
+/// `a[i]` and `a[hi..lo]` on a packed `[T; n]`, in elements.
+///
+/// Element `k` occupies bits `[(k+1)*w-1 : k*w]`, which is how a packed array
+/// lays out in SystemVerilog too, so a DDL `[i32; 4]` and its `.svh`
+/// counterpart still meet at a module boundary.
+fn lower_array_index(
+    low: &mut Lowerer,
+    sub: &crate::parse::SubscriptAccess,
+    base: ValueId,
+    elem: &Ty,
+    n: u32,
+    env: &Env,
+    sink: &mut DiagSink,
+) -> Option<ValueId> {
+    let w = elem.bit_width();
+    let display = Ty::Array(Box::new(elem.clone()), n).display();
+
+    let out_of_bounds = |low: &Lowerer, sink: &mut DiagSink, k: u128| {
+        sink.push(
+            Diag::error(
+                low.here(),
+                format!("element {} is out of bounds for `{}`", k, display),
+            )
+            .with_note(format!("it has {} element(s), indexed from 0", n)),
+        );
+    };
+
+    // `a[hi..lo]` -- a run of elements, which is a shorter array.
+    if let PrecResExpr::Span(range) = &sub.index {
+        let hi = const_eval(&range.left).ok()?;
+        let lo = const_eval(&range.right).ok()?;
+        if hi < lo {
+            sink.err_span(low.here(), format!("this range runs backwards: `{}..{}`", hi, lo));
+            return None;
+        }
+        if hi >= n as u128 {
+            out_of_bounds(low, sink, hi);
+            return None;
+        }
+        let (hi, lo) = (hi as u32, lo as u32);
+        let ty = Ty::Array(Box::new(elem.clone()), hi - lo + 1);
+        return Some(low.emit(ty, Op::Slice { arg: base, hi: (hi + 1) * w - 1, lo: lo * w }));
+    }
+
+    // `a[k]` -- one element, at a constant index.
+    let element = |low: &mut Lowerer, sink: &mut DiagSink, k: u128| {
+        if k >= n as u128 {
+            out_of_bounds(low, sink, k);
+            return None;
+        }
+        let k = k as u32;
+        Some(low.emit(elem.clone(), Op::Slice { arg: base, hi: (k + 1) * w - 1, lo: k * w }))
+    };
+    if let Ok(k) = const_eval(&sub.index) {
+        return element(low, sink, k);
+    }
+
+    // Lowered once, and only then asked whether it folded: `const_eval` works
+    // on the syntax, so it misses a constant parameter and misses the
+    // induction variable of an unrolled `for`, and both arrive here as an
+    // `Op::Const`. Lowering twice to find that out would double whatever the
+    // index expression does on the way.
+    let idx = lower_expr(low, &sub.index, env, sink)?;
+    if let Op::Const(k) = low.values[idx.0 as usize].op {
+        return element(low, sink, k);
+    }
+
+    // `a[i]` -- one element, at a computed index, which is a `+:` part-select
+    // whose base is the index scaled by the element width.
+    //
+    // The index is widened first: `i` addressing 32 elements is 5 bits and the
+    // base it has to produce is 10, so scaling in the index's own width would
+    // shift the top of it off.
+    let idx_ty = low.ty_of(idx);
+    if idx_ty.is_signed() {
+        sink.push(
+            Diag::error(
+                low.here(),
+                format!("an index must be unsigned, found `{}`", idx_ty.display()),
+            )
+            .with_note("convert with `@unsigned(x)`"),
+        );
+        return None;
+    }
+    let addr_w = u32::BITS - (n * w - 1).leading_zeros();
+    let wide = low.emit(Ty::UInt(addr_w), Op::ZExt { arg: idx, to: addr_w });
+    // A shift where the element width allows one. `*` is a multiplier as far
+    // as GowinSynthesis is concerned, and an address is the last place to
+    // spend a DSP on a constant.
+    let scaled = if w.is_power_of_two() {
+        let shift = low.emit(Ty::UInt(addr_w), Op::Const(w.trailing_zeros() as u128));
+        low.emit(Ty::UInt(addr_w), Op::Bin { op: BinOp::Shl, lhs: wide, rhs: shift })
+    } else {
+        let width = low.emit(Ty::UInt(addr_w), Op::Const(w as u128));
+        low.emit(Ty::UInt(addr_w), Op::Bin { op: BinOp::Mul, lhs: wide, rhs: width })
+    };
+    Some(low.emit(elem.clone(), Op::DynSlice { arg: base, base: scaled, width: w }))
+}
+
 fn lower_subscript(
     low: &mut Lowerer,
     sub: &crate::parse::SubscriptAccess,
@@ -3095,6 +3155,20 @@ fn lower_subscript(
     let base = lower_expr(low, &sub.base, env, sink)?;
     let base_ty = low.ty_of(base);
     let base_w = base_ty.bit_width();
+
+    // `a[i]` where `a` is an ARRAY VALUE selects an element, not a bit.
+    //
+    // An `[T; n]` that is not a memory is still an array: it is a packed
+    // vector so that it can be a struct field, a pipe payload or an operand
+    // (ty.rs:49), and packing is a representation rather than a change of
+    // meaning. Subscripting one used to fall through to the bit selects
+    // below, so `line.words[1]` -- a struct field of type `[i32; 4]` -- read
+    // bit 1 of the flattened struct and typed as `i1`. That is a wrong answer
+    // rather than a diagnostic, and it is the shape of wrong answer that
+    // synthesizes and runs.
+    if let Ty::Array(elem, n) = &base_ty {
+        return lower_array_index(low, sub, base, elem, *n, env, sink);
+    }
 
     // `x[hi..lo]` -- a constant range.
     if let PrecResExpr::Span(range) = &sub.index {

@@ -1,10 +1,13 @@
-// `inout` parameters and `stream` pipes.
+// `inout` parameters, and what a parameter is allowed to be.
 //
-// Both are cases where the language already had the vocabulary and the
-// compiler refused the word. `inout` is desc.md:62 -- by reference and
-// readable, which is what lets a helper update its argument instead of
-// returning a new copy of it. `stream` is desc.md:82 -- a pipe whose producer
-// is never told to wait, because the oldest item is overwritten instead.
+// `inout` is desc.md:62 -- by reference and readable, which is what lets a
+// helper update its argument instead of returning a new copy of it.
+//
+// The other half of this file used to be `stream`, a pipe whose producer was
+// never told to wait because the oldest item was overwritten instead. It is
+// gone from the language: a sink that fell behind lost a transfer and nothing
+// said so. What is left here is that the word is refused everywhere it used
+// to be accepted.
 
 use ddl::diag::SourceMap;
 use ddl::driver::compile_to_verilog;
@@ -142,71 +145,80 @@ fn a_call_that_produces_nothing_says_so() {
     assert!(text.contains("produces nothing"), "{}", text);
 }
 
-// ---- stream --------------------------------------------------------------
+// ---- what is no longer a pipe kind ---------------------------------------
 
 #[test]
-fn a_stream_output_on_a_sequence_has_no_ready() {
-    let v = compile(concat!(
-        "sequence widen (src: buffer in i16, dst: stream out i32)\n",
-        "  let a = @rcv(src)\n",
-        "  |||\n",
-        "  let w: i32 = @zext(a, 32)\n",
-        "  @send(dst, w)\n",
+fn a_stream_is_refused_on_a_sequence() {
+    let text = compile_err(concat!(
+        "sequence widen (src: buffer in i16, dst: stream out i32)
+",
+        "  let a = @rcv(src)
+",
+        "  |||
+",
+        "  let w: i32 = @zext(a, 32)
+",
+        "  @send(dst, w)
+",
     ));
-    assert!(v.contains("output        dst_valid,"), "{}", v);
-    assert!(v.contains("output [31:0] dst_data"), "{}", v);
-    assert!(!v.contains("dst_ready"), "{}", v);
+    assert!(text.contains("`stream out` is not a pipe kind; DDL has `buffer`"), "{}", text);
 }
 
 #[test]
-fn a_stream_sink_means_the_pipeline_never_stalls() {
-    // Nothing downstream can refuse an item, so the shift enable is a constant
-    // and the input is always accepted.
-    let v = compile(concat!(
-        "sequence widen (src: buffer in i16, dst: stream out i32)\n",
-        "  let a = @rcv(src)\n",
-        "  |||\n",
-        "  let w: i32 = @zext(a, 32)\n",
-        "  @send(dst, w)\n",
+fn a_stream_is_refused_on_a_graph_parameter() {
+    // A graph's own ports go through their own path, so refusing the word on a
+    // process says nothing about refusing it here.
+    let text = compile_err(concat!(
+        "sequence dbl (src: buffer in i16, dst: buffer out i16)
+",
+        "  let a = @rcv(src)
+",
+        "  |||
+",
+        "  @send(dst, a + a)
+",
+        "graph g (src: stream in i16, dst: buffer out i16)
+",
+        "  dbl(src, dst)
+",
     ));
-    assert!(v.contains("assign src_ready = 1'b1;"), "{}", v);
-    assert!(!v.contains("(!v1) | 1'b1"), "{}", v);
+    assert!(text.contains("is not a pipe kind; DDL has `buffer`"), "{}", text);
 }
 
 #[test]
-fn a_stream_input_is_sampled_rather_than_accepted() {
+fn every_pipe_has_all_three_legs() {
+    // The anti-vacuous half: `ready` used to be the leg a stream did not have,
+    // so its absence was a real difference in the emitted module. Now there is
+    // no shape of pipe that emits two legs.
     let v = compile(concat!(
-        "sequence tap (src: stream in i16, dst: buffer out i32)\n",
-        "  let a = @rcv(src)\n",
-        "  |||\n",
-        "  let w: i32 = @zext(a, 32)\n",
-        "  @send(dst, w)\n",
-    ));
-    assert!(v.contains("input         src_valid,"), "{}", v);
-    assert!(!v.contains("src_ready"), "{}", v);
-    // The validity bit rides through, so a cycle with nothing on the stream
-    // produces an item marked invalid rather than a stall.
-    assert!(v.contains("v0 <= (shift ? src_valid : v0);"), "{}", v);
-}
-
-#[test]
-fn a_graph_wires_a_stream_with_two_legs_not_three() {
-    let v = compile(concat!(
-        "sequence widen (src: buffer in i16, dst: stream out i32)\n",
-        "  let a = @rcv(src)\n",
-        "  |||\n",
-        "  let w: i32 = @zext(a, 32)\n",
-        "  @send(dst, w)\n",
-        "sequence sink_ (src: stream in i32, dst: buffer out i32)\n",
-        "  let a = @rcv(src)\n",
-        "  |||\n",
-        "  @send(dst, a)\n",
-        "graph g (src: buffer in i16, dst: buffer out i32)\n",
-        "  let mid: stream i32\n",
-        "  widen(src, mid)\n",
-        "  sink_(mid, dst)\n",
+        "sequence widen (src: buffer in i16, dst: buffer out i32)
+",
+        "  let a = @rcv(src)
+",
+        "  |||
+",
+        "  let w: i32 = @zext(a, 32)
+",
+        "  @send(dst, w)
+",
+        "sequence sink_ (src: buffer in i32, dst: buffer out i32)
+",
+        "  let a = @rcv(src)
+",
+        "  |||
+",
+        "  @send(dst, a)
+",
+        "graph g (src: buffer in i16, dst: buffer out i32)
+",
+        "  let mid: buffer i32
+",
+        "  widen(src, mid)
+",
+        "  sink_(mid, dst)
+",
     ));
     assert!(v.contains("wire mid_valid;"), "{}", v);
+    assert!(v.contains("wire mid_ready;"), "{}", v);
     assert!(v.contains("wire [31:0] mid_data;"), "{}", v);
-    assert!(!v.contains("wire mid_ready;"), "{}", v);
 }

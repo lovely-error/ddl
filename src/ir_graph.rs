@@ -14,9 +14,6 @@
 //     no producer would sit at `z` and read as an intermittent hang.
 //   * both ends agree on the payload type. A width mismatch is a silent
 //     truncation at an instance port, and it is silent in every tool.
-//   * both ends agree on `buffer` versus `stream`. They differ in whether a
-//     `ready` exists at all, so mixing them leaves a port unconnected -- which
-//     in Verilog means the producer never stalls and quietly drops items.
 //
 // Cycles are fine and need no handling: a net is a net whichever order the
 // instances appear in. desc.md:88 asks for that explicitly, and it is what
@@ -26,7 +23,7 @@ use std::collections::BTreeMap;
 
 use crate::diag::{Diag, DiagSink, SourceMap};
 use crate::ir::{Instance, Module, Net, Port, PortDir};
-use crate::lex::{AlphanumSpan, ArgTypeQualifier};
+use crate::lex::{AlphanumSpan, ArgTypeQualifier, PipeWord};
 use crate::parse::{GraphDecl, GraphStmt, PrecArgDefTuple, anumspan_to_str};
 use crate::symbols::Symbols;
 use crate::ty::{Ty, resolve_type_expr};
@@ -36,7 +33,6 @@ use crate::ty::{Ty, resolve_type_expr};
 pub struct PipeSig {
     pub name: String,
     pub is_input: bool,
-    pub is_stream: bool,
     pub ty: Ty,
 }
 
@@ -59,24 +55,18 @@ pub struct BlockSig {
 pub fn signature_of(name: &str, kind: &'static str, args: &PrecArgDefTuple, syms: &Symbols) -> BlockSig {
     let mut pipes = Vec::new();
     for arg in &args.entries {
-        let (is_input, is_stream) = match arg.qualifier {
-            ArgTypeQualifier::BufferIn => (true, false),
-            ArgTypeQualifier::BufferOut => (false, false),
-            ArgTypeQualifier::StreamIn => (true, true),
-            ArgTypeQualifier::StreamOut => (false, true),
-            // A constant parameter, or an error the callee will report.
+        let is_input = match arg.qualifier {
+            ArgTypeQualifier::BufferIn => true,
+            ArgTypeQualifier::BufferOut => false,
+            // A constant parameter, a `stream`, or an error the callee will
+            // report. All three are reported against the callee itself.
             _ => continue,
         };
         let ty = match resolve_type_expr(&arg.type_expr, syms) {
             Ok(t) => t,
             Err(_) => continue,
         };
-        pipes.push(PipeSig {
-            name: anumspan_to_str(&arg.arg_name).to_string(),
-            is_input,
-            is_stream,
-            ty,
-        });
+        pipes.push(PipeSig { name: anumspan_to_str(&arg.arg_name).to_string(), is_input, ty });
     }
     BlockSig { name: name.to_string(), kind, pipes }
 }
@@ -88,19 +78,12 @@ struct GraphPipeInfo {
     /// nothing connects to has no instance to blame, and its declaration is
     /// the only place a reader can act on.
     declared_at: AlphanumSpan,
-    is_stream: bool,
     /// A port of the enclosing graph rather than an internal wire. A graph
     /// input is produced from outside and a graph output consumed outside, so
     /// the endpoint that is missing inside the graph is not missing.
     external: Option<bool>,
     producers: Vec<AlphanumSpan>,
     consumers: Vec<AlphanumSpan>,
-}
-
-impl GraphPipeInfo {
-    fn kind(&self) -> &'static str {
-        if self.is_stream { "stream" } else { "buffer" }
-    }
 }
 
 pub fn lower_graph(
@@ -128,18 +111,23 @@ pub fn lower_graph(
             sink.err_at(&arg.arg_name, format!("`{}` is implicit on a graph", name));
             return None;
         }
-        let (is_input, is_stream) = match arg.qualifier {
-            ArgTypeQualifier::BufferIn => (true, false),
-            ArgTypeQualifier::BufferOut => (false, false),
-            ArgTypeQualifier::StreamIn => (true, true),
-            ArgTypeQualifier::StreamOut => (false, true),
+        let is_input = match arg.qualifier {
+            ArgTypeQualifier::BufferIn => true,
+            ArgTypeQualifier::BufferOut => false,
+            ArgTypeQualifier::StreamIn | ArgTypeQualifier::StreamOut => {
+                sink.push(crate::ir::stream_was_removed(
+                    map.span_of(&arg.arg_name),
+                    "stream",
+                ));
+                return None;
+            }
             _ => {
                 sink.push(
                     Diag::error(
                         map.span_of(&arg.arg_name),
                         format!("`{}` is not a pipe, and a graph connects nothing else", name),
                     )
-                    .with_note("a graph parameter is `buffer in`, `buffer out`, `stream in` or `stream out`"),
+                    .with_note("a graph parameter is `buffer in` or `buffer out`"),
                 );
                 return None;
             }
@@ -162,9 +150,7 @@ pub fn lower_graph(
             (PortDir::Out, PortDir::In, PortDir::Out)
         };
         ports.push(Port { name: format!("{}_valid", name), dir: vd, ty: Ty::BOOL });
-        if !is_stream {
-            ports.push(Port { name: format!("{}_ready", name), dir: rd, ty: Ty::BOOL });
-        }
+        ports.push(Port { name: format!("{}_ready", name), dir: rd, ty: Ty::BOOL });
         ports.push(Port { name: format!("{}_data", name), dir: dd, ty: ty.clone() });
 
         pipes.insert(
@@ -172,7 +158,6 @@ pub fn lower_graph(
             GraphPipeInfo {
                 ty,
                 declared_at: arg.arg_name,
-                is_stream,
                 external: Some(is_input),
                 producers: Vec::new(),
                 consumers: Vec::new(),
@@ -198,28 +183,30 @@ pub fn lower_graph(
                 return None;
             }
         };
-        // Which kind it is decides whether there is a `ready` leg at all, so
-        // it cannot be defaulted. `let mid: i16` is the shape of a mistake
-        // people will make now that the keyword is `let`.
-        let is_stream = match pipe.is_stream {
-            Some(k) => k,
-            None => {
+        // `buffer` is written out rather than assumed. `let mid: i16` is the
+        // shape of a mistake people will make now that the keyword is `let`,
+        // and a pipe declaration that names no kind reads as a wire.
+        match pipe.said {
+            PipeWord::Buffer => {}
+            PipeWord::Stream => {
+                sink.push(crate::ir::stream_was_removed(map.span_of(&pipe.name), "stream"));
+                return None;
+            }
+            PipeWord::Missing => {
                 sink.push(
                     Diag::error(
                         map.span_of(&pipe.name),
-                        format!("`{}` does not say whether it is a buffer or a stream", name),
+                        format!("`{}` does not say what kind of pipe it is", name),
                     )
                     .with_note(
-                        "write `let <name>: buffer <T>`, whose producer stalls when it is full, or `let <name>: stream <T>`, where the oldest item is overwritten instead",
+                        "write `let <name>: buffer <T>`, whose producer waits when both slots are full",
                     ),
                 );
                 return None;
             }
-        };
-        nets.push(Net { name: format!("{}_valid", name), ty: Ty::BOOL });
-        if !is_stream {
-            nets.push(Net { name: format!("{}_ready", name), ty: Ty::BOOL });
         }
+        nets.push(Net { name: format!("{}_valid", name), ty: Ty::BOOL });
+        nets.push(Net { name: format!("{}_ready", name), ty: Ty::BOOL });
         nets.push(Net { name: format!("{}_data", name), ty: ty.clone() });
 
         pipes.insert(
@@ -227,7 +214,6 @@ pub fn lower_graph(
             GraphPipeInfo {
                 ty,
                 declared_at: pipe.name,
-                is_stream,
                 external: None,
                 producers: Vec::new(),
                 consumers: Vec::new(),
@@ -288,9 +274,8 @@ pub fn lower_graph(
                     sig.pipes
                         .iter()
                         .map(|p| format!(
-                            "{}: {} {} {}",
+                            "{}: buffer {} {}",
                             p.name,
-                            if p.is_stream { "stream" } else { "buffer" },
                             if p.is_input { "in" } else { "out" },
                             p.ty.display()
                         ))
@@ -350,27 +335,6 @@ pub fn lower_graph(
                 );
                 return None;
             }
-            if info.is_stream != formal.is_stream {
-                sink.push(
-                    Diag::error(
-                        map.span_of(actual),
-                        format!(
-                            "`{}` is a `{}` and `{}.{}` is a `{}`",
-                            actual_name,
-                            info.kind(),
-                            module,
-                            formal.name,
-                            if formal.is_stream { "stream" } else { "buffer" }
-                        ),
-                    )
-                    .with_note(
-                        "a `buffer` stalls its producer and a `stream` overwrites; only one of \
-                         them has a `ready`, so the two cannot meet on one pipe",
-                    ),
-                );
-                return None;
-            }
-
             // An instance whose port is an input CONSUMES the pipe.
             if formal.is_input {
                 info.consumers.push(*actual);
@@ -380,9 +344,7 @@ pub fn lower_graph(
             }
 
             conns.push((format!("{}_valid", formal.name), format!("{}_valid", actual_name)));
-            if !formal.is_stream {
-                conns.push((format!("{}_ready", formal.name), format!("{}_ready", actual_name)));
-            }
+            conns.push((format!("{}_ready", formal.name), format!("{}_ready", actual_name)));
             conns.push((format!("{}_data", formal.name), format!("{}_data", actual_name)));
         }
 

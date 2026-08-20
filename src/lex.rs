@@ -318,6 +318,12 @@ pub enum ArgTypeQualifier {
     Inout,
     BufferIn,
     BufferOut,
+    /// `stream in` / `stream out`, which the language no longer has.
+    ///
+    /// Still lexed, and refused during lowering with a message that says what
+    /// to write instead -- the same treatment `#[impl(bkram)]` gets. Deleting
+    /// it from the lexer instead would make `a: stream in i8` fail as an
+    /// unrecognised type, which blames the wrong word.
     StreamIn,
     StreamOut,
 }
@@ -383,17 +389,25 @@ pub enum RawGraphStmt {
     Instance(RawGraphInstance),
 }
 
+/// Which word a graph's `let` used to say what kind of pipe it declares.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PipeWord {
+    Buffer,
+    /// Recognised only so lowering can say the language has no streams.
+    Stream,
+    Missing,
+}
+
 #[derive(Debug)]
 pub struct RawGraphPipe {
     pub name: AlphanumSpan,
-    /// `stream` rather than `buffer`; the two differ in whether the producer
-    /// stalls, and a pipe's two ends have to agree.
+    /// `stream` was written where `buffer` belongs, or neither word was.
     ///
-    /// `None` when neither word was written. Parsed rather than rejected so
-    /// that lowering can say which word is missing and point at the line --
-    /// the parser has no diagnostics, and failing here blames the whole
-    /// `graph` declaration for a typo on one line of it.
-    pub is_stream: Option<bool>,
+    /// Parsed rather than rejected so that lowering can say which word is
+    /// missing and point at the line -- the parser has no diagnostics, and
+    /// failing here blames the whole `graph` declaration for a typo on one
+    /// line of it.
+    pub said: PipeWord,
     pub type_expr: RawTypeExpr,
 }
 
@@ -2527,7 +2541,7 @@ unsafe fn try_parse_graph_stmt(
     Ok((RawGraphStmt::Instance(inst), tail))
 }
 
-/// `let name: buffer T` or `let name: stream T`.
+/// `let name: buffer T`.
 ///
 /// No direction: an internal pipe has both ends inside the graph, and which
 /// end is which is decided by the instances wired to it.
@@ -2560,16 +2574,16 @@ unsafe fn try_parse_graph_pipe(
     char_ptr = tail;
 
     let (stream, tail) = strip_prefix_on_match(char_ptr, char_end_ptr, "stream ");
-    char_ptr = tail;
-    let is_stream = if stream {
-        Some(true)
+    let said = if stream {
+        char_ptr = tail;
+        PipeWord::Stream
     } else {
         let (is_buffer, tail) = strip_prefix_on_match(char_ptr, char_end_ptr, "buffer ");
         if is_buffer {
             char_ptr = tail;
-            Some(false)
+            PipeWord::Buffer
         } else {
-            None
+            PipeWord::Missing
         }
     };
     let (_, tail) = skip_whitespaces(char_ptr, char_end_ptr);
@@ -2577,7 +2591,7 @@ unsafe fn try_parse_graph_pipe(
     let (type_expr, tail) = try_parse_type_expr(char_ptr, char_end_ptr)?;
     char_ptr = tail;
 
-    Ok((RawGraphPipe { name, is_stream, type_expr }, char_ptr))
+    Ok((RawGraphPipe { name, said, type_expr }, char_ptr))
 }
 
 /// `Name(a, b, c)`.

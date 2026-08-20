@@ -82,8 +82,8 @@ fn render_graph(out: &mut String, module: &Module) {
 /// The graph's parameters, by pipe name and direction.
 ///
 /// Derived from the ports rather than kept separately: a pipe is three ports
-/// sharing a prefix, and `_valid` is on every one of them whether or not it is
-/// a stream, which makes it the reliable one to key off.
+/// sharing a prefix, and `_valid` is the one whose direction says which way
+/// the pipe goes -- `_ready` points the other way and `_data` carries a type.
 fn boundary_pipes(module: &Module) -> Vec<(String, PortDir)> {
     module
         .ports

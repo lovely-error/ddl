@@ -37,8 +37,8 @@ pub enum GraphStmt {
 #[derive(Debug, Clone)]
 pub struct GraphPipe {
     pub name: AlphanumSpan,
-    /// `None` when neither `buffer` nor `stream` was written; lowering says so.
-    pub is_stream: Option<bool>,
+    /// Which word the `let` used, if any; lowering says what is wrong with it.
+    pub said: crate::lex::PipeWord,
     pub ty: PrecTypeExpr,
 }
 
@@ -930,7 +930,7 @@ pub unsafe fn resolve_precedence_for_graph(
         let item = match item {
             RawGraphStmt::Pipe(pipe) => GraphStmt::Pipe(GraphPipe {
                 name: pipe.name,
-                is_stream: pipe.is_stream,
+                said: pipe.said,
                 ty: resolve_type(char_ptr, &pipe.type_expr)?,
             }),
             RawGraphStmt::Instance(inst) => GraphStmt::Instance(GraphInstance {

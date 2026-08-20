@@ -105,25 +105,26 @@ Two aspects:
    2. monodirectional fifo
    3. single producer & multiple consumer (when >1 consumer, just physically duplicate sinks)
    4. blocking reads and nonblocking reads
-   5. any pipe is either `buffer` or `stream`
-      1. `buffer`
-         1. producer stalls when no slots available
-         2. `@try_rcv` -> (T, i1) , if data item present, consume it (ok in seq & proc)
-         3. `@rcv` -> T , blocking read (ok in proc, banned in seq)
-         4. 4. `@send` blocking send (ok in proc, banned in seq)
-      2. `stream`
-         1. oldest values are overwritten
-         2. `@try_rcv` -> (T, i1) , if data item present, consume it (ok in seq & proc)
-         3. `@rcv` -> T , blocking read (ok in proc, banned in seq)
-         4. `@send` non blocking send (ok in proc, banned in seq)
-   6. `<X> in T` read only pipe of Ts (X can be either buffer or stream)
-   7. `<X> out T` write only pipe of Ts (X can be either buffer or stream)
+   5. every pipe is a `buffer`
+      1. producer stalls when no slots available; two slots, head and skid
+      2. `@try_rcv` -> (T, i1) , if data item present, consume it (ok in seq & proc)
+      3. `@rcv` -> T , blocking read (ok in proc, banned in seq)
+      4. `@send` blocking send (ok in proc, banned in seq)
+   6. there was a second kind, `stream`, whose producer never stalled because
+      the oldest value was overwritten. REMOVED. Overwriting is a dropped
+      transfer, and a dropped transfer is not visible where it happens -- it
+      surfaces later and elsewhere as a machine one item out of step, which is
+      the failure mode this whole language exists to design out. A sink that
+      genuinely cannot refuse ties `ready` high at the boundary and says so,
+      which puts the claim where a reader can check it.
+   7. `buffer in T` read only pipe of Ts
+   8. `buffer out T` write only pipe of Ts
 
 ### implemented so far
 The compiler in this repository accepts: `fun`, `sequence`, `process`,
 `graph`, `struct`, `enum` (with payloads), `import`, `for in` (unrolled),
-`break`, compound assignment, `inout` parameters, `buffer` and `stream` pipes,
-and `lutram` and `bram` memories. README.md is the current list; what follows
+`break`, compound assignment, `inout` parameters, `buffer` pipes, and
+`lutram` and `bram` memories. README.md is the current list; what follows
 is the design, including the parts that are not built.
 
 ### unresolved issues
@@ -175,13 +176,13 @@ pin out led_enable: i1 = 0
 pin in data_pin: i1
 clock ex1 = 12*10**6
 
-io process LedBlinker (arg1: stream out i1)
+io process LedBlinker (arg1: buffer out i1)
 
     @bind_clock(ex1)
 
     loop
         led_enable = !led_enable
         let smth = @read_pin(data_pin)
-        @send(arg1, smth) -- non blocking send, because sink is a stream
+        @send(arg1, smth) -- blocking; the sink has a slot or the loop waits
         @wait_ticks(12*10**6)
 ```

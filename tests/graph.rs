@@ -259,7 +259,10 @@ fn a_width_mismatch_at_an_instance_port_is_caught_here() {
 }
 
 #[test]
-fn a_stream_cannot_meet_a_buffer() {
+fn a_stream_pipe_is_refused() {
+    // The two kinds used to have to agree at both ends of a pipe, because
+    // only one of them had a `ready`. There is one kind now, so the check is
+    // gone and the word is what is refused.
     let text = compile_err(&format!(
         "{}{}",
         DBL,
@@ -270,8 +273,9 @@ fn a_stream_cannot_meet_a_buffer() {
             "  dbl(mid, dst)\n",
         )
     ));
-    assert!(text.contains("is a `stream`"), "{}", text);
-    assert!(text.contains("only one of them has a `ready`"), "{}", text);
+    assert!(text.contains("is not a pipe kind; DDL has `buffer`"), "{}", text);
+    // It blames the line, not the whole `graph` declaration.
+    assert!(text.contains("let mid: stream i16"), "{}", text);
 }
 
 #[test]
@@ -318,9 +322,8 @@ fn an_undeclared_pipe_name_says_how_to_declare_it() {
 
 #[test]
 fn a_pipe_with_no_kind_says_which_word_is_missing() {
-    // `let mid: i16` is the shape of the mistake the `let` spelling invites,
-    // and which kind it is decides whether there is a `ready` leg at all --
-    // so it cannot be defaulted.
+    // `let mid: i16` is the shape of the mistake the `let` spelling invites:
+    // a pipe declaration that names no kind reads as a wire.
     let text = compile_err(&format!(
         "{}{}",
         DBL,
@@ -335,7 +338,7 @@ fn a_pipe_with_no_kind_says_which_word_is_missing() {
 ",
         )
     ));
-    assert!(text.contains("does not say whether it is a buffer or a stream"), "{}", text);
+    assert!(text.contains("does not say what kind of pipe it is"), "{}", text);
     assert!(text.contains("let <name>: buffer <T>"), "{}", text);
     // And it blames the line, not the whole `graph` declaration.
     assert!(text.contains("let mid: i16"), "{}", text);

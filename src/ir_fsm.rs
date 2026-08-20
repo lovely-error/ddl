@@ -865,16 +865,8 @@ pub fn lower_blocking(
             }
         };
         let pipe = low.pipes[barrier.pipe_ix].clone();
-        let other = match if barrier.is_recv { Some(pipe.valid_port) } else { pipe.ready_port } {
-            Some(p) => p,
-            None => {
-                sink.err_span(
-                    map.span_of(&decl.name),
-                    "a blocking `@send` needs a `buffer` pipe; a `stream` send never blocks",
-                );
-                return None;
-            }
-        };
+        // The other side of the handshake: what says the transfer can happen.
+        let other = if barrier.is_recv { pipe.valid_port } else { pipe.ready_port };
         let handshake = low.emit(Ty::BOOL, Op::Port(other));
         let fire = low.emit(Ty::BOOL, Op::Bin { op: BinOp::And, lhs: in_st[k], rhs: handshake });
         low.name_value(fire, format!("fire_s{}", k));
@@ -892,9 +884,7 @@ pub fn lower_blocking(
         let active = any_of(&mut low, &states);
         let pipe = low.pipes[ix].clone();
         if pipe.is_input {
-            if let Some(ready) = pipe.ready_port {
-                drivers.push((ready, active));
-            }
+            drivers.push((pipe.ready_port, active));
         } else {
             drivers.push((pipe.valid_port, active));
         }

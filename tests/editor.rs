@@ -78,7 +78,7 @@ fn every_statement_keyword_is_in_the_grammar() {
     let text = grammar();
     for kw in [
         "let", "var", "if", "then", "else", "match", "loop", "break", "for", "in", "return",
-        "import", "buffer", "stream", "out", "inout",
+        "import", "buffer", "out", "inout",
     ] {
         assert!(text.contains(kw), "the grammar does not highlight `{}`", kw);
     }
