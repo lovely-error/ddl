@@ -873,22 +873,10 @@ pub fn lower_blocking(
         fires.push(fire);
     }
 
+    // `ready` and `valid` are driven further down, once the states have been
+    // lowered: a non-blocking operation contributes to them too, and which
+    // states did one is not known until their statements have run.
     let mut drivers: Vec<(crate::ir::PortId, ValueId)> = Vec::new();
-    for ix in 0..low.pipes.len() {
-        let states: Vec<ValueId> = states_sched
-            .iter()
-            .enumerate()
-            .filter(|(_, s)| s.barrier.as_ref().is_some_and(|b| b.pipe_ix == ix))
-            .map(|(k, _)| in_st[k])
-            .collect();
-        let active = any_of(&mut low, &states);
-        let pipe = low.pipes[ix].clone();
-        if pipe.is_input {
-            drivers.push((pipe.ready_port, active));
-        } else {
-            drivers.push((pipe.valid_port, active));
-        }
-    }
 
     // Allocate a register for every binding that crosses a state, before any
     // state runs, so another one can read the registered copy.
@@ -916,6 +904,10 @@ pub fn lower_blocking(
     let mut mem_reads: Vec<(usize, usize, ValueId)> = Vec::new();
 
     let mut send_values: Vec<(usize, usize, ValueId)> = Vec::new();
+    // Per pipe: the states that touched it non-blockingly, and the branch the
+    // operation sat on when it was not at the top of the state.
+    let mut nonblocking: Vec<Vec<(usize, Option<ValueId>)>> =
+        vec![Vec::new(); low.pipes.len()];
     // Several states may define the same name, one per arm of a branch, so
     // this is a list rather than a map: the register takes whichever of them
     // fired.
@@ -954,6 +946,25 @@ pub fn lower_blocking(
         vec![Vec::new(); low.mems.len()];
 
     for (k, st) in states_sched.iter().enumerate() {
+        // NON-BLOCKING OPERATIONS ARE PER-STATE, which is the whole difference
+        // between them here and in a process with no states. `fired` there is
+        // "did this pipe transfer this cycle", computed once before the body.
+        // Here a pipe can be sampled in one state and offered to in another,
+        // so it is "did it transfer while we were in state k" -- and `used`,
+        // which stops two operations on one pipe colliding, resets per state
+        // rather than per cycle for the same reason.
+        for ix in 0..low.pipes.len() {
+            let pipe = low.pipes[ix].clone();
+            let other = if pipe.is_input { pipe.valid_port } else { pipe.ready_port };
+            let handshake = low.emit(Ty::BOOL, Op::Port(other));
+            let f = low.emit(Ty::BOOL, Op::Bin { op: BinOp::And, lhs: in_st[k], rhs: handshake });
+            low.name_value_safe(f, format!("{}_xfer_s{}", pipe.name, k));
+            low.pipes[ix].fired = Some(f);
+            low.pipes[ix].used = false;
+            low.pipes[ix].sent = None;
+            low.pipes[ix].send_guard = None;
+        }
+
         for (ix, name) in reg_names.iter().enumerate() {
             if let (Some(v), Some(b)) = (var_start[ix], env.get_mut(name)) {
                 b.value = Some(v);
@@ -1012,6 +1023,24 @@ pub fn lower_blocking(
             }
             low.name_value(v, format!("branch_s{}", k));
             branch_conds[k] = Some(v);
+        }
+
+        // A non-blocking operation asks for the handshake in this state
+        // without making the state wait for it, so the state contributes to
+        // the pipe's `ready`/`valid` exactly as a barrier state does -- and
+        // does NOT contribute to `fires`, which is what "does not wait" means.
+        for (ix, uses) in nonblocking.iter_mut().enumerate() {
+            let used_here = low.pipes[ix].used;
+            let barriered_here = st.barrier.as_ref().is_some_and(|b| b.pipe_ix == ix);
+            if !used_here || barriered_here {
+                continue;
+            }
+            uses.push((k, low.pipes[ix].send_guard));
+            if !low.pipes[ix].is_input
+                && let Some(v) = low.pipes[ix].sent
+            {
+                send_values.push((ix, k, v));
+            }
         }
 
         // What this state leaves behind for the others.
@@ -1095,6 +1124,35 @@ pub fn lower_blocking(
                     );
                 }
             }
+        }
+    }
+
+    // A state asks for a pipe's handshake if it waits on it (a barrier) or if
+    // it touched it without waiting. The two differ in `fires`, not here.
+    for (ix, uses) in nonblocking.iter().enumerate() {
+        let mut asks: Vec<ValueId> = states_sched
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| s.barrier.as_ref().is_some_and(|b| b.pipe_ix == ix))
+            .map(|(k, _)| in_st[k])
+            .collect();
+        for (k, guard) in uses {
+            // An offer written inside an `if` only happens on that branch, so
+            // the state alone is not the condition.
+            let ask = match guard {
+                None => in_st[*k],
+                Some(g) => {
+                    low.emit(Ty::BOOL, Op::Bin { op: BinOp::And, lhs: in_st[*k], rhs: *g })
+                }
+            };
+            asks.push(ask);
+        }
+        let active = any_of(&mut low, &asks);
+        let pipe = low.pipes[ix].clone();
+        if pipe.is_input {
+            drivers.push((pipe.ready_port, active));
+        } else {
+            drivers.push((pipe.valid_port, active));
         }
     }
 

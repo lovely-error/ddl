@@ -241,48 +241,117 @@ fn a_wait_in_the_condition_itself_is_refused() {
     assert!(text.contains("cannot contain a blocking"), "{}", text);
 }
 
-// ---- non-blocking operations, which do not mix with states yet ------------
+// ---- non-blocking operations in a state machine ---------------------------
+
+/// The widening-multiply shape: one item in, one cycle, except when a second
+/// writeback is owed -- and then nothing new is accepted until it has gone.
+const MULW: &str = concat!(
+    "process mulw (uops: buffer in i32, wb: buffer out i32)
+",
+    "  var hi: i32 = @zeroed()
+",
+    "  loop
+",
+    "    let u = @rcv(uops)
+",
+    "    let wide: i1 = u[0]
+",
+    "    hi = u + u
+",
+    "    let _s = @try_send(wb, u)
+",
+    "    if wide then
+",
+    "      @send(wb, hi)
+",
+);
 
 #[test]
-fn a_try_send_in_a_state_machine_is_diagnosed_not_a_panic() {
-    // It used to unwrap a `None` and report "the compiler panicked; this is a
-    // bug in the compiler", which it was. `fired` is computed before the body
-    // and only for a process with no states; the FSM lowering does not compute
-    // it at all.
-    let text = compile_err(concat!(
-        "process a (i: buffer in i32, o: buffer out i32)\n",
-        "  loop\n",
-        "    let u = @rcv(i)\n",
-        "    let _s = @try_send(o, u)\n",
-    ));
-    assert!(text.contains("`@try_send` is not supported in a process with states"), "{}", text);
-    assert!(text.contains("no state to belong to"), "{}", text);
+fn a_try_send_does_not_make_its_state_wait() {
+    // The difference between `@try_send` and `@send` in one line of Verilog:
+    // state 0 fires on the INPUT's handshake alone, so a sink that is not
+    // ready does not hold the state.
+    let v = compile(MULW);
+    assert!(v.contains("wire fire_s0 = in_s0 & uops_valid;"), "{}", v);
+    assert!(v.contains("wire fire_s1 = in_s1 & wb_ready;"), "{}", v);
 }
 
 #[test]
-fn a_try_rcv_beside_a_blocking_send_is_diagnosed_too() {
-    // The other direction, and a different unwrap: the blocking `@send` inside
-    // the `if` is what makes this a state machine, so the `@try_rcv` above it
-    // has nothing to read.
-    let text = compile_err(concat!(
-        "process e (i: buffer in i32, o: buffer out i32)\n",
-        "  loop\n",
-        "    let (u, got) = @try_rcv(i)\n",
-        "    if u[0] then\n",
-        "      @send(o, u)\n",
+fn the_two_cycle_path_refuses_new_work_while_it_finishes() {
+    // What the shape is for. `uops_ready` is the receiving state and nothing
+    // else, so the second writeback cannot be overtaken by the next item.
+    let v = compile(MULW);
+    assert!(v.contains("assign uops_ready = in_s0;"), "{}", v);
+}
+
+#[test]
+fn a_pipe_offered_in_two_states_is_valid_in_both_and_muxed_by_state() {
+    let v = compile(MULW);
+    assert!(v.contains("assign wb_valid = (in_s1 | in_s0);"), "{}", v);
+    assert!(v.contains("assign wb_data = (in_s1 ? hi : uops_data);"), "{}", v);
+}
+
+#[test]
+fn rule_three_still_holds_with_a_non_blocking_offer() {
+    // `valid` is a function of the state register and never of `ready`. It is
+    // the property the whole language is arranged around, and a non-blocking
+    // offer is exactly where it would be easy to lose.
+    let v = compile(MULW);
+    let valid = v
+        .lines()
+        .find(|l| l.contains("assign wb_valid"))
+        .expect("an output has a valid");
+    assert!(!valid.contains("wb_ready"), "{}", v);
+    // Anti-vacuous: `wb_ready` is in the module, just not on that line.
+    assert!(v.contains("wb_ready"), "{}", v);
+}
+
+#[test]
+fn the_branch_still_costs_no_extra_cycle() {
+    // The offer did not push the branch into a state of its own: it is decided
+    // in the cycle the item arrives, as fsm_branch's other tests require.
+    let v = compile(MULW);
+    assert!(v.contains("wire branch_s0 = uops_data[0];"), "{}", v);
+    assert!(v.contains("state <= ((fire_s0 | fire_s1) ? (fire_s0 ? branch_s0"), "{}", v);
+}
+
+#[test]
+fn a_try_rcv_samples_without_waiting() {
+    // The other direction: a state whose barrier is a send may still look at
+    // an input, and `got` says whether anything was there.
+    let v = compile(concat!(
+        "process tap (src: buffer in i32, dst: buffer out i32)
+",
+        "  var last: i32 = @zeroed()
+",
+        "  loop
+",
+        "    let (x, got) = @try_rcv(src)
+",
+        "    if got then
+",
+        "      last = x
+",
+        "    @send(dst, last)
+",
     ));
-    assert!(text.contains("`@try_rcv` is not supported in a process with states"), "{}", text);
+    // The send is what the state waits on; the sample is not.
+    assert!(v.contains("& dst_ready"), "{}", v);
+    assert!(v.contains("assign src_ready"), "{}", v);
 }
 
 #[test]
 fn a_body_with_no_blocking_operation_still_takes_them() {
-    // Anti-vacuous: the diagnostics above must be about the STATES, not about
-    // `@try_*` having stopped working.
+    // The stateless form, unchanged: no state register at all.
     let v = compile(concat!(
-        "process a (i: buffer in i32, o: buffer out i32)\n",
-        "  loop\n",
-        "    let (u, got) = @try_rcv(i)\n",
-        "    let _s = @try_send(o, u)\n",
+        "process a (i: buffer in i32, o: buffer out i32)
+",
+        "  loop
+",
+        "    let (u, got) = @try_rcv(i)
+",
+        "    let _s = @try_send(o, u)
+",
     ));
     assert!(!v.contains("state"), "{}", v);
     assert!(v.contains("assign o_valid = o_busy;"), "{}", v);
