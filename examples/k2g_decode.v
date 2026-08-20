@@ -201,12 +201,11 @@ module k2g_decode (
   wire [126:0] n999 = cps_xfer ? (n797 ? (is_prefix ? (n800 ? {n808[126:112], {16'd0, cp}, n808[79:0]} : (pfx_xc ? (n141 ? n787 : {n866[126:112], {16'd0, cp}, n866[79:0]}) : n787)) : (n782 ? n787 : n784)) : (n947 ? n787 : {n977[126:71], n793[60], n977[69:0]})) : n787;
   wire [126:0] n1005 = {n999[126:32], (bytes_held + 32'd2)};
   wire n1011 = !cps_xfer;
-  wire n1028 = cps_xfer & n995;
   wire uop_pop = uop_busy & uop_ready;
-  wire n1033 = !uop_pop;
-  wire n1036 = n1028 & ((!uop_busy) | uop_pop);
-  wire n1037 = uop_pop & uop_skid_busy;
-  wire n1044 = n1028 & (uop_busy & n1033);
+  wire n1032 = !uop_pop;
+  wire n1035 = n995 & ((!uop_busy) | uop_pop);
+  wire n1036 = uop_pop & uop_skid_busy;
+  wire n1043 = n995 & (uop_busy & n1032);
 
   always @* begin
     case (cc)
@@ -284,10 +283,10 @@ module k2g_decode (
       llc_dst <= (flushing ? 5'd0 : (n1011 ? llc_dst : (cps_xfer ? (n797 ? (is_prefix ? llc_dst : (n782 ? arg1 : llc_dst)) : llc_dst) : llc_dst)));
       llc_kind <= (flushing ? 3'd2 : (n1011 ? llc_kind : (cps_xfer ? (n797 ? (is_prefix ? llc_kind : (n782 ? n783 : llc_kind)) : llc_kind) : llc_kind)));
       llc_hi <= (flushing ? 16'd0 : (n1011 ? llc_hi : (cps_xfer ? (n797 ? llc_hi : (n947 ? cp : llc_hi)) : llc_hi)));
-      uop_busy <= (((uop_busy & n1033) | n1037) | n1036);
-      uop_hold <= (n1037 ? uop_skid : (n1036 ? n1005 : uop_hold));
-      uop_skid_busy <= ((uop_skid_busy & n1033) | n1044);
-      uop_skid <= (n1044 ? n1005 : uop_skid);
+      uop_busy <= (((uop_busy & n1032) | n1036) | n1035);
+      uop_hold <= (n1036 ? uop_skid : (n1035 ? n1005 : uop_hold));
+      uop_skid_busy <= ((uop_skid_busy & n1032) | n1043);
+      uop_skid <= (n1043 ? n1005 : uop_skid);
     end
   end
 

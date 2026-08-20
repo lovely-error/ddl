@@ -467,4 +467,8 @@ process k2g_xstage (uops: buffer in uop_t, wb: buffer out wb_t,
       flagbit[w.addr] = w.flag
 
     w = n
-    @try_send(wb, n)
+    -- Guarded on the transfer rather than left to an implicit gate. An offer
+    -- is made on the branch it is written on and no other, so a cycle with no
+    -- micro-op publishes nothing.
+    if got then
+      @try_send(wb, n)

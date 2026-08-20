@@ -110,11 +110,16 @@ more than one thing), and `inout` (by reference and readable: it updates the
 caller's variable, and at a module boundary becomes `x` plus `x_out`).
 
 **Pipes.** `buffer`, in and out, with `@rcv`, `@send`, `@try_rcv`,
-`@try_send`, `@peek`, `@drop`, and `@hold(c)` — which is how a process that does not block
-refuses a cycle's input while it finishes something it already owes. Its
-condition is read before the body, so it may name a `var` and nothing the body
-computes; that is what keeps `ready` register-derived. A held cycle still
-produces, or holding would mean having nowhere to put the result.
+`@try_send`, `@peek` and `@drop`.
+
+**A pipe is claimed where the program asks for it, under the condition it
+asks.** One rule, and it is the same in a process that blocks and one that does
+not. A `@try_rcv` or `@drop` written inside an `if` takes `ready` down on every
+other branch, so a stage that is busy finishing something declines its input by
+saying so where it is busy — there is no separate way to stall. An offer is
+made on the branch its `@try_send` is written on and no other, so a cycle that
+produces nothing publishes nothing, and a cycle that owes a result is free to
+produce one whether or not anything arrived.
 
 A pipe gets one transfer per cycle, and `@peek` is how you look without
 spending it: `let (v, present) = @peek(p)` reads the offer and takes nothing,

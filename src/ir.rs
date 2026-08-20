@@ -533,6 +533,18 @@ pub fn stream_was_removed(span: crate::diag::Span, what: &str) -> Diag {
     )
 }
 
+/// `got`, narrowed to the branch the operation sat on.
+///
+/// The pipe is only CLAIMED on that branch, so on any other one no transfer
+/// happened and the answer has to say so. Without this a `@try_rcv` inside an
+/// `if` reports a transfer the handshake never performed.
+fn narrow_to_path(low: &mut Lowerer, fired: ValueId, path: Option<ValueId>) -> ValueId {
+    match path {
+        None => fired,
+        Some(p) => low.emit(Ty::BOOL, Op::Bin { op: BinOp::And, lhs: fired, rhs: p }),
+    }
+}
+
 /// Classifies one parameter, or reports why it cannot be one.
 pub fn classify_param(
     low: &Lowerer,
@@ -1861,49 +1873,6 @@ pub fn lower_process(
     let always_true = low.emit(Ty::BOOL, Op::Const(1));
     let ready_out = can_accept.unwrap_or(always_true);
 
-    // `@hold(c)` -- refuse this cycle's input while `c`.
-    //
-    // This is the one thing the body gets to say about its own readiness, and
-    // it is evaluated HERE, before the body runs. That is not a restriction
-    // dodged but the point: `ready` has to be register-derived or the chain
-    // through it comes back (k3g_chan.sv:193, "never a function of the
-    // opposite side's handshake"), and the body's own `fired` is downstream of
-    // `ready`, so a hold computed from it would be a combinational loop.
-    //
-    // What it buys is the shape a datapath needs and could not have: a stage
-    // that accepts one item per cycle except when it owes a second cycle to
-    // the one before. K2G's `stall` is exactly this, and every term in it --
-    // `mulw_pending`, `m_valid`, `csp_stall` -- is a register (k2g_core.sv:787).
-    let mut held: Option<ValueId> = None;
-    for stmt in &body_stmts {
-        let PrecResInnerStmt::CallStmt(call) = stmt else { continue };
-        let PrecResExpr::Builtin(BuiltinOp::Hold) = &call.base else { continue };
-        if call.args.len() != 1 {
-            sink.err_span(low.here(), "`@hold` takes one condition");
-            return None;
-        }
-        let c = lower_expr(&mut low, &call.args[0], &env, sink)?;
-        if low.ty_of(c) != Ty::BOOL {
-            sink.err_span(
-                low.here(),
-                format!("`@hold` takes an `i1`, found `{}`", low.ty_of(c).display()),
-            );
-            return None;
-        }
-        held = Some(match held {
-            None => c,
-            Some(prev) => low.emit(Ty::BOOL, Op::Bin { op: BinOp::Or, lhs: prev, rhs: c }),
-        });
-    }
-    let ready_out = match held {
-        None => ready_out,
-        Some(h) => {
-            let free = low.emit(Ty::BOOL, Op::Un { op: UnOp::LogNot, arg: h });
-            low.name_value_safe(free, "not_held".to_string());
-            low.emit(Ty::BOOL, Op::Bin { op: BinOp::And, lhs: ready_out, rhs: free })
-        }
-    };
-
     // Once the pass is over the process refuses everything, which is what
     // "reaches a terminal state" has to mean at a channel boundary.
     let ready_out = match running {
@@ -1923,46 +1892,26 @@ pub fn lower_process(
         low.pipes[ix].fired = Some(fired);
     }
 
-    // The top-level holds were read above. What is left is the body proper,
-    // and a `@hold` still in it is one that was nested, which the statement
-    // path refuses.
-    let body_proper: Vec<PrecResInnerStmt> = body_stmts
-        .iter()
-        .filter(|stmt| !matches!(stmt,
-            PrecResInnerStmt::CallStmt(c) if matches!(&c.base, PrecResExpr::Builtin(BuiltinOp::Hold))))
-        .cloned()
-        .collect();
-    lower_stmts(&mut low, &body_proper, &mut env, sink)?;
+    lower_stmts(&mut low, &body_stmts, &mut env, sink)?;
     low.stop_writes = running;
     low.settle_memories(&env);
 
     let mut drivers = Vec::new();
 
-    // What the body offered decides the slot's next state, and the offer is
-    // taken on a cycle the process was PRODUCTIVE: one where an input
-    // transferred, or one it held to finish something it already owed.
-    //
-    // The second half is what makes `@hold` worth having. Without it the
-    // held cycle offers nothing -- the slot is written only when an item
-    // arrives -- so a stage could decline its input to finish a second
-    // writeback and then have nowhere to put it.
-    let fired_any = {
-        let inputs: Vec<ValueId> =
-            low.pipes.iter().filter(|p| p.is_input).filter_map(|p| p.fired).collect();
-        let took = match inputs.first() {
-            Some(f) => *f,
-            None => low.emit(Ty::BOOL, Op::Const(0)),
-        };
-        match held {
-            None => took,
-            Some(h) => low.emit(Ty::BOOL, Op::Bin { op: BinOp::Or, lhs: took, rhs: h }),
-        }
-    };
 
     for ix in 0..low.pipes.len() {
         let pipe = low.pipes[ix].clone();
         if pipe.is_input {
-            drivers.push((pipe.ready_port, ready_out));
+            // Same rule, the receiving side. `send_guard` on an input pipe is
+            // the branch its `@try_rcv` or `@drop` sat on; a pipe the body
+            // never consumes keeps the old unconditional `ready`, because
+            // "never asked for" and "asked for on no path" are different
+            // claims and only the second one means stop.
+            let claimed = match pipe.send_guard {
+                None => ready_out,
+                Some(g) => low.emit(Ty::BOOL, Op::Bin { op: BinOp::And, lhs: ready_out, rhs: g }),
+            };
+            drivers.push((pipe.ready_port, claimed));
             continue;
         }
         let base = pipe.slot_reg.expect("an output pipe has a slot");
@@ -1980,10 +1929,20 @@ pub fn lower_process(
             }
         };
 
-        // An offer written inside an `if` only happens on that branch.
+        // THE OFFER IS ITS OWN PATH, and nothing else. One rule, the same one
+        // a process with states follows: a pipe is claimed where the program
+        // asks for it, under the condition it asks.
+        //
+        // It used to be "an input transferred, and the branch held". That
+        // implicit gate is why `@hold` had to exist: a stage that declined its
+        // input to finish something already owed had no input transfer that
+        // cycle, so its offer was suppressed and the result had nowhere to go.
+        // Writing the guard out -- `if got then @try_send(...)` -- says the
+        // same thing where a reader can see it, and leaves the cycles that owe
+        // a result free to produce one.
         let offering = match pipe.send_guard {
-            None => fired_any,
-            Some(g) => low.emit(Ty::BOOL, Op::Bin { op: BinOp::And, lhs: fired_any, rhs: g }),
+            None => low.emit(Ty::BOOL, Op::Const(1)),
+            Some(g) => g,
         };
 
         let idx = base - reg_names.len();
@@ -2186,8 +2145,10 @@ fn lower_try_rcv_binding(
     // the two disagree, and that disagreement is exactly what a peek is for.
     let answer = if takes {
         low.pipes[ix].used = true;
-        low.pipes[ix].send_guard = low.materialise_path();
-        low.pipes[ix].fired.expect("computed before each state's body")
+        let path = low.materialise_path();
+        low.pipes[ix].send_guard = path;
+        let fired = low.pipes[ix].fired.expect("computed before each state's body");
+        narrow_to_path(low, fired, path)
     } else {
         let v = low.emit(Ty::BOOL, Op::Port(low.pipes[ix].valid_port));
         low.name_value_safe(v, format!("{}_present", pipe_name));
@@ -2711,24 +2672,6 @@ fn lower_stmt_at(
             if let PrecResExpr::Builtin(BuiltinOp::Drop) = &call.base {
                 lower_builtin(low, BuiltinOp::Drop, &call.args, env, sink)?;
                 return Some(());
-            }
-            // Read before the body, where `ready` is built. Reaching it here
-            // means it was not at the top of a `loop` in a process with no
-            // states -- the only place a hold can be honoured.
-            if let PrecResExpr::Builtin(BuiltinOp::Hold) = &call.base {
-                sink.push(
-                    Diag::error(
-                        low.here(),
-                        "`@hold` belongs at the top of a `loop`, in a process with no blocking operations"
-                            .to_string(),
-                    )
-                    .with_note(
-                        "it decides whether this cycle's input is accepted, so it is read before 
-                         the body runs and cannot sit on a branch. A process that blocks 
-                         already declines its input in every state but the one waiting on it",
-                    ),
-                );
-                return None;
             }
             let checking = match &call.base {
                 PrecResExpr::Builtin(BuiltinOp::Assert) => Some(false),
@@ -3560,9 +3503,10 @@ fn lower_builtin(
             return None;
         }
         low.pipes[ix].used = true;
-        low.pipes[ix].send_guard = low.materialise_path();
+        let path = low.materialise_path();
+        low.pipes[ix].send_guard = path;
         let fired = low.pipes[ix].fired.expect("computed before each state's body");
-        return Some(fired);
+        return Some(narrow_to_path(low, fired, path));
     }
 
     if op == TrySend {

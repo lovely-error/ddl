@@ -57,4 +57,7 @@ process k3g_stage (iops: buffer in in_item_t, uops: buffer out out_item_t)
       _ =>
         out.is_mem = 1'b0
 
-    let _taken = @try_send(uops, out)
+    -- An offer is made on the branch it is written on, so the cycles with no
+    -- item have to say so rather than relying on the slot to notice.
+    if got then
+      let _taken = @try_send(uops, out)

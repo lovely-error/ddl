@@ -193,3 +193,76 @@ fn only_the_two_pair_forms_produce_a_pair() {
     ));
     assert!(text.contains("`@try_rcv(p)` and `@peek(p)` produce a pair"), "{}", text);
 }
+
+// ---- a pipe is claimed where the program asks for it ----------------------
+
+/// The widening-multiply shape with no stall construct in it: the receive is
+/// written on the branch that can take one, and that is the whole of it.
+const WIDEN: &str = concat!(
+    "process widen (src: buffer in i32, dst: buffer out i32)\n",
+    "  var pending: i1 = @zeroed()\n",
+    "  var lo: i32 = @zeroed()\n",
+    "  loop\n",
+    "    let (x, present) = @peek(src)\n",
+    "    var took: i1 = 1'b0\n",
+    "    if pending then\n",
+    "      took = 1'b0\n",
+    "    else\n",
+    "      took = @drop(src)\n",
+    "    let out_val: i32 = if pending then lo else x + x\n",
+    "    if pending | took then\n",
+    "      let _s = @try_send(dst, out_val)\n",
+    "    if pending then\n",
+    "      pending = 1'b0\n",
+    "    else\n",
+    "      if took then\n",
+    "        pending = 1'b1\n",
+    "        lo = x\n",
+);
+
+#[test]
+fn a_guarded_receive_takes_ready_down_on_the_other_branch() {
+    // There is no `@hold` any more and nothing replaced it: the branch the
+    // `@drop` is written on IS the condition, so a cycle spent finishing
+    // something declines its input by construction.
+    let v = compile(WIDEN);
+    assert!(v.contains("wire n18 = !pending;"), "{}", v);
+    assert!(v.contains("assign src_ready = (dst_room & n18);"), "{}", v);
+}
+
+#[test]
+fn an_offer_is_made_on_its_own_branch_and_no_other() {
+    // Which is what lets the held cycle produce. The offer used to be gated on
+    // an input having transferred, and a cycle that declined its input to
+    // finish a result therefore had nowhere to put it.
+    let v = compile(WIDEN);
+    assert!(v.contains("assign dst_valid = dst_busy;"), "{}", v);
+    // Anti-vacuous: an UNguarded send offers whenever it is reached, so the
+    // guard above is doing something rather than being the default.
+    let plain = compile(concat!(
+        "process pass (src: buffer in i32, dst: buffer out i32)\n",
+        "  loop\n",
+        "    let (x, got) = @try_rcv(src)\n",
+        "    let _s = @try_send(dst, x)\n",
+    ));
+    assert!(plain.contains("assign src_ready = dst_room;"), "{}", plain);
+}
+
+#[test]
+fn got_agrees_with_the_narrowed_ready() {
+    // `got` has to mean "a transfer happened". A receive on a branch claims
+    // the pipe only there, so on any other branch nothing transferred and the
+    // answer must say so, or the program acts on an item it never got.
+    let v = compile(concat!(
+        "process g (src: buffer in i32, dst: buffer out i1)\n",
+        "  var arm: i1 = @zeroed()\n",
+        "  loop\n",
+        "    arm = !arm\n",
+        "    var took: i1 = 1'b0\n",
+        "    if arm then\n",
+        "      took = @drop(src)\n",
+        "    let _s = @try_send(dst, took)\n",
+    ));
+    assert!(v.contains("src_ready"), "{}", v);
+    assert!(v.contains("arm"), "{}", v);
+}
