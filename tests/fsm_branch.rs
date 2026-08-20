@@ -240,3 +240,50 @@ fn a_wait_in_the_condition_itself_is_refused() {
     ));
     assert!(text.contains("cannot contain a blocking"), "{}", text);
 }
+
+// ---- non-blocking operations, which do not mix with states yet ------------
+
+#[test]
+fn a_try_send_in_a_state_machine_is_diagnosed_not_a_panic() {
+    // It used to unwrap a `None` and report "the compiler panicked; this is a
+    // bug in the compiler", which it was. `fired` is computed before the body
+    // and only for a process with no states; the FSM lowering does not compute
+    // it at all.
+    let text = compile_err(concat!(
+        "process a (i: buffer in i32, o: buffer out i32)\n",
+        "  loop\n",
+        "    let u = @rcv(i)\n",
+        "    let _s = @try_send(o, u)\n",
+    ));
+    assert!(text.contains("`@try_send` is not supported in a process with states"), "{}", text);
+    assert!(text.contains("no state to belong to"), "{}", text);
+}
+
+#[test]
+fn a_try_rcv_beside_a_blocking_send_is_diagnosed_too() {
+    // The other direction, and a different unwrap: the blocking `@send` inside
+    // the `if` is what makes this a state machine, so the `@try_rcv` above it
+    // has nothing to read.
+    let text = compile_err(concat!(
+        "process e (i: buffer in i32, o: buffer out i32)\n",
+        "  loop\n",
+        "    let (u, got) = @try_rcv(i)\n",
+        "    if u[0] then\n",
+        "      @send(o, u)\n",
+    ));
+    assert!(text.contains("`@try_rcv` is not supported in a process with states"), "{}", text);
+}
+
+#[test]
+fn a_body_with_no_blocking_operation_still_takes_them() {
+    // Anti-vacuous: the diagnostics above must be about the STATES, not about
+    // `@try_*` having stopped working.
+    let v = compile(concat!(
+        "process a (i: buffer in i32, o: buffer out i32)\n",
+        "  loop\n",
+        "    let (u, got) = @try_rcv(i)\n",
+        "    let _s = @try_send(o, u)\n",
+    ));
+    assert!(!v.contains("state"), "{}", v);
+    assert!(v.contains("assign o_valid = o_busy;"), "{}", v);
+}

@@ -516,6 +516,31 @@ pub enum ParamKind {
     Constant,
 }
 
+/// `@try_rcv` / `@try_send` in a process that also blocks.
+///
+/// A process with no blocking operation is ONE state that fires every cycle,
+/// and `fired` is computed once, before the body, from the generated
+/// handshake. A process that blocks is a state machine (`ir_fsm.rs`), where
+/// "did this pipe transfer" is a property of the state rather than of the
+/// cycle -- and the FSM lowering does not compute `fired` at all.
+///
+/// So the two do not mix yet, and the mixture is worth wanting: it is the
+/// shape a datapath needs when the common path is one cycle and one case is
+/// two. K2G's widening multiply is exactly that -- one uop in, one cycle,
+/// except for a `MUL` with `uto_valid`, which writes the high half and then
+/// the low half and must not accept a uop in between (k2g_core.sv:712).
+///
+/// Until then this is a diagnostic rather than the `None` unwrap it used to
+/// be, which panicked and reported a compiler bug.
+fn no_nonblocking_in_a_state_machine(span: crate::diag::Span, what: &str) -> Diag {
+    Diag::error(span, format!("`{}` is not supported in a process with states", what)).with_note(
+        "this process blocks on `@rcv` or `@send` somewhere, which makes it a \
+         state machine, and a non-blocking operation has no state to belong to. \
+         Either block here too, or keep the body free of blocking operations so \
+         it is one state that fires every cycle",
+    )
+}
+
 /// The one place that says what happened to `stream`.
 ///
 /// It overwrote its oldest item when the sink fell behind, which is a dropped
@@ -2101,11 +2126,17 @@ fn lower_try_rcv_binding(
         sink.err_at(&decl.name, format!("`{}` is received from more than once in one cycle", pipe_name));
         return None;
     }
+    let Some(fired) = low.pipes[ix].fired else {
+        sink.push(no_nonblocking_in_a_state_machine(
+            low.span_of(&decl.name),
+            "@try_rcv",
+        ));
+        return None;
+    };
     low.pipes[ix].used = true;
 
     let ty = low.pipes[ix].ty.clone();
     let data = low.pipes[ix].data_value.expect("an input pipe has a data value");
-    let fired = low.pipes[ix].fired.expect("computed before the body");
 
     let item = anumspan_to_str(&decl.name).to_string();
     let got = anumspan_to_str(&decl.rest[0]).to_string();
@@ -3443,12 +3474,17 @@ fn lower_builtin(
                 }
             }
         }
+        // Whether the offer was taken is decided by the generated handshake,
+        // which is computed before the body -- and only for a process with no
+        // states. See `no_nonblocking_in_a_state_machine`.
+        let Some(fired) = low.pipes[ix].fired else {
+            sink.push(no_nonblocking_in_a_state_machine(low.here(), "@try_send"));
+            return None;
+        };
         low.pipes[ix].used = true;
         low.pipes[ix].sent = Some(value);
         low.pipes[ix].send_guard = low.materialise_path();
-        // Whether the offer was taken is decided by the generated handshake;
-        // a placeholder stands in until it is built.
-        return Some(low.pipes[ix].fired.expect("computed before the body"));
+        return Some(fired);
     }
 
     // `if c then a else b`, desugared by the parser. Both arms must agree on a
