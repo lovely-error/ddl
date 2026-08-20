@@ -20,11 +20,27 @@
 -- asynchronous, the address adder stays in the same cycle, and there is no
 -- channel between them.
 --
--- WHAT THIS IS NOT. Predication and condition codes, fault detection, the CSP
--- port, multi-cycle sequencing, jumps, the memory stage and its byte-enable
--- network, and the widening multiply are all left in k2g_core.sv. The point
--- here is the register file and the path that depends on its read timing, not
--- a whole core.
+-- WHAT IS HERE. The register file and the path that depends on its read
+-- timing; predication and condition codes; the reserved-F32 operand check;
+-- alignment and range; and the fault priority chain that decides between them.
+--
+-- WHAT IS STILL IN k2g_core.sv. The CSP port, the widening multiply, jumps,
+-- the memory stage, and `rdt_normalize`.
+--
+-- `rdt_normalize` is the one that is a gap rather than a plan.
+-- k2g_core.sv:887 runs every writeback value through it once, after the mux,
+-- so a register's bits always match what its tag claims. Neither this file nor
+-- k2g_xstage_ref.sv does, so the equivalence agrees and proves nothing about
+-- it -- which is what a shared omission always looks like. It is the next
+-- thing to add here.
+-- The first two are BLOCKED rather than skipped: both
+-- need the process to spend a second cycle without accepting a new uop, and a
+-- DDL process with no blocking operation is one state that fires every cycle
+-- and cannot decline its input. Mixing a blocking `@send` into this body to
+-- get that second state is what the language would want -- and `@try_rcv`
+-- beside it is refused today (`@try_rcv` is not supported in a process with
+-- states). Jumps need `isa`, which is not in `uop_t`; it wants a payload
+-- struct carrying the uop and the address it started at.
 --
 -- THE VALUE ARRAY HAS EXACTLY ONE WRITE PORT, and in DDL it cannot have two.
 -- k2g_regfile.sv:18-24 records what a second one cost when it was tried: no
@@ -50,7 +66,25 @@ struct wb_t
   overflow: i1
   flag: i1
 
-process k2g_xstage (uops: buffer in uop_t, wb: buffer out wb_t)
+  -- What X detected, travelling with the packet rather than on ports of its
+  -- own. `fault_valid` suppresses every write above it; `fault_info` is the
+  -- number the FAULT_INFO port reports (spec 8).
+  fault_valid: i1
+  fault: fault_e
+  fault_info: i32
+
+-- Store width comes from the source register's tag, not the opcode (spec 5.3),
+-- so the width is a function of a tag everywhere it is needed.
+fun rdt_width_bytes (t: rdt_e, w: out i3)
+  let low: i2 = t[1..0]
+  w = if low == 2'd0 then 3'd1 else if low == 2'd1 then 3'd2 else 3'd4
+
+-- `mem_bytes` is where ADDR_OUT_OF_RANGE begins (spec 8), so it is
+-- architecture rather than configuration: the emulator carries the same
+-- number and the cosimulation is what checks that they agree. A plain
+-- parameter is folded at compile time and is not a port.
+process k2g_xstage (uops: buffer in uop_t, wb: buffer out wb_t,
+                    mem_bytes: i32 = 32'h00800000)
   var values: #[impl(lutram)] [i32; 32] = @zeroed()
   -- The reset tag matches the emulator's, so a register that has never been
   -- written still compares equal.
@@ -122,6 +156,64 @@ process k2g_xstage (uops: buffer in uop_t, wb: buffer out wb_t)
     let xb_flg: i1 = if mb & w.we_flag then w.flag else rb_flg
     let xc_flg: i1 = if mc & w.we_flag then w.flag else rc_flg
 
+    -- ---- predication ----------------------------------------------------
+    -- Zero and negative are computed from the register value on demand; there
+    -- is no global condition register (spec 7). This is what the third read
+    -- port exists for, and reading it is no longer free of consequence.
+    var cond_raw: i1 = 1'b1
+    match uop.cond
+      .CCK_OVERFLOW =>
+        cond_raw = xc_ovf
+      .CCK_FLAG =>
+        cond_raw = xc_flg
+      .CCK_ZERO =>
+        cond_raw = xc_value == 32'd0
+      .CCK_NEGATIVE =>
+        cond_raw = xc_value[31]
+      .CCK_POSITIVE =>
+        cond_raw = (xc_value != 32'd0) & (!xc_value[31])
+      _ =>
+        cond_raw = 1'b1
+    let unpredicated: i1 = uop.cond == CCK_NONE
+    let cond_met: i1 = if unpredicated then 1'b1 else cond_raw ^ uop.cond_invert
+
+    -- ---- reserved F32 operands -------------------------------------------
+    -- `F32` is reserved (spec 11), so reading a register carrying the tag
+    -- faults. Expressed as "which read ports does this uop architecturally
+    -- use", because that is what the check physically is -- the ports read
+    -- every cycle regardless, so an unqualified test would fault on registers
+    -- the instruction never looks at.
+    --
+    -- The emulator's `check_no_f32_operands` enumerates the same set in the
+    -- same A-before-B order, so `FAULT_INFO` agrees when both carry the tag.
+    var reads_a: i1 = @zeroed()
+    var reads_b: i1 = @zeroed()
+    match uop.kind
+      .UOP_COPY | .UOP_LOAD | .UOP_CSP_LOAD | .UOP_BEXT =>
+        reads_b = 1'b1
+      .UOP_STORE | .UOP_CSP_STORE | .UOP_BINS =>
+        reads_a = 1'b1
+        reads_b = 1'b1
+      .UOP_UNARY =>
+        reads_a = 1'b1
+      .UOP_ARITH | .UOP_LOGIC | .UOP_SHIFT | .UOP_CMP =>
+        reads_a = 1'b1
+        reads_b = !uop.use_imm
+      -- The link register is written, not read.
+      .UOP_PREP_JUMP =>
+        reads_a = uop.jump_kind != JT_REL_IMM
+      -- NOP, PUT_IMM, SET_TAG, PERFORM_JUMP, HALT and FAULT read no register.
+      -- `uop_fault` clears `dst` and `src`, so a decode fault reports its own
+      -- cause rather than a tag it never read.
+      _ =>
+        reads_a = 1'b0
+
+    let f32_a: i1 = reads_a & (xa_tag == RDT_F32)
+    let f32_b: i1 = reads_b & (xb_tag == RDT_F32)
+    -- The predicate register is read whatever the predicate decides, so its
+    -- tag is checked outside the `cond_met` gate.
+    let f32_cond: i1 = (!unpredicated) & (xc_tag == RDT_F32)
+
     -- ---- functional units ----------------------------------------------
     -- The two verified helpers, called rather than reimplemented. An
     -- immediate carries no tag of its own, so it takes the left operand's
@@ -146,6 +238,86 @@ process k2g_xstage (uops: buffer in uop_t, wb: buffer out wb_t)
     -- A store takes its width from the SOURCE register's tag, not the opcode.
     let access_tag: rdt_e = if is_load then uop.datakind else xb_tag
 
+    -- The FLAG prefix makes a logic op work on flag bits instead of values
+    -- (k2g_core.sv:981). Computed here so the writeback arm is a choice
+    -- between two ready answers.
+    var flag_logic: i1 = @zeroed()
+    match uop.logic_op
+      .LOGIC_AND =>
+        flag_logic = xa_flg & xb_flg
+      .LOGIC_OR =>
+        flag_logic = xa_flg | xb_flg
+      _ =>
+        flag_logic = xa_flg ^ xb_flg
+
+    -- ---- alignment and range ---------------------------------------------
+    -- Checked before anything commits, which is what makes faults precise
+    -- (spec 8).
+    let access_width: i3 = rdt_width_bytes(access_tag)
+    let is_store: i1 = uop.kind == UOP_STORE
+    let is_access: i1 = is_load | is_store
+
+    var misaligned: i1 = @zeroed()
+    if access_width == 3'd1 then
+      misaligned = 1'b0
+    else
+      if access_width == 3'd2 then
+        misaligned = access_addr[0]
+      else
+        misaligned = access_addr[1] | access_addr[0]
+
+    -- The last byte the access touches has to be inside memory too, so the
+    -- width is added before the comparison rather than after it.
+    let last_byte: i32 = access_addr + @zext(access_width, 32)
+    let out_of_range: i1 = last_byte > mem_bytes
+
+    -- ---- fault detection --------------------------------------------------
+    -- A PRIORITY CHAIN, and the order is architecture rather than taste. The
+    -- emulator rejects an `F32` operand before the instruction executes, so an
+    -- `F32` address register faults as FP rather than as whatever address it
+    -- would have computed -- which puts the operand check ahead of the access
+    -- checks and not after them.
+    --
+    -- `f32_cond` sits outside the `cond_met` gate: the predicate register is
+    -- read whatever the predicate decides.
+    var fault_valid: i1 = @zeroed()
+    var fault: fault_e = FAULT_NONE
+    var fault_info: i32 = @zeroed()
+
+    if got & f32_cond then
+      fault_valid = 1'b1
+      fault = FAULT_FP_UNIMPLEMENTED
+      fault_info = @zext(uop.cond_reg, 32)
+    else
+      if got & cond_met then
+        if uop.kind == UOP_FAULT then
+          fault_valid = 1'b1
+          fault = uop.fault
+          -- The offending code point, carried through decode in `imm`.
+          fault_info = uop.imm
+        else
+          if f32_a | f32_b then
+            fault_valid = 1'b1
+            fault = FAULT_FP_UNIMPLEMENTED
+            fault_info = if f32_a then @zext(uop.dst, 32) else @zext(uop.src, 32)
+          else
+            if is_access & misaligned then
+              fault_valid = 1'b1
+              fault = if is_load then FAULT_MISALIGNED_LOAD else FAULT_MISALIGNED_STORE
+              fault_info = access_addr
+            else
+              if is_access & out_of_range then
+                fault_valid = 1'b1
+                fault = FAULT_ADDR_OUT_OF_RANGE
+                fault_info = access_addr
+              else
+                fault_valid = 1'b0
+
+    -- Nothing commits behind a fault, and nothing commits on a predicate that
+    -- did not hold. One term, used by every arm of the writeback below, which
+    -- is what keeps a new opcode from forgetting it.
+    let commits: i1 = got & cond_met & (!fault_valid)
+
     -- ---- the writeback packet -------------------------------------------
     var n: wb_t = @zeroed()
     n.addr = uop.dst
@@ -153,47 +325,58 @@ process k2g_xstage (uops: buffer in uop_t, wb: buffer out wb_t)
     n.tag = xa_tag
     n.overflow = 1'b0
     n.flag = 1'b0
+    n.fault_valid = fault_valid
+    n.fault = fault
+    n.fault_info = fault_info
 
     match uop.kind
       .UOP_PUT_IMM =>
-        n.we_value = got
-        n.we_tag = got
+        n.we_value = commits
+        n.we_tag = commits
         n.value = uop.imm
         n.tag = uop.datakind
       .UOP_SET_TAG =>
-        n.we_tag = got
+        n.we_tag = commits
         n.tag = uop.datakind
       .UOP_COPY =>
-        n.we_value = got
-        n.we_tag = got
-        n.we_overflow = got
-        n.we_flag = got
+        n.we_value = commits
+        n.we_tag = commits
+        n.we_overflow = commits
+        n.we_flag = commits
         n.value = xb_value
         n.tag = xb_tag
         n.overflow = xb_ovf
         n.flag = xb_flg
       .UOP_ARITH =>
-        n.we_value = got
-        n.we_overflow = got
+        n.we_value = commits
+        n.we_overflow = commits
         n.value = arith_result
         n.overflow = arith_ovf
       .UOP_LOGIC =>
-        n.we_value = got
-        n.value = logic_result
+        if uop.on_flags then
+          n.we_flag = commits
+          n.flag = flag_logic
+        else
+          n.we_value = commits
+          n.value = logic_result
       .UOP_UNARY =>
-        n.we_value = got
-        n.value = unary_result
+        if uop.on_flags then
+          n.we_flag = commits
+          n.flag = !xa_flg
+        else
+          n.we_value = commits
+          n.value = unary_result
       .UOP_CMP =>
-        n.we_flag = got
+        n.we_flag = commits
         n.flag = cmp_result
       .UOP_SHIFT =>
-        n.we_value = got
+        n.we_value = commits
         n.value = shift_result
       .UOP_BEXT =>
-        n.we_value = got
+        n.we_value = commits
         n.value = bext_result
       .UOP_BINS =>
-        n.we_value = got
+        n.we_value = commits
         n.value = bins_result
       -- A load's address is what X produces; the value comes back from the
       -- memory stage, which is not in this slice. The address is published so

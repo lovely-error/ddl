@@ -19,7 +19,11 @@
 module k2g_xstage_ref
   import k2g_pkg::*;
   import k2g_types::*;
-(
+#(
+    // Where ADDR_OUT_OF_RANGE begins (spec 8). The same number the DDL folds
+    // in as `mem_bytes`, and the same one the emulator carries.
+    parameter int MEM_BYTES = 8 * 1024 * 1024
+) (
     input  logic       clk,
     input  logic       rst_n,
 
@@ -28,7 +32,7 @@ module k2g_xstage_ref
 
     // The packet X computed, packed the way the DDL packs `wb_t`: first field
     // in the high bits.
-    output logic [45:0] packet
+    output logic [83:0] packet
 );
 
   // ---- register file -----------------------------------------------------
@@ -79,8 +83,51 @@ module k2g_xstage_ref
   wire logic [2:0]  xc_tag   = (mc && w_we_tag)      ? w_tag      : rc_tag;
   wire logic        xa_ovf   = (ma && w_we_overflow) ? w_overflow : ra_overflow;
   wire logic        xb_ovf   = (mb && w_we_overflow) ? w_overflow : rb_overflow;
+  wire logic        xc_ovf   = (mc && w_we_overflow) ? w_overflow : rc_overflow;
   wire logic        xa_flg   = (ma && w_we_flag)     ? w_flag     : ra_flag;
   wire logic        xb_flg   = (mb && w_we_flag)     ? w_flag     : rb_flag;
+  wire logic        xc_flg   = (mc && w_we_flag)     ? w_flag     : rc_flag;
+
+  // ---- predication ---------------------------------------------------------
+  // k2g_core.sv:477-488. Zero and negative come from the register value on
+  // demand; there is no global condition register (spec 7).
+  logic cond_raw;
+  always_comb begin
+    unique case (uop.cond)
+      CCK_OVERFLOW: cond_raw = xc_ovf;
+      CCK_FLAG:     cond_raw = xc_flg;
+      CCK_ZERO:     cond_raw = (xc_value == 32'd0);
+      CCK_NEGATIVE: cond_raw = xc_value[31];
+      CCK_POSITIVE: cond_raw = (xc_value != 32'd0) && !xc_value[31];
+      default:      cond_raw = 1'b1;
+    endcase
+  end
+  wire logic unpredicated = (uop.cond == CCK_NONE);
+  wire logic cond_met     = unpredicated ? 1'b1 : (cond_raw ^ uop.cond_invert);
+
+  // ---- reserved F32 operands -----------------------------------------------
+  // k2g_core.sv:507-527, and the same A-before-B order as the emulator's
+  // `check_no_f32_operands`, so FAULT_INFO agrees when both carry the tag.
+  logic reads_a, reads_b;
+  always_comb begin
+    reads_a = 1'b0;
+    reads_b = 1'b0;
+    unique case (uop.kind)
+      UOP_COPY, UOP_LOAD, UOP_CSP_LOAD, UOP_BEXT: reads_b = 1'b1;
+      UOP_STORE, UOP_CSP_STORE, UOP_BINS: begin reads_a = 1'b1; reads_b = 1'b1; end
+      UOP_UNARY: reads_a = 1'b1;
+      UOP_ARITH, UOP_LOGIC, UOP_SHIFT, UOP_CMP: begin
+        reads_a = 1'b1;
+        reads_b = !uop.use_imm;
+      end
+      UOP_PREP_JUMP: reads_a = (uop.jump_kind != JT_REL_IMM);
+      default: ;
+    endcase
+  end
+
+  wire logic f32_a    = reads_a && (xa_tag == RDT_F32);
+  wire logic f32_b    = reads_b && (xb_tag == RDT_F32);
+  wire logic f32_cond = !unpredicated && (xc_tag == RDT_F32);
 
   // ---- functional units --------------------------------------------------
   // An immediate carries no tag of its own, so it takes the left operand's
@@ -120,6 +167,66 @@ module k2g_xstage_ref
   wire logic [31:0] access_addr = is_load ? load_addr : store_addr;
   wire logic [2:0]  access_tag  = is_load ? uop.datakind : xb_tag;
 
+  // ---- alignment and range -------------------------------------------------
+  // k2g_core.sv:626-635. Checked before anything commits, which is what makes
+  // faults precise (spec 8).
+  wire logic [2:0] access_width = rdt_width_bytes(access_tag);
+  wire logic       is_store     = (uop.kind == UOP_STORE);
+  wire logic       is_access    = is_load || is_store;
+
+  logic misaligned;
+  always_comb begin
+    unique case (access_width)
+      3'd1:    misaligned = 1'b0;
+      3'd2:    misaligned = access_addr[0];
+      default: misaligned = |access_addr[1:0];
+    endcase
+  end
+  wire logic out_of_range = (access_addr + {29'd0, access_width}) > MEM_BYTES[31:0];
+
+  // ---- fault detection -----------------------------------------------------
+  // k2g_core.sv:815-848, less the CSP and PREP_JUMP arms, which are not in
+  // this slice. The order is architecture: the emulator rejects an `F32`
+  // operand before the instruction executes, so an `F32` address register
+  // faults as FP rather than as whatever address it would have computed.
+  fault_e      n_fault;
+  logic        n_fault_valid;
+  logic [31:0] n_fault_info;
+
+  always_comb begin
+    n_fault       = FAULT_NONE;
+    n_fault_valid = 1'b0;
+    n_fault_info  = 32'd0;
+
+    if (uop_valid && f32_cond) begin
+      n_fault       = FAULT_FP_UNIMPLEMENTED;
+      n_fault_valid = 1'b1;
+      n_fault_info  = {27'd0, uop.cond_reg};
+    end else if (uop_valid && cond_met) begin
+      if (uop.kind == UOP_FAULT) begin
+        n_fault       = uop.fault;
+        n_fault_valid = 1'b1;
+        n_fault_info  = uop.imm;
+      end else if (f32_a || f32_b) begin
+        n_fault       = FAULT_FP_UNIMPLEMENTED;
+        n_fault_valid = 1'b1;
+        n_fault_info  = f32_a ? {27'd0, uop.dst} : {27'd0, uop.src};
+      end else if (is_access && misaligned) begin
+        n_fault       = is_load ? FAULT_MISALIGNED_LOAD : FAULT_MISALIGNED_STORE;
+        n_fault_valid = 1'b1;
+        n_fault_info  = access_addr;
+      end else if (is_access && out_of_range) begin
+        n_fault       = FAULT_ADDR_OUT_OF_RANGE;
+        n_fault_valid = 1'b1;
+        n_fault_info  = access_addr;
+      end
+    end
+  end
+
+  // Nothing commits behind a fault, and nothing commits on a predicate that
+  // did not hold.
+  wire logic commits = uop_valid && cond_met && !n_fault_valid;
+
   // ---- the writeback packet ----------------------------------------------
   logic        n_we_value, n_we_tag, n_we_overflow, n_we_flag;
   logic [4:0]  n_addr;
@@ -140,53 +247,69 @@ module k2g_xstage_ref
 
     unique case (uop.kind)
       UOP_PUT_IMM: begin
-        n_we_value = uop_valid;
-        n_we_tag   = uop_valid;
+        n_we_value = commits;
+        n_we_tag   = commits;
         n_value    = uop.imm;
         n_tag      = uop.datakind;
       end
       UOP_SET_TAG: begin
-        n_we_tag = uop_valid;
+        n_we_tag = commits;
         n_tag    = uop.datakind;
       end
       UOP_COPY: begin
-        n_we_value    = uop_valid;
-        n_we_tag      = uop_valid;
-        n_we_overflow = uop_valid;
-        n_we_flag     = uop_valid;
+        n_we_value    = commits;
+        n_we_tag      = commits;
+        n_we_overflow = commits;
+        n_we_flag     = commits;
         n_value       = xb_value;
         n_tag         = xb_tag;
         n_overflow    = xb_ovf;
         n_flag        = xb_flg;
       end
       UOP_ARITH: begin
-        n_we_value    = uop_valid;
-        n_we_overflow = uop_valid;
+        n_we_value    = commits;
+        n_we_overflow = commits;
         n_value       = arith_result;
         n_overflow    = arith_overflow;
       end
       UOP_LOGIC: begin
-        n_we_value = uop_valid;
-        n_value    = logic_result;
+        // The FLAG prefix operates on flag bits instead of values
+        // (k2g_core.sv:981).
+        if (uop.on_flags) begin
+          unique case (uop.logic_op)
+            LOGIC_AND: n_flag = xa_flg & xb_flg;
+            LOGIC_OR:  n_flag = xa_flg | xb_flg;
+            default:   n_flag = xa_flg ^ xb_flg;
+          endcase
+          n_we_flag = commits;
+        end else begin
+          n_we_value = commits;
+          n_value    = logic_result;
+        end
       end
       UOP_UNARY: begin
-        n_we_value = uop_valid;
-        n_value    = unary_result;
+        if (uop.on_flags) begin
+          n_flag    = ~xa_flg;
+          n_we_flag = commits;
+        end else begin
+          n_we_value = commits;
+          n_value    = unary_result;
+        end
       end
       UOP_CMP: begin
-        n_we_flag = uop_valid;
+        n_we_flag = commits;
         n_flag    = cmp_result;
       end
       UOP_SHIFT: begin
-        n_we_value = uop_valid;
+        n_we_value = commits;
         n_value    = shift_result;
       end
       UOP_BEXT: begin
-        n_we_value = uop_valid;
+        n_we_value = commits;
         n_value    = bext_result;
       end
       UOP_BINS: begin
-        n_we_value = uop_valid;
+        n_we_value = commits;
         n_value    = bins_result;
       end
       UOP_LOAD, UOP_STORE: begin
@@ -199,7 +322,8 @@ module k2g_xstage_ref
   end
 
   assign packet = {n_we_value, n_we_tag, n_we_overflow, n_we_flag,
-                   n_addr, n_value, n_tag, n_overflow, n_flag};
+                   n_addr, n_value, n_tag, n_overflow, n_flag,
+                   n_fault_valid, n_fault, n_fault_info};
 
   // ---- W -----------------------------------------------------------------
   always_ff @(posedge clk) begin
