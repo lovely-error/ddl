@@ -67,14 +67,14 @@ testbenches, and a separate future core).
 | `k2g_icache.sv` | 232 | **workable**, with a hit-latency risk (B5, B14) |
 | `k2g_dcache.sv` | 312 | **workable**, same risk plus the flush walk (B13) |
 | `k2g_core.sv` | 1318 | **hard**: one module that both instantiates and computes (B12), fetch credit (B6), redirect (B11) |
-| `k2g_mon.sv` | 862 | **hard**: three concurrent FSMs sharing state (B7) |
+| `k2g_mon.sv` | 862 | **hard**: three concurrent FSMs sharing state (B7); its RX needs the overrun shim (B3) |
 | `k2g_mem.sv` | 165 | **hard**: true dual-port, instantiated `DPB` primitives (B2, B14) |
 | `k2g_membus_mux.sv` | 46 | **hard**: combinational routing of channels (B5, B12) |
 | `k2g_cdc_fifo.sv` | 198 | **impossible**: two clock domains (B1) |
 | `k2g_psram.sv` | 560 | **impossible**: two clock domains, vendor user-side protocol (B1, B2) |
 | `board/k2g_pll.sv` | 116 | **impossible**: `rPLL` primitive (B2) |
 | `board/k2g_soc.sv` | 633 | **impossible**: pins, tri-state, PLL, multi-clock, IP instantiation (B1, B2, B12) |
-| `board/k2g_uart.sv` | 146 | **impossible as written**: `tx`/`rx` are pins, not pipes (B2, B3) |
+| `board/k2g_uart.sv` | 146 | **impossible as written**: `tx`/`rx` are pins, not pipes (B2, B3). Grows a holding register that turns the RX pulse into a handshake with an `overrun` bit |
 | `k2g_blink`, `k2g_loopback`, `k2g_mon_probe`, `k2g_psram_probe` | 840 | bring-up scaffolding; stays SystemVerilog |
 
 Rough split: ~1,900 lines already done or deleted outright, ~2,100
@@ -152,6 +152,29 @@ the same one the fetch credit already carries (B6).
 
 Six LEDs still cannot consume anything, so status that leaves the design
 leaves through SystemVerilog either way.
+
+**The one boundary a tie-off cannot honestly cover** is the other direction:
+a SOURCE that cannot be told to wait. `k2g_mon.sv:110` -- "`rx_valid` is a
+one-cycle pulse from k2g_uart_rx; there is no way to refuse a byte, which is
+why the receive path never back-pressures and instead reports what it could
+not take". A byte arrives when the wire says it does.
+
+Tying the generated `rx_ready` high there asserts something the design does
+not believe: `k2g_mon` explicitly counts what it dropped, and `k2g_mon.sv:849`
+carries a simulation assert for the case it thinks cannot happen on a board.
+A tied-off `ready` would turn a counted drop into a silent one, which is
+exactly the trade `stream` used to make and the reason it is gone.
+
+So this boundary gets a shim in SystemVerilog: one holding register between
+`k2g_uart_rx` and the DDL process, presenting a real `valid`/`ready` pair and
+raising a sticky `overrun` bit when a byte lands while it is full. The bit
+rides into DDL as a payload field, the same way `k2g_decode.ddl:75-77` carries
+`restart` instead of taking a `flush` port. That is strictly better than
+either the old stream or a tie-off: the loss becomes a value the program can
+see, rather than an assumption in a comment.
+
+It costs about a dozen lines of SystemVerilog and it moves the DDL/SV line one
+module further in than §3 draws it.
 
 ### B4. One producer and one consumer per pipe
 
