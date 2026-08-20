@@ -3,7 +3,7 @@
 -- This is the answer to "is k2g_regfile encodable in DDL". The storage is,
 -- and always was -- four arrays, one write port, asynchronous reads. What is
 -- not encodable is the MODULE: 24 flat ports exposing combinational reads of
--- local state to a different module. desc.md:23 forbids exactly that, and it
+-- local state to a different module. desc.md:26 forbids exactly that, and it
 -- is a design position rather than a gap.
 --
 -- Putting the file behind a channel instead would compile, and would be worse

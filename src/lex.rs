@@ -308,7 +308,7 @@ pub enum RawTypeExpr {
     Ident(AlphanumSpan), 
     Array(Box<RawTypeExpr>, RawExpr),
     /// `#[impl(lutram)] [T; n]` -- an array that asks for a particular backing
-    /// store rather than being a packed vector. desc.md:92.
+    /// store rather than being a packed vector. desc.md:98.
     MemArray { elem: Box<RawTypeExpr>, len: RawExpr, kind: AlphanumSpan },
 }
 #[derive(Debug, Clone, Copy)]
@@ -1441,7 +1441,7 @@ unsafe fn try_parse_var_decl_stmt(
 
     // `let (val, ok) = @try_rcv(p)`. A non-blocking receive answers with the
     // item and whether there was one, and there is no way to use it without
-    // taking both (desc.md:148).
+    // taking both (desc.md:162).
     let mut rest: Vec<AlphanumSpan> = Vec::new();
     let (is_tuple, tail) = strip_prefix_on_match(char_ptr, char_end_ptr, "(");
     let var_name;

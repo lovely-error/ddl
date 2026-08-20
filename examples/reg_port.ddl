@@ -24,7 +24,7 @@
 
 process reg_port (cmd: buffer in i8, din: buffer in i32, dout: buffer out i32)
   -- The register being read and written. A process reaches its own state and
-  -- nothing else (desc.md:23), so this cell is genuinely private -- the only
+  -- nothing else (desc.md:26), so this cell is genuinely private -- the only
   -- way to its contents is through the pipes.
   var cell: i32 = @zeroed()
 

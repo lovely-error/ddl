@@ -1,6 +1,6 @@
 // `inout` parameters, and what a parameter is allowed to be.
 //
-// `inout` is desc.md:62 -- by reference and readable, which is what lets a
+// `inout` is desc.md:57 -- by reference and readable, which is what lets a
 // helper update its argument instead of returning a new copy of it.
 //
 // The other half of this file used to be `stream`, a pipe whose producer was

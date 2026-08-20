@@ -1366,7 +1366,7 @@ fn blocks_somewhere(body: &[PrecResInnerStmt]) -> bool {
 
 /// The half-open range a `for` runs over.
 ///
-/// Two spellings, from desc.md:56. `0..n` is the range itself. `for k in arr`
+/// Two spellings, from desc.md:65. `0..n` is the range itself. `for k in arr`
 /// iterates a memory, and means `0..len` -- the binding is the INDEX, because
 /// a memory element is reached by subscript and handing back a copy would hide
 /// that every read is a port.
@@ -1730,7 +1730,7 @@ pub fn lower_process(
     // What the body MEANS, and it is the `loop` that decides.
     //
     // A process body is a program: it runs once and then the process stops
-    // (desc.md:39, "may stop (reach terminal state)"). `loop` is what makes it
+    // (desc.md:37, "may stop (reach terminal state)"). `loop` is what makes it
     // repeat. So there are three shapes, not two:
     //
     //   * a `loop` with blocking `@rcv`/`@send` -- a state machine, one state

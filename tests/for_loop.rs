@@ -94,7 +94,7 @@ fn a_constant_parameter_can_be_the_bound() {
 
 #[test]
 fn naming_an_array_walks_its_indices() {
-    // desc.md:57. The binding is the INDEX rather than a copy of the element:
+    // desc.md:68. The binding is the INDEX rather than a copy of the element:
     // a memory element is reached by subscript, and handing back a copy would
     // hide that every read is a port.
     let v = compile(concat!(

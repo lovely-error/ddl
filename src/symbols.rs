@@ -113,7 +113,7 @@ pub struct FuncSig {
     pub params: Vec<(String, ParamDir, Ty)>,
 }
 
-/// How a parameter passes, from desc.md:60-63.
+/// How a parameter passes, from desc.md:53-58.
 ///
 /// `In` is by value. `Out` is by reference, write-only -- which is how a
 /// function returns more than one thing. `InOut` is by reference and readable:

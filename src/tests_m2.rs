@@ -1579,7 +1579,7 @@ fn an_output_valid_is_a_register_output() {
 
 #[test]
 fn a_buffer_is_two_deep() {
-    // desc.md:99 calls a pipe a fifo and desc.md:104 says the producer stalls
+    // desc.md:105 calls a pipe a fifo and desc.md:109 says the producer stalls
     // "when no slots available" -- plural. One entry is not that, and it is
     // also what forced `ready` to be combinational.
     let v = compile(&format!(
@@ -1766,7 +1766,7 @@ fn a_loop_with_no_blocking_operation_repeats_every_cycle() {
 
 #[test]
 fn a_linear_body_runs_once_and_stops() {
-    // desc.md:39 -- a process "may stop (reach terminal state)". `loop` is
+    // desc.md:37 -- a process "may stop (reach terminal state)". `loop` is
     // what makes a body repeat; without one it is a program that runs once.
     let v = compile(concat!(
         "process p (src: buffer in i32, dst: buffer out i32)\n",

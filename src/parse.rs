@@ -1258,7 +1258,7 @@ fn sized_and_radix_literals() {
     assert_eq!(shape(&resolve_expr_in("0b1010")), "10");
     assert_eq!(shape(&resolve_expr_in("0o17")), "15");
     assert_eq!(shape(&resolve_expr_in("1_000_000")), "1000000");
-    // desc.md:163 spells a clock frequency this way.
+    // desc.md:177 spells a clock frequency this way.
     assert_eq!(shape(&resolve_expr_in("12*10**6")), "(Mul 12 (Pow 10 6))");
 }
 

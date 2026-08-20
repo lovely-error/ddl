@@ -141,7 +141,7 @@ pub fn lower_sequence(
     let stages = split_stages(&decl.body);
     let n = stages.len();
 
-    // The head reads; the tail sends. desc.md:46 -- only the first stage may
+    // The head reads; the tail sends. desc.md:47 -- only the first stage may
     // block on a read, and the send belongs with the result.
     let mut head_recv: Option<(String, String)> = None;
     let mut tail_send: Option<(String, PrecResExpr)> = None;
