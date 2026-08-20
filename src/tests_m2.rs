@@ -2554,3 +2554,62 @@ fn the_verified_alu_and_shifter_can_be_called() {
     assert!(v.contains(">>>"), "{}", v);
     assert!(!v.contains("k2g_alu u_"), "{}", v);
 }
+
+// ---- an `if` expression that wraps onto the next line ---------------------
+
+#[test]
+fn a_wrapped_if_expression_means_what_the_one_line_form_means() {
+    // The indented continuation made it a block with an `IfThenElse` statement
+    // inside, and lowering refused the block -- so the meaning of the text
+    // changed with a line break. `rdt_normalize` in k2g_xstage.ddl is where
+    // this was found: the two extends are long enough to want wrapping.
+    let v = compile(concat!(
+        "fun pick (c: i1, a: i32, b: i32, o: out i32, p: out i32)\n",
+        "  o = if c then a else b\n",
+        "  p =\n",
+        "      if c then a else b\n",
+    ));
+    assert!(v.contains("assign o = (c ? a : b);"), "{}", v);
+    assert!(v.contains("assign p = (c ? a : b);"), "{}", v);
+}
+
+#[test]
+fn a_wrapped_chain_of_else_ifs_lowers_to_nested_selects() {
+    let v = compile(concat!(
+        "fun pick (d: i2, o: out i8)\n",
+        "  o =\n",
+        "      if d == 2'd0 then 8'd1\n",
+        "      else if d == 2'd1 then 8'd2\n",
+        "      else 8'd3\n",
+    ));
+    assert!(
+        v.contains("assign o = ((d == 2'd0) ? 8'd1 : ((d == 2'd1) ? 8'd2 : 8'd3));"),
+        "{}",
+        v
+    );
+}
+
+#[test]
+fn every_other_block_shape_is_refused_by_the_parser() {
+    // The unwrap above handles one shape because one shape is all that
+    // reaches it. An `if` with no `else` is rejected before lowering, and so
+    // is the one-line form of the same thing -- the message is the parser's
+    // and is poor for both, which is a separate problem from this one.
+    for src in [
+        "fun f (c: i1, a: i32, o: out i32)
+  o =
+      if c then a
+",
+        "fun f (c: i1, a: i32, o: out i32)
+  o = if c then a
+",
+        "fun f (c: i1, a: i32, o: out i32)
+  o =
+      let x: i32 = a
+      let y: i32 = a
+",
+    ] {
+        let text = compile_err(src);
+        assert!(text.contains("error"), "{}", text);
+    }
+}

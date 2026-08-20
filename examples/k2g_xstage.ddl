@@ -95,12 +95,15 @@ struct wb_t
 -- mux costs nothing on the branches that do not need it (k2g_core.sv:880).
 fun rdt_normalize (v: i32, t: rdt_e, o: out i32)
   let sgn: i1 = rdt_is_signed(t)
-  -- On one line each: a wrapped `if ... then ... else` parses as a block
-  -- rather than as an expression, which lowering then refuses.
-  let as_byte: i32 = if sgn then @concat(@rep(v[7], 24), v[7..0]) else @concat(24'd0, v[7..0])
-  let as_half: i32 = if sgn then @concat(@rep(v[15], 16), v[15..0]) else @concat(16'd0, v[15..0])
+  let as_byte: i32 =
+      if sgn then @concat(@rep(v[7], 24), v[7..0]) else @concat(24'd0, v[7..0])
+  let as_half: i32 =
+      if sgn then @concat(@rep(v[15], 16), v[15..0]) else @concat(16'd0, v[15..0])
   let width: i2 = t[1..0]
-  o = if width == 2'd0 then as_byte else if width == 2'd1 then as_half else v
+  o =
+      if width == 2'd0 then as_byte
+      else if width == 2'd1 then as_half
+      else v
 
 -- Store width comes from the source register's tag, not the opcode (spec 5.3),
 -- so the width is a function of a tag everywhere it is needed.

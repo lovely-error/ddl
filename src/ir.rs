@@ -3059,6 +3059,38 @@ pub fn lower_expr(
             }
         }
 
+        // A block holding one `if`, in a position that wants a value.
+        //
+        // `let x = if a then b else c` on one line resolves to `Select` in the
+        // parser. Wrap the same text onto a continuation line and the indented
+        // form makes it a block with an `IfThenElse` statement inside -- so the
+        // meaning of the text changed with a line break, and lowering refused
+        // it. The arms are already expressions (a chained `else if` resolves as
+        // one), so the block is a value and unwrapping it is the whole fix.
+        //
+        // Every other block shape is refused by the PARSER before it gets
+        // here -- an `if` with no `else`, two statements, two `if`s -- so this
+        // arm handles the one that arrives and anything else falls through to
+        // the refusal below rather than to a message that cannot be produced.
+        PrecResExpr::StmtBlock(block)
+            if matches!(
+                &block.components[..],
+                [PrecResInnerStmt::IfThenElse(ite)] if ite.else_case.is_some()
+            ) =>
+        {
+            let [PrecResInnerStmt::IfThenElse(ite)] = &block.components[..] else {
+                unreachable!("guarded above")
+            };
+            let else_case = ite.else_case.clone().expect("guarded above");
+            lower_builtin(
+                low,
+                BuiltinOp::Select,
+                &[ite.condition.clone(), ite.then_case.clone(), else_case],
+                env,
+                sink,
+            )
+        }
+
         other => {
             sink.err_span(
                 low.here(),
