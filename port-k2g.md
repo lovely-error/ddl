@@ -1,17 +1,33 @@
 # Porting KAMASUTRA2G to DDL
 
-What it would take to reimplement `E:/Code/KAMASUTRA2G/rtl` in this language,
-which parts the compiler cannot express today, and which of those are gaps
-worth closing versus positions the language is taking on purpose.
+## The rule
 
-Read `README.md` for what compiles today and `desc.md` for what is designed.
-This file is neither: it is the K2G tree measured against both.
+**K2G adapts to DDL, not the other way round.** Where the SystemVerilog's
+shape and the language's model disagree, the SystemVerilog changes.
 
-## 0. Where the port already is
+An earlier draft of this file had it backwards. It took `rtl/*.sv` as the
+specification of the *design* rather than of the *machine*, walked the module
+list asking "can DDL express this port list", and where the answer was no it
+proposed tie-offs and shims to make DDL accommodate a shape Verilog had
+imposed in the first place. That produces a worse design than either language
+would have reached alone, and it hides the actual finding: most of what looked
+like a DDL limitation is DDL declining to let you rebuild something the
+compiler already writes.
 
-Six declarations' worth is done and passes `examples/verify.sh` -- equivalence
-against the SystemVerilog plus a primitive-count comparison after Gowin
-synthesis:
+The specification is `emu/` and `docs/isa-spec.md`. The RTL is one
+implementation of it, and its structure carries decisions made under a cost
+model DDL does not have — where a module boundary was free and a register was
+expensive, where a handshake was yours to write and therefore yours to get
+wrong. Read below for what the machine becomes when the handshake is the
+compiler's.
+
+Read `README.md` for what compiles today and `desc.md` for the design. This
+file is the third thing: what K2G looks like written for that design.
+
+## 0. Where the port is
+
+Six declarations, passing `examples/verify.sh` -- equivalence against the
+SystemVerilog plus a primitive count after Gowin synthesis:
 
 | DDL | replaces | kind |
 |---|---|---|
@@ -22,498 +38,223 @@ synthesis:
 | `k2g_decode.ddl` | `rtl/k2g_decode.sv` | `process` |
 | `k2g_xstage.ddl` | `rtl/k2g_regfile.sv` + a slice of `k2g_core.sv` | `process` |
 
-That is roughly 800 of the 11,100 lines of hand-written RTL, and it is the
-easy 800: pure combinational logic, one accumulator FSM, and one datapath
-slice with private arrays. Everything structural, everything multi-clock and
-everything that touches a pin is untouched.
-
-Two facts from those ports are load-bearing for everything below.
-
-**The decoder's `flush` became a payload bit.** `k2g_decode.sv:29` takes a
-`flush` input to abandon a partly-accumulated prefix chain on a branch
-redirect. `k2g_decode.ddl` has no such port; `cp_item_t` carries a `restart`
-bit instead, and the redirect travels in-band with the code points. That is
-the idiom the rest of the port has to use, because DDL has no way to reach
-into a pipe.
-
-**The register file stopped being a module.** `k2g_xstage.ddl:1-31` records
-why: 24 flat ports exposing combinational reads of local state is precisely
-what `desc.md:23` forbids, and putting the file behind a channel would
-register the read and add the fourth pipeline stage the three-stage design
-exists to avoid. So the arrays moved into the process that reads them. Every
-remaining module that exports combinational access to its own state has the
-same fate: it is not ported, it is absorbed.
-
-## 1. The inventory
-
-Canonical sources only -- `rtl/*.sv`, `rtl/board/*.sv`. `rtl/out/**`,
-`rtl/sv-probe/`, `rtl/tb/` and `rtl/k3g/` are excluded (build copies, probes,
-testbenches, and a separate future core).
-
-| Module | Lines | Verdict |
-|---|---|---|
-| `k2g_alu.sv` | 97 | **done** |
-| `k2g_shift.sv` | 60 | **done** |
-| `k2g_decode.sv` | 499 | **done** |
-| `k2g_types.svh` | 247 | **done** |
-| `k2g_pkg.sv` | 249 | **done** (generated) |
-| `k2g_regfile.sv` | 152 | **absorbed** into `k2g_xstage.ddl` |
-| `k2g_chan.sv` | 150 | **deleted** -- the compiler generates the handshake |
-| `k2g_membus.sv` | 114 | **deleted** -- becomes `buffer out mem_req_t` + `buffer in i32`, the response side's `ready` tied off (B3) |
-| `k2g_host_pkg.sv` | 82 | trivial: constants and enums |
-| `board/k2g_rom.sv` | 199 | easy: a generated `case`, becomes a generated `match` |
-| `k2g_csp.sv` | 129 | easy: absorbed into the core process, since it is state the core reads combinationally |
-| `k2g_cache_maint.sv` | 121 | easy as a `process`: two request pipes in, two out |
-| `k2g_icache.sv` | 232 | **workable**, with a hit-latency risk (B5, B14) |
-| `k2g_dcache.sv` | 312 | **workable**, same risk plus the flush walk (B13) |
-| `k2g_core.sv` | 1318 | **hard**: one module that both instantiates and computes (B12), fetch credit (B6), redirect (B11) |
-| `k2g_mon.sv` | 862 | **hard**: three concurrent FSMs sharing state (B7); its RX needs the overrun shim (B3) |
-| `k2g_mem.sv` | 165 | **hard**: true dual-port, instantiated `DPB` primitives (B2, B14) |
-| `k2g_membus_mux.sv` | 46 | **hard**: combinational routing of channels (B5, B12) |
-| `k2g_cdc_fifo.sv` | 198 | **impossible**: two clock domains (B1) |
-| `k2g_psram.sv` | 560 | **impossible**: two clock domains, vendor user-side protocol (B1, B2) |
-| `board/k2g_pll.sv` | 116 | **impossible**: `rPLL` primitive (B2) |
-| `board/k2g_soc.sv` | 633 | **impossible**: pins, tri-state, PLL, multi-clock, IP instantiation (B1, B2, B12) |
-| `board/k2g_uart.sv` | 146 | **impossible as written**: `tx`/`rx` are pins, not pipes (B2, B3). Grows a holding register that turns the RX pulse into a handshake with an `overrun` bit |
-| `k2g_blink`, `k2g_loopback`, `k2g_mon_probe`, `k2g_psram_probe` | 840 | bring-up scaffolding; stays SystemVerilog |
-
-Rough split: ~1,900 lines already done or deleted outright, ~2,100
-straightforward, ~2,700 hard, ~2,300 that must stay in SystemVerilog whatever
-happens to the language.
-
-## 2. The blockers
-
-Numbered so the rest of the document can point at them. Each says what the
-compiler does today, what in K2G hits it, and whether it is a gap or a
-position.
-
-### B1. One clock, one reset, implicit and unnameable
-
-`src/ir.rs:1489-1501` gives every `process`, `sequence` and `graph` exactly
-`clk` and `rst_n`, and `src/ir.rs:1505` refuses to let you name either one.
-There is no second domain and no synchronizer.
-
-`k2g_cdc_fifo.sv` and `k2g_psram.sv` are dual-domain by construction: the core
-runs at 13.5 MHz and the PSRAM controller hands out its own 67.5 MHz
-`clk_out`. Nothing about gray-coded pointers and two-flop synchronizers is
-expressible, and `k2g_cdc_fifo.sv:9-12` already says cosimulation cannot check
-that code either -- it is verified by reading and by the constraints.
-
-**Position, not gap, for now.** `desc.md` puts clocks under `io process`,
-which is unbuilt and explicitly unresolved ("how should we do cdc for io
-procs?"). Multi-clock DDL means a clock-domain type system and a
-`syn_preserve` equivalent; that is a language project, not a feature. These
-two modules stay in SystemVerilog and the DDL design sits entirely inside
-`clk_sys`.
-
-### B2. No pins, no tri-state, no primitives, no external instantiation
-
-`desc.md` designs `pin in`/`pin out`/`pin inout`, `@read_pin` and
-`@write_pin`. None of it is built. There is also no way for a `graph` to
-instantiate anything DDL did not compile -- `src/ir_graph.rs:258` accepts "a
-`process`, a `sequence` or another `graph`" and nothing else. No blackbox, no
-verbatim-Verilog escape hatch.
-
-K2G needs `rPLL`, `PSRAM_Memory_Interface_HS_Top`, four `DPB` instances inside
-`k2g_mem.sv`, and `inout wire [15:0] IO_psram_dq`.
-
-**Gap, but the wrong one to close first.** The immediate need is smaller than
-`pin`: a way for a `graph` to instantiate a module it did not compile, given a
-declared port list. Without that, DDL can never be the top of a hierarchy and
-every design needs a hand-written SystemVerilog wrapper -- which for K2G is
-fine, because `board/` is that wrapper and always was.
-
-### B3. A module boundary is a pipe or it is nothing
-
-A `process` or `sequence` takes pipes and compile-time constants.
-`src/ir.rs:736`: "a plain parameter is a compile-time constant and needs
-`= <value>`; data arrives through a `buffer in` pipe". A
-`graph` is stricter -- `src/ir_graph.rs:140`, anything that is not a pipe "is
-not a pipe, and a graph connects nothing else".
-
-So there is no way to declare a per-cycle input that is not handshaked.
-`fetch_hold`, `idle`, `halted`, `fault_cause_o`, `cycle_count_o`, `cmaint_req`,
-`inval_req`, `flush_busy`, `sel`, `calib`, `core_rst`, `bus_own` -- every
-status and control wire in K2G is one of these.
-
-**Half position, half gap.** For control the position is right: `fetch_hold`
-and `hold` exist only because those signals have no `ready` beside them, and
-`k2g_decode.ddl:87-95` shows the back-pressured version needs neither.
-
-For *status* the answer is a `buffer out` whose `ready` the SystemVerilog ties
-high. `retire`, `halted`, `fault_*` and `cycle_count` become pipes the process
-writes every cycle, and the wrapper samples `valid`/`data` and never refuses.
-There used to be a pipe kind for this -- a `stream`, which had no `ready` leg
-at all -- and it is gone, which turns out to make the boundary *more* honest
-rather than less: "this sink cannot refuse" is now a tie-off written in the
-wrapper where a reader can check it, instead of a property of the pipe kind
-that made a dropped item invisible if it was ever untrue. The obligation is
-the same one the fetch credit already carries (B6).
-
-Six LEDs still cannot consume anything, so status that leaves the design
-leaves through SystemVerilog either way.
-
-**The one boundary a tie-off cannot honestly cover** is the other direction:
-a SOURCE that cannot be told to wait. `k2g_mon.sv:110` -- "`rx_valid` is a
-one-cycle pulse from k2g_uart_rx; there is no way to refuse a byte, which is
-why the receive path never back-pressures and instead reports what it could
-not take". A byte arrives when the wire says it does.
-
-Tying the generated `rx_ready` high there asserts something the design does
-not believe: `k2g_mon` explicitly counts what it dropped, and `k2g_mon.sv:849`
-carries a simulation assert for the case it thinks cannot happen on a board.
-A tied-off `ready` would turn a counted drop into a silent one, which is
-exactly the trade `stream` used to make and the reason it is gone.
-
-So this boundary gets a shim in SystemVerilog: one holding register between
-`k2g_uart_rx` and the DDL process, presenting a real `valid`/`ready` pair and
-raising a sticky `overrun` bit when a byte lands while it is full. The bit
-rides into DDL as a payload field, the same way `k2g_decode.ddl:75-77` carries
-`restart` instead of taking a `flush` port. That is strictly better than
-either the old stream or a tie-off: the loss becomes a value the program can
-see, rather than an assumption in a comment.
-
-It costs about a dozen lines of SystemVerilog and it moves the DDL/SV line one
-module further in than §3 draws it.
-
-### B4. One producer and one consumer per pipe
-
-`src/ir_graph.rs:482`: "`{}` has {} consumers", noting that `desc.md` allows
-several by duplicating the sink and that the duplication is not built.
-
-K2G broadcasts constantly. `retire` goes to the cosimulation harness while the
-same state drives the core's own bookkeeping; `core_halted`/`core_faulted` go
-to both `k2g_mon` and the LEDs; `cmaint_done` answers two requesters.
-
-**Gap, and no longer a cheap one.** It used to be free for a `stream` --
-duplicate the wires, there is no `ready` to reconcile -- and that was the
-argument for building `stream` fan-out first. With one pipe kind left, every
-broadcast has to reconcile readys. ANDing them reintroduces exactly the
-combinational `ready` coupling `k2g_chan.sv:26` rule 3 is about, so a broadcast
-buffer wants a slot per sink: two entries per consumer, each draining at its
-own rate, and a producer that waits for the slowest.
-
-That is the honest cost of the lossless position, and it is worth being
-explicit that removing `stream` is what raised it. The alternative it replaces
--- a broadcast where a slow consumer silently misses items -- is the failure
-this language is built to refuse.
-
-### B5. Every process boundary costs a cycle
-
-`examples/k2g_xstage.v:322-324` is the shape: `assign wb_valid = wb_busy` --
-the output is a register, because rule 3 requires it. A `fun` has no boundary
-at all (it is inlined) and a `process` boundary is a pipeline register. There
-is nothing in between.
-
-K2G has combinational module boundaries that are load-bearing:
-`k2g_membus_mux.sv` is nine `assign`s and no state; `k2g_regfile.sv` reads
-asynchronously so one cycle can do read → forward → address add;
-`k2g_decode.sv`'s `uop` is combinational, and the DDL port registers it.
-
-**Position.** This is the language's thesis and the reason rule 3 holds by
-construction. The planning consequence is concrete: **a DDL K2G will not be
-cycle-identical to the SystemVerilog one**, and every hop added by splitting a
-module costs IPC. `rtl/sim/cosim.sh` compares architectural state after each
-retirement and is timing-insensitive by design, so it will still pass -- which
-means the *performance* comparison has to be a separate, explicit measurement
-or the regression goes unnoticed.
-
-The corollary is a design rule: **split only where the SystemVerilog already
-has a pipeline register.** F→D and D→X are real cuts. Core↔regfile, core↔ALU,
-core↔CSP are not; those become `fun` calls and `var`s inside one process,
-exactly as `k2g_xstage.ddl` did.
-
-### B6. A pipe is two entries, and there is no way to ask for more
-
-A `buffer` is a two-entry skid buffer -- head and skid, `out_hold` and
-`out_skid` in the emitted Verilog -- which is the same thing `k2g_skid` is and
-for the same reason. The second entry is what makes the producer's `ready` a
-register instead of a wire through to the consumer's, so `ready` is "the skid
-is empty" and a chain of processes is not one combinational path as long as
-the chain.
-
-There is still no `let p: buffer i32 [8]`, no deeper FIFO, and no credit.
-
-That caps one thing in K2G. `k2g_membus` responses are unconditional --
-`k2g_membus.sv:10`, there is no `rsp_ready`, and the master's credit is what
-stops an overrun -- and the core allows up to four outstanding fetches. Two
-entries support a credit of two, wired to the SoC by leaving the generated
-`ready` unconnected, which is sound exactly as long as the credit guarantees
-it is high. Four needs a depth the language cannot express.
-
-**Gap, but a performance ceiling rather than a blocker.** Credit two is a
-fetch every other cycle against a memory that answers in one, and against the
-caches it is what decides how much of a miss the front end can cover. The
-workarounds are still bad -- chain processes for slots and pay a cycle each --
-so a depth on a pipe declaration is worth having. It is no longer the thing
-the core port waits on.
-
-### B7. A process is one thread
-
-One `process`, one `loop`, one state machine. There is no `while` and no
-`continue` in `src/lex.rs`, and `src/ir.rs` refuses "a `loop` belongs at the
-top of a `process` body, not nested inside it".
-
-`k2g_mon.sv` is three concurrent FSMs in one module: receive/parse
-(`k2g_mon.sv:176`), transmit (`:205`) and command (`:258`), sharing the console
-buffers, `bus_own` and the pause sequencer. `k2g_soc.sv` similarly runs the
-boot copier, the debouncer and the LED logic concurrently.
-
-**Position, and the split is probably an improvement** -- three processes
-joined by pipes is what the module means anyway. The work is real: shared state
-has to become messages, and `bus_own` in particular is a mutex between two
-machines that currently just read each other's registers.
-
-### B8. No parameters at instantiation
-
-Plain parameters are compile-time constants, but a `graph` instance takes only
-pipe names (`src/ir_graph.rs:278-298`), and `tests/graph.rs:354` asserts a
-plain parameter on a graph is refused outright. A constant is therefore global
-to the program, never per-instance.
-
-K2G parameterises everywhere: `k2g_skid #(.WIDTH(48))`, `k2g_cdc_fifo
-#(.WIDTH, .DEPTH)`, `k2g_icache #(.BYTES, .LINE_BYTES)`, `k2g_mon
-#(.HAS_CONSOLE_IN)` -- the last existing so one build can drop 33 logic cells
-and another can keep them.
-
-**Gap, less urgent than it looks.** The compiler generates handshakes, so the
-width-parameterised plumbing (`k2g_skid`, `k2g_chan`, `k2g_cdc_fifo`)
-disappears rather than needing generics. What remains is genuine configuration
--- cache size, feature bits -- and there is exactly one instance of each in the
-design. Global constants cover it until there are two.
-
-### B9. A memory is private to its process; an array value is read-only
-
-A MEMORY -- `#[impl(lutram)] [T; n]` -- is only ever a `var` inside a
-`process`; `src/ir.rs:717-723`, "`{}` is a memory, which cannot be a
-parameter". So a process cannot hand one to a `fun` and two processes cannot
-share one.
-
-**Position** ("no global memory: a declaration touches its own state and
-nothing else"), and `k2g_xstage.ddl` is what it looks like when followed.
-
-An ARRAY VALUE -- `[T; n]` with no `#[impl(...)]` -- is a packed vector and
-can be a struct field, a pipe payload or a parameter. Subscripting one used to
-fall through to the bit selects, so `l.words[1]` on a `words: [i32; 4]` field
-read bit 1 of the flattened struct and typed as `i1`. **Fixed**: a subscript
-on an array value selects an element, a range of one selects a run of elements,
-and an index past the end is a diagnostic. `tests/array.rs` holds the cases,
-including the one that says a 32-bit element is not assignable to an `i1`.
-
-What remains is that an array value cannot be *written* by element:
-`s.words[1] = x` is refused with "only a name or a field of one can be
-assigned". A cache line is therefore built whole, with `@concat`, rather than
-filled a word at a time -- which for a line arriving over a burst is the wrong
-shape. **Gap, small, and the next one in this area.**
-
-### B10. There is no way to write a multi-bit dynamic slice
-
-Bit indexing an `iN` at a computed index emits a one-bit `+:` part-select, and
-that is the only form the syntax reaches. There is no `x[i +: 8]`.
-
-The mechanism is no longer the obstacle: an array element at a computed index
-lowers to a `+:` of the element's width, scaled by a shift where the width
-allows one. What is missing is a spelling for the same thing on a value that
-is not an array.
-
-K2G's byte-enable network (`k2g_core.sv:606-640`) and every store-width path
-selects a lane by a runtime index.
-
-**Small gap, two clean workarounds.** Declare the thing as `[i8; 4]` and index
-it, which is what it is; or `match` on the width selector with constant slices
-in each arm, which is what the SystemVerilog already writes as
-`unique case (access_width)`.
-
-### B11. A pipe cannot be flushed
-
-There is no `flush` anywhere in `src/`. A branch redirect must discard code
-points already fetched.
-
-**Position, and the workaround is already the house idiom.** `cp_item_t` in
-`k2g_decode.ddl:75-77` carries a `restart` bit and the SystemVerilog's `flush`
-port is gone. Generalised: tag items with an epoch, bump it on redirect, drop
-stale items at the consumer. It is arguably better -- `k2g_chan.sv:66-70` has a
-long comment about `flush` not reaching upstream and stale responses arriving
-after it, and an in-band epoch cannot have that bug.
-
-What it costs is drain bandwidth: stale items still occupy slots and must be
-consumed to be got rid of. With B6 unfixed that is tolerable; it is a reason
-not to make pipes deep without also making dropping cheap.
-
-### B12. A graph is structure with no glue
-
-`src/ir_graph.rs` accepts pipe declarations and instantiations. There is no
-logic in a graph, no expression on a pipe, no mux, no arbiter.
-
-`k2g_membus_mux.sv` is a two-to-one channel mux. `k2g_psram.sv` arbitrates
-fetch against data cycle by cycle. `k2g_core.sv` is the hard case: it
-instantiates seven submodules *and* contains some 700 lines of its own logic,
-which DDL has no declaration kind for -- `graph` computes nothing, `process`
-instantiates nothing.
-
-**Position for the mixing; gap for the arbiter.** The core splitting into leaf
-processes plus a graph is the intended shape. But an arbiter written as a
-`process` registers everything it routes (B5), turning a combinational mux into
-a cycle. The clean answer is pipe combinators the compiler lowers structurally
--- merge, split, arbitrate -- rather than making users pay a process for each.
-Nothing like that exists.
-
-### B13. Loops are `loop` + `break`, at the top level only
-
-No `while`, no `continue`, no nesting. `for` is unrolled and needs a
-compile-time trip count.
-
-`k2g_dcache.sv`'s flush walks every line and, for each dirty one, writes back
-every word -- a nested loop over runtime bounds.
-
-**Gap, small.** Flattening into one `loop` with explicit index `var`s works,
-and is what the state machine compiles to anyway. It reads worse than the
-SystemVerilog. `while` would fix that; nested `loop` is the fuller fix and
-needs `break` to name its target.
-
-### B14. Memories: one port, and a `bram` read costs a state
-
-A `var` array is read and written by subscript inside one process. `lutram`
-reads asynchronously; `bram` reads synchronously and the read costs a state,
-refused inside an expression. There is no dual-port array, no byte-enable, and
-no way to initialise a `bram`.
-
-- `k2g_mem.sv` is *true dual-port*, four striped byte lanes, and instantiates
-  `DPB` directly because inference produced a write mode place-and-route
-  rejects. Not expressible: B2 for the primitive, one-port-per-array for the
-  shape.
-- `k2g_icache.sv`/`k2g_dcache.sv` use that memory with port A reading for the
-  core and port B written by the refill -- but `k2g_icache.sv:136` notes the two
-  never overlap, so a single-port array works. What does not survive unchanged
-  is the timing: `k2g_icache.sv:158` says a hit costs one cycle, "exactly what
-  memory used to", and a DDL `bram` read spends a state. Whether a hit can still
-  be one cycle depends on whether the accepting state and the read state can be
-  the same one. **Measure this before planning the cache port in detail.**
-- Byte lanes are recoverable as four `[i8; N]` arrays, which is what the
-  SystemVerilog does anyway and for the same reason.
-- ROM contents: no `$readmemh`, but GowinSynthesis will not honour one either
-  (`k2g_soc.sv:5`), which is why the boot ROM is logic and a copier moves it.
-  `board/k2g_rom.sv` is a generated `case`; a generated DDL `match` is the same
-  thing. Not a blocker.
-
-### B15. `fun` cannot take a memory, and cannot be instantiated
-
-A `fun` is inlined and needs at least one `out` parameter. It cannot be an
-instance in a `graph`, and it cannot touch a memory. With B9 this means a
-combinational helper that indexes an array must be written inline in every
-process that needs it.
-
-Minor for K2G -- the ALU and shifter are pure and already ported -- but it is
-why the register file could not stay factored out even as a function.
-
-## 3. What a DDL K2G looks like
-
-```
-board/k2g_soc.sv                     SystemVerilog. Pins, rPLL, PSRAM IP,
-  |- k2g_pll.sv                      tri-state, LEDs, the boot copier, the
-  |- k2g_psram.sv    -.  two clocks  membus mux, the UART's bit timing.
-  |    `- k2g_cdc_fifo.sv
-  |- k2g_uart.sv                     serial pins <-> byte streams
-  |- k2g_mon.ddl        <- DDL: 3 processes + a graph
-  `- k2g_machine.ddl    <- DDL: a graph of
-       |- k2g_fetch     process   pc, credit, epoch tagging
-       |- k2g_decode    process   DONE
-       |- k2g_xstage    process   regfile + ALU + shift + CSP, mostly DONE
-       |- k2g_mstage    process   byte lanes, the data bus master
-       |- k2g_icache    process
-       |- k2g_dcache    process
-       `- k2g_cmaint    process
+Two of those already followed the rule, which is why they are worth reading
+before writing any more.
+
+**`k2g_decode.ddl` deleted two ports rather than reproducing them.** The
+SystemVerilog takes `flush` to abandon a partly-accumulated prefix chain, and
+`hold` to freeze the accumulator without suppressing its combinational output
+-- the latter existing only because `uop_valid` has no `ready` beside it, so
+there was no way for the sink to refuse. The DDL version has neither: `hold`
+is what back-pressure already is, and `flush` became a `restart` bit inside
+`cp_item_t`, travelling in-band with the code points it invalidates.
+
+That second one is the better design and not merely the available one.
+`k2g_chan.sv:66` spends a paragraph on the hazard `flush` opens -- it does not
+reach upstream, so a response already accepted by a slow memory arrives after
+the flush and is decoded as part of the new stream. An in-band epoch cannot
+have that bug, because the ordering is a property of the channel rather than a
+race between two signals.
+
+**`k2g_xstage.ddl` absorbed a module instead of porting it.** `k2g_regfile.sv`
+is 24 flat ports exposing combinational reads of local state, which
+`desc.md:26` forbids outright. Putting the array behind a channel would have
+compiled and would have been worse -- the asynchronous read is what lets one
+cycle do register read, forward, address add. So the arrays moved into the
+process that reads them, and the module stopped existing.
+
+## 1. What K2G becomes
+
+### The memory bus gets its `ready` back
+
+`k2g_membus.sv:9` removes `rsp_ready` on purpose, and the reasoning was sound
+when it was written: "the alternative puts a buffer inside every slave so it
+can hold a response the master is not ready for... the slaves here are caches
+whose entire job is to be small on a part that is already at 55% of its LUTs".
+Making the master count instead cost one small counter in one place.
+
+In DDL the buffer is not an alternative, it is already there. Every output pipe
+is two registered entries, generated. The thing that was expensive is free, so
+the reason to omit `ready` is gone and the bus becomes an ordinary pair of
+pipes: `buffer out mem_req_t`, `buffer in mem_rsp_t`.
+
+What that deletes from `k2g_core.sv` is not a wire, it is a subsystem:
+
+- `issue_addr [0:3]`, `issue_wp`, `issue_rp` -- a queue pairing each response
+  with the address that asked for it, because a bare response cannot say. In
+  DDL the address rides in `mem_rsp_t`, put there by the process that answers.
+  Along with the queue goes its documented failure mode: "a queue shorter than
+  the credit wraps and pairs code points with the wrong addresses -- which
+  corrupts `isa` rather than the instruction" (`k2g_core.sv:232`).
+- `inflight`, `outstanding`, and the `inflight < F2D_DEPTH` credit -- a
+  hand-built substitute for back-pressure.
+- `drop` -- a counter of answers belonging to an abandoned stream, discarded
+  as they arrive. With an epoch in `mem_rsp_t` the consumer recognises them
+  directly, and there is no count to keep in step.
+- the `rst_n &&` guard on `req_valid`, and the long comment at
+  `k2g_core.sv:196` about the mutant that no longer fails because a cache
+  happens to mask it.
+- both `k2g_skid` instances on the F→D path, and `k2g_chan.sv` with them.
+
+That is roughly 90 lines of `k2g_core.sv` plus a 150-line file, and every one
+of them is handshake plumbing rather than machine.
+
+### `stall` is not a signal
+
+`k2g_csp.sv:103` is the whole of it:
+
+```systemverilog
+assign stall = uart_write && !uart_tx_ready;
 ```
 
-The line is drawn where `desc.md:5` draws it: "compute only logic in ddl, io in
-verilog". Above it, single-clock pipe-connected compute; below it, the board.
+A CSP write to the UART port cannot complete, so the core holds the
+instruction and nothing architectural changes -- which is why the pause is
+invisible to the lockstep comparison, an argument `k2g_csp.sv:29` has to make
+in a comment.
 
-At the boundary the SoC instantiates the generated modules and wires
-`_valid`/`_ready`/`_data` triples by hand, because DDL cannot instantiate
-SystemVerilog (B2). `k2g_membus` becomes a `buffer out mem_req_t` plus a
-`buffer in i32`, and the response side's generated `rsp_ready` is tied off in
-the wrapper: `k2g_membus.sv:10` says a master must accept every response it
-asked for and controls that by credit, which is exactly the claim the tie-off
-makes. Writing it as a tie-off puts the credit invariant somewhere a reader
-can check, next to the counter that maintains it.
+In DDL that is `@send(uart_tx, byte)` and the argument is structural: the
+process cannot advance past a blocking send, so there is no state in which it
+has half-retired the instruction. The `stall` port, the core's handling of it,
+and the reasoning that connects them all go.
 
-**Three things must be settled before any of this is written:**
+### Status becomes events, and the boot copier becomes a state
 
-1. **Fetch credit** (B6). A pipe holds two, so the credit is two unless
-   something is built. The question is what that costs behind the instruction
-   cache -- a hit answers in a cycle or two, and a credit of two covers that,
-   but it does not cover a miss. Measure it on the Phase D graph rather than
-   guessing; it is a performance decision, not a blocking one.
-2. **Cache hit latency** (B14). Measure whether a `bram` read can share a state
-   with the request that caused it. If not, every hit costs two cycles and the
-   cache stops being a cache.
-3. **Status out** (B3/B4). `retire`, `halted`, `fault_*`, `cycle_count` and
-   `idle` all leave the core for the cosimulation harness, the monitor and six
-   LEDs. A `buffer out` with `ready` tied high in the wrapper gets them out of
-   a process; nothing gets them to a pin. Probably: one `retire`-shaped pipe
-   into SystemVerilog, and the SoC fans out -- which also sidesteps B4, since
-   the fan-out then happens where fan-out is free.
+Two more places where the SystemVerilog's shape is Verilog's, not the
+machine's.
+
+`halted`, `faulted`, `fault_cause_o`, `fault_addr_o`, `cycle_count_o` are
+flat outputs continuously exposing the core's private state. `desc.md:26` says
+a declaration touches its own state and nothing else, and this is the same
+violation `k2g_regfile.sv` was. The DDL machine emits a `status_t` on a pipe
+when something changes; whatever wants a snapshot latches the last one. The
+LEDs latch it in SystemVerilog because LEDs are pins, not because DDL could
+not carry it.
+
+`k2g_membus_mux.sv` is 46 lines selecting between the boot copier and the core
+by a level, safe only because "the core is held in reset for the whole copy"
+and `sel` may only move when nothing is in flight -- a correctness argument
+that lives in a comment and is checked by nothing. Two mutually exclusive
+owners of one resource is a phase of one process, not two processes and a mux.
+The copier becomes the machine's boot state, the mux disappears, and the
+condition that made it safe becomes the reason there is only one writer.
+
+The same shape covers `k2g_cache_maint.sv`'s two requesters, which it already
+handles by latching an owner because "'cannot happen' and 'is not handled' are
+different claims" -- correct, and unnecessary once the two requests arrive on
+one pipe in the order they were sent.
+
+### The core splits along dataflow, not along the old stage boundaries
+
+`k2g_core.sv` is 1318 lines that both instantiate seven submodules and compute.
+DDL has no declaration kind for that, and it should not: `graph` is structure,
+`process` is behaviour.
+
+The split is F / D / X / M as processes plus a graph, which is where the
+SystemVerilog's own pipeline registers already are. But the rule for choosing
+it is the dataflow, not the old boundaries. In DDL a module boundary **is** a
+pipeline register -- there is no combinational boundary short of a `fun` call,
+which is inlined. So `k2g_regfile`, `k2g_alu`, `k2g_shift` and `k2g_csp` are
+not modules that DDL fails to express; they are `fun` calls and `var`s inside
+the process that uses them, and the cycle they would have cost is one the
+design never has to spend.
+
+**A DDL K2G will not be cycle-identical to the SystemVerilog one.** The
+cosimulation compares architectural state after each retirement and is
+timing-insensitive by design, so it will still pass. The IPC comparison has to
+be a separate, explicit measurement or a regression goes unnoticed.
+
+### The lossless boundary at the UART
+
+`k2g_mon.sv:110`: "`rx_valid` is a one-cycle pulse from k2g_uart_rx; there is
+no way to refuse a byte, which is why the receive path never back-pressures
+and instead reports what it could not take."
+
+Under this rule that sentence is a defect, not a constraint to design around.
+Nothing in a DDL machine drops an item. The deserializer is the pin boundary
+and stays in SystemVerilog, but it stops emitting a pulse and starts emitting
+a transfer: one holding register presenting `valid`/`ready`, sized against the
+1170 cycles between bytes at 115200 baud that the design already relies on.
+The overrun stops being a counted outcome and becomes an assertion, because it
+is now a thing that cannot happen rather than a thing that is tolerated.
+
+## 2. What DDL genuinely lacks
+
+Everything above is K2G changing. This is the residue -- places where the DDL
+design is right and the compiler has not built it yet. It is a short list, and
+that is the finding.
+
+1. **Broadcast.** One producer, several consumers (`src/ir_graph.rs:482`).
+   `desc.md` specifies it by duplicating the sink; it is not built. Wanted for
+   `retire` reaching both the machine's own bookkeeping and the cosimulation
+   harness. Costs a slot per sink -- ANDing readys would rebuild the
+   combinational coupling `k2g_chan.sv:26` rule 3 exists to prevent.
+2. **Pipe combinators.** Merge, split, arbitrate, lowered structurally rather
+   than as a `process` costing a cycle per hop. Deleting `k2g_membus_mux`
+   removes the urgent case, but a merge is what lets two requesters share one
+   pipe without a hand-written round-robin.
+3. **Element assignment on an array value.** `s.words[1] = x` is still "only a
+   name or a field of one can be assigned". Reading was fixed; a cache line
+   arriving over a burst wants to be filled a beat at a time.
+4. **Pipe depth.** `let p: buffer i32 [4]`. Two entries is a credit of two.
+   Enough behind a cache that hits; not enough to cover a miss.
+5. **Multi-bit dynamic slice, as syntax.** The mechanism exists -- an array
+   element at a computed index lowers to a `+:` of the element width -- but
+   there is no way to write one on a plain `iN`. Declaring the thing `[i8; 4]`
+   is the workaround and is usually what it was.
+6. **`while`, or nested `loop`.** The data cache's flush walk flattens into one
+   `loop` with explicit indices. Reads worse; expresses the same thing.
+
+## 3. The board
+
+Not a gap list. `desc.md:29` draws this line itself -- "compute only logic in
+ddl, io in verilog" -- and everything below it stays SystemVerilog because it
+is the board, not because DDL fell short.
+
+| | Why it stays |
+|---|---|
+| `k2g_psram.sv`, `k2g_cdc_fifo.sv` | two clock domains. `src/ir.rs:1489` gives one, implicit and unnameable. Multi-clock DDL is a clock-domain type system, a `syn_preserve` equivalent and a constraints story -- a language project |
+| `board/k2g_pll.sv` | `rPLL`. No primitive instantiation |
+| `k2g_mem.sv` | true dual-port, four `DPB` instances, because inference produced a write mode place-and-route rejects |
+| `board/k2g_soc.sv` | pins, tri-state `IO_psram_dq`, the PSRAM IP, the LEDs |
+| `board/k2g_uart.sv` | bit timing against a pin, plus the holding register above |
+| the bring-up probes | scaffolding |
+
+One thing here is a real gap rather than a boundary: **a `graph` cannot
+instantiate a module DDL did not compile** (`src/ir_graph.rs:258`). That is
+smaller than `pin` and it is what would let DDL own the hierarchy instead of
+being a guest in it. Until then the SoC instantiates the generated modules and
+wires `_valid`/`_ready`/`_data` triples by hand.
 
 ## 4. Phases
 
-Each phase ends with `examples/verify.sh` green for what it added -- equivalence
-against the SystemVerilog it replaces, plus a primitive count that is not
-materially worse. That gate is what keeps the port reversible at every point.
+Each phase ends with `examples/verify.sh` green for what it added. Equivalence
+is against the SystemVerilog **where the two still implement the same
+structure**; where K2G has changed shape, the reference is the emulator and
+the gate is `rtl/sim/cosim.sh`.
 
-**Phase A -- close the cheapest gaps.** Array-value indexing (B9) is **done**,
-and so is the sequence skid that made `ready` a register on both declaration
-kinds. Nothing else here blocks Phase B, so Phase A is finished; broadcast
-(B4) is wanted but the `retire` path routes around it through the wrapper.
+**A -- done.** Array-value indexing, and the skid entry that made `ready` a
+register on a `sequence` as well as a `process`.
 
-**Phase B -- finish the execute stage.** `k2g_xstage.ddl` covers the register
-file and the datapath. Add predication, condition codes, fault detection, the
-CSP port (absorbed, not a module), jumps and the widening multiply -- the list
-`k2g_xstage.ddl:23-27` says it left out. No new language features needed; the
-largest piece of pure porting work in the project, and fully unblocked today.
+**B -- finish the execute stage.** `k2g_xstage.ddl` has the register file and
+the datapath. Add predication, condition codes, fault detection, jumps, the
+widening multiply, and the CSP port as `fun` calls and `var`s rather than a
+module. No language features needed; the largest piece of pure porting work
+in the project and unblocked today.
 
-**Phase C -- fetch and memory.** `k2g_fetch` with epoch tagging instead of
-flush (B11), and the M stage with its byte-lane network as a `match` (B10).
-Unblocked: a credit of two is what a pipe already carries, and whether that is
-enough is a measurement for Phase D rather than a prerequisite.
+**C -- fetch, and the bus as it should have been.** `mem_req_t`/`mem_rsp_t`
+carrying address and epoch, `k2g_fetch` with neither a credit counter nor an
+address queue, and the M stage's byte-lane network as a `match`. This is the
+phase that pays for the rule: it deletes more of `k2g_core.sv` than it ports.
 
-**Phase D -- the graph.** Wire F→D→X→M into `k2g_machine.ddl` and cosimulate
-against the emulator. First point at which a DDL K2G runs a program, and the
-first honest performance comparison against the SystemVerilog.
+**D -- the graph.** F→D→X→M wired into `k2g_machine.ddl`, cosimulated against
+the emulator. First point at which a DDL K2G runs a program, and the first
+honest IPC comparison.
 
-**Phase E -- caches.** Blocked on the B14 measurement. `k2g_cache_maint` is
-easy and can precede them.
+**E -- caches.** Blocked on one measurement: whether a `bram` read can share a
+state with the request that caused it. `k2g_icache.sv:158` says a hit costs one
+cycle; if DDL spends two, the cache stops being a cache. `k2g_cache_maint`
+folds into the machine and can precede this.
 
-**Phase F -- the monitor.** Three processes and a graph (B7). Largest single
-module left, no language blockers, mechanical once the shared state becomes
-messages.
-
-Never: `k2g_psram`, `k2g_cdc_fifo`, `k2g_pll`, `k2g_soc`, the UART's bit
-timing, the bring-up probes. Those are the board, and DDL is not for boards.
-
-## 5. Language changes, by leverage
-
-1. **Pipe combinators, including broadcast.** Merge, split, arbitrate and
-   fan-out, lowered structurally rather than as a `process` costing a cycle
-   per hop. This is now one item rather than two: with `stream` gone, a
-   broadcast has readys to reconcile like every other combinator, and wants a
-   slot per sink (B4). Without them every mux and arbiter in a design is a
-   pipeline stage, which is what makes `k2g_membus_mux` and `k2g_cache_maint`
-   cost more in DDL than in SystemVerilog.
-2. **Element assignment on an array value.** `s.words[1] = x`. Reading is
-   fixed; writing is still "only a name or a field of one can be assigned", so
-   a cache line has to be built whole rather than filled a beat at a time.
-3. **Pipe depth.** `let p: buffer i32 [4]`. A pipe already holds two, so this
-   is a ceiling on the fetch credit rather than a wall -- it raises what the
-   front end can cover across a cache miss.
-4. **External module declaration.** Let a `graph` instantiate a module DDL did
-   not compile, given its ports. Smaller than `pin`, and it is what would let
-   DDL own a hierarchy instead of being a guest in one.
-5. **Multi-bit dynamic slice, as syntax.** `x[i +: 8]` on an `iN`. The
-   mechanism exists and is now exercised -- an array element at a computed
-   index lowers to exactly that -- but there is no way to write one by hand.
-6. **`while`, or nested `loop`.** Makes the cache flush walk readable. Purely
-   cosmetic -- everything it expresses is already expressible.
-7. Everything else -- `pin`, `io process`, multi-clock, per-instance parameters,
-   dual-port memories -- is either a language project of its own or is answered
-   by "that part stays in SystemVerilog", which for K2G is the right answer
-   anyway.
+**F -- the monitor.** `k2g_mon.sv` is three concurrent FSMs sharing state,
+which is three processes and a graph -- the split the module already wanted.
+No language blockers; mechanical once the shared state becomes messages.
