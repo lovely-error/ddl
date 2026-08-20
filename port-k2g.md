@@ -163,6 +163,19 @@ cosimulation compares architectural state after each retirement and is
 timing-insensitive by design, so it will still pass. The IPC comparison has to
 be a separate, explicit measurement or a regression goes unnoticed.
 
+**A boundary is priced by payload width, and Phase B measured it.** Each one
+is a head and a skid: 2N+2 flops for an N-bit payload, plus the muxing that
+feeds them. On `k2g_xstage`, narrowing the writeback packet from 84 bits to 46
+removed 223 primitives -- about 5.9 per bit. That is the whole of the +12.5%
+the xstage gate reports against a reference whose output is a bare
+combinational bus with no handshake at all; narrow that port to one bit and
+the DDL comes out around 7.5% SMALLER than the hand-written wiring of the same
+three components.
+
+So the rule for choosing the split is not "boundaries are expensive" but
+"boundaries are priced by what crosses them". A cut carrying a micro-op costs
+real silicon; a cut carrying a byte does not.
+
 ### The lossless boundary at the UART
 
 `k2g_mon.sv:110`: "`rx_valid` is a one-cycle pulse from k2g_uart_rx; there is

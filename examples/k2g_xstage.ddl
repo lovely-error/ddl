@@ -42,6 +42,29 @@
 -- states). Jumps need `isa`, which is not in `uop_t`; it wants a payload
 -- struct carrying the uop and the address it started at.
 --
+-- WHAT THE AREA COMPARISON MEASURES, which is not what it looks like.
+-- `verify.sh` reports the DDL at 3106 primitives against the reference's 2761,
+-- +12.5%. All of that is the `wb` channel and none of it is the logic.
+--
+-- The reference's `packet` is a bare combinational output with no handshake.
+-- This process emits a real pipe, so it pays a head and a skid: 2N+2 flops for
+-- an N-bit payload, plus the muxing that feeds them. The netlist names them --
+-- 168 of the 192 DFFREs are `wb_hold` (84) and `wb_skid` (84), and the
+-- reference has the other 24 and nothing else. Narrowing the packet from 84
+-- bits to 46 removes 223 primitives, so the channel scales with the payload
+-- and dominates the difference.
+--
+-- Which makes the comparison unfair rather than the design wasteful. Narrow
+-- the output to one bit and the DDL synthesizes to 2555 against the
+-- reference's 2761 -- SMALLER, by 7.5%. (Read that number as a direction and
+-- not a total: with nothing reading `fault` and `fault_info` they optimize
+-- away, so it flatters by however much that mux costs. `fault_valid` stays
+-- live through `commits`.)
+--
+-- The port is here so the equivalence testbench can watch what X computed; the
+-- arrays are written from `w`, inside. In `k2g_machine.ddl` this becomes the
+-- real X->M boundary and the cost stops being scaffolding.
+--
 -- THE VALUE ARRAY HAS EXACTLY ONE WRITE PORT, and in DDL it cannot have two.
 -- k2g_regfile.sv:18-24 records what a second one cost when it was tried: no
 -- RAM was inferred at all, and 32 primitives plus ~100 LUTs became 1120
