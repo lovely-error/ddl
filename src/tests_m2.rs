@@ -1691,9 +1691,9 @@ fn a_pipe_payload_is_type_checked() {
 }
 
 #[test]
-fn only_try_rcv_produces_a_pair() {
+fn only_the_pipe_forms_produce_a_pair() {
     let text = compile_err("fun f (a: i8, o: out i8)\n  let (x, y) = a\n  o = x\n");
-    assert!(text.contains("only `@try_rcv(p)` produces a pair"), "{}", text);
+    assert!(text.contains("`@try_rcv(p)` and `@peek(p)` produce a pair"), "{}", text);
 }
 
 // ---- blocking channel operations -----------------------------------------

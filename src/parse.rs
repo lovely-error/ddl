@@ -272,6 +272,18 @@ pub enum BuiltinOp {
     /// `@unreachable`, valid only as the body of a `match` catch-all: an
     /// assertion that no value reaches that arm.
     Unreachable,
+    /// `@peek(p)` -- what `p` is offering, WITHOUT taking it.
+    ///
+    /// Binds a pair like `@try_rcv`, and unlike it completes no transfer and
+    /// asks for nothing: it reads the pipe's `valid` and `data` and stops
+    /// there. So it does not count as the one operation a pipe gets per cycle,
+    /// and a `@peek` may be followed by a `@try_rcv` or a `@drop` of the same
+    /// pipe -- looking, then deciding, is the point of it.
+    Peek,
+    /// `@drop(p)` -- take what `p` is offering and discard it.
+    ///
+    /// A `@try_rcv` that binds nothing. Answers whether anything was taken.
+    Drop,
     /// `@hold(c)` -- refuse this cycle's input while `c`.
     ///
     /// A statement at the top of a `loop` in a process with no states. Its
@@ -340,6 +352,8 @@ unsafe fn resolve_anum_span(anum_span: &AlphanumSpan) -> Result<AnumResolution, 
             "zeroed" => return Ok(AnumResolution::Builtin(BuiltinOp::Zeroed)),
             "unreachable" => return Ok(AnumResolution::Builtin(BuiltinOp::Unreachable)),
             "hold" => return Ok(AnumResolution::Builtin(BuiltinOp::Hold)),
+            "peek" => return Ok(AnumResolution::Builtin(BuiltinOp::Peek)),
+            "drop" => return Ok(AnumResolution::Builtin(BuiltinOp::Drop)),
             "cast" => return Ok(AnumResolution::Builtin(BuiltinOp::Cast)),
             "assert" => return Ok(AnumResolution::Builtin(BuiltinOp::Assert)),
             "fatal" => return Ok(AnumResolution::Builtin(BuiltinOp::Fatal)),

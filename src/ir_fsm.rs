@@ -960,7 +960,11 @@ pub fn lower_blocking(
             let f = low.emit(Ty::BOOL, Op::Bin { op: BinOp::And, lhs: in_st[k], rhs: handshake });
             low.name_value_safe(f, format!("{}_xfer_s{}", pipe.name, k));
             low.pipes[ix].fired = Some(f);
-            low.pipes[ix].used = false;
+            // A barrier already spends this state's one transfer on that pipe,
+            // so anything else consuming from it here would be a second
+            // transfer in a cycle that has one. Marking it used is what makes
+            // `@drop(p)` beside `@rcv(p)` an error instead of a no-op.
+            low.pipes[ix].used = st.barrier.as_ref().is_some_and(|b| b.pipe_ix == ix);
             low.pipes[ix].sent = None;
             low.pipes[ix].send_guard = None;
         }
@@ -1137,12 +1141,18 @@ pub fn lower_blocking(
             .map(|(k, _)| in_st[k])
             .collect();
         for (k, guard) in uses {
-            // An offer written inside an `if` only happens on that branch, so
-            // the state alone is not the condition.
+            // FIRING, not merely being in the state. A state with a barrier
+            // does its work in the cycle that barrier completes, so a pipe it
+            // touches without waiting is touched then and not before -- which
+            // for an offer means not publishing a value computed from an item
+            // that has not arrived, and for a drop means not throwing one away.
+            //
+            // And an operation written inside an `if` only happens on that
+            // branch, so the state alone is not the condition either.
             let ask = match guard {
-                None => in_st[*k],
+                None => fires[*k],
                 Some(g) => {
-                    low.emit(Ty::BOOL, Op::Bin { op: BinOp::And, lhs: in_st[*k], rhs: *g })
+                    low.emit(Ty::BOOL, Op::Bin { op: BinOp::And, lhs: fires[*k], rhs: *g })
                 }
             };
             asks.push(ask);

@@ -2106,10 +2106,15 @@ pub fn lower_process(
 }
 
 
-/// `let (item, got) = @try_rcv(p)`.
+/// `let (item, got) = @try_rcv(p)` and `let (item, present) = @peek(p)`.
 ///
-/// The only tuple-producing form in the language, so this is deliberately
+/// The only tuple-producing forms in the language, so this is deliberately
 /// narrow rather than a general tuple type.
+///
+/// They differ in one thing and it is the whole difference: `@try_rcv`
+/// completes a transfer and `@peek` does not. A peek reads `valid` and `data`
+/// and asks for nothing, so it does not spend the pipe's one operation for the
+/// cycle and the item is still there afterwards.
 fn lower_try_rcv_binding(
     low: &mut Lowerer,
     decl: &crate::parse::VarDeclStmt,
@@ -2128,23 +2133,28 @@ fn lower_try_rcv_binding(
             return None;
         }
     };
-    let (pipe_expr, is_try_rcv) = match init {
+    let (pipe_expr, kind) = match init {
         PrecResExpr::Call { base, args } => match &**base {
             PrecResExpr::Builtin(BuiltinOp::TryRecieve) if args.len() == 1 => {
-                (&args[0], true)
+                (&args[0], Some(BuiltinOp::TryRecieve))
             }
-            _ => (init, false),
+            PrecResExpr::Builtin(BuiltinOp::Peek) if args.len() == 1 => {
+                (&args[0], Some(BuiltinOp::Peek))
+            }
+            _ => (init, None),
         },
-        _ => (init, false),
+        _ => (init, None),
     };
-    if !is_try_rcv {
-        sink.err_at(&decl.name, "only `@try_rcv(p)` produces a pair");
+    let Some(kind) = kind else {
+        sink.err_at(&decl.name, "only `@try_rcv(p)` and `@peek(p)` produce a pair");
         return None;
-    }
+    };
+    let takes = kind == BuiltinOp::TryRecieve;
+    let what = if takes { "@try_rcv" } else { "@peek" };
     let pipe_name = match pipe_expr {
         PrecResExpr::Ref(n) => anumspan_to_str(n).to_string(),
         _ => {
-            sink.err_at(&decl.name, "`@try_rcv` needs a pipe name");
+            sink.err_at(&decl.name, format!("`{}` needs a pipe name", what));
             return None;
         }
     };
@@ -2156,23 +2166,38 @@ fn lower_try_rcv_binding(
         }
     };
     if !low.pipes[ix].is_input {
-        sink.err_at(&decl.name, format!("`{}` is an `out` pipe; it cannot be received from", pipe_name));
+        let verb = if takes { "received from" } else { "peeked at" };
+        sink.err_at(
+            &decl.name,
+            format!("`{}` is an `out` pipe; it cannot be {}", pipe_name, verb),
+        );
         return None;
     }
-    if low.pipes[ix].used {
+    if takes && low.pipes[ix].used {
         sink.err_at(&decl.name, format!("`{}` is received from more than once in one cycle", pipe_name));
         return None;
     }
-    let fired = low.pipes[ix].fired.expect("computed before each state's body");
-    low.pipes[ix].used = true;
 
     let ty = low.pipes[ix].ty.clone();
     let data = low.pipes[ix].data_value.expect("an input pipe has a data value");
+    // A peek answers "is one being offered", which is the pipe's `valid` and
+    // nothing else. A `@try_rcv` answers "did one transfer", which is `valid`
+    // and this side's `ready` -- so on a cycle the process is not accepting,
+    // the two disagree, and that disagreement is exactly what a peek is for.
+    let answer = if takes {
+        low.pipes[ix].used = true;
+        low.pipes[ix].send_guard = low.materialise_path();
+        low.pipes[ix].fired.expect("computed before each state's body")
+    } else {
+        let v = low.emit(Ty::BOOL, Op::Port(low.pipes[ix].valid_port));
+        low.name_value_safe(v, format!("{}_present", pipe_name));
+        v
+    };
 
     let item = anumspan_to_str(&decl.name).to_string();
     let got = anumspan_to_str(&decl.rest[0]).to_string();
     env.insert(item, Binding::constant(data, ty));
-    env.insert(got, Binding::constant(fired, Ty::BOOL));
+    env.insert(got, Binding::constant(answer, Ty::BOOL));
     Some(())
 }
 
@@ -2680,6 +2705,11 @@ fn lower_stmt_at(
             // one branch and not the other is rejected by the SSA join.
             if let PrecResExpr::Builtin(BuiltinOp::TrySend) = &call.base {
                 lower_builtin(low, BuiltinOp::TrySend, &call.args, env, sink)?;
+                return Some(());
+            }
+            // A bare `@drop(p)` discards the answer as well as the item.
+            if let PrecResExpr::Builtin(BuiltinOp::Drop) = &call.base {
+                lower_builtin(low, BuiltinOp::Drop, &call.args, env, sink)?;
                 return Some(());
             }
             // Read before the body, where `ready` is built. Reaching it here
@@ -3495,6 +3525,46 @@ fn lower_builtin(
     // `@try_send(p, v)`. The value is offered; the answer is whether the slot
     // took it. Only the offer is recorded here -- the handshake itself is
     // generated after the body, so it cannot be got wrong per call site.
+    // `@drop(p)` -- take what `p` offers and discard it. A `@try_rcv` with no
+    // binding, so it spends the pipe's one operation for the cycle and answers
+    // the same question: did anything transfer.
+    if op == Drop {
+        if args.len() != 1 {
+            sink.err_span(low.here(), "`@drop` takes one pipe");
+            return None;
+        }
+        let PrecResExpr::Ref(n) = &args[0] else {
+            sink.err_span(low.here(), "`@drop` needs a pipe name");
+            return None;
+        };
+        let pipe_name = anumspan_to_str(n).to_string();
+        let Some(ix) = low.pipes.iter().position(|p| p.name == pipe_name) else {
+            sink.err_span(
+                low.here(),
+                format!("`{}` is not a pipe of this process", pipe_name),
+            );
+            return None;
+        };
+        if !low.pipes[ix].is_input {
+            sink.err_span(
+                low.here(),
+                format!("`{}` is an `out` pipe; there is nothing on it to drop", pipe_name),
+            );
+            return None;
+        }
+        if low.pipes[ix].used {
+            sink.err_span(
+                low.here(),
+                format!("`{}` is received from more than once in one cycle", pipe_name),
+            );
+            return None;
+        }
+        low.pipes[ix].used = true;
+        low.pipes[ix].send_guard = low.materialise_path();
+        let fired = low.pipes[ix].fired.expect("computed before each state's body");
+        return Some(fired);
+    }
+
     if op == TrySend {
         let arity_is_right = args.len() == 2;
         if !arity_is_right {

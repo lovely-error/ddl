@@ -287,7 +287,10 @@ fn the_two_cycle_path_refuses_new_work_while_it_finishes() {
 #[test]
 fn a_pipe_offered_in_two_states_is_valid_in_both_and_muxed_by_state() {
     let v = compile(MULW);
-    assert!(v.contains("assign wb_valid = (in_s1 | in_s0);"), "{}", v);
+    // `fire_s0`, not `in_s0`: the offer is made in the cycle the item
+    // arrives, so a packet computed from data that is not there is never
+    // published.
+    assert!(v.contains("assign wb_valid = (in_s1 | fire_s0);"), "{}", v);
     assert!(v.contains("assign wb_data = (in_s1 ? hi : uops_data);"), "{}", v);
 }
 

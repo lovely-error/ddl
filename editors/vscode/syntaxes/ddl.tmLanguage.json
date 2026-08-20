@@ -56,7 +56,7 @@
     },
     "builtin": {
       "comment": "Every `@` name the parser resolves. An unknown one is an error, so highlighting only the real set makes a typo visible before compiling.",
-      "match": "@(try_rcv|try_send|rcv|send|hold|zeroed|zext|sext|trunc|signed|unsigned|concat|rep|cast|assert|fatal|unreachable|map)\\b",
+      "match": "@(try_rcv|try_send|rcv|send|hold|peek|drop|zeroed|zext|sext|trunc|signed|unsigned|concat|rep|cast|assert|fatal|unreachable|map)\\b",
       "name": "support.function.builtin.ddl"
     },
     "keyword": {
