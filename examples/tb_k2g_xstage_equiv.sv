@@ -74,7 +74,7 @@ module tb_k2g_xstage_equiv;
   logic [2:0]  mw_tag;
   logic        mw_overflow, mw_flag;
 
-  int predicated = 0, faults = 0, suppressed = 0;
+  int predicated = 0, faults = 0, suppressed = 0, narrowed = 0;
 
   logic        held_valid = 1'b0;
   logic [83:0] held_wb;
@@ -142,6 +142,11 @@ module tb_k2g_xstage_equiv;
                               && (xb_tag != RDT_F32);
 
       if (uop.cond != CCK_NONE) predicated++;
+      // The DDL implements `rdt_normalize` itself and the reference calls the
+      // one in k2g_types.svh, so the comparison checks it -- but only on the
+      // packets where it is not the identity. Count those.
+      if ((uop.kind == UOP_PUT_IMM)
+          && (rdt_normalize(uop.imm, uop.datakind) !== uop.imm)) narrowed++;
       if (ref_packet[37]) faults++;
       // A COPY commits all four fields or none, so a COPY that wrote nothing
       // is predication doing its job rather than an opcode that writes little.
@@ -366,17 +371,19 @@ module tb_k2g_xstage_equiv;
     // A run where forwarding never fired, or nothing stalled, proves nothing
     // about the two things this module is for.
     if (compared < 20000 || forwarded < 5000 || stalls < 500 || copies < 5000
-        || predicated < 2000 || faults < 500 || suppressed < 500) begin
+        || predicated < 2000 || faults < 500 || suppressed < 500
+        || narrowed < 500) begin
       $display({"TB_FAIL  vacuous: %0d packets, %0d forwarded, %0d stalls, ",
-                "%0d copies, %0d predicated, %0d faults, %0d suppressed"},
-               compared, forwarded, stalls, copies, predicated, faults, suppressed);
+                "%0d copies, %0d predicated, %0d faults, %0d suppressed, %0d narrowed"},
+               compared, forwarded, stalls, copies, predicated, faults, suppressed,
+               narrowed);
       $finish;
     end
 
     if (errors == 0)
       $display({"TB_PASS  %0d cycles, %0d comparisons, %0d packets, %0d forwarded, ",
-                "%0d stalls, %0d predicated, %0d faults, 0 mismatches"},
-               cycles, checks, compared, forwarded, stalls, predicated, faults);
+                "%0d stalls, %0d predicated, %0d faults, %0d narrowed, 0 mismatches"},
+               cycles, checks, compared, forwarded, stalls, predicated, faults, narrowed);
     else
       $display("TB_FAIL  %0d cycles, %0d mismatches", cycles, errors);
     $finish;

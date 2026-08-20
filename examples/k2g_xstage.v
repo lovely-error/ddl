@@ -141,6 +141,21 @@ module k2g_shift (
 
 endmodule
 
+module rdt_normalize (
+    input  [31:0] v,
+    input  [2:0]  t,
+    output [31:0] o
+);
+
+  wire sgn = t[2];
+  wire [31:0] as_byte = sgn ? {{24{v[7]}}, v[7:0]} : {24'd0, v[7:0]};
+  wire [31:0] as_half = sgn ? {{16{v[15]}}, v[15:0]} : {16'd0, v[15:0]};
+  wire [1:0] width = t[1:0];
+
+  assign o = ((width == 2'd0) ? as_byte : ((width == 2'd1) ? as_half : v));
+
+endmodule
+
 module rdt_width_bytes (
     input  [2:0] t,
     output [2:0] w
@@ -278,9 +293,8 @@ module k2g_xstage (
   wire n368 = n319 ? 1'b1 : (n324 ? (n330 ? 1'b1 : (n335 ? 1'b1 : (n343 ? 1'b1 : n348))) : 1'b0);
   wire commits = (uops_xfer & cond_met) & (!n368);
   wire [83:0] n = 84'd0;
-  wire [83:0] n376 = {n[83:80], uops_data[121:117], n[74:0]};
-  wire [83:0] n380 = {n376[83:75], 32'd0, n376[42:0]};
-  wire [83:0] n383 = {n380[83:43], xa_tag, n380[39:0]};
+  wire [83:0] n378 = {n[83:80], uops_data[121:117], n[74:0]};
+  wire [83:0] n383 = {n378[83:43], uops_data[49:47], n378[39:0]};
   wire [83:0] n387 = {n383[83:40], 1'b0, n383[38:0]};
   wire [83:0] n391 = {n387[83:39], 1'b0, n387[37:0]};
   wire [83:0] n394 = {n391[83:38], n368, n391[36:0]};
@@ -289,35 +303,43 @@ module k2g_xstage (
   wire [4:0] n401 = uops_data[126:122];
   wire [83:0] n403 = {commits, n399[82:0]};
   wire [83:0] n406 = {n403[83], commits, n403[81:0]};
-  wire [83:0] n410 = {n406[83:75], uops_data[111:80], n406[42:0]};
-  wire [83:0] n418 = {n399[83], commits, n399[81:0]};
-  wire [83:0] n425 = {commits, n399[82:0]};
-  wire [83:0] n428 = {n425[83], commits, n425[81:0]};
-  wire [83:0] n431 = {n428[83:82], commits, n428[80:0]};
-  wire [83:0] n434 = {n431[83:81], commits, n431[79:0]};
-  wire [83:0] n437 = {n434[83:75], xb_value, n434[42:0]};
-  wire [83:0] n440 = {n437[83:43], xb_tag, n437[39:0]};
-  wire [83:0] n443 = {n440[83:40], xb_ovf, n440[38:0]};
-  wire [83:0] n448 = {commits, n399[82:0]};
-  wire [83:0] n451 = {n448[83:82], commits, n448[80:0]};
-  wire [83:0] n454 = {n451[83:75], arith_result, n451[42:0]};
-  wire [83:0] n461 = {n399[83:81], commits, n399[79:0]};
-  wire [83:0] n466 = {commits, n399[82:0]};
-  wire [83:0] n474 = {n399[83:81], commits, n399[79:0]};
-  wire [83:0] n480 = {commits, n399[82:0]};
+  wire [83:0] n409 = {n406[83:82], commits, n406[80:0]};
+  wire [83:0] n412 = {n409[83:81], commits, n409[79:0]};
+  wire [83:0] n422 = {commits, n399[82:0]};
+  wire [83:0] n425 = {n422[83], commits, n422[81:0]};
+  wire [83:0] n434 = {commits, n399[82:0]};
+  wire [83:0] n437 = {n434[83], commits, n434[81:0]};
+  wire [83:0] n440 = {n437[83:82], commits, n437[80:0]};
+  wire [83:0] n443 = {n440[83:81], commits, n440[79:0]};
+  wire [83:0] n446 = {n443[83:43], xb_tag, n443[39:0]};
+  wire [83:0] n449 = {n446[83:40], xb_ovf, n446[38:0]};
+  wire [83:0] n454 = {commits, n399[82:0]};
+  wire [83:0] n457 = {n454[83:82], commits, n454[80:0]};
+  wire n461 = uops_data[56];
+  wire [83:0] n464 = {n399[83:81], commits, n399[79:0]};
+  wire n472 = uops_data[56];
+  wire [83:0] n475 = {n399[83:81], commits, n399[79:0]};
   wire [83:0] n487 = {n399[83:81], commits, n399[79:0]};
-  wire [83:0] n492 = {commits, n399[82:0]};
-  wire [83:0] n497 = {commits, n399[82:0]};
-  wire [83:0] n502 = {commits, n399[82:0]};
-  wire [83:0] n508 = {1'b0, n399[82:0]};
-  wire [83:0] n511 = {n508[83:75], access_addr, n508[42:0]};
-  reg [83:0] n518;
-  wire n525 = w[82];
+  wire [83:0] n494 = {commits, n399[82:0]};
+  wire [83:0] n497 = {n494[83], commits, n494[81:0]};
+  wire [83:0] n500 = {n497[83:82], commits, n497[80:0]};
+  wire [83:0] n503 = {n500[83:81], commits, n500[79:0]};
+  reg [83:0] n516;
+  reg [2:0] n517;
+  reg [31:0] n518;
+  wire sgn = n517[2];
+  wire [31:0] as_byte = sgn ? {{24{n518[7]}}, n518[7:0]} : {24'd0, n518[7:0]};
+  wire [31:0] as_half = sgn ? {{16{n518[15]}}, n518[15:0]} : {16'd0, n518[15:0]};
+  wire [1:0] width = n517[1:0];
+  wire [83:0] n545 = {n516[83:75], ((width == 2'd0) ? as_byte : ((width == 2'd1) ? as_half : n518)), n516[42:0]};
+  wire [83:0] n548 = {n545[83:75], access_addr, n545[42:0]};
+  wire [83:0] n552 = is_access ? {n548[83:43], access_tag, n548[39:0]} : n545;
+  wire n559 = w[82];
   wire wb_pop = wb_busy & wb_ready;
-  wire n558 = !wb_pop;
-  wire n561 = uops_xfer & ((!wb_busy) | wb_pop);
-  wire n562 = wb_pop & wb_skid_busy;
-  wire n569 = uops_xfer & (wb_busy & n558);
+  wire n592 = !wb_pop;
+  wire n595 = uops_xfer & ((!wb_busy) | wb_pop);
+  wire n596 = wb_pop & wb_skid_busy;
+  wire n603 = uops_xfer & (wb_busy & n592);
 
   always @* begin
     case (n115)
@@ -400,18 +422,43 @@ module k2g_xstage (
 
   always @* begin
     case (n401)
-      5'd1: n518 = {n410[83:43], uops_data[49:47], n410[39:0]};
-      5'd2: n518 = {n418[83:43], uops_data[49:47], n418[39:0]};
-      5'd3: n518 = {n443[83:39], xb_flg, n443[37:0]};
-      5'd8: n518 = {n454[83:40], arith_ovf, n454[38:0]};
-      5'd9: n518 = (uops_data[56] ? {n461[83:39], n283, n461[37:0]} : {n466[83:75], logic_result, n466[42:0]});
-      5'h10: n518 = (uops_data[56] ? {n474[83:39], (!xa_flg), n474[37:0]} : {n480[83:75], unary_result, n480[42:0]});
-      5'hD: n518 = {n487[83:39], cmp_result, n487[37:0]};
-      5'hA: n518 = {n492[83:75], shift_result, n492[42:0]};
-      5'hB: n518 = {n497[83:75], bext_result, n497[42:0]};
-      5'hC: n518 = {n502[83:75], bins_result, n502[42:0]};
-      5'd4, 5'd5: n518 = {n511[83:43], access_tag, n511[39:0]};
-      default: n518 = {1'b0, n399[82:0]};
+      5'd1: n516 = {n412[83:43], uops_data[49:47], n412[39:0]};
+      5'd2: n516 = {n425[83:43], uops_data[49:47], n425[39:0]};
+      5'd3: n516 = {n449[83:39], xb_flg, n449[37:0]};
+      5'd8: n516 = {n457[83:40], arith_ovf, n457[38:0]};
+      5'd9: n516 = (n461 ? {n464[83:39], n283, n464[37:0]} : {commits, n399[82:0]});
+      5'h10: n516 = (n472 ? {n475[83:39], (!xa_flg), n475[37:0]} : {commits, n399[82:0]});
+      5'hD: n516 = {n487[83:39], cmp_result, n487[37:0]};
+      5'hA: n516 = {commits, n399[82:0]};
+      5'hB: n516 = {n503[83:43], 3'd2, n503[39:0]};
+      5'hC: n516 = {commits, n399[82:0]};
+      5'd4, 5'd5: n516 = {1'b0, n399[82:0]};
+      default: n516 = {1'b0, n399[82:0]};
+    endcase
+  end
+
+  always @* begin
+    case (n401)
+      5'd1: n517 = uops_data[49:47];
+      5'd2: n517 = uops_data[49:47];
+      5'h10: n517 = (n472 ? 3'd2 : xa_tag);
+      5'hA: n517 = xa_tag;
+      default: n517 = 3'd2;
+    endcase
+  end
+
+  always @* begin
+    case (n401)
+      5'd1: n518 = uops_data[111:80];
+      5'd2: n518 = xa_value;
+      5'd3: n518 = xb_value;
+      5'd8: n518 = arith_result;
+      5'd9: n518 = (n461 ? 32'd0 : logic_result);
+      5'h10: n518 = (n472 ? 32'd0 : unary_result);
+      5'hA: n518 = shift_result;
+      5'hB: n518 = bext_result;
+      5'hC: n518 = bins_result;
+      default: n518 = 32'd0;
     endcase
   end
 
@@ -427,11 +474,11 @@ module k2g_xstage (
       wb_skid_busy <= 1'b0;
       wb_skid <= 84'd0;
     end else begin
-      w <= n518;
-      wb_busy <= (((wb_busy & n558) | n562) | n561);
-      wb_hold <= (n562 ? wb_skid : (n561 ? n518 : wb_hold));
-      wb_skid_busy <= ((wb_skid_busy & n558) | n569);
-      wb_skid <= (n569 ? n518 : wb_skid);
+      w <= n552;
+      wb_busy <= (((wb_busy & n592) | n596) | n595);
+      wb_hold <= (n596 ? wb_skid : (n595 ? n552 : wb_hold));
+      wb_skid_busy <= ((wb_skid_busy & n592) | n603);
+      wb_skid <= (n603 ? n552 : wb_skid);
     end
   end
 
@@ -448,7 +495,7 @@ module k2g_xstage (
   always @(posedge clk) begin
     if (!rst_n) begin
       for (tags_ix = 0; tags_ix < 32; tags_ix = tags_ix + 1) tags[tags_ix] <= 3'd2;
-    end else if (n525) begin
+    end else if (n559) begin
       tags[w[79:75]] <= w[42:40];
     end
   end
@@ -474,7 +521,7 @@ module k2g_xstage (
 `ifdef SIMULATION
   always @(posedge clk) begin
     if (rst_n) begin
-      if (!(((!n525) | (w[42:40] != 3'd7)))) $error("%m: the reserved tag encoding was written");
+      if (!(((!n559) | (w[42:40] != 3'd7)))) $error("%m: the reserved tag encoding was written");
     end
   end
 `endif

@@ -25,14 +25,7 @@
 -- alignment and range; and the fault priority chain that decides between them.
 --
 -- WHAT IS STILL IN k2g_core.sv. The CSP port, the widening multiply, jumps,
--- the memory stage, and `rdt_normalize`.
---
--- `rdt_normalize` is the one that is a gap rather than a plan.
--- k2g_core.sv:887 runs every writeback value through it once, after the mux,
--- so a register's bits always match what its tag claims. Neither this file nor
--- k2g_xstage_ref.sv does, so the equivalence agrees and proves nothing about
--- it -- which is what a shared omission always looks like. It is the next
--- thing to add here.
+-- and the memory stage.
 -- The first two are BLOCKED rather than skipped: both
 -- need the process to spend a second cycle without accepting a new uop, and a
 -- DDL process with no blocking operation is one state that fires every cycle
@@ -95,6 +88,19 @@ struct wb_t
   fault_valid: i1
   fault: fault_e
   fault_info: i32
+
+-- A register's bits always match what its tag claims (spec 5.1, 1.1.1), so a
+-- value written back is re-extended to its tag's width. `RDT_U32` and
+-- `RDT_S32` are the identity, which is why one normalize after the writeback
+-- mux costs nothing on the branches that do not need it (k2g_core.sv:880).
+fun rdt_normalize (v: i32, t: rdt_e, o: out i32)
+  let sgn: i1 = rdt_is_signed(t)
+  -- On one line each: a wrapped `if ... then ... else` parses as a block
+  -- rather than as an expression, which lowering then refuses.
+  let as_byte: i32 = if sgn then @concat(@rep(v[7], 24), v[7..0]) else @concat(24'd0, v[7..0])
+  let as_half: i32 = if sgn then @concat(@rep(v[15], 16), v[15..0]) else @concat(16'd0, v[15..0])
+  let width: i2 = t[1..0]
+  o = if width == 2'd0 then as_byte else if width == 2'd1 then as_half else v
 
 -- Store width comes from the source register's tag, not the opcode (spec 5.3),
 -- so the width is a function of a tag everywhere it is needed.
@@ -342,10 +348,15 @@ process k2g_xstage (uops: buffer in uop_t, wb: buffer out wb_t,
     let commits: i1 = got & cond_met & (!fault_valid)
 
     -- ---- the writeback packet -------------------------------------------
+    -- `n_raw` is the value before normalization and `n_norm` the tag to
+    -- normalize it to. They are NOT the same as `n.tag`: a shift normalizes to
+    -- the operand's tag while writing back the destination's, so the two
+    -- differ on three branches (k2g_core.sv:880).
     var n: wb_t = @zeroed()
+    var n_raw: i32 = @zeroed()
+    var n_norm: rdt_e = RDT_U32
     n.addr = uop.dst
-    n.value = 32'd0
-    n.tag = xa_tag
+    n.tag = uop.datakind
     n.overflow = 1'b0
     n.flag = 1'b0
     n.fault_valid = fault_valid
@@ -354,26 +365,38 @@ process k2g_xstage (uops: buffer in uop_t, wb: buffer out wb_t,
 
     match uop.kind
       .UOP_PUT_IMM =>
-        n.we_value = commits
-        n.we_tag = commits
-        n.value = uop.imm
-        n.tag = uop.datakind
-      .UOP_SET_TAG =>
-        n.we_tag = commits
-        n.tag = uop.datakind
-      .UOP_COPY =>
+        -- Put-constant clears both flags (k2g_core.sv:932).
         n.we_value = commits
         n.we_tag = commits
         n.we_overflow = commits
         n.we_flag = commits
-        n.value = xb_value
+        n_raw = uop.imm
+        n_norm = uop.datakind
+        n.tag = uop.datakind
+      .UOP_SET_TAG =>
+        -- RDT re-normalizes, which is what makes LD8 + RDT S8 a
+        -- sign-extending byte load (spec 5.10). It writes the VALUE as well as
+        -- the tag, which is the whole point of it.
+        n.we_value = commits
+        n.we_tag = commits
+        n_raw = xa_value
+        n_norm = uop.datakind
+        n.tag = uop.datakind
+      .UOP_COPY =>
+        -- A full move: value, tag and both flags (spec 5.2). The value is
+        -- already normalized to the tag it arrives with.
+        n.we_value = commits
+        n.we_tag = commits
+        n.we_overflow = commits
+        n.we_flag = commits
+        n_raw = xb_value
         n.tag = xb_tag
         n.overflow = xb_ovf
         n.flag = xb_flg
       .UOP_ARITH =>
         n.we_value = commits
         n.we_overflow = commits
-        n.value = arith_result
+        n_raw = arith_result
         n.overflow = arith_ovf
       .UOP_LOGIC =>
         if uop.on_flags then
@@ -381,35 +404,51 @@ process k2g_xstage (uops: buffer in uop_t, wb: buffer out wb_t,
           n.flag = flag_logic
         else
           n.we_value = commits
-          n.value = logic_result
+          n_raw = logic_result
       .UOP_UNARY =>
         if uop.on_flags then
           n.we_flag = commits
           n.flag = !xa_flg
         else
           n.we_value = commits
-          n.value = unary_result
+          n_raw = unary_result
+          n_norm = xa_tag
       .UOP_CMP =>
+        -- Comparisons write only flag_bit of the left operand (spec 5.9).
         n.we_flag = commits
         n.flag = cmp_result
       .UOP_SHIFT =>
         n.we_value = commits
-        n.value = shift_result
+        n_raw = shift_result
+        n_norm = xa_tag
       .UOP_BEXT =>
+        -- Extract writes the whole register; insert writes only the value
+        -- (spec 5.8).
         n.we_value = commits
-        n.value = bext_result
+        n.we_tag = commits
+        n.we_overflow = commits
+        n.we_flag = commits
+        n_raw = bext_result
+        n.tag = RDT_U32
       .UOP_BINS =>
         n.we_value = commits
-        n.value = bins_result
-      -- A load's address is what X produces; the value comes back from the
-      -- memory stage, which is not in this slice. The address is published so
-      -- the adder above is observable.
+        n_raw = bins_result
       .UOP_LOAD | .UOP_STORE =>
         n.we_value = 1'b0
-        n.value = access_addr
-        n.tag = access_tag
       _ =>
         n.we_value = 1'b0
+
+    -- ONE normalize, after the mux, rather than one per source. Six branches
+    -- would otherwise put a sign-extend in front of six of the mux's inputs.
+    n.value = rdt_normalize(n_raw, n_norm)
+
+    -- A load's value comes back from the memory stage, which is not in this
+    -- slice; the core writes nothing here. The address and the tag that will
+    -- decide the store width are published instead, so the adder above and the
+    -- width decision are both observable.
+    if is_access then
+      n.value = access_addr
+      n.tag = access_tag
 
     -- ---- the array write port -------------------------------------------
     -- Driven by W, not by X. That is what makes the read above see the value

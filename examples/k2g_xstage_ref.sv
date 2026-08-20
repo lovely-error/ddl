@@ -228,11 +228,17 @@ module k2g_xstage_ref
   wire logic commits = uop_valid && cond_met && !n_fault_valid;
 
   // ---- the writeback packet ----------------------------------------------
+  // k2g_core.sv:887-1045. `nw_raw`/`nw_norm` are the value before
+  // normalization and the tag to normalize it to; `nw_norm` is NOT `nw_tag`,
+  // because a shift normalizes to the operand's tag while writing back the
+  // destination's.
   logic        n_we_value, n_we_tag, n_we_overflow, n_we_flag;
   logic [4:0]  n_addr;
-  logic [31:0] n_value;
-  logic [2:0]  n_tag;
+  logic [31:0] n_value, n_raw;
+  logic [2:0]  n_tag, n_norm;
   logic        n_overflow, n_flag;
+
+  assign n_value = is_access ? access_addr : rdt_normalize(n_raw, n_norm);
 
   always_comb begin
     n_we_value    = 1'b0;
@@ -240,41 +246,49 @@ module k2g_xstage_ref
     n_we_overflow = 1'b0;
     n_we_flag     = 1'b0;
     n_addr        = uop.dst;
-    n_value       = 32'd0;
-    n_tag         = xa_tag;
+    n_raw         = 32'd0;
+    n_norm        = RDT_U32;
+    n_tag         = is_access ? access_tag : uop.datakind;
     n_overflow    = 1'b0;
     n_flag        = 1'b0;
 
     unique case (uop.kind)
       UOP_PUT_IMM: begin
-        n_we_value = commits;
-        n_we_tag   = commits;
-        n_value    = uop.imm;
-        n_tag      = uop.datakind;
-      end
-      UOP_SET_TAG: begin
-        n_we_tag = commits;
-        n_tag    = uop.datakind;
-      end
-      UOP_COPY: begin
+        // Put-constant clears both flags.
+        n_raw         = uop.imm;
+        n_norm        = uop.datakind;
+        n_tag         = uop.datakind;
         n_we_value    = commits;
         n_we_tag      = commits;
         n_we_overflow = commits;
         n_we_flag     = commits;
-        n_value       = xb_value;
+      end
+      UOP_SET_TAG: begin
+        // RDT re-normalizes, which is what makes LD8 + RDT S8 a
+        // sign-extending byte load (spec 5.10).
+        n_raw      = xa_value;
+        n_norm     = uop.datakind;
+        n_tag      = uop.datakind;
+        n_we_value = commits;
+        n_we_tag   = commits;
+      end
+      UOP_COPY: begin
+        n_raw         = xb_value;
         n_tag         = xb_tag;
         n_overflow    = xb_ovf;
         n_flag        = xb_flg;
+        n_we_value    = commits;
+        n_we_tag      = commits;
+        n_we_overflow = commits;
+        n_we_flag     = commits;
       end
       UOP_ARITH: begin
+        n_raw         = arith_result;
+        n_overflow    = arith_overflow;
         n_we_value    = commits;
         n_we_overflow = commits;
-        n_value       = arith_result;
-        n_overflow    = arith_overflow;
       end
       UOP_LOGIC: begin
-        // The FLAG prefix operates on flag bits instead of values
-        // (k2g_core.sv:981).
         if (uop.on_flags) begin
           unique case (uop.logic_op)
             LOGIC_AND: n_flag = xa_flg & xb_flg;
@@ -283,8 +297,8 @@ module k2g_xstage_ref
           endcase
           n_we_flag = commits;
         end else begin
+          n_raw      = logic_result;
           n_we_value = commits;
-          n_value    = logic_result;
         end
       end
       UOP_UNARY: begin
@@ -292,32 +306,37 @@ module k2g_xstage_ref
           n_flag    = ~xa_flg;
           n_we_flag = commits;
         end else begin
+          n_raw      = unary_result;
+          n_norm     = xa_tag;
           n_we_value = commits;
-          n_value    = unary_result;
         end
       end
       UOP_CMP: begin
-        n_we_flag = commits;
+        // Comparisons write only flag_bit of the left operand (spec 5.9).
         n_flag    = cmp_result;
+        n_we_flag = commits;
       end
       UOP_SHIFT: begin
+        n_raw      = shift_result;
+        n_norm     = xa_tag;
         n_we_value = commits;
-        n_value    = shift_result;
       end
       UOP_BEXT: begin
-        n_we_value = commits;
-        n_value    = bext_result;
+        // Extract writes the whole register; insert writes only the value
+        // (spec 5.8).
+        n_raw         = bext_result;
+        n_tag         = RDT_U32;
+        n_we_value    = commits;
+        n_we_tag      = commits;
+        n_we_overflow = commits;
+        n_we_flag     = commits;
       end
       UOP_BINS: begin
+        n_raw      = bins_result;
         n_we_value = commits;
-        n_value    = bins_result;
       end
-      UOP_LOAD, UOP_STORE: begin
-        n_we_value = 1'b0;
-        n_value    = access_addr;
-        n_tag      = access_tag;
-      end
-      default: n_we_value = 1'b0;
+      UOP_LOAD, UOP_STORE: n_we_value = 1'b0;
+      default:             n_we_value = 1'b0;
     endcase
   end
 
