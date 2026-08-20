@@ -272,6 +272,13 @@ pub enum BuiltinOp {
     /// `@unreachable`, valid only as the body of a `match` catch-all: an
     /// assertion that no value reaches that arm.
     Unreachable,
+    /// `@hold(c)` -- refuse this cycle's input while `c`.
+    ///
+    /// A statement at the top of a `loop` in a process with no states. Its
+    /// condition is evaluated BEFORE the body, so it may read `var`s (which
+    /// are their registers at that point) and nothing the body computes --
+    /// which is what keeps `ready` register-derived and rule 3 intact.
+    Hold,
     /// `if c then a else b`, desugared. Three operands: condition, then, else.
     Select,
     /// `@cast(x)`: reinterpret the bits as the type the context expects.
@@ -332,6 +339,7 @@ unsafe fn resolve_anum_span(anum_span: &AlphanumSpan) -> Result<AnumResolution, 
             "rep" => return Ok(AnumResolution::Builtin(BuiltinOp::Rep)),
             "zeroed" => return Ok(AnumResolution::Builtin(BuiltinOp::Zeroed)),
             "unreachable" => return Ok(AnumResolution::Builtin(BuiltinOp::Unreachable)),
+            "hold" => return Ok(AnumResolution::Builtin(BuiltinOp::Hold)),
             "cast" => return Ok(AnumResolution::Builtin(BuiltinOp::Cast)),
             "assert" => return Ok(AnumResolution::Builtin(BuiltinOp::Assert)),
             "fatal" => return Ok(AnumResolution::Builtin(BuiltinOp::Fatal)),

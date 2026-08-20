@@ -52,8 +52,16 @@ fn every_builtin_the_compiler_resolves_is_in_the_grammar() {
     let known = builtins_the_compiler_knows();
     assert!(known.len() >= 15, "only found {} builtins; the scrape broke", known.len());
 
+    // Searched in the `builtin` rule's own pattern, not across the whole file.
+    // A substring search over the JSON passes on prose: `hold` was reported as
+    // highlighted by the word in a comment reading "the six things a file can
+    // hold", so the guard said yes about a builtin the grammar did not have.
     let text = grammar();
-    let missing: Vec<&String> = known.iter().filter(|b| !text.contains(b.as_str())).collect();
+    let pattern = text
+        .lines()
+        .find(|l| l.contains("\"match\"") && l.contains("@("))
+        .expect("the builtin rule has an `@(...)` pattern");
+    let missing: Vec<&String> = known.iter().filter(|b| !pattern.contains(b.as_str())).collect();
     assert!(
         missing.is_empty(),
         "the grammar does not highlight: {:?}\nadd them to the `builtin` pattern in \

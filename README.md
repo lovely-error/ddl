@@ -110,7 +110,11 @@ more than one thing), and `inout` (by reference and readable: it updates the
 caller's variable, and at a module boundary becomes `x` plus `x_out`).
 
 **Pipes.** `buffer`, in and out, with `@rcv`, `@send`, `@try_rcv`,
-`@try_send`. There is one kind and it never drops anything: the producer waits.
+`@try_send`, and `@hold(c)` — which is how a process that does not block
+refuses a cycle's input while it finishes something it already owes. Its
+condition is read before the body, so it may name a `var` and nothing the body
+computes; that is what keeps `ready` register-derived. A held cycle still
+produces, or holding would mean having nowhere to put the result. There is one kind and it never drops anything: the producer waits.
 A `buffer` is two entries deep — a head and a skid — which is what makes
 `ready` a register rather than a wire through to the sink's: the producer
 learns about a stall a cycle late and the second entry is where the item it
