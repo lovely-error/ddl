@@ -28,22 +28,32 @@ module k3g_stage_ref (
     input  logic        clk,
     input  logic        rst_n,
 
-    input  logic        iops_valid,
-    output logic        iops_ready,
-    input  logic [31:0] iops_data,
+    // Two entries, a salt each way. `docs/attic/pipe.sv`'s `PipeCDC`, in one
+    // clock domain -- which is where its missing synchronizers stop mattering.
+    input  logic [1:0]  iops_wsalt,
+    output logic [1:0]  iops_rsalt,
+    input  logic [63:0] iops_data,
 
-    output logic        uops_valid,
-    input  logic        uops_ready,
-    output logic [48:0] uops_data
+    output logic [1:0]  uops_wsalt,
+    input  logic [1:0]  uops_rsalt,
+    output logic [97:0] uops_data
 );
+
+  // ---- the consuming side --------------------------------------------------
+  logic [1:0] iops_rsalt_q;
+  wire logic  in_ridx  = iops_rsalt_q[0] ^ iops_rsalt_q[1];
+  wire logic  in_empty = (iops_wsalt == iops_rsalt_q);
+  wire logic [31:0] in_item = in_ridx ? iops_data[63:32] : iops_data[31:0];
+
+  assign iops_rsalt = iops_rsalt_q;
 
   // in_item_t: epoch[2:0] kind[2:0] dst[4:0] src[4:0] imm[15:0], first field
   // in the high bits.
-  wire logic [2:0]  in_epoch = iops_data[31:29];
-  wire logic [2:0]  in_kind  = iops_data[28:26];
-  wire logic [4:0]  in_dst   = iops_data[25:21];
-  wire logic [4:0]  in_src   = iops_data[20:16];
-  wire logic [15:0] in_imm   = iops_data[15:0];
+  wire logic [2:0]  in_epoch = in_item[31:29];
+  wire logic [2:0]  in_kind  = in_item[28:26];
+  wire logic [4:0]  in_dst   = in_item[25:21];
+  wire logic [4:0]  in_src   = in_item[20:16];
+  wire logic [15:0] in_imm   = in_item[15:0];
 
   localparam logic [2:0] K_LOAD  = 3'd3;
   localparam logic [2:0] K_STORE = 3'd4;
@@ -54,47 +64,32 @@ module k3g_stage_ref (
   wire logic [48:0] next_item =
       {in_epoch, in_kind, in_dst, in_src, {16'd0, in_imm}, is_mem};
 
-  logic        head_full, skid_full;
-  logic [48:0] head, skid;
+  // ---- the producing side --------------------------------------------------
+  logic [1:0]  uops_wsalt_q;
+  logic [48:0] e0, e1;
+  wire logic   out_widx = uops_wsalt_q[0] ^ uops_wsalt_q[1];
+  // Both bits inverted is one lap ahead in gray code, which for two entries is
+  // full.
+  wire logic   out_full = (uops_wsalt_q == ~uops_rsalt);
 
-  // Both handshake outputs are register outputs. Neither looks at the other
-  // side's.
-  assign uops_valid = head_full;
-  assign uops_data  = head;
-  assign iops_ready = !skid_full;
+  assign uops_wsalt = uops_wsalt_q;
+  assign uops_data  = {e1, e0};
 
-  wire logic up_xfer = iops_valid && iops_ready;
-  wire logic pop     = head_full && uops_ready;
+  // One transfer, both ends of it. The stage takes an item only when it has
+  // somewhere to put the result -- which is the same predicate the valid/ready
+  // version wrote as `iops_ready = !skid_full`, arrived at differently.
+  wire logic xfer = !in_empty && !out_full;
 
   always_ff @(posedge clk) begin
     if (!rst_n) begin
-      head_full <= 1'b0;
-      skid_full <= 1'b0;
-      head      <= '0;
-      skid      <= '0;
-    end else begin
-      // The head drains first, pulling the skid down behind it.
-      if (pop) begin
-        if (skid_full) begin
-          head      <= skid;
-          skid_full <= 1'b0;
-        end else begin
-          head_full <= 1'b0;
-        end
-      end
-
-      // An arriving item goes to the head if the head is free or freeing this
-      // cycle, and to the skid otherwise. It can never find the skid occupied,
-      // because that is exactly what `iops_ready` refused.
-      if (up_xfer) begin
-        if (!head_full || pop) begin
-          head      <= next_item;
-          head_full <= 1'b1;
-        end else begin
-          skid      <= next_item;
-          skid_full <= 1'b1;
-        end
-      end
+      iops_rsalt_q <= 2'b00;
+      uops_wsalt_q <= 2'b00;
+      e0           <= '0;
+      e1           <= '0;
+    end else if (xfer) begin
+      if (out_widx) e1 <= next_item; else e0 <= next_item;
+      uops_wsalt_q[out_widx] <= ~uops_wsalt_q[out_widx];
+      iops_rsalt_q[in_ridx]  <= ~iops_rsalt_q[in_ridx];
     end
   end
 
