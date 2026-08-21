@@ -21,7 +21,7 @@
 use std::collections::HashSet;
 
 use crate::diag::DiagSink;
-use crate::ir::{BinOp, Binding, Env, Lowerer, Op, PortId, Reg, UnOp, ValueId};
+use crate::ir::{BinOp, Binding, Env, Lowerer, Op, PortId, Reg, SALT, UnOp, ValueId};
 use crate::ir_fsm::reads_of;
 use crate::parse::{
     BuiltinOp, PrecResExpr, PrecResInnerStmt, PrecSeqInnerStmt, anumspan_to_str,
@@ -235,23 +235,33 @@ pub fn lower_sequence(
     // -- so the second entry costs one slot and adds no latency.
     let mut regs: Vec<Reg> = Vec::new();
     let valid_base = 0usize;
-    let v_last = low.emit(Ty::BOOL, Op::RegRead((valid_base + n - 1) as u32));
-    low.name_value(v_last, format!("v{}", n - 1));
 
-    // Reserved before the stages are lowered, because `shift` reads
-    // `out_skid_busy` and the crossing registers discovered down there take
-    // their slots after it.
-    let skid_busy_slot = n;
-    let skid_slot = n + 1;
-    let mut next_slot = n + 2;
+    // THE VALIDITY CHAIN IS ONE SHORTER THAN THE PIPELINE, because the last
+    // stage's validity bit and the output slot's occupancy were always the
+    // same fact told twice. `wsalt` is that fact now. Keeping `v{n-1}` beside
+    // it would be two representations of occupancy that can disagree.
+    let chain = n - 1;
 
-    let skid_busy = low.emit(Ty::BOOL, Op::RegRead(skid_busy_slot as u32));
-    low.name_value(skid_busy, "out_skid_busy".to_string());
-    let en = low.emit(Ty::BOOL, Op::Un { op: UnOp::LogNot, arg: skid_busy });
+    // Reserved before the stages are lowered: `shift` reads `out_wsalt_q`, and
+    // the crossing registers discovered down there take their slots after it.
+    let in_rsalt_slot = chain;
+    let e0_slot = chain + 1;
+    let e1_slot = chain + 2;
+    let wsalt_slot = chain + 3;
+    let mut next_slot = chain + 4;
+
+    let in_rsalt_q = low.emit(SALT, Op::RegRead(in_rsalt_slot as u32));
+    low.name_value(in_rsalt_q, "src_rsalt_q".to_string());
+    let wsalt_q = low.emit(SALT, Op::RegRead(wsalt_slot as u32));
+    low.name_value(wsalt_q, "out_wsalt_q".to_string());
+
+    // The pipeline moves when there is somewhere for what leaves it to go.
+    let out_full = low.pipe_full(out_ix, wsalt_q);
+    let en = low.emit(Ty::BOOL, Op::Un { op: UnOp::LogNot, arg: out_full });
     low.name_value(en, "shift".to_string());
 
     // ---- stage bodies -----------------------------------------------------
-    let in_data = low.pipes[in_ix].data_value.expect("an input pipe has data");
+    let in_data = low.pipe_item_at(in_ix, in_rsalt_q);
     env.insert(recv_bind.clone(), Binding::constant(in_data, low.pipes[in_ix].ty.clone()));
 
     let defs: Vec<HashSet<String>> = plain
@@ -330,109 +340,59 @@ pub fn lower_sequence(
         return None;
     }
 
-    // The last stage's result is registered like every other boundary, so it
-    // leaves alongside the validity bit that belongs to it. Without this a
-    // one-stage sequence would offer the current input while advertising the
-    // validity of the previous one.
-    let out_slot = next_slot;
-    let out_held = low.emit(out_ty.clone(), Op::RegRead(out_slot as u32));
-    low.name_value(out_held, "out_hold".to_string());
+    // The last stage's result is pushed into an entry rather than registered
+    // into a head, which is the same flop count arranged differently: two
+    // entries and a salt, instead of head, skid, and two occupancy bits.
+    let in_empty = low.pipe_empty(in_ix, in_rsalt_q);
+    let offered = low.emit(Ty::BOOL, Op::Un { op: UnOp::LogNot, arg: in_empty });
 
-    let in_valid = low.emit(Ty::BOOL, Op::Port(low.pipes[in_ix].valid_port));
-    // The item arriving at the head this cycle comes from the stage behind it,
-    // which for a one-stage sequence is the input port itself.
-    let head_feed = if n == 1 {
-        in_valid
+    // What arrives at the output this cycle comes from the stage behind it,
+    // which for a one-stage sequence is the input itself.
+    let feed = if n == 1 {
+        offered
     } else {
         low.emit(Ty::BOOL, Op::RegRead((valid_base + n - 2) as u32))
     };
+    // Nothing leaves the last stage on a cycle the pipeline does not shift.
+    let push = low.emit(Ty::BOOL, Op::Bin { op: BinOp::And, lhs: en, rhs: feed });
+    low.name_value(push, "out_push".to_string());
 
-    // `head_valid_next` is the head's validity bit, which the chain below
-    // installs in place of the plain shift, because the head is one entry of
-    // a two-entry slot rather than an ordinary boundary.
-    let (out_next, head_valid_next) = {
-        let ready_port = low.pipes[out_ix].ready_port;
-        {
-            let skid_busy = low.emit(Ty::BOOL, Op::RegRead(skid_busy_slot as u32));
-            let skid = low.emit(out_ty.clone(), Op::RegRead(skid_slot as u32));
-            low.name_value(skid, "out_skid".to_string());
-            let out_ready = low.emit(Ty::BOOL, Op::Port(ready_port));
+    let e0 = low.emit(out_ty.clone(), Op::RegRead(e0_slot as u32));
+    low.name_value(e0, "out_e0".to_string());
+    let e1 = low.emit(out_ty.clone(), Op::RegRead(e1_slot as u32));
+    low.name_value(e1, "out_e1".to_string());
+    let widx = low.salt_idx(wsalt_q, "out_widx".to_string());
+    let not_widx = low.emit(Ty::BOOL, Op::Un { op: UnOp::LogNot, arg: widx });
+    let to_e0 = low.emit(Ty::BOOL, Op::Bin { op: BinOp::And, lhs: push, rhs: not_widx });
+    let to_e1 = low.emit(Ty::BOOL, Op::Bin { op: BinOp::And, lhs: push, rhs: widx });
+    let e0_next = low.emit(out_ty.clone(), Op::Mux { cond: to_e0, then_val: sent, else_val: e0 });
+    let e1_next = low.emit(out_ty.clone(), Op::Mux { cond: to_e1, then_val: sent, else_val: e1 });
+    let wsalt_next = low.salt_next(wsalt_q, widx, push);
 
-            let pop = low.emit(Ty::BOOL, Op::Bin { op: BinOp::And, lhs: v_last, rhs: out_ready });
-            let not_pop = low.emit(Ty::BOOL, Op::Un { op: UnOp::LogNot, arg: pop });
-            // Nothing leaves the last stage on a cycle the pipeline does not
-            // shift, so the offer is gated on `en` and not merely on validity.
-            let offer = low.emit(Ty::BOOL, Op::Bin { op: BinOp::And, lhs: en, rhs: head_feed });
+    // The input is taken on the same predicate it always was: something is
+    // offered and the pipeline is moving.
+    let take = low.emit(Ty::BOOL, Op::Bin { op: BinOp::And, lhs: offered, rhs: en });
+    low.name_value(take, "src_take".to_string());
+    let in_ridx = low.pipes[in_ix].idx.expect("the input's index was emitted with its item");
+    let in_rsalt_next = low.salt_next(in_rsalt_q, in_ridx, take);
 
-            let not_last = low.emit(Ty::BOOL, Op::Un { op: UnOp::LogNot, arg: v_last });
-            let head_free = low.emit(Ty::BOOL, Op::Bin { op: BinOp::Or, lhs: not_last, rhs: pop });
-            let to_head = low.emit(Ty::BOOL, Op::Bin { op: BinOp::And, lhs: offer, rhs: head_free });
-            let from_skid =
-                low.emit(Ty::BOOL, Op::Bin { op: BinOp::And, lhs: pop, rhs: skid_busy });
-            // The head is also where an item stays when nothing drains it.
-            let keep_head =
-                low.emit(Ty::BOOL, Op::Bin { op: BinOp::And, lhs: v_last, rhs: not_pop });
-
-            let held_or_refilled =
-                low.emit(Ty::BOOL, Op::Bin { op: BinOp::Or, lhs: keep_head, rhs: from_skid });
-            let head_valid = low.emit(
-                Ty::BOOL,
-                Op::Bin { op: BinOp::Or, lhs: held_or_refilled, rhs: to_head },
-            );
-
-            // `from_skid` and `to_head` cannot both hold: an offer needs an
-            // empty skid, and `from_skid` needs a full one.
-            let taken = low.emit(
-                out_ty.clone(),
-                Op::Mux { cond: to_head, then_val: sent, else_val: out_held },
-            );
-            let head_next = low.emit(
-                out_ty.clone(),
-                Op::Mux { cond: from_skid, then_val: skid, else_val: taken },
-            );
-
-            // The skid takes the offer only when the head is occupied and is
-            // not draining -- which is exactly `keep_head`.
-            let to_skid =
-                low.emit(Ty::BOOL, Op::Bin { op: BinOp::And, lhs: offer, rhs: keep_head });
-            let skid_keeps =
-                low.emit(Ty::BOOL, Op::Bin { op: BinOp::And, lhs: skid_busy, rhs: not_pop });
-            let skid_busy_next =
-                low.emit(Ty::BOOL, Op::Bin { op: BinOp::Or, lhs: skid_keeps, rhs: to_skid });
-            let skid_next = low.emit(
-                out_ty.clone(),
-                Op::Mux { cond: to_skid, then_val: sent, else_val: skid },
-            );
-
-            pending.push((
-                "out_skid_busy".to_string(),
-                Ty::BOOL,
-                skid_busy_next,
-                skid_busy_slot,
-            ));
-            pending.push(("out_skid".to_string(), out_ty.clone(), skid_next, skid_slot));
-
-            (head_next, head_valid)
-        }
-    };
-    pending.push(("out_hold".to_string(), out_ty.clone(), out_next, out_slot));
+    pending.push(("src_rsalt_q".to_string(), SALT, in_rsalt_next, in_rsalt_slot));
+    pending.push(("out_e0".to_string(), out_ty.clone(), e0_next, e0_slot));
+    pending.push(("out_e1".to_string(), out_ty.clone(), e1_next, e1_slot));
+    pending.push(("out_wsalt_q".to_string(), SALT, wsalt_next, wsalt_slot));
 
     // ---- the validity chain ----------------------------------------------
-    let mut valid_regs: Vec<Reg> = Vec::with_capacity(n);
-    for k in 0..n {
+    // `chain` bits, not `n`: the last stage's occupancy is `wsalt`.
+    let mut valid_regs: Vec<Reg> = Vec::with_capacity(chain);
+    for k in 0..chain {
         let cur = low.emit(Ty::BOOL, Op::RegRead((valid_base + k) as u32));
         low.name_value(cur, format!("v{}", k));
-        let is_head = k + 1 == n;
-        let next = if is_head {
-            head_valid_next
+        let feed = if k == 0 {
+            offered
         } else {
-            let feed = if k == 0 {
-                in_valid
-            } else {
-                low.emit(Ty::BOOL, Op::RegRead((valid_base + k - 1) as u32))
-            };
-            low.emit(Ty::BOOL, Op::Mux { cond: en, then_val: feed, else_val: cur })
+            low.emit(Ty::BOOL, Op::RegRead((valid_base + k - 1) as u32))
         };
+        let next = low.emit(Ty::BOOL, Op::Mux { cond: en, then_val: feed, else_val: cur });
         valid_regs.push(Reg { name: format!("v{}", k), ty: Ty::BOOL, reset: 0, next });
     }
     regs.extend(valid_regs);
@@ -443,10 +403,11 @@ pub fn lower_sequence(
         regs.push(Reg { name, ty, reset: 0, next });
     }
 
+    let pair = low.pack_entries(e0, e1, &out_ty);
     let drivers: Vec<(PortId, ValueId)> = vec![
-        (low.pipes[in_ix].ready_port, en),
-        (low.pipes[out_ix].valid_port, v_last),
-        (low.pipes[out_ix].data_port, out_held),
+        (low.pipes[in_ix].rsalt_port, in_rsalt_q),
+        (low.pipes[out_ix].wsalt_port, wsalt_q),
+        (low.pipes[out_ix].data_port, pair),
     ];
 
     if sink.has_errors() {

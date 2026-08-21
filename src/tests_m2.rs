@@ -1329,8 +1329,8 @@ fn a_process_gets_implicit_clock_and_reset() {
         PROC_IN,
         concat!("  if go then\n", "    c = c + 8'd1\n", "  let _s = @try_send(o, c)\n")
     ));
-    assert!(v.contains("input        clk"), "{}", v);
-    assert!(v.contains("input        rst_n"), "{}", v);
+    assert!(v.contains("input         clk"), "{}", v);
+    assert!(v.contains("input         rst_n"), "{}", v);
     assert!(v.contains("always @(posedge clk)"), "{}", v);
     assert!(v.contains("if (!rst_n) begin"), "sync active-low reset:\n{}", v);
 }
@@ -1373,7 +1373,7 @@ fn a_register_read_sees_earlier_assignments_in_the_same_cycle() {
         concat!("  let _s = @try_send(o, c)\n", "  if go then\n", "    c = c + 8'd1\n")
     ));
     // Sent first: what leaves is the registered value, untouched.
-    assert!(before.contains("? c : o_hold"), "{}", before);
+    assert!(before.contains("? c : o_e0"), "{}", before);
 
     let after = compile(&format!(
         "{}{}",
@@ -1381,7 +1381,7 @@ fn a_register_read_sees_earlier_assignments_in_the_same_cycle() {
         concat!("  if go then\n", "    c = c + 8'd1\n", "  let _s = @try_send(o, c)\n")
     ));
     // Sent after: what leaves is what will be clocked in.
-    assert!(!after.contains("? c : o_hold"), "{}", after);
+    assert!(!after.contains("? c : o_e0"), "{}", after);
     assert!(after.contains("(c + 8'd1)"), "{}", after);
 }
 
@@ -1531,7 +1531,7 @@ const PIPE: &str = concat!(
 );
 
 #[test]
-fn a_pipe_becomes_a_valid_ready_data_triple() {
+fn a_pipe_becomes_a_salt_pair_and_two_entries() {
     // The flattening k3g_chan.sv:60 pre-commits to for the yosys-slang risk.
     let v = compile(&format!(
         concat!(
@@ -1542,12 +1542,12 @@ fn a_pipe_becomes_a_valid_ready_data_triple() {
         ),
         PIPE
     ));
-    assert!(v.contains("input         src_valid"), "{}", v);
-    assert!(v.contains("output        src_ready"), "{}", v);
-    assert!(v.contains("input  [19:0] src_data"), "{}", v);
-    assert!(v.contains("output        dst_valid"), "{}", v);
-    assert!(v.contains("input         dst_ready"), "{}", v);
-    assert!(v.contains("output [19:0] dst_data"), "{}", v);
+    assert!(v.contains("input  [1:0]  src_wsalt"), "{}", v);
+    assert!(v.contains("output [1:0]  src_rsalt"), "{}", v);
+    assert!(v.contains("input  [39:0] src_data"), "{}", v);
+    assert!(v.contains("output [1:0]  dst_wsalt"), "{}", v);
+    assert!(v.contains("input  [1:0]  dst_rsalt"), "{}", v);
+    assert!(v.contains("output [39:0] dst_data"), "{}", v);
 }
 
 /// Channel rule 3: `valid` must not depend combinationally on `ready`. It
@@ -1566,15 +1566,16 @@ fn an_output_valid_is_a_register_output() {
         ),
         PIPE
     ));
-    assert!(v.contains("reg dst_busy;"), "{}", v);
-    assert!(v.contains("assign dst_valid = dst_busy;"), "valid is the register:\n{}", v);
-    // And `ready` is a register output too, which is the reason for the second
-    // entry: with one, the only honest answer was "I am empty, or my consumer
-    // is taking it this cycle", and that put the consumer's `ready` on a wire
-    // straight through to the producer's.
-    assert!(v.contains("wire dst_room = !dst_skid_busy;"), "{}", v);
-    assert!(v.contains("assign src_ready = dst_room;"), "{}", v);
-    assert!(!v.contains("| dst_ready"), "ready must not reach ready:\n{}", v);
+    assert!(v.contains("reg [1:0] dst_wsalt_q;"), "{}", v);
+    // EVERYTHING PUBLISHED IS A REGISTER, in both directions. Under
+    // valid/ready only `valid` had to be, and `ready` could still carry a
+    // combinational path out of the consumer. Here neither side's wires pass
+    // through the other's logic at all.
+    assert!(v.contains("assign dst_wsalt = dst_wsalt_q;"), "{}", v);
+    assert!(v.contains("assign dst_data = {dst_e1, dst_e0};"), "{}", v);
+    assert!(v.contains("assign src_rsalt = src_rsalt_q;"), "{}", v);
+    // Room is two registers compared: ours, and the consumer's.
+    assert!(v.contains("wire dst_full = dst_wsalt_q == (~dst_rsalt);"), "{}", v);
 }
 
 #[test]
@@ -1591,18 +1592,22 @@ fn a_buffer_is_two_deep() {
         ),
         PIPE
     ));
-    assert!(v.contains("reg dst_busy;"), "head:\n{}", v);
-    assert!(v.contains("reg dst_skid_busy;"), "skid:\n{}", v);
-    assert!(v.contains("reg [19:0] dst_hold;"), "{}", v);
-    assert!(v.contains("reg [19:0] dst_skid;"), "{}", v);
+    assert!(v.contains("reg [19:0] dst_e0;"), "entry 0:
+{}", v);
+    assert!(v.contains("reg [19:0] dst_e1;"), "entry 1:
+{}", v);
+    // Two entries and ONE salt. The occupancy that used to take two bits --
+    // head busy and skid busy -- is the gray distance between the salts, and
+    // the consumer owns half of it.
+    assert!(v.contains("reg [1:0] dst_wsalt_q;"), "{}", v);
     // The skid drains into the head, never straight out.
-    assert!(v.contains("dst_hold <= "), "{}", v);
-    assert!(v.contains("dst_skid"), "{}", v);
+    assert!(v.contains("dst_e0 <= "), "{}", v);
+    assert!(v.contains("dst_e1 <= "), "{}", v);
 }
 
 #[test]
 fn every_output_pipe_is_two_deep() {
-    // There is one kind of pipe now, so there is one depth: head and skid.
+    // There is one kind of pipe now, so there is one depth: two entries.
     // `stream` used to be the exception that stayed one deep, and the reason
     // it is gone is that the exception was the lossy one.
     let v = compile(concat!(
@@ -1610,8 +1615,9 @@ fn every_output_pipe_is_two_deep() {
         "  let (x, got) = @try_rcv(src)\n",
         "  let _s = @try_send(o, x)\n",
     ));
-    assert!(v.contains("reg o_busy;"), "{}", v);
-    assert!(v.contains("reg o_skid_busy;"), "{}", v);
+    assert!(v.contains("reg [31:0] o_e0;"), "{}", v);
+    assert!(v.contains("reg [31:0] o_e1;"), "{}", v);
+    assert!(v.contains("reg [1:0] o_wsalt_q;"), "{}", v);
 }
 
 #[test]
@@ -1626,14 +1632,15 @@ fn a_slot_holds_until_it_drains() {
         PIPE
     ));
     assert!(v.contains("always @(posedge clk)"), "{}", v);
-    // The head keeps its item unless the consumer takes it; when it does, the
-    // skid moves down rather than the item being lost.
-    assert!(v.contains("wire dst_pop = dst_busy & dst_ready;"), "{}", v);
-    assert!(v.contains("dst_busy <= "), "{}", v);
-    assert!(v.contains("dst_hold <= "), "{}", v);
-    // An offer can only land while the skid is free, so "push into the skid as
-    // the skid drains into the head" is unreachable by construction.
-    assert!(v.contains("dst_skid_busy <= "), "{}", v);
+    // An entry is written by the producer and read by the consumer, and
+    // neither one moves it again. There is no pop, no skid-to-head shuffle and
+    // no second copy of the payload -- a producer that only ever pushes cannot
+    // get those cases wrong.
+    assert!(v.contains("dst_e0 <= "), "{}", v);
+    assert!(v.contains("dst_e1 <= "), "{}", v);
+    assert!(v.contains("dst_wsalt_q <= "), "{}", v);
+    assert!(!v.contains("dst_pop"), "nothing pops:
+{}", v);
 }
 
 #[test]
@@ -1720,8 +1727,8 @@ fn blocking_ops_become_one_state_each() {
 #[test]
 fn a_send_states_valid_is_a_function_of_state() {
     let v = compile(ADDER);
-    assert!(v.contains("assign dst_valid = in_s2;"), "{}", v);
-    assert!(v.contains("assign src_ready = (in_s0 | in_s1);"), "{}", v);
+    assert!(v.contains("wire fire_s2 = in_s2 & (!dst_full);"), "{}", v);
+    assert!(v.contains("wire src_take = fire_s0 | fire_s1;"), "{}", v);
 }
 
 #[test]
@@ -1729,8 +1736,11 @@ fn a_value_crossing_a_state_becomes_a_register() {
     // `a` is received in state 0 and read in state 2, so it cannot be a wire.
     let v = compile(ADDER);
     assert!(v.contains("reg [31:0] a_r;"), "{}", v);
-    assert!(v.contains("a_r <= (fire_s0 ? src_data : a_r);"), "{}", v);
-    assert!(v.contains("dst_data = (a_r + b_r)"), "{}", v);
+    assert!(v.contains("a_r <= (fire_s0 ? src_item : a_r);"), "{}", v);
+    // The result is PUSHED into an entry now. A state machine had no output
+    // register at all before; it cannot stay combinational, because the
+    // consumer reads an entry on a cycle this side may already have left.
+    assert!(v.contains("dst_e0 <= "), "{}", v);
 }
 
 #[test]
@@ -1745,7 +1755,7 @@ fn a_barrier_inside_a_conditional_gets_its_own_state() {
     // Three states: the branch, the guarded receive, and the send.
     assert!(v.contains("in_s0"), "{}", v);
     assert!(v.contains("in_s2"), "{}", v);
-    assert!(v.contains("assign src_ready ="), "{}", v);
+    assert!(v.contains("wire fire_s1 ="), "{}", v);
 }
 
 #[test]
@@ -1794,8 +1804,8 @@ fn a_linear_body_with_barriers_ends_in_a_terminal_state() {
     // construction rather than by a rule written out somewhere.
     assert!(v.contains("reg [1:0] state;"), "{}", v);
     assert!(v.contains("2'd2"), "{}", v);
-    assert!(v.contains("assign src_ready = in_s0;"), "{}", v);
-    assert!(v.contains("assign dst_valid = in_s1;"), "{}", v);
+    assert!(v.contains("wire fire_s0 = in_s0 & (!src_empty);"), "{}", v);
+    assert!(v.contains("wire fire_s1 = in_s1 & (!dst_full);"), "{}", v);
 }
 
 #[test]
@@ -1873,9 +1883,12 @@ const PIPE3: &str = concat!(
 fn a_stage_cut_becomes_a_register_bank_and_a_validity_bit() {
     // `|||` was parsed and thrown away since before this work started.
     let v = compile(PIPE3);
+    // The chain is one shorter than the pipeline: the last stage's occupancy
+    // IS `out_wsalt_q`, told once rather than twice.
     assert!(v.contains("reg v0;"), "{}", v);
     assert!(v.contains("reg v1;"), "{}", v);
-    assert!(v.contains("reg v2;"), "{}", v);
+    assert!(!v.contains("reg v2;"), "the last stage's bit is the salt:
+{}", v);
     assert!(v.contains("reg [15:0] doubled_s1;"), "{}", v);
     assert!(v.contains("reg [31:0] wide_s2;"), "{}", v);
 }
@@ -1885,37 +1898,40 @@ fn the_pipeline_shifts_when_its_sink_has_a_slot() {
     let v = compile(PIPE3);
     // The slot is two entries deep, so the room it reports is the skid being
     // empty rather than the sink taking something this cycle.
-    assert!(v.contains("wire shift = !out_skid_busy;"), "{}", v);
-    assert!(v.contains("assign src_ready = shift;"), "{}", v);
+    assert!(v.contains("wire shift = !dst_full;"), "{}", v);
+    assert!(v.contains("wire src_take = "), "{}", v);
     // Rule 3: the output valid is the last validity bit, a register.
-    assert!(v.contains("assign dst_valid = v2;"), "{}", v);
+    assert!(v.contains("assign dst_wsalt = out_wsalt_q;"), "{}", v);
     assert!(v.contains("v1 <= (shift ? v0 : v1);"), "{}", v);
 }
 
 #[test]
-fn the_producer_side_ready_is_not_a_wire_to_the_sink() {
-    // What the second entry is for. With one entry `shift` was
-    // `(!v2) | dst_ready` and `src_ready` was `shift`, so `scaler` in
-    // examples/pipeline_graph.ddl put one combinational path through three
-    // modules -- rule 3 satisfied and the path there anyway.
+fn neither_side_reaches_the_other_combinationally() {
+    // What the second entry was for, and now what the split ownership is for.
+    // Under valid/ready this test could only check ONE direction -- that
+    // `ready` was not a wire to `dst_ready`. There was nothing to check the
+    // other way, because `valid` was allowed to be anything the producer liked
+    // as long as it did not read `ready`.
     //
-    // Anti-vacuous: `dst_ready` does appear in this module, in the head's own
-    // drain condition, so a test that merely grepped for it would pass on the
-    // one-entry version too.
+    // Now both published values are register reads, so the check is symmetric
+    // and mechanical: neither `assign` mentions the other side's salt.
     let v = compile(PIPE3);
-    assert!(v.contains("dst_ready"), "{}", v);
+    // Anti-vacuous: both salts ARE in the module, just not in each other's
+    // drivers.
+    assert!(v.contains("dst_rsalt"), "{}", v);
+    assert!(v.contains("src_wsalt"), "{}", v);
 
-    let ready_line = v
-        .lines()
-        .find(|l| l.contains("assign src_ready"))
-        .expect("a buffer input has a ready");
-    let feeds_ready: Vec<&str> = v
-        .lines()
-        .filter(|l| l.trim_start().starts_with("wire shift ="))
-        .collect();
-    assert!(!ready_line.contains("dst_ready"), "{}", v);
-    for l in &feeds_ready {
-        assert!(!l.contains("dst_ready"), "{}", v);
+    for line in v.lines().filter(|l| l.trim_start().starts_with("assign ")) {
+        let drives_out = line.contains("dst_wsalt") || line.contains("dst_data");
+        let drives_in = line.contains("src_rsalt");
+        if drives_out {
+            assert!(!line.contains("dst_rsalt"), "producer reads the consumer:
+{}", line);
+        }
+        if drives_in {
+            assert!(!line.contains("src_wsalt"), "consumer reads the producer:
+{}", line);
+        }
     }
 }
 
@@ -1937,8 +1953,8 @@ fn the_item_leaving_is_registered_alongside_its_validity_bit() {
     // Without this the pipeline would offer the CURRENT input while
     // advertising the validity of one three cycles older.
     let v = compile(PIPE3);
-    assert!(v.contains("reg [31:0] out_hold;"), "{}", v);
-    assert!(v.contains("assign dst_data = out_hold;"), "{}", v);
+    assert!(v.contains("reg [31:0] out_e0;"), "{}", v);
+    assert!(v.contains("assign dst_data = {out_e1, out_e0};"), "{}", v);
 }
 
 #[test]
@@ -2005,18 +2021,18 @@ fn a_memory_read_is_asynchronous() {
     // The read is a continuous assignment, not something clocked: that is the
     // shape SSRAM is inferred from, and it is what lets one cycle do
     // read -> forward -> add.
-    assert!(v.contains("= vals[cmd_data[36:32]];"), "{}", v);
+    assert!(v.contains("= vals[cmd_item[36:32]];"), "{}", v);
 }
 
 #[test]
 fn a_conditional_write_becomes_a_write_enable() {
     let v = compile(REGFILE);
-    assert!(v.contains("end else if (cmd_data[37]) begin"), "{}", v);
-    assert!(v.contains("vals[cmd_data[36:32]] <= cmd_data[31:0];"), "{}", v);
+    assert!(v.contains("end else if (cmd_item[37]) begin"), "{}", v);
+    assert!(v.contains("vals[cmd_item[36:32]] <= cmd_item[31:0];"), "{}", v);
     // The address and the data must NOT carry the enable's mux as well: the
     // write does not happen when the enable is low, so muxing them is pure
     // area. The SSA join produces those muxes and they are dropped again.
-    assert!(!v.contains("? cmd_data[36:32] :"), "{}", v);
+    assert!(!v.contains("? cmd_item[36:32] :"), "{}", v);
 }
 
 #[test]
@@ -2049,7 +2065,7 @@ fn a_memory_with_no_initialiser_has_no_reset_loop() {
     ));
     assert!(!v.contains("integer vals_ix;"), "{}", v);
     assert!(!v.contains("for ("), "{}", v);
-    assert!(v.contains("if (cmd_data[37]) begin"), "{}", v);
+    assert!(v.contains("if (cmd_item[37]) begin"), "{}", v);
 }
 
 #[test]
@@ -2132,7 +2148,7 @@ fn a_memory_in_a_blocking_process_writes_only_in_the_state_that_writes_it() {
     ));
     assert!(v.contains("reg [31:0] vals [0:31];"), "{}", v);
     assert!(v.contains("end else if (fire_s0) begin"), "{}", v);
-    assert!(v.contains("vals[5'd0] <= a_r;") || v.contains("vals[5'd0] <= src_data;"), "{}", v);
+    assert!(v.contains("vals[5'd0] <= a_r;") || v.contains("vals[5'd0] <= src_item;"), "{}", v);
 }
 
 #[test]

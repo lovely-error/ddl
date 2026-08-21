@@ -66,7 +66,7 @@ fn a_branch_on_a_just_received_value_costs_no_extra_cycle() {
     // the post scope of a barrier state buys, and without it every command
     // decode would cost a cycle it does not need.
     let v = compile(RW);
-    assert!(v.contains("wire branch_s0 = cmd_data[0];"), "{}", v);
+    assert!(v.contains("wire branch_s0 = cmd_item[0];"), "{}", v);
     assert!(!v.contains("branch_s0 = c_r"), "{}", v);
 }
 
@@ -75,7 +75,7 @@ fn only_the_arm_that_ran_writes_the_register() {
     // `cell` is assigned on the write path only, so the write path firing is
     // the only thing that may change it.
     let v = compile(RW);
-    assert!(v.contains("cell_ <= (fire_s1 ? din_data : cell_);"), "{}", v);
+    assert!(v.contains("cell_ <= (fire_s1 ? din_item : cell_);"), "{}", v);
 }
 
 #[test]
@@ -83,9 +83,9 @@ fn each_pipe_is_only_ready_in_the_state_that_waits_on_it() {
     // The bug this prevents is a process that accepts an item it is not ready
     // to handle, which shows up much later as a dropped transfer.
     let v = compile(RW);
-    assert!(v.contains("assign cmd_ready = in_s0;"), "{}", v);
-    assert!(v.contains("assign din_ready = in_s1;"), "{}", v);
-    assert!(v.contains("assign dout_valid = in_s2;"), "{}", v);
+    assert!(v.contains("wire fire_s0 = in_s0 & (!cmd_empty);"), "{}", v);
+    assert!(v.contains("wire fire_s1 = in_s1 & (!din_empty);"), "{}", v);
+    assert!(v.contains("wire fire_s2 = in_s2 & (!dout_full);"), "{}", v);
 }
 
 #[test]
@@ -136,7 +136,7 @@ fn an_empty_else_falls_straight_through() {
         "    @send(dst, 32'd0)\n",
     ));
     assert!(v.contains("module p ("), "{}", v);
-    assert!(v.contains("assign src_ready ="), "{}", v);
+    assert!(v.contains("wire fire_s1 ="), "{}", v);
 }
 
 #[test]
@@ -272,8 +272,8 @@ fn a_try_send_does_not_make_its_state_wait() {
     // state 0 fires on the INPUT's handshake alone, so a sink that is not
     // ready does not hold the state.
     let v = compile(MULW);
-    assert!(v.contains("wire fire_s0 = in_s0 & uops_valid;"), "{}", v);
-    assert!(v.contains("wire fire_s1 = in_s1 & wb_ready;"), "{}", v);
+    assert!(v.contains("wire fire_s0 = in_s0 & (!uops_empty);"), "{}", v);
+    assert!(v.contains("wire fire_s1 = in_s1 & (!wb_full);"), "{}", v);
 }
 
 #[test]
@@ -281,7 +281,7 @@ fn the_two_cycle_path_refuses_new_work_while_it_finishes() {
     // What the shape is for. `uops_ready` is the receiving state and nothing
     // else, so the second writeback cannot be overtaken by the next item.
     let v = compile(MULW);
-    assert!(v.contains("assign uops_ready = in_s0;"), "{}", v);
+    assert!(v.contains("wire fire_s0 = in_s0 & (!uops_empty);"), "{}", v);
 }
 
 #[test]
@@ -290,23 +290,33 @@ fn a_pipe_offered_in_two_states_is_valid_in_both_and_muxed_by_state() {
     // `fire_s0`, not `in_s0`: the offer is made in the cycle the item
     // arrives, so a packet computed from data that is not there is never
     // published.
-    assert!(v.contains("assign wb_valid = (in_s1 | fire_s0);"), "{}", v);
-    assert!(v.contains("assign wb_data = (in_s1 ? hi : uops_data);"), "{}", v);
+    assert!(v.contains("wire wb_take = fire_s1 | fire_s0;"), "{}", v);
+    // The value is PUSHED into an entry rather than muxed onto the wire.
+    assert!(v.contains("wb_e0 <= "), "{}", v);
+    assert!(v.contains("assign wb_data = {wb_e1, wb_e0};"), "{}", v);
 }
 
 #[test]
-fn rule_three_still_holds_with_a_non_blocking_offer() {
-    // `valid` is a function of the state register and never of `ready`. It is
-    // the property the whole language is arranged around, and a non-blocking
-    // offer is exactly where it would be easy to lose.
+fn neither_side_reaches_the_other_with_a_non_blocking_offer() {
+    // The property the whole language is arranged around, and a non-blocking
+    // offer is where it would be easiest to lose. Both published values are
+    // register reads, so the check is symmetric now: the producer's drivers
+    // must not mention the consumer's salt, or the other way round.
     let v = compile(MULW);
-    let valid = v
-        .lines()
-        .find(|l| l.contains("assign wb_valid"))
-        .expect("an output has a valid");
-    assert!(!valid.contains("wb_ready"), "{}", v);
-    // Anti-vacuous: `wb_ready` is in the module, just not on that line.
-    assert!(v.contains("wb_ready"), "{}", v);
+    // Anti-vacuous: both salts are in the module, just not in each other.
+    assert!(v.contains("wb_rsalt"), "{}", v);
+    assert!(v.contains("uops_wsalt"), "{}", v);
+
+    for line in v.lines().filter(|l| l.trim_start().starts_with("assign ")) {
+        if line.contains("wb_wsalt") || line.contains("wb_data") {
+            assert!(!line.contains("wb_rsalt"), "producer reads the consumer:
+{}", line);
+        }
+        if line.contains("uops_rsalt") {
+            assert!(!line.contains("uops_wsalt"), "consumer reads the producer:
+{}", line);
+        }
+    }
 }
 
 #[test]
@@ -314,7 +324,7 @@ fn the_branch_still_costs_no_extra_cycle() {
     // The offer did not push the branch into a state of its own: it is decided
     // in the cycle the item arrives, as fsm_branch's other tests require.
     let v = compile(MULW);
-    assert!(v.contains("wire branch_s0 = uops_data[0];"), "{}", v);
+    assert!(v.contains("wire branch_s0 = uops_item[0];"), "{}", v);
     assert!(v.contains("state <= ((fire_s0 | fire_s1) ? (fire_s0 ? branch_s0"), "{}", v);
 }
 
@@ -339,8 +349,8 @@ fn a_try_rcv_samples_without_waiting() {
 ",
     ));
     // The send is what the state waits on; the sample is not.
-    assert!(v.contains("& dst_ready"), "{}", v);
-    assert!(v.contains("assign src_ready"), "{}", v);
+    assert!(v.contains("!dst_full"), "{}", v);
+    assert!(v.contains("wire fire_s0"), "{}", v);
 }
 
 #[test]
@@ -357,5 +367,5 @@ fn a_body_with_no_blocking_operation_still_takes_them() {
 ",
     ));
     assert!(!v.contains("state"), "{}", v);
-    assert!(v.contains("assign o_valid = o_busy;"), "{}", v);
+    assert!(v.contains("assign o_wsalt = o_wsalt_q;"), "{}", v);
 }

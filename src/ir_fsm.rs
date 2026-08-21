@@ -28,7 +28,7 @@
 use std::collections::HashSet;
 
 use crate::diag::DiagSink;
-use crate::ir::{BinOp, Binding, CmpOp, Env, Lowerer, Op, Reg, ValueId};
+use crate::ir::{BinOp, Binding, CmpOp, Env, Lowerer, Op, Reg, SALT, UnOp, ValueId};
 use crate::parse::{BuiltinOp, PrecResExpr, PrecResInnerStmt, anumspan_to_str};
 use crate::ty::Ty;
 
@@ -841,6 +841,58 @@ pub fn lower_blocking(
     let state = low.emit(st_ty.clone(), Op::RegRead(st_slot as u32));
     low.name_value(state, "state".to_string());
 
+    // PIPE REGISTERS, reserved between the state register and the crossing
+    // registers. A consumer holds two bits; a producer holds two entries and
+    // two bits -- which for a state machine is new. Its outputs used to be
+    // combinational off the state (`dst_valid = in_s2`, `dst_data = a_r + b_r`),
+    // and under salt they cannot be: the consumer reads an entry on a cycle
+    // this side may already have left.
+    let pipe_base = st_slot + 1;
+    let mut pipe_regs: Vec<(String, Ty, usize)> = Vec::new();
+    for ix in 0..low.pipes.len() {
+        let name = low.pipes[ix].name.clone();
+        let ty = low.pipes[ix].ty.clone();
+        let slot = pipe_base + pipe_regs.len();
+        if low.pipes[ix].is_input {
+            pipe_regs.push((format!("{}_rsalt_q", name), SALT, slot));
+            low.pipes[ix].salt_reg = Some(slot);
+        } else {
+            pipe_regs.push((format!("{}_e0", name), ty.clone(), slot));
+            pipe_regs.push((format!("{}_e1", name), ty, slot + 1));
+            pipe_regs.push((format!("{}_wsalt_q", name), SALT, slot + 2));
+            low.pipes[ix].slot_reg = Some(slot);
+        }
+    }
+    let pipe_slots = pipe_regs.len();
+
+    // Emitted once per pipe and reused: `empty`/`full` and the entry index are
+    // pure functions of two registers, so recomputing them per state only
+    // multiplies identical wires in the output.
+    for ix in 0..low.pipes.len() {
+        let is_input = low.pipes[ix].is_input;
+        let slot = if is_input {
+            low.pipes[ix].salt_reg.expect("an input pipe has an rsalt register")
+        } else {
+            low.pipes[ix].slot_reg.expect("an output pipe has a slot") + 2
+        };
+        let name = low.pipes[ix].name.clone();
+        let own = low.emit(SALT, Op::RegRead(slot as u32));
+        let blocked =
+            if is_input { low.pipe_empty(ix, own) } else { low.pipe_full(ix, own) };
+        let movable = low.emit(Ty::BOOL, Op::Un { op: UnOp::LogNot, arg: blocked });
+        low.pipes[ix].movable = Some(movable);
+        if is_input {
+            // `pipe_item_at` emits the index on its way to the entry and
+            // records it, so asking for one separately would name a second
+            // wire for the same XOR.
+            let item = low.pipe_item_at(ix, own);
+            low.pipes[ix].item = Some(item);
+        } else {
+            let idx = low.salt_idx(own, format!("{}_widx", name));
+            low.pipes[ix].idx = Some(idx);
+        }
+    }
+
     let mut in_st: Vec<ValueId> = Vec::with_capacity(n_states);
     for k in 0..n_states {
         let c = in_state(&mut low, state, &st_ty, k as u128);
@@ -864,10 +916,10 @@ pub fn lower_blocking(
                 continue;
             }
         };
-        let pipe = low.pipes[barrier.pipe_ix].clone();
-        // The other side of the handshake: what says the transfer can happen.
-        let other = if barrier.is_recv { pipe.valid_port } else { pipe.ready_port };
-        let handshake = low.emit(Ty::BOOL, Op::Port(other));
+        let ix = barrier.pipe_ix;
+        // What says the transfer can happen: something to take, or somewhere
+        // to put one. Both are two registers compared -- ours and theirs.
+        let handshake = low.pipes[ix].movable.expect("computed once above");
         let fire = low.emit(Ty::BOOL, Op::Bin { op: BinOp::And, lhs: in_st[k], rhs: handshake });
         low.name_value(fire, format!("fire_s{}", k));
         fires.push(fire);
@@ -877,13 +929,17 @@ pub fn lower_blocking(
     // lowered: a non-blocking operation contributes to them too, and which
     // states did one is not known until their statements have run.
     let mut drivers: Vec<(crate::ir::PortId, ValueId)> = Vec::new();
+    // Filled as the drivers are built; installed into `generated` in slot
+    // order once every state has been lowered.
+    let mut pipe_next: Vec<(usize, ValueId)> = Vec::new();
+    let mut pushes: Vec<(usize, ValueId, ValueId)> = Vec::new();
 
     // Allocate a register for every binding that crosses a state, before any
     // state runs, so another one can read the registered copy.
     let cross = crossing(&states_sched);
     let mut slot_of: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     let mut cross_order: Vec<String> = Vec::new();
-    let mut next_slot = st_slot + 1;
+    let mut next_slot = pipe_base + pipe_slots;
     for set in &cross {
         let mut names: Vec<String> = set.iter().cloned().collect();
         names.sort();
@@ -955,8 +1011,7 @@ pub fn lower_blocking(
         // rather than per cycle for the same reason.
         for ix in 0..low.pipes.len() {
             let pipe = low.pipes[ix].clone();
-            let other = if pipe.is_input { pipe.valid_port } else { pipe.ready_port };
-            let handshake = low.emit(Ty::BOOL, Op::Port(other));
+            let handshake = pipe.movable.expect("computed once above");
             let f = low.emit(Ty::BOOL, Op::Bin { op: BinOp::And, lhs: in_st[k], rhs: handshake });
             low.name_value_safe(f, format!("{}_xfer_s{}", pipe.name, k));
             low.pipes[ix].fired = Some(f);
@@ -1004,7 +1059,7 @@ pub fn lower_blocking(
         if let Some(bind) = st.barrier.as_ref().and_then(|b| b.bind.as_ref()) {
             let pipe = low.pipes[st.barrier.as_ref().expect("a bind implies a barrier").pipe_ix]
                 .clone();
-            let data = pipe.data_value.expect("an input pipe has a data value");
+            let data = pipe.item.expect("an input pipe has an item");
             env.insert(bind.clone(), Binding::constant(data, pipe.ty.clone()));
         }
         // Statements between the barrier and a branch. They see what the
@@ -1134,11 +1189,17 @@ pub fn lower_blocking(
     // A state asks for a pipe's handshake if it waits on it (a barrier) or if
     // it touched it without waiting. The two differ in `fires`, not here.
     for (ix, uses) in nonblocking.iter().enumerate() {
+        // `fires[k]`, not `in_st[k]`. Under valid/ready a barrier state
+        // ASSERTED and waited: `valid = in_st[k]`, and the transfer was
+        // `valid & ready` decided at the other end. There is no asserting
+        // here -- the toggle IS the transfer -- so a state that is merely
+        // sitting in a stalled send must not push, and a state waiting on an
+        // empty pipe must not walk its read index forward.
         let mut asks: Vec<ValueId> = states_sched
             .iter()
             .enumerate()
             .filter(|(_, s)| s.barrier.as_ref().is_some_and(|b| b.pipe_ix == ix))
-            .map(|(k, _)| in_st[k])
+            .map(|(k, _)| fires[k])
             .collect();
         for (k, guard) in uses {
             // FIRING, not merely being in the state. A state with a barrier
@@ -1159,10 +1220,25 @@ pub fn lower_blocking(
         }
         let active = any_of(&mut low, &asks);
         let pipe = low.pipes[ix].clone();
+        low.name_value_fresh(active, format!("{}_take", pipe.name));
         if pipe.is_input {
-            drivers.push((pipe.ready_port, active));
+            // Taking IS toggling. The consumer publishes its own bits and
+            // nothing else.
+            let slot = pipe.salt_reg.expect("an input pipe has an rsalt register");
+            let rsalt_q = low.emit(SALT, Op::RegRead(slot as u32));
+            let ridx = pipe.idx.expect("computed once above");
+            let next = low.salt_next(rsalt_q, ridx, active);
+            pipe_next.push((slot, next));
+            drivers.push((pipe.rsalt_port, rsalt_q));
         } else {
-            drivers.push((pipe.valid_port, active));
+            // The push is the transfer; the salt is what says so.
+            let base = pipe.slot_reg.expect("an output pipe has a slot");
+            let wsalt_q = low.emit(SALT, Op::RegRead((base + 2) as u32));
+            let widx = pipe.idx.expect("computed once above");
+            let next = low.salt_next(wsalt_q, widx, active);
+            pipe_next.push((base + 2, next));
+            drivers.push((pipe.wsalt_port, wsalt_q));
+            pushes.push((ix, active, widx));
         }
     }
 
@@ -1192,7 +1268,31 @@ pub fn lower_blocking(
                 Op::Mux { cond: in_st[*k], then_val: *v, else_val: acc },
             );
         }
-        drivers.push((pipe.data_port, acc));
+
+        // `acc` used to BE the data port -- a mux over states of combinational
+        // values, with no register anywhere. Under salt it is what gets pushed
+        // into an entry, because the consumer reads that entry on a cycle this
+        // side may already have left.
+        let (push, widx) = pushes
+            .iter()
+            .find(|(p, _, _)| *p == ix)
+            .map(|(_, a, w)| (*a, *w))
+            .expect("an output pipe was driven above");
+        let base = pipe.slot_reg.expect("an output pipe has a slot");
+        let e0 = low.emit(pipe.ty.clone(), Op::RegRead(base as u32));
+        let e1 = low.emit(pipe.ty.clone(), Op::RegRead((base + 1) as u32));
+        let not_widx = low.emit(Ty::BOOL, Op::Un { op: UnOp::LogNot, arg: widx });
+        let to_e0 = low.emit(Ty::BOOL, Op::Bin { op: BinOp::And, lhs: push, rhs: not_widx });
+        let to_e1 = low.emit(Ty::BOOL, Op::Bin { op: BinOp::And, lhs: push, rhs: widx });
+        let e0_next =
+            low.emit(pipe.ty.clone(), Op::Mux { cond: to_e0, then_val: acc, else_val: e0 });
+        let e1_next =
+            low.emit(pipe.ty.clone(), Op::Mux { cond: to_e1, then_val: acc, else_val: e1 });
+        pipe_next.push((base, e0_next));
+        pipe_next.push((base + 1, e1_next));
+
+        let pair = low.pack_entries(e0, e1, &pipe.ty);
+        drivers.push((pipe.data_port, pair));
     }
 
     // One write port, whichever state drove it. The enable is that state's
@@ -1282,6 +1382,15 @@ pub fn lower_blocking(
         Op::Mux { cond: any_fire, then_val: next_state, else_val: state },
     );
     generated.push(Reg { name: "state".to_string(), ty: st_ty, reset: 0, next: held });
+
+    // In slot order, immediately after the state register -- which is where
+    // they were reserved.
+    pipe_next.sort_by_key(|(slot, _)| *slot);
+    debug_assert_eq!(pipe_next.len(), pipe_slots, "every pipe register has a next value");
+    for ((name, ty, slot), (nslot, next)) in pipe_regs.iter().zip(pipe_next.iter()) {
+        debug_assert_eq!(slot, nslot, "pipe register slots line up with their reservations");
+        generated.push(Reg { name: name.clone(), ty: ty.clone(), reset: 0, next: *next });
+    }
 
     for name in &cross_order {
         let writes: Vec<(usize, ValueId, Ty)> = cross_writes

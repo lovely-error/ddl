@@ -8,58 +8,59 @@
 module mul3 (
     input         clk,
     input         rst_n,
-    input         src_valid,
-    output        src_ready,
-    input  [15:0] src_data,
-    output        dst_valid,
-    input         dst_ready,
-    output [31:0] dst_data
+    input  [1:0]  src_wsalt,
+    output [1:0]  src_rsalt,
+    input  [31:0] src_data,
+    output [1:0]  dst_wsalt,
+    input  [1:0]  dst_rsalt,
+    output [63:0] dst_data
 );
 
   reg v0;
   reg v1;
-  reg v2;
-  reg out_skid_busy;
-  reg [31:0] out_skid;
+  reg [1:0] src_rsalt_q;
+  reg [31:0] out_e0;
+  reg [31:0] out_e1;
+  reg [1:0] out_wsalt_q;
   reg [15:0] doubled_s1;
   reg [31:0] wide_s2;
-  reg [31:0] out_hold;
 
-  wire shift = !out_skid_busy;
-  wire [15:0] doubled = src_data + src_data;
+  wire dst_full = out_wsalt_q == (~dst_rsalt);
+  wire shift = !dst_full;
+  wire src_ridx = src_rsalt_q[0] ^ src_rsalt_q[1];
+  wire [15:0] src_item = src_ridx ? src_data[31:16] : src_data[15:0];
+  wire [15:0] doubled = src_item + src_item;
   wire [31:0] wide = {{16{1'b0}}, doubled_s1};
   wire [31:0] scaled = wide_s2 + wide_s2;
-  wire n19 = v2 & dst_ready;
-  wire n20 = !n19;
-  wire n21 = shift & v1;
-  wire n24 = n21 & ((!v2) | n19);
-  wire n25 = n19 & out_skid_busy;
-  wire n26 = v2 & n20;
-  wire n31 = n21 & n26;
+  wire src_empty = src_wsalt == src_rsalt_q;
+  wire n24 = !src_empty;
+  wire out_push = shift & v1;
+  wire out_widx = out_wsalt_q[0] ^ out_wsalt_q[1];
+  wire src_take = n24 & shift;
 
-  assign src_ready = shift;
-  assign dst_valid = v2;
-  assign dst_data = out_hold;
+  assign src_rsalt = src_rsalt_q;
+  assign dst_wsalt = out_wsalt_q;
+  assign dst_data = {out_e1, out_e0};
 
   always @(posedge clk) begin
     if (!rst_n) begin
       v0 <= 1'b0;
       v1 <= 1'b0;
-      v2 <= 1'b0;
-      out_skid_busy <= 1'b0;
-      out_skid <= 32'd0;
+      src_rsalt_q <= 2'd0;
+      out_e0 <= 32'd0;
+      out_e1 <= 32'd0;
+      out_wsalt_q <= 2'd0;
       doubled_s1 <= 16'd0;
       wide_s2 <= 32'd0;
-      out_hold <= 32'd0;
     end else begin
-      v0 <= (shift ? src_valid : v0);
+      v0 <= (shift ? n24 : v0);
       v1 <= (shift ? v0 : v1);
-      v2 <= ((n26 | n25) | n24);
-      out_skid_busy <= ((out_skid_busy & n20) | n31);
-      out_skid <= (n31 ? scaled : out_skid);
+      src_rsalt_q <= (src_take ? (src_rsalt_q ^ (src_ridx ? 2'd2 : 2'd1)) : src_rsalt_q);
+      out_e0 <= ((out_push & (!out_widx)) ? scaled : out_e0);
+      out_e1 <= ((out_push & out_widx) ? scaled : out_e1);
+      out_wsalt_q <= (out_push ? (out_wsalt_q ^ (out_widx ? 2'd2 : 2'd1)) : out_wsalt_q);
       doubled_s1 <= (shift ? doubled : doubled_s1);
       wide_s2 <= (shift ? wide : wide_s2);
-      out_hold <= (n25 ? out_skid : (n24 ? scaled : out_hold));
     end
   end
 

@@ -138,8 +138,10 @@ fn an_array_travels_through_a_pipe() {
         "    let c = @rcv(a)\n",
         "    @send(b, c[0])\n",
     ));
-    assert!(v.contains("input [127:0] a_data"), "{}", v);
-    assert!(v.contains("output [31:0] b_data"), "{}", v);
+    // Two entries on the wire, so the port is twice the payload: 4 x i32 is
+    // 128 bits, and a pipe of them is 256.
+    assert!(v.contains("input [255:0] a_data"), "{}", v);
+    assert!(v.contains("output [63:0] b_data"), "{}", v);
 }
 
 #[test]

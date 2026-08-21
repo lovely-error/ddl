@@ -88,8 +88,8 @@ fn a_constant_parameter_can_be_the_bound() {
         "      acc = acc + @zext(v[i], 8)\n",
         "    @try_send(dst, acc)\n",
     ));
-    assert!(v.contains("src_data[3]"), "{}", v);
-    assert!(!v.contains("src_data[4]"), "{}", v);
+    assert!(v.contains("src_item[3]"), "{}", v);
+    assert!(!v.contains("src_item[4]"), "{}", v);
 }
 
 #[test]

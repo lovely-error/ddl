@@ -50,8 +50,9 @@ fn present_is_the_offer_and_got_is_the_transfer() {
     // is not accepting they disagree, and that disagreement is what lets a
     // peek see an item before deciding to take it.
     let v = compile(GATE);
-    assert!(v.contains("wire wanted = src_valid & (!src_data[0]);"), "{}", v);
-    assert!(v.contains("wire src_xfer = src_valid & dst_room;"), "{}", v);
+    assert!(v.contains("wire wanted = src_present & (!src_item[0]);"), "{}", v);
+    assert!(v.contains("wire src_take = "), "{}", v);
+    assert!(v.contains("!src_empty"), "{}", v);
 }
 
 #[test]
@@ -59,7 +60,8 @@ fn a_peek_does_not_spend_the_cycles_one_operation() {
     // GATE peeks and then receives from the same pipe in the same cycle. If
     // the peek counted, this would be "received from more than once".
     let v = compile(GATE);
-    assert!(v.contains("assign src_ready = dst_room;"), "{}", v);
+    assert!(v.contains("wire src_take = "), "{}", v);
+    assert!(v.contains("!src_empty"), "{}", v);
 }
 
 #[test]
@@ -71,7 +73,7 @@ fn two_peeks_are_fine() {
         "    let (b, p2) = @peek(src)\n",
         "    let _s = @try_send(dst, p1 & p2 & (a == b))\n",
     ));
-    assert!(v.contains("assign src_ready"), "{}", v);
+    assert!(v.contains("assign src_rsalt"), "{}", v);
 }
 
 #[test]
@@ -83,7 +85,8 @@ fn a_drop_takes_the_item() {
         "    let _s = @try_send(dst, took)\n",
     ));
     // `took` is the transfer, the same answer `@try_rcv` gives.
-    assert!(v.contains("wire src_xfer = src_valid & dst_room;"), "{}", v);
+    assert!(v.contains("wire src_take = "), "{}", v);
+    assert!(v.contains("!src_empty"), "{}", v);
 }
 
 #[test]
@@ -96,7 +99,7 @@ fn a_bare_drop_discards_the_answer_too() {
         "    n = n + 32'd1\n",
         "    let _s = @try_send(dst, n)\n",
     ));
-    assert!(v.contains("assign src_ready"), "{}", v);
+    assert!(v.contains("assign src_rsalt"), "{}", v);
 }
 
 #[test]
@@ -154,11 +157,12 @@ fn a_drop_in_a_state_machine_consumes_in_that_state() {
     ));
     assert!(v.contains("reg state"), "{}", v);
     // The dropping state claims `src`, and only while the branch holds.
-    let ready = v.lines().find(|l| l.contains("assign src_ready")).expect("a ready");
     // Only in the cycle the `ctl` receive fires, and only on the branch that
-    // asked for it.
-    assert!(ready.contains("fire_s0"), "{}", v);
-    assert!(ready.contains("ctl_data") || ready.contains("branch_s0"), "{}", v);
+    // asked for it. `src_take` is the toggle enable -- the salt protocol's
+    // whole answer to "am I claiming this pipe".
+    let take = v.lines().find(|l| l.contains("wire src_take")).expect("a take");
+    assert!(take.contains("fire_s0"), "{}", v);
+    assert!(take.contains("ctl_item") || take.contains("branch_s0"), "{}", v);
 }
 
 #[test]
@@ -226,8 +230,9 @@ fn a_guarded_receive_takes_ready_down_on_the_other_branch() {
     // `@drop` is written on IS the condition, so a cycle spent finishing
     // something declines its input by construction.
     let v = compile(WIDEN);
-    assert!(v.contains("wire n18 = !pending;"), "{}", v);
-    assert!(v.contains("assign src_ready = (dst_room & n18);"), "{}", v);
+    
+    assert!(v.contains("wire src_take = src_xfer & n33;"), "{}", v);
+    assert!(v.contains("wire n33 = !pending;"), "{}", v);
 }
 
 #[test]
@@ -236,7 +241,7 @@ fn an_offer_is_made_on_its_own_branch_and_no_other() {
     // an input having transferred, and a cycle that declined its input to
     // finish a result therefore had nowhere to put it.
     let v = compile(WIDEN);
-    assert!(v.contains("assign dst_valid = dst_busy;"), "{}", v);
+    assert!(v.contains("assign dst_wsalt = dst_wsalt_q;"), "{}", v);
     // Anti-vacuous: an UNguarded send offers whenever it is reached, so the
     // guard above is doing something rather than being the default.
     let plain = compile(concat!(
@@ -245,7 +250,7 @@ fn an_offer_is_made_on_its_own_branch_and_no_other() {
         "    let (x, got) = @try_rcv(src)\n",
         "    let _s = @try_send(dst, x)\n",
     ));
-    assert!(plain.contains("assign src_ready = dst_room;"), "{}", plain);
+    assert!(plain.contains("wire src_take = (!src_empty) & dst_push;"), "{}", plain);
 }
 
 #[test]
@@ -263,6 +268,6 @@ fn got_agrees_with_the_narrowed_ready() {
         "      took = @drop(src)\n",
         "    let _s = @try_send(dst, took)\n",
     ));
-    assert!(v.contains("src_ready"), "{}", v);
+    assert!(v.contains("src_rsalt"), "{}", v);
     assert!(v.contains("arm"), "{}", v);
 }

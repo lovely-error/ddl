@@ -67,9 +67,10 @@ fn a_graph_instantiates_and_wires() {
     assert!(v.contains("widen u_widen ("), "{}", v);
 
     // Every internal pipe is three wires, and the payload keeps its width.
-    assert!(v.contains("wire once_valid;"), "{}", v);
-    assert!(v.contains("wire once_ready;"), "{}", v);
-    assert!(v.contains("wire [15:0] once_data;"), "{}", v);
+    assert!(v.contains("wire [1:0] once_wsalt;"), "{}", v);
+    assert!(v.contains("wire [1:0] once_rsalt;"), "{}", v);
+    // Two entries on the wire, so the net is twice the payload.
+    assert!(v.contains("wire [31:0] once_data;"), "{}", v);
 
     // Connected by name, and the second instance reads what the first drove.
     assert!(v.contains(".dst_data  (once_data)"), "{}", v);
@@ -105,11 +106,11 @@ fn a_graph_port_connects_straight_through() {
             "  dbl(src, dst)\n",
         )
     ));
-    assert!(v.contains("input         src_valid,"), "{}", v);
-    assert!(v.contains("output        src_ready,"), "{}", v);
-    assert!(v.contains("output        dst_valid,"), "{}", v);
-    assert!(v.contains(".src_valid (src_valid)"), "{}", v);
-    assert!(v.contains(".dst_valid (dst_valid)"), "{}", v);
+    assert!(v.contains("input  [1:0]  src_wsalt,"), "{}", v);
+    assert!(v.contains("output [1:0]  src_rsalt,"), "{}", v);
+    assert!(v.contains("output [1:0]  dst_wsalt,"), "{}", v);
+    assert!(v.contains(".src_wsalt (src_wsalt)"), "{}", v);
+    assert!(v.contains(".dst_wsalt (dst_wsalt)"), "{}", v);
 
     // A graph has no logic of its own: wires and instances, nothing else.
     let graph = v.split("module g (").nth(1).expect("the graph module");

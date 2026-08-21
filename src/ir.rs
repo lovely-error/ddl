@@ -460,28 +460,50 @@ pub type Env = BTreeMap<String, Binding>;
 
 /// A pipe parameter, and what the body did with it.
 ///
-/// The compiler writes the handshake, not the user. That is the whole point:
-/// channel rule 3 -- `valid` must not depend combinationally on `ready` -- then
-/// holds BY CONSTRUCTION, because an output's `valid` is a register output and
-/// nothing else can be wired to it. k2g_chan.sv records the bug that rule
-/// exists to prevent: routing a stall back into `cp_valid` closed a loop
-/// through stall -> decode -> CSP request -> stall.
+/// The compiler writes the protocol, not the user, and the protocol is two
+/// entries with a salt bit pair on each side -- `docs/attic/pipe.sv`'s
+/// `PipeCDC` in KAMASUTRA2G, which that repo kept for exactly this idea.
+///
+/// Each side reads only the other's REGISTERED bits, so there is no
+/// combinational path across a module boundary in either direction. Channel
+/// rule 3 -- `valid` must not depend combinationally on `ready` -- stops being
+/// a rule to keep and becomes a shape that cannot be written. k2g_chan.sv
+/// records the bug it existed to prevent: routing a stall back into `cp_valid`
+/// closed a loop through stall -> decode -> CSP request -> stall.
+///
+/// The salt pair is a gray-coded pointer, which is why the vector compares
+/// below are exact rather than approximate: `wsalt` runs 00, 01, 11, 10, the
+/// 2-bit gray code of 0..3, so it is `k2g_cdc_fifo`'s `wgray` at DEPTH 2.
 #[derive(Debug, Clone)]
 pub struct PipeInfo {
     pub name: String,
+    /// The PAYLOAD type. `data_port` is two of these; everything that
+    /// type-checks a send or a receive reads this one.
     pub ty: Ty,
     pub is_input: bool,
-    /// `<name>_valid`, `<name>_ready`, `<name>_data` in that order.
-    pub valid_port: PortId,
-    pub ready_port: PortId,
+    /// `<name>_wsalt` (2 bits, producer's), `<name>_rsalt` (2 bits,
+    /// consumer's), `<name>_data` (two entries, entry 0 in the low half).
+    pub wsalt_port: PortId,
+    pub rsalt_port: PortId,
     pub data_port: PortId,
-    /// The value read from the data port; inputs only.
+    /// The raw two-entry read of the data port; inputs only.
     pub data_value: Option<ValueId>,
+    /// `data[ridx]` -- the entry this side is owed. Inputs only, and set by
+    /// each lowering once its `rsalt` register exists, which is why it cannot
+    /// be `data_value`.
+    pub item: Option<ValueId>,
+    /// Inputs: the `rsalt` register. Outputs: unused (see `slot_reg`).
+    pub salt_reg: Option<usize>,
+    /// The entry index this side is at, emitted once and reused.
+    pub idx: Option<ValueId>,
+    /// Can an item move: `!empty` at a consumer, `!full` at a producer.
+    /// Emitted once, from registers on both sides.
+    pub movable: Option<ValueId>,
     /// Set once the body has done a `@try_rcv` / `@try_send` on this pipe.
     pub used: bool,
     /// What `@try_send` offered; outputs only.
     pub sent: Option<ValueId>,
-    /// The branch the `@try_send` sat on, if it was not at the top level.
+    /// The branch this pipe's operation sat on, if not at the top level.
     ///
     /// A decoder does not produce a micro-op every cycle. Without this an
     /// offer written inside an `if` would leak out of it -- `sent` lives on
@@ -489,13 +511,16 @@ pub struct PipeInfo {
     /// everything else never sees it.
     pub send_guard: Option<ValueId>,
     /// Inputs: this pipe transferred this cycle. Outputs: the slot can take a
-    /// new item. Both are computed before the body, from registers and the
-    /// `ready` inputs only.
+    /// new item. Both are computed before the body, from this side's registers
+    /// and the other side's salt -- which is also a register.
     pub fired: Option<ValueId>,
-    /// Outputs only: the first of the four registers backing the slot --
-    /// head valid/data, then skid valid/data.
+    /// Outputs only: the first of the three registers backing the slot --
+    /// entry 0, entry 1, then the `wsalt` register.
     pub slot_reg: Option<usize>,
 }
+
+/// A salt: two bits, gray-coded, counting 0..3 over a buffer that holds two.
+pub(crate) const SALT: Ty = Ty::UInt(2);
 
 /// One narrowing of the path an assertion sits on.
 #[derive(Debug, Clone)]
@@ -684,11 +709,12 @@ impl<'a> Lowerer<'a> {
                 low.ports.push(Port { name: format!("{}_{}", name, suffix), dir, ty: t });
                 id
             };
-            let valid_port = mk(self, "valid", vd, Ty::BOOL);
-            let ready_port = mk(self, "ready", rd, Ty::BOOL);
-            let data_port = mk(self, "data", dd, ty.clone());
+            let wsalt_port = mk(self, "wsalt", vd, SALT);
+            let rsalt_port = mk(self, "rsalt", rd, SALT);
+            let pair = Ty::Array(Box::new(ty.clone()), 2);
+            let data_port = mk(self, "data", dd, pair.clone());
             let data_value = if is_input {
-                let v = self.emit(ty.clone(), Op::Port(data_port));
+                let v = self.emit(pair, Op::Port(data_port));
                 self.values[v.0 as usize].name = Some(format!("{}_data", name));
                 Some(v)
             } else {
@@ -698,10 +724,14 @@ impl<'a> Lowerer<'a> {
                 name,
                 ty,
                 is_input,
-                valid_port,
-                ready_port,
+                wsalt_port,
+                rsalt_port,
                 data_port,
                 data_value,
+                item: None,
+                salt_reg: None,
+                idx: None,
+                movable: None,
                 used: false,
                 sent: None,
                 send_guard: None,
@@ -1043,6 +1073,18 @@ impl<'a> Lowerer<'a> {
     /// A port or a register read has a name the backend depends on, and a
     /// constant is folded rather than declared -- renaming any of them would
     /// produce a reference to a wire that is never emitted.
+    /// Name a value only if it does not already have one.
+    ///
+    /// A single-barrier state's `fire_sN` and that pipe's `<p>_take` are the
+    /// same wire, and `fire_sN` is the better name: it is what the state
+    /// transition is written in terms of. Naming over it loses that vocabulary
+    /// for a synonym.
+    pub fn name_value_fresh(&mut self, v: ValueId, name: String) {
+        if self.values[v.0 as usize].name.is_none() {
+            self.name_value_safe(v, name);
+        }
+    }
+
     pub fn name_value_safe(&mut self, v: ValueId, name: String) {
         let is_already_a_signal = matches!(
             self.values[v.0 as usize].op,
@@ -1142,6 +1184,98 @@ impl<'a> Lowerer<'a> {
     /// does not have it (which the caller has already reported).
     pub fn enum_variants(&self, name: &str) -> Option<Vec<(String, u128)>> {
         self.syms.enums.get(name).map(|d| d.variants.clone())
+    }
+
+    // ---- the salt protocol -------------------------------------------------
+    //
+    // Written once, here, and never inline. `pipe_full` and `pipe_empty` read
+    // their own port rather than taking a salt argument, because passing the
+    // wrong side's salt is the one mistake that compiles, synthesizes, and
+    // deadlocks only under back-pressure.
+
+    /// The salt the OTHER side publishes: `wsalt` at a consumer, `rsalt` at a
+    /// producer.
+    pub(crate) fn salt_from_other(&mut self, ix: usize) -> ValueId {
+        let p = &self.pipes[ix];
+        let port = if p.is_input { p.wsalt_port } else { p.rsalt_port };
+        let name = format!("{}_{}", p.name, if p.is_input { "wsalt" } else { "rsalt" });
+        let v = self.emit(SALT, Op::Port(port));
+        self.name_value_safe(v, name);
+        v
+    }
+
+    /// Which entry a salt points at: `salt[0] ^ salt[1]`.
+    ///
+    /// The gray sequence is 00, 01, 11, 10, so the parity of the two bits is
+    /// the low bit of the binary position -- which for two entries is the
+    /// index.
+    pub(crate) fn salt_idx(&mut self, salt: ValueId, name: String) -> ValueId {
+        let b0 = self.emit(Ty::BOOL, Op::Slice { arg: salt, hi: 0, lo: 0 });
+        let b1 = self.emit(Ty::BOOL, Op::Slice { arg: salt, hi: 1, lo: 1 });
+        let v = self.emit(Ty::BOOL, Op::Bin { op: BinOp::Xor, lhs: b0, rhs: b1 });
+        self.name_value_safe(v, name);
+        v
+    }
+
+    /// Nothing to take: the two salts agree.
+    pub(crate) fn pipe_empty(&mut self, ix: usize, rsalt_q: ValueId) -> ValueId {
+        let wsalt = self.salt_from_other(ix);
+        let v = self.emit_eq(wsalt, rsalt_q);
+        let name = format!("{}_empty", self.pipes[ix].name);
+        self.name_value_safe(v, name);
+        v
+    }
+
+    /// Nowhere to put one: the salts differ in BOTH bits, which in gray code
+    /// is one lap ahead -- two entries, for a buffer that holds two.
+    pub(crate) fn pipe_full(&mut self, ix: usize, wsalt_q: ValueId) -> ValueId {
+        let rsalt = self.salt_from_other(ix);
+        // BitNot, not LogNot: a one-bit answer here would widen in the compare
+        // and `full` would be false almost always.
+        let flipped = self.emit(SALT, Op::Un { op: UnOp::BitNot, arg: rsalt });
+        let v = self.emit_eq(wsalt_q, flipped);
+        let name = format!("{}_full", self.pipes[ix].name);
+        self.name_value_safe(v, name);
+        v
+    }
+
+    /// The salt after a transfer: toggle the bit the index names, or hold.
+    pub(crate) fn salt_next(&mut self, salt_q: ValueId, idx: ValueId, enable: ValueId) -> ValueId {
+        let one = self.emit(SALT, Op::Const(0b01));
+        let two = self.emit(SALT, Op::Const(0b10));
+        let bit = self.emit(SALT, Op::Mux { cond: idx, then_val: two, else_val: one });
+        let toggled = self.emit(SALT, Op::Bin { op: BinOp::Xor, lhs: salt_q, rhs: bit });
+        self.emit(SALT, Op::Mux { cond: enable, then_val: toggled, else_val: salt_q })
+    }
+
+    /// One entry out of the pair on the wire.
+    ///
+    /// A `Mux` over two constant-bounds slices rather than a `DynSlice`: the
+    /// latter scales the index to a bit offset, and for a payload whose width
+    /// is not a power of two that is a multiplier in front of a 2-way select.
+    pub(crate) fn entry_of(&mut self, pair: ValueId, idx: ValueId, ty: &Ty) -> ValueId {
+        let w = ty.bit_width();
+        let e0 = self.emit(ty.clone(), Op::Slice { arg: pair, hi: w - 1, lo: 0 });
+        let e1 = self.emit(ty.clone(), Op::Slice { arg: pair, hi: 2 * w - 1, lo: w });
+        self.emit(ty.clone(), Op::Mux { cond: idx, then_val: e1, else_val: e0 })
+    }
+
+    /// The entry this side is owed, given its own `rsalt` register.
+    pub(crate) fn pipe_item_at(&mut self, ix: usize, rsalt_q: ValueId) -> ValueId {
+        let name = self.pipes[ix].name.clone();
+        let ty = self.pipes[ix].ty.clone();
+        let pair = self.pipes[ix].data_value.expect("an input pipe has a data value");
+        let ridx = self.salt_idx(rsalt_q, format!("{}_ridx", name));
+        let item = self.entry_of(pair, ridx, &ty);
+        self.name_value_safe(item, format!("{}_item", name));
+        self.pipes[ix].idx = Some(ridx);
+        item
+    }
+
+    /// Both entries as one value, entry 0 in the low half.
+    pub(crate) fn pack_entries(&mut self, e0: ValueId, e1: ValueId, ty: &Ty) -> ValueId {
+        let pair = Ty::Array(Box::new(ty.clone()), 2);
+        self.emit(pair, Op::Concat(vec![e1, e0]))
     }
 
     /// An equality test between two already-matching operands.
@@ -1552,8 +1686,9 @@ pub fn lower_process(
         }
         // A pipe becomes three flat ports. That is the flattening
         // k3g_chan.sv:60 already pre-commits to for the yosys-slang risk --
-        // "every process port list flattens to valid/ready/data triples and
-        // the rules stay exactly as written".
+        // "every process port list flattens to ... triples and the rules stay
+        // exactly as written". The triple is a salt each way and the pair of
+        // entries; the flattening is what was being promised, not the names.
         let mk = |low: &mut Lowerer, suffix: &str, dir: PortDir, ty: Ty| {
             let id = PortId(low.ports.len() as u32);
             low.ports.push(Port { name: format!("{}_{}", name, suffix), dir, ty });
@@ -1564,12 +1699,13 @@ pub fn lower_process(
         } else {
             (PortDir::Out, PortDir::In, PortDir::Out)
         };
-        let valid_port = mk(&mut low, "valid", vdir, Ty::BOOL);
-        let ready_port = mk(&mut low, "ready", rdir, Ty::BOOL);
-        let data_port = mk(&mut low, "data", ddir, ty.clone());
+        let wsalt_port = mk(&mut low, "wsalt", vdir, SALT);
+        let rsalt_port = mk(&mut low, "rsalt", rdir, SALT);
+        let pair = Ty::Array(Box::new(ty.clone()), 2);
+        let data_port = mk(&mut low, "data", ddir, pair.clone());
 
         let data_value = if is_input {
-            let v = low.emit(ty.clone(), Op::Port(data_port));
+            let v = low.emit(pair, Op::Port(data_port));
             low.values[v.0 as usize].name = Some(format!("{}_data", name));
             Some(v)
         } else {
@@ -1579,10 +1715,14 @@ pub fn lower_process(
             name: name.clone(),
             ty,
             is_input,
-            valid_port,
-            ready_port,
+            wsalt_port,
+            rsalt_port,
             data_port,
             data_value,
+            item: None,
+            salt_reg: None,
+            idx: None,
+            movable: None,
             used: false,
             sent: None,
             send_guard: None,
@@ -1809,6 +1949,38 @@ pub fn lower_process(
     };
     let running: Option<ValueId> = done.map(|d| low.logical_not(d));
 
+    // A CONSUMER holds two bits and nothing else. `rsalt` is the whole of what
+    // it publishes: toggling it IS saying "I took that one", and the producer
+    // learns at the next edge rather than through a wire it drives this one.
+    for ix in 0..low.pipes.len() {
+        if !low.pipes[ix].is_input {
+            continue;
+        }
+        let ty = low.pipes[ix].ty.clone();
+        let pname = low.pipes[ix].name.clone();
+
+        let slot = reg_names.len() + generated.len();
+        let rsalt_q = low.emit(SALT, Op::RegRead(slot as u32));
+        low.name_value_safe(rsalt_q, format!("{}_rsalt_q", pname));
+        generated.push(Reg {
+            name: format!("{}_rsalt_q", pname),
+            ty: SALT,
+            reset: 0,
+            next: rsalt_q,
+        });
+        low.pipes[ix].salt_reg = Some(slot);
+
+        let ridx = low.salt_idx(rsalt_q, format!("{}_ridx", pname));
+        let pair = low.pipes[ix].data_value.expect("an input pipe has a data value");
+        let item = low.entry_of(pair, ridx, &ty);
+        low.name_value_safe(item, format!("{}_item", pname));
+        low.pipes[ix].item = Some(item);
+        low.pipes[ix].idx = Some(ridx);
+    }
+
+    // A PRODUCER holds the two entries and two bits. It only ever pushes --
+    // there is no pop, because taking is the consumer's business and it does
+    // not need this side's help to do it.
     for ix in 0..low.pipes.len() {
         if low.pipes[ix].is_input {
             continue;
@@ -1817,43 +1989,29 @@ pub fn lower_process(
         let pname = low.pipes[ix].name.clone();
 
         let base = reg_names.len() + generated.len();
-        let busy = low.emit(Ty::BOOL, Op::RegRead(base as u32));
-        low.values[busy.0 as usize].name = Some(format!("{}_busy", pname));
-        let hold = low.emit(ty.clone(), Op::RegRead((base + 1) as u32));
-        low.values[hold.0 as usize].name = Some(format!("{}_hold", pname));
-        generated.push(Reg { name: format!("{}_busy", pname), ty: Ty::BOOL, reset: 0, next: busy });
-        generated
-            .push(Reg { name: format!("{}_hold", pname), ty: ty.clone(), reset: 0, next: hold });
-
-        // A BUFFER is two deep, and the second entry is what makes `ready` a
-        // register.
-        //
-        // With one entry the only honest thing `ready` can say is "I am empty,
-        // or I am draining this cycle" -- and "draining" means the consumer's
-        // `ready`. So the producer's `ready` became a wire straight through to
-        // the consumer's, and a chain of N processes was one combinational path
-        // N modules long. Rule 3 was still satisfied (`valid` never looked at
-        // `ready`), but the path was there.
-        //
-        // With a skid entry, `ready` is `the skid is empty` -- register-derived,
-        // like `up.ready = !full` in k3g_chan.sv:193, whose comment insists on
-        // exactly this: "never a function of the opposite side's handshake".
-        // The producer now learns about a stall one cycle late and has a place
-        // to put the item it already committed to, which is the whole job of
-        // the second entry.
-        let skid_busy = low.emit(Ty::BOOL, Op::RegRead((base + 2) as u32));
-        low.values[skid_busy.0 as usize].name = Some(format!("{}_skid_busy", pname));
-        let skid = low.emit(ty.clone(), Op::RegRead((base + 3) as u32));
-        low.values[skid.0 as usize].name = Some(format!("{}_skid", pname));
+        let e0 = low.emit(ty.clone(), Op::RegRead(base as u32));
+        low.name_value_safe(e0, format!("{}_e0", pname));
+        let e1 = low.emit(ty.clone(), Op::RegRead((base + 1) as u32));
+        low.name_value_safe(e1, format!("{}_e1", pname));
+        // `_q`, because a register named `<p>_wsalt` would collide with the
+        // port of that name in the emitted Verilog.
+        let wsalt_q = low.emit(SALT, Op::RegRead((base + 2) as u32));
+        low.name_value_safe(wsalt_q, format!("{}_wsalt_q", pname));
+        generated.push(Reg { name: format!("{}_e0", pname), ty: ty.clone(), reset: 0, next: e0 });
+        generated.push(Reg { name: format!("{}_e1", pname), ty: ty.clone(), reset: 0, next: e1 });
         generated.push(Reg {
-            name: format!("{}_skid_busy", pname),
-            ty: Ty::BOOL,
+            name: format!("{}_wsalt_q", pname),
+            ty: SALT,
             reset: 0,
-            next: skid_busy,
+            next: wsalt_q,
         });
-        generated.push(Reg { name: format!("{}_skid", pname), ty, reset: 0, next: skid });
-        let accept = low.emit(Ty::BOOL, Op::Un { op: UnOp::LogNot, arg: skid_busy });
-        low.values[accept.0 as usize].name = Some(format!("{}_room", pname));
+
+        // Room is "not full", and full is a comparison of two registers: ours
+        // and the consumer's. Neither side's answer passes through the other's
+        // combinational logic, which is the property the whole protocol is for.
+        let full = low.pipe_full(ix, wsalt_q);
+        let accept = low.emit(Ty::BOOL, Op::Un { op: UnOp::LogNot, arg: full });
+        low.name_value_safe(accept, format!("{}_room", pname));
         accepts.push(accept);
 
         low.pipes[ix].fired = Some(accept);
@@ -1884,10 +2042,15 @@ pub fn lower_process(
         if !low.pipes[ix].is_input {
             continue;
         }
-        let up_valid = low.emit(Ty::BOOL, Op::Port(low.pipes[ix].valid_port));
+        let rsalt_q = {
+            let slot = low.pipes[ix].salt_reg.expect("an input pipe has an rsalt register");
+            low.emit(SALT, Op::RegRead(slot as u32))
+        };
+        let empty = low.pipe_empty(ix, rsalt_q);
+        let offered = low.emit(Ty::BOOL, Op::Un { op: UnOp::LogNot, arg: empty });
         // An input transfers only when every output slot can take the result.
         let fired =
-            low.emit(Ty::BOOL, Op::Bin { op: BinOp::And, lhs: up_valid, rhs: ready_out });
+            low.emit(Ty::BOOL, Op::Bin { op: BinOp::And, lhs: offered, rhs: ready_out });
         low.values[fired.0 as usize].name = Some(format!("{}_xfer", low.pipes[ix].name));
         low.pipes[ix].fired = Some(fired);
     }
@@ -1907,16 +2070,31 @@ pub fn lower_process(
             // never consumes keeps the old unconditional `ready`, because
             // "never asked for" and "asked for on no path" are different
             // claims and only the second one means stop.
-            let claimed = match pipe.send_guard {
-                None => ready_out,
-                Some(g) => low.emit(Ty::BOOL, Op::Bin { op: BinOp::And, lhs: ready_out, rhs: g }),
-            };
-            drivers.push((pipe.ready_port, claimed));
+            // Taking IS toggling, so the enable has to be the TRANSFER and not
+            // merely this side's willingness. `fired` already carries the
+            // "something is offered" half; under valid/ready that half lived at
+            // the producer, which is why `ready` alone used to be enough here.
+            // It is not enough now: a toggle with nothing to take walks the
+            // read index past an entry that was never written.
+            //
+            // This is literally the value `got` is bound to, which is what
+            // makes the claim rule hold by construction rather than by review.
+            let fired = pipe.fired.expect("an input pipe has `fired` computed");
+            let claimed = narrow_to_path(&mut low, fired, pipe.send_guard);
+            low.name_value_safe(claimed, format!("{}_take", pipe.name));
+
+            let slot = pipe.salt_reg.expect("an input pipe has an rsalt register");
+            let rsalt_q = low.emit(SALT, Op::RegRead(slot as u32));
+            let ridx = pipe.idx.expect("an input pipe has its index computed");
+            let next = low.salt_next(rsalt_q, ridx, claimed);
+            generated[slot - reg_names.len()].next = next;
+            drivers.push((pipe.rsalt_port, rsalt_q));
             continue;
         }
         let base = pipe.slot_reg.expect("an output pipe has a slot");
-        let busy = low.emit(Ty::BOOL, Op::RegRead(base as u32));
-        let hold = low.emit(pipe.ty.clone(), Op::RegRead((base + 1) as u32));
+        let e0 = low.emit(pipe.ty.clone(), Op::RegRead(base as u32));
+        let e1 = low.emit(pipe.ty.clone(), Op::RegRead((base + 1) as u32));
+        let wsalt_q = low.emit(SALT, Op::RegRead((base + 2) as u32));
 
         let sent = match pipe.sent {
             Some(v) => v,
@@ -1932,91 +2110,39 @@ pub fn lower_process(
         // THE OFFER IS ITS OWN PATH, and nothing else. One rule, the same one
         // a process with states follows: a pipe is claimed where the program
         // asks for it, under the condition it asks.
-        //
-        // It used to be "an input transferred, and the branch held". That
-        // implicit gate is why `@hold` had to exist: a stage that declined its
-        // input to finish something already owed had no input transfer that
-        // cycle, so its offer was suppressed and the result had nowhere to go.
-        // Writing the guard out -- `if got then @try_send(...)` -- says the
-        // same thing where a reader can see it, and leaves the cycles that owe
-        // a result free to produce one.
         let offering = match pipe.send_guard {
             None => low.emit(Ty::BOOL, Op::Const(1)),
             Some(g) => g,
         };
+        // ...and there has to be somewhere to put it. `@try_send` answers
+        // whether there was, and a body that ignores the answer must not
+        // overwrite an entry the consumer has not taken.
+        let room = low.pipes[ix].fired.expect("an output pipe has room computed");
+        let push = low.emit(Ty::BOOL, Op::Bin { op: BinOp::And, lhs: offering, rhs: room });
+        low.name_value_safe(push, format!("{}_push", pipe.name));
+
+        // ONE entry is written and it is the one `widx` names. There is no
+        // pop, no skid-to-head move and no second copy of the payload: a
+        // producer that only ever pushes cannot get those cases wrong.
+        let widx = low.salt_idx(wsalt_q, format!("{}_widx", pipe.name));
+        let not_widx = low.logical_not(widx);
+        let to_e0 = low.emit(Ty::BOOL, Op::Bin { op: BinOp::And, lhs: push, rhs: not_widx });
+        let to_e1 = low.emit(Ty::BOOL, Op::Bin { op: BinOp::And, lhs: push, rhs: widx });
+        let e0_next =
+            low.emit(pipe.ty.clone(), Op::Mux { cond: to_e0, then_val: sent, else_val: e0 });
+        let e1_next =
+            low.emit(pipe.ty.clone(), Op::Mux { cond: to_e1, then_val: sent, else_val: e1 });
+        let wsalt_next = low.salt_next(wsalt_q, widx, push);
 
         let idx = base - reg_names.len();
-        // Two deep: head, then skid.
-        //
-        // An offer can only arrive while the skid is empty, because that is
-        // what `ready` said -- so "push into the skid while the skid is moving
-        // into the head" cannot happen, and the four cases below are all of
-        // them.
-        {
-            let ready = pipe.ready_port;
-            {
-                let skid_busy = low.emit(Ty::BOOL, Op::RegRead((base + 2) as u32));
-                let skid = low.emit(pipe.ty.clone(), Op::RegRead((base + 3) as u32));
-                let ready_in = low.emit(Ty::BOOL, Op::Port(ready));
+        generated[idx].next = e0_next;
+        generated[idx + 1].next = e1_next;
+        generated[idx + 2].next = wsalt_next;
 
-                let pop = low.emit(Ty::BOOL, Op::Bin { op: BinOp::And, lhs: busy, rhs: ready_in });
-                low.values[pop.0 as usize].name = Some(format!("{}_pop", pipe.name));
-                let not_pop = low.logical_not(pop);
-
-                // The head takes a new item when it is empty or emptying, and
-                // takes the skid when the skid has something waiting.
-                let not_busy = low.logical_not(busy);
-                let head_free =
-                    low.emit(Ty::BOOL, Op::Bin { op: BinOp::Or, lhs: not_busy, rhs: pop });
-                let to_head =
-                    low.emit(Ty::BOOL, Op::Bin { op: BinOp::And, lhs: offering, rhs: head_free });
-                let from_skid =
-                    low.emit(Ty::BOOL, Op::Bin { op: BinOp::And, lhs: pop, rhs: skid_busy });
-                let keep_head =
-                    low.emit(Ty::BOOL, Op::Bin { op: BinOp::And, lhs: busy, rhs: not_pop });
-
-                let held_or_filled =
-                    low.emit(Ty::BOOL, Op::Bin { op: BinOp::Or, lhs: keep_head, rhs: from_skid });
-                let busy_next = low.emit(
-                    Ty::BOOL,
-                    Op::Bin { op: BinOp::Or, lhs: held_or_filled, rhs: to_head },
-                );
-                // `from_skid` and `to_head` cannot both hold: an offer needs an
-                // empty skid, and `from_skid` needs a full one.
-                let taken_from_skid = low.emit(
-                    pipe.ty.clone(),
-                    Op::Mux { cond: to_head, then_val: sent, else_val: hold },
-                );
-                let hold_next = low.emit(
-                    pipe.ty.clone(),
-                    Op::Mux { cond: from_skid, then_val: skid, else_val: taken_from_skid },
-                );
-
-                // The skid takes the offer only when the head is occupied and
-                // staying that way.
-                let head_stays =
-                    low.emit(Ty::BOOL, Op::Bin { op: BinOp::And, lhs: busy, rhs: not_pop });
-                let to_skid =
-                    low.emit(Ty::BOOL, Op::Bin { op: BinOp::And, lhs: offering, rhs: head_stays });
-                let skid_keeps =
-                    low.emit(Ty::BOOL, Op::Bin { op: BinOp::And, lhs: skid_busy, rhs: not_pop });
-                let skid_busy_next =
-                    low.emit(Ty::BOOL, Op::Bin { op: BinOp::Or, lhs: skid_keeps, rhs: to_skid });
-                let skid_next = low.emit(
-                    pipe.ty.clone(),
-                    Op::Mux { cond: to_skid, then_val: sent, else_val: skid },
-                );
-
-                generated[idx].next = busy_next;
-                generated[idx + 1].next = hold_next;
-                generated[idx + 2].next = skid_busy_next;
-                generated[idx + 3].next = skid_next;
-            }
-        }
-
-        // `valid` is the register, never anything combinational.
-        drivers.push((pipe.valid_port, busy));
-        drivers.push((pipe.data_port, hold));
+        // Both are register outputs. Nothing the consumer drives reaches them.
+        let pair = low.pack_entries(e0, e1, &pipe.ty);
+        drivers.push((pipe.wsalt_port, wsalt_q));
+        drivers.push((pipe.data_port, pair));
     }
 
     let mut regs = Vec::new();
@@ -2138,11 +2264,12 @@ fn lower_try_rcv_binding(
     }
 
     let ty = low.pipes[ix].ty.clone();
-    let data = low.pipes[ix].data_value.expect("an input pipe has a data value");
-    // A peek answers "is one being offered", which is the pipe's `valid` and
-    // nothing else. A `@try_rcv` answers "did one transfer", which is `valid`
-    // and this side's `ready` -- so on a cycle the process is not accepting,
-    // the two disagree, and that disagreement is exactly what a peek is for.
+    // The entry this side is owed, not the pair on the wire.
+    let data = low.pipes[ix].item.expect("an input pipe has an item");
+    // A peek answers "is one being offered", which is the two salts disagreeing
+    // and nothing else. A `@try_rcv` answers "did one transfer", which also
+    // needs this side to have taken it -- so on a cycle the process is not
+    // accepting, the two disagree, and that disagreement is what a peek is for.
     let answer = if takes {
         low.pipes[ix].used = true;
         let path = low.materialise_path();
@@ -2150,7 +2277,12 @@ fn lower_try_rcv_binding(
         let fired = low.pipes[ix].fired.expect("computed before each state's body");
         narrow_to_path(low, fired, path)
     } else {
-        let v = low.emit(Ty::BOOL, Op::Port(low.pipes[ix].valid_port));
+        let rsalt_q = {
+            let slot = low.pipes[ix].salt_reg.expect("an input pipe has an rsalt register");
+            low.emit(SALT, Op::RegRead(slot as u32))
+        };
+        let empty = low.pipe_empty(ix, rsalt_q);
+        let v = low.emit(Ty::BOOL, Op::Un { op: UnOp::LogNot, arg: empty });
         low.name_value_safe(v, format!("{}_present", pipe_name));
         v
     };

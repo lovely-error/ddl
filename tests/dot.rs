@@ -83,8 +83,8 @@ fn one_edge_per_pipe_not_one_per_wire() {
         )
     ));
     assert_eq!(g.matches(" -> ").count(), 3, "{}", g);
-    assert!(!g.contains("_valid\"]"), "{}", g);
-    assert!(!g.contains("_ready\"]"), "{}", g);
+    assert!(!g.contains("_wsalt\"]"), "{}", g);
+    assert!(!g.contains("_rsalt\"]"), "{}", g);
 }
 
 #[test]

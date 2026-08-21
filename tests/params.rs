@@ -218,7 +218,7 @@ fn every_pipe_has_all_three_legs() {
         "  sink_(mid, dst)
 ",
     ));
-    assert!(v.contains("wire mid_valid;"), "{}", v);
-    assert!(v.contains("wire mid_ready;"), "{}", v);
-    assert!(v.contains("wire [31:0] mid_data;"), "{}", v);
+    assert!(v.contains("wire [1:0] mid_wsalt;"), "{}", v);
+    assert!(v.contains("wire [1:0] mid_rsalt;"), "{}", v);
+    assert!(v.contains("wire [63:0] mid_data;"), "{}", v);
 }

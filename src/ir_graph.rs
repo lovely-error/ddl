@@ -149,9 +149,10 @@ pub fn lower_graph(
         } else {
             (PortDir::Out, PortDir::In, PortDir::Out)
         };
-        ports.push(Port { name: format!("{}_valid", name), dir: vd, ty: Ty::BOOL });
-        ports.push(Port { name: format!("{}_ready", name), dir: rd, ty: Ty::BOOL });
-        ports.push(Port { name: format!("{}_data", name), dir: dd, ty: ty.clone() });
+        ports.push(Port { name: format!("{}_wsalt", name), dir: vd, ty: crate::ir::SALT });
+        ports.push(Port { name: format!("{}_rsalt", name), dir: rd, ty: crate::ir::SALT });
+        let pair = Ty::Array(Box::new(ty.clone()), 2);
+        ports.push(Port { name: format!("{}_data", name), dir: dd, ty: pair });
 
         pipes.insert(
             name,
@@ -205,9 +206,10 @@ pub fn lower_graph(
                 return None;
             }
         }
-        nets.push(Net { name: format!("{}_valid", name), ty: Ty::BOOL });
-        nets.push(Net { name: format!("{}_ready", name), ty: Ty::BOOL });
-        nets.push(Net { name: format!("{}_data", name), ty: ty.clone() });
+        nets.push(Net { name: format!("{}_wsalt", name), ty: crate::ir::SALT });
+        nets.push(Net { name: format!("{}_rsalt", name), ty: crate::ir::SALT });
+        let pair = Ty::Array(Box::new(ty.clone()), 2);
+        nets.push(Net { name: format!("{}_data", name), ty: pair });
 
         pipes.insert(
             name,
@@ -343,8 +345,8 @@ pub fn lower_graph(
                 produces.push(actual_name.clone());
             }
 
-            conns.push((format!("{}_valid", formal.name), format!("{}_valid", actual_name)));
-            conns.push((format!("{}_ready", formal.name), format!("{}_ready", actual_name)));
+            conns.push((format!("{}_wsalt", formal.name), format!("{}_wsalt", actual_name)));
+            conns.push((format!("{}_rsalt", formal.name), format!("{}_rsalt", actual_name)));
             conns.push((format!("{}_data", formal.name), format!("{}_data", actual_name)));
         }
 

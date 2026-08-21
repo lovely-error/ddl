@@ -82,15 +82,15 @@ fn render_graph(out: &mut String, module: &Module) {
 /// The graph's parameters, by pipe name and direction.
 ///
 /// Derived from the ports rather than kept separately: a pipe is three ports
-/// sharing a prefix, and `_valid` is the one whose direction says which way
-/// the pipe goes -- `_ready` points the other way and `_data` carries a type.
+/// sharing a prefix, and `_wsalt` is the one whose direction says which way the
+/// pipe goes -- `_rsalt` points the other way and `_data` carries a type.
 fn boundary_pipes(module: &Module) -> Vec<(String, PortDir)> {
     module
         .ports
         .iter()
         .filter_map(|p| {
             p.name
-                .strip_suffix("_valid")
+                .strip_suffix("_wsalt")
                 .map(|base| (base.to_string(), p.dir))
         })
         .collect()
@@ -115,7 +115,7 @@ fn edges(module: &Module) -> Vec<Edge> {
 
     for inst in &module.instances {
         for (_, actual) in &inst.conns {
-            let Some(pipe) = actual.strip_suffix("_valid") else {
+            let Some(pipe) = actual.strip_suffix("_wsalt") else {
                 continue;
             };
             if inst.produces.iter().any(|p| p == pipe) {

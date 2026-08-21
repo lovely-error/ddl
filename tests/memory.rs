@@ -56,7 +56,7 @@ fn a_write_happens_only_when_its_state_fires() {
     // in the write state waiting for data that had not arrived.
     let v = compile(SCRATCH);
     assert!(v.contains("end else if (fire_s1) begin"), "{}", v);
-    assert!(v.contains("cells[addr_r] <= din_data;"), "{}", v);
+    assert!(v.contains("cells[addr_r] <= din_item;"), "{}", v);
 }
 
 #[test]
@@ -105,9 +105,19 @@ fn the_read_happens_inside_the_memorys_own_clocked_block() {
     let v = compile(LOOKUP);
     assert!(v.contains("reg [31:0] table__q;"), "{}", v);
     assert!(v.contains("if (in_s1) table__q <= table_[a_r];"), "{}", v);
-    // The array is never read outside that block.
-    assert!(!v.contains("wire [31:0] n"), "{}", v);
-    assert!(v.contains("assign resp_data = table__q;"), "{}", v);
+    // The array is never read outside that block. Checked against the ARRAY
+    // rather than against "no wire of that width": the read register now feeds
+    // an entry, so a wire carrying `table__q` is expected and says nothing
+    // about where the array was touched.
+    for line in v.lines().filter(|l| l.trim_start().starts_with("wire ")) {
+        assert!(!line.contains("table_["), "the array is read combinationally:
+{}", line);
+    }
+    // The read register feeds an ENTRY, which is then published as the pair.
+    // A `bram` read still costs the state it always did; what changed is where
+    // its answer lands.
+    assert!(v.contains("reg [31:0] table__q;"), "{}", v);
+    assert!(v.contains("assign resp_data = {resp_e1, resp_e0};"), "{}", v);
 }
 
 #[test]
@@ -132,7 +142,7 @@ fn the_address_is_registered_before_the_fetch_state_uses_it() {
     let v = compile(LOOKUP);
     assert!(v.contains("reg [7:0] a_r;"), "{}", v);
     assert!(v.contains("= table_[a_r];"), "{}", v);
-    assert!(!v.contains("table_[req_data]"), "{}", v);
+    assert!(!v.contains("table_[req_item]"), "{}", v);
 }
 
 #[test]
@@ -153,7 +163,7 @@ fn a_bram_takes_reads_and_writes_on_different_paths() {
     ));
     assert!(v.contains("block RAM"), "{}", v);
     // Both ports in one clocked block, which is the simple-dual-port template.
-    assert!(v.contains("table_[addr_r] <= din_data;"), "{}", v);
+    assert!(v.contains("table_[addr_r] <= din_item;"), "{}", v);
     assert!(v.contains("table__q <= table_["), "{}", v);
     let block = v.split("// table_ [0:255]").nth(1).expect("the memory block");
     let block = block.split("endmodule").next().expect("the end");
