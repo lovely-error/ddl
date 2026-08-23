@@ -37,22 +37,64 @@ module tb_k2g_xstage_equiv;
   logic wb_ready;   // the consumer will take a writeback packet
 
   logic [83:0] ref_packet;
-  logic        ddl_uops_ready, ddl_wb_valid;
-  logic [83:0] ddl_wb;
 
-  // The reference occupies X exactly when the DDL accepts a micro-op.
-  wire xfer = offer & ddl_uops_ready;
+  // ---- the testbench is the salt producer on `uops` ------------------------
+  logic [1:0]   tb_wsalt;
+  uop_t         tb_e [0:1];
+  logic [1:0]   ddl_uops_rsalt;
+  wire  tb_widx = tb_wsalt[0] ^ tb_wsalt[1];
+  wire  tb_full = (tb_wsalt == ~ddl_uops_rsalt);
+  wire  push    = offer && !tb_full;
+
+  // ---- and the salt consumer on `wb` ---------------------------------------
+  logic [1:0]   tb_rsalt;
+  logic [1:0]   ddl_wb_wsalt;
+  logic [167:0] ddl_wb_pair;
+  wire  tb_ridx   = tb_rsalt[0] ^ tb_rsalt[1];
+  wire  ddl_empty = (ddl_wb_wsalt == tb_rsalt);
+  wire [83:0] ddl_wb = tb_ridx ? ddl_wb_pair[167:84] : ddl_wb_pair[83:0];
+  wire  pop = wb_ready && !ddl_empty;
+
+  // THE BRIDGE. Not `push`: an item entering the pipe is not the same event as
+  // the DDL occupying X with it, and under salt they can be cycles apart. The
+  // reference is driven from the DDL's own consume decision, and reads the
+  // entry the DDL is reading.
+  wire  xfer = u_ddl.uops_take;
+  uop_t taken;
+  assign taken = u_ddl.uops_ridx ? tb_e[1] : tb_e[0];
+
+  // Anti-footgun: the entry the reference is handed must be the one the DDL is
+  // reading. If these ever differ the two are decoding different micro-ops and
+  // every downstream mismatch is noise.
+  always @(posedge clk)
+    if (rst_n && xfer)
+      assert (taken === u_ddl.uops_item)
+        else $error("bridge: ref sees a different micro-op than the DDL took");
 
   k2g_xstage_ref u_ref (
       .clk(clk), .rst_n(rst_n),
-      .uop(uop), .uop_valid(xfer), .packet(ref_packet)
+      .uop(taken), .uop_valid(xfer), .packet(ref_packet)
   );
 
   k2g_xstage u_ddl (
       .clk(clk), .rst_n(rst_n),
-      .uops_valid(offer), .uops_ready(ddl_uops_ready), .uops_data(uop),
-      .wb_valid(ddl_wb_valid), .wb_ready(wb_ready), .wb_data(ddl_wb)
+      .uops_wsalt(tb_wsalt), .uops_rsalt(ddl_uops_rsalt),
+      .uops_data({tb_e[1], tb_e[0]}),
+      .wb_wsalt(ddl_wb_wsalt), .wb_rsalt(tb_rsalt), .wb_data(ddl_wb_pair)
   );
+
+  always_ff @(posedge clk) begin
+    if (!rst_n) begin
+      tb_wsalt <= 2'b00;
+      tb_rsalt <= 2'b00;
+    end else begin
+      if (push) begin
+        tb_e[tb_widx] <= uop;
+        tb_wsalt[tb_widx] <= ~tb_wsalt[tb_widx];
+      end
+      if (pop) tb_rsalt[tb_ridx] <= ~tb_rsalt[tb_ridx];
+    end
+  end
 
   int errors = 0, checks = 0, cycles = 0, compared = 0;
   int stalls = 0, forwarded = 0, copies = 0;
@@ -112,8 +154,8 @@ module tb_k2g_xstage_equiv;
 
     // Rule 2: an offer may not be withdrawn or altered before it is taken.
     checks++;
-    if (held_valid && !(ddl_wb_valid && wb_ready)) begin
-      if (!ddl_wb_valid) begin
+    if (held_valid && !pop) begin
+      if (ddl_empty) begin
         errors++;
         if (errors <= 5) $display("RULE2 withdrawn @%0d", cycles);
       end else if (ddl_wb !== held_wb) begin
@@ -122,12 +164,16 @@ module tb_k2g_xstage_equiv;
       end
     end
 
-    if (offer && !ddl_uops_ready) stalls++;
+    if (offer && tb_full) stalls++;
 
+    // Everything in here is about the micro-op the DDL CONSUMED, which is
+    // `taken` -- the entry its own read index names -- and not whatever the
+    // testbench happens to be offering. Under valid/ready those were the
+    // same value; with two entries between the sides they are not.
     if (xfer) begin
       // ---- the model, as of the start of the cycle ----------------------
-      automatic logic [4:0]  ra = uop.dst;
-      automatic logic [4:0]  rb = uop.src;
+      automatic logic [4:0]  ra = taken.dst;
+      automatic logic [4:0]  rb = taken.src;
       automatic logic mwriting = mw_we_value | mw_we_tag | mw_we_overflow | mw_we_flag;
       automatic logic ma = mwriting && (mw_addr == ra);
       automatic logic mb = mwriting && (mw_addr == rb);
@@ -137,20 +183,20 @@ module tb_k2g_xstage_equiv;
       automatic logic        xb_flg   = (mb && mw_we_flag)     ? mw_flag     : m_flag[rb];
       // The model knows about forwarding, not about predication or the
       // reserved tag, so it only claims a COPY that neither of those touches.
-      automatic bit is_copy = (uop.kind == UOP_COPY)
-                              && (uop.cond == CCK_NONE)
+      automatic bit is_copy = (taken.kind == UOP_COPY)
+                              && (taken.cond == CCK_NONE)
                               && (xb_tag != RDT_F32);
 
-      if (uop.cond != CCK_NONE) predicated++;
+      if (taken.cond != CCK_NONE) predicated++;
       // The DDL implements `rdt_normalize` itself and the reference calls the
       // one in k2g_types.svh, so the comparison checks it -- but only on the
       // packets where it is not the identity. Count those.
-      if ((uop.kind == UOP_PUT_IMM)
-          && (rdt_normalize(uop.imm, uop.datakind) !== uop.imm)) narrowed++;
+      if ((taken.kind == UOP_PUT_IMM)
+          && (rdt_normalize(taken.imm, taken.datakind) !== taken.imm)) narrowed++;
       if (ref_packet[37]) faults++;
       // A COPY commits all four fields or none, so a COPY that wrote nothing
       // is predication doing its job rather than an opcode that writes little.
-      if ((uop.cond != CCK_NONE) && (uop.kind == UOP_COPY)
+      if ((taken.cond != CCK_NONE) && (taken.kind == UOP_COPY)
           && (ref_packet[83:80] == 4'd0)) suppressed++;
 
       if (ma || mb) forwarded++;
@@ -183,27 +229,42 @@ module tb_k2g_xstage_equiv;
       mw_flag        = ref_packet[38];
     end
 
-    if (ddl_wb_valid && wb_ready) ddl_q.push_back(ddl_wb);
+    if (pop) ddl_q.push_back(ddl_wb);
     if (armed) drain();
 
-    held_valid = ddl_wb_valid && !wb_ready;
+    held_valid = !ddl_empty && !pop;
     held_wb    = ddl_wb;
     @(posedge clk);
     cycles++;
   endtask
 
-  // Rule 3: toggling `ready` within a cycle must not move `valid` or `data`.
+  // Rule 3, BOTH WAYS: driving one side's salt to an arbitrary value within a
+  // cycle must not move anything the other side publishes. The second half has
+  // no counterpart under valid/ready.
   task automatic check_rule3();
-    logic        v0;
-    logic [83:0] d0;
-    wb_ready = 1'b0; #1;
-    v0 = ddl_wb_valid; d0 = ddl_wb;
-    wb_ready = 1'b1; #1;
+    logic [1:0]   w0, r0, save_r, save_w;
+    logic [167:0] d0;
+    save_r = tb_rsalt; save_w = tb_wsalt;
+
+    tb_rsalt = 2'b00; #1; w0 = ddl_wb_wsalt; d0 = ddl_wb_pair;
+    tb_rsalt = 2'b11; #1;
     checks++;
-    if (ddl_wb_valid !== v0 || ddl_wb !== d0) begin
+    if (ddl_wb_wsalt !== w0 || ddl_wb_pair !== d0) begin
       errors++;
-      if (errors <= 5) $display("RULE3 valid/data moved with ready @%0d", cycles);
+      if (errors <= 5) $display("RULE3 producer moved with rsalt @%0d", cycles);
     end
+    tb_rsalt = save_r;
+
+    tb_wsalt = 2'b00; #1; r0 = ddl_uops_rsalt;
+    tb_wsalt = 2'b11; #1;
+    checks++;
+    if (ddl_uops_rsalt !== r0) begin
+      errors++;
+      if (errors <= 5) $display("RULE3 consumer moved with wsalt @%0d", cycles);
+    end
+    // Restored before the edge: arbitrary salts make full/empty meaningless.
+    tb_wsalt = save_w;
+    #1;
     wb_ready = 1'b0;
   endtask
 

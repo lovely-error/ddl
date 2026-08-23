@@ -43,28 +43,62 @@ module tb_k2g_decode_equiv;
 
   logic         ref_accept, ref_uop_valid;
   uop_t         ref_uop;
-  logic         ddl_cps_ready, ddl_uop_valid;
-  logic [126:0] ddl_uop;
 
-  // The reference consumes exactly when the DDL does, and sees the redirect at
-  // the moment the item carrying it transfers.
-  wire xfer = offer & ddl_cps_ready;
-  wire flush = xfer & restart;
+  // ---- the testbench is the salt producer on `cps` -------------------------
+  logic [1:0]  tb_wsalt;
+  logic [16:0] tb_e [0:1];        // {cp, restart}, first field high
+  logic [1:0]  ddl_cps_rsalt;
+  wire  tb_widx = tb_wsalt[0] ^ tb_wsalt[1];
+  wire  tb_full = (tb_wsalt == ~ddl_cps_rsalt);
+  wire  push    = offer && !tb_full;
 
-  // The item, packed the way the DDL packs `cp_item_t`: first field high.
-  wire [16:0] cps_item = {cp, restart};
+  // ---- and the salt consumer on `uop` --------------------------------------
+  logic [1:0]   tb_rsalt;
+  logic [1:0]   ddl_uop_wsalt;
+  logic [253:0] ddl_uop_pair;
+  wire  tb_ridx  = tb_rsalt[0] ^ tb_rsalt[1];
+  wire  ddl_empty = (ddl_uop_wsalt == tb_rsalt);
+  wire [126:0] ddl_uop = tb_ridx ? ddl_uop_pair[253:127] : ddl_uop_pair[126:0];
+  wire  pop = uop_ready && !ddl_empty;
+
+  // THE BRIDGE. `push` is NOT the reference's `cp_valid`: push is when an item
+  // enters the pipe, and under salt it can sit in an entry for cycles before
+  // the DDL looks at it. The reference has to be driven from the DDL's own
+  // consume decision, which is `cps_take` -- the enable on its `rsalt` toggle,
+  // and the direct heir of the `ddl_cps_ready` this bridge used to use.
+  wire xfer = u_ddl.cps_take;
+  // And the redirect belongs to the entry BEING CONSUMED, not to whatever the
+  // testbench happens to be offering this cycle. Getting this wrong flushes on
+  // the wrong code point and reads as a decode bug.
+  wire [16:0] taken = u_ddl.cps_ridx ? tb_e[1] : tb_e[0];
+  wire [15:0] taken_cp = taken[16:1];
+  wire        flush    = xfer & taken[0];
 
   k2g_decode u_ref (
       .clk(clk), .rst_n(rst_n),
-      .cp(cp), .cp_valid(xfer), .flush(flush), .hold(1'b0),
+      .cp(taken_cp), .cp_valid(xfer), .flush(flush), .hold(1'b0),
       .accept(ref_accept), .uop(ref_uop), .uop_valid(ref_uop_valid)
   );
 
   k2g_decode_ddl u_ddl (
       .clk(clk), .rst_n(rst_n),
-      .cps_valid(offer), .cps_ready(ddl_cps_ready), .cps_data(cps_item),
-      .uop_valid(ddl_uop_valid), .uop_ready(uop_ready), .uop_data(ddl_uop)
+      .cps_wsalt(tb_wsalt), .cps_rsalt(ddl_cps_rsalt),
+      .cps_data({tb_e[1], tb_e[0]}),
+      .uop_wsalt(ddl_uop_wsalt), .uop_rsalt(tb_rsalt), .uop_data(ddl_uop_pair)
   );
+
+  always_ff @(posedge clk) begin
+    if (!rst_n) begin
+      tb_wsalt <= 2'b00;
+      tb_rsalt <= 2'b00;
+    end else begin
+      if (push) begin
+        tb_e[tb_widx] <= {cp, restart};
+        tb_wsalt[tb_widx] <= ~tb_wsalt[tb_widx];
+      end
+      if (pop) tb_rsalt[tb_ridx] <= ~tb_rsalt[tb_ridx];
+    end
+  end
 
   bit armed = 1'b0;
   int diverged_at = -1;
@@ -76,7 +110,15 @@ module tb_k2g_decode_equiv;
   int           ref_cyc[$];
   int           ddl_cyc[$];
 
-  logic         held_valid = 1'b0;
+  logic         held = 1'b0;
+  logic [1:0]   prev_wsalt;
+
+  // 00 -> 01 -> 11 -> 10 -> 00; toggle the bit the index names.
+  function automatic logic [1:0] gray_next(input logic [1:0] g);
+    return (g[0] ^ g[1]) ? {~g[1], g[0]} : {g[1], ~g[0]};
+  endfunction
+
+  logic         held_valid_unused = 1'b0;
   logic [126:0] held_uop;
 
   task automatic drain();
@@ -100,39 +142,41 @@ module tb_k2g_decode_equiv;
     cp = c; offer = v; restart = f; uop_ready = r;
     #1;
 
-    // Rule 2: an offer may not be withdrawn or altered before it is taken.
+    // Rule 2: while we are owed an entry, that entry is frozen and `wsalt`
+    // may advance at most one gray step -- the producer filling the other one.
     checks++;
-    if (held_valid && !(ddl_uop_valid && uop_ready)) begin
-      if (!ddl_uop_valid) begin
+    if (held) begin
+      if (ddl_uop_wsalt !== prev_wsalt && ddl_uop_wsalt !== gray_next(prev_wsalt)) begin
         errors++;
-        if (errors <= 5) $display("RULE2 withdrawn @%0d", cycles);
-      end else if (ddl_uop !== held_uop) begin
+        if (errors <= 5) $display("RULE2 wsalt jumped @%0d", cycles);
+      end
+      if (ddl_uop !== held_uop) begin
         errors++;
-        if (errors <= 5) $display("RULE2 data changed @%0d", cycles);
+        if (errors <= 5) $display("RULE2 entry changed @%0d", cycles);
       end
     end
 
     if (ref_uop_valid) begin
       ref_q.push_back(ref_uop); ref_cyc.push_back(cycles); ref_n++;
     end
-    if (ddl_uop_valid && uop_ready) begin
+    if (pop) begin
       ddl_q.push_back(ddl_uop); ddl_cyc.push_back(cycles); ddl_n++;
     end
-    if (offer && !ddl_cps_ready) stalls++;
+    if (offer && tb_full) stalls++;
 
     if (armed && diverged_at < 0 && (ddl_n > ref_n || ref_n - ddl_n > 1)) begin
       diverged_at = cycles;
-      $display("COUNT @%0d ref_n=%0d ddl_n=%0d ddlv=%b rdy=%b cps_rdy=%b flush=%b offer=%b refv=%b",
-               cycles, ref_n, ddl_n, ddl_uop_valid, uop_ready, ddl_cps_ready,
+      $display("COUNT @%0d ref_n=%0d ddl_n=%0d empty=%b rdy=%b xfer=%b flush=%b offer=%b refv=%b",
+               cycles, ref_n, ddl_n, ddl_empty, uop_ready, xfer,
                flush, offer, ref_uop_valid);
     end
 
     if (armed && diverged_at < 0) begin
       if (u_ref.pfx !== u_ddl.pfx || u_ref.state !== u_ddl.state) begin
         diverged_at = cycles;
-        $display("STATE DIVERGE @%0d cp=%04x offer=%b cps_rdy=%b rdy=%b flush=%b refv=%b ddlv=%b",
-                 cycles, cp, offer, ddl_cps_ready, uop_ready, flush,
-                 ref_uop_valid, ddl_uop_valid);
+        $display("STATE DIVERGE @%0d cp=%04x offer=%b xfer=%b rdy=%b flush=%b refv=%b empty=%b",
+                 cycles, cp, offer, xfer, uop_ready, flush,
+                 ref_uop_valid, ddl_empty);
         $display("  ref pfx=%026x state=%0d", u_ref.pfx, u_ref.state);
         $display("  ddl pfx=%026x state=%0d", u_ddl.pfx, u_ddl.state);
       end
@@ -140,24 +184,38 @@ module tb_k2g_decode_equiv;
 
     drain();
 
-    held_valid = ddl_uop_valid && !uop_ready;
+    held       = !ddl_empty && !pop;
     held_uop   = ddl_uop;
+    prev_wsalt = ddl_uop_wsalt;
     @(posedge clk);
     cycles++;
   endtask
 
-  // Rule 3: toggling `ready` within a cycle must not move `valid` or `data`.
+  // Rule 3, BOTH WAYS: driving one side's salt within a cycle must not move
+  // anything the other publishes.
   task automatic check_rule3();
-    logic         v0;
-    logic [126:0] d0;
-    uop_ready = 1'b0; #1;
-    v0 = ddl_uop_valid; d0 = ddl_uop;
-    uop_ready = 1'b1; #1;
+    logic [1:0]   w0, r0, save_r, save_w;
+    logic [253:0] d0;
+    save_r = tb_rsalt; save_w = tb_wsalt;
+
+    tb_rsalt = 2'b00; #1; w0 = ddl_uop_wsalt; d0 = ddl_uop_pair;
+    tb_rsalt = 2'b11; #1;
     checks++;
-    if (ddl_uop_valid !== v0 || ddl_uop !== d0) begin
+    if (ddl_uop_wsalt !== w0 || ddl_uop_pair !== d0) begin
       errors++;
-      if (errors <= 5) $display("RULE3 valid/data moved with ready @%0d", cycles);
+      if (errors <= 5) $display("RULE3 producer moved with rsalt @%0d", cycles);
     end
+    tb_rsalt = save_r;
+
+    tb_wsalt = 2'b00; #1; r0 = ddl_cps_rsalt;
+    tb_wsalt = 2'b11; #1;
+    checks++;
+    if (ddl_cps_rsalt !== r0) begin
+      errors++;
+      if (errors <= 5) $display("RULE3 consumer moved with wsalt @%0d", cycles);
+    end
+    tb_wsalt = save_w;
+    #1;
     uop_ready = 1'b0;
   endtask
 
