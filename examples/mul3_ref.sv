@@ -1,82 +1,87 @@
 // Hand-written reference for mul3: the three-stage pipeline a person would
-// write, with a validity chain, a shift enable, and a skid entry behind the
-// output so `src_ready` is a register.
+// write, under the salt protocol.
 //
-// The skid is the part that is easy to leave out and expensive to leave out.
-// Without it `shift` is `!v2 || dst_ready` and `src_ready` is `shift`, so the
-// producer's `ready` is a wire straight through to the consumer's -- and a
-// chain of these is one combinational path as long as the chain. k3g_chan.sv
-// puts it as a rule: `ready` is "never a function of the opposite side's
-// handshake". The second entry is where the item the producer had already
-// committed to goes while the head is stalled, which is what lets `ready` stop
-// watching `dst_ready`.
+// THE VALIDITY CHAIN IS ONE BIT SHORTER THAN THE PIPELINE, and that is the
+// part worth getting right rather than transcribing. Under valid/ready the
+// last stage needed its own `v2` beside the output slot's occupancy, and the
+// two said the same thing twice. `wsalt` says it once: the pipeline is three
+// deep and the chain is `v0`, `v1`, and then the salt distance to the
+// consumer's.
+//
+// The other half of what disappeared is the skid shuffle. A producer here only
+// ever pushes -- there is no pop, no skid-draining-into-head, and no second
+// copy of the payload, because taking is the consumer's business and it does
+// not need this side's help to do it.
 `timescale 1ns/1ps
 
 module mul3_ref (
     input  logic        clk,
     input  logic        rst_n,
 
-    input  logic        src_valid,
-    output logic        src_ready,
-    input  logic [15:0] src_data,
+    input  logic [1:0]  src_wsalt,
+    output logic [1:0]  src_rsalt,
+    input  logic [31:0] src_data,
 
-    output logic        dst_valid,
-    input  logic        dst_ready,
-    output logic [31:0] dst_data
+    output logic [1:0]  dst_wsalt,
+    input  logic [1:0]  dst_rsalt,
+    output logic [63:0] dst_data
 );
 
-  logic        v0, v1, v2;
-  logic [15:0] doubled_q;
-  logic [31:0] wide_q, out_q;
+  // ---- the consuming side --------------------------------------------------
+  logic [1:0] src_rsalt_q;
+  wire logic  in_ridx  = src_rsalt_q[0] ^ src_rsalt_q[1];
+  wire logic  in_empty = (src_wsalt == src_rsalt_q);
+  wire logic [15:0] in_item = in_ridx ? src_data[31:16] : src_data[15:0];
 
-  // The second output entry.
-  logic        skid_full;
-  logic [31:0] skid_q;
+  assign src_rsalt = src_rsalt_q;
+
+  // ---- the producing side --------------------------------------------------
+  logic [1:0]  dst_wsalt_q;
+  logic [31:0] e0, e1;
+  wire logic   out_widx = dst_wsalt_q[0] ^ dst_wsalt_q[1];
+  wire logic   out_full = (dst_wsalt_q == ~dst_rsalt);
+
+  assign dst_wsalt = dst_wsalt_q;
+  assign dst_data  = {e1, e0};
 
   // The pipeline moves when there is somewhere for what leaves it to go.
-  wire logic shift = !skid_full;
+  wire logic shift = !out_full;
 
-  wire logic [15:0] doubled = src_data + src_data;
+  logic        v0, v1;
+  logic [15:0] doubled_q;
+  logic [31:0] wide_q;
+
+  wire logic [15:0] doubled = in_item + in_item;
   wire logic [31:0] wide    = {16'd0, doubled_q};
   wire logic [31:0] scaled  = wide_q + wide_q;
 
-  // Nothing leaves the last stage on a cycle the pipeline does not shift, so
-  // the offer is gated on `shift` and not merely on `v1`.
-  wire logic pop       = v2 && dst_ready;
-  wire logic offer     = shift && v1;
-  wire logic keep_head = v2 && !pop;
-  wire logic to_head   = offer && (!v2 || pop);
-  wire logic from_skid = pop && skid_full;
-  wire logic to_skid   = offer && keep_head;
-
-  assign src_ready = shift;
-  assign dst_valid = v2;
-  assign dst_data  = out_q;
+  // The input is taken when something is offered and the pipeline is moving.
+  wire logic take = !in_empty && shift;
+  // ...and the last stage's result is pushed on the same condition, one bit
+  // further down the chain.
+  wire logic push = shift && v1;
 
   always_ff @(posedge clk) begin
     if (!rst_n) begin
-      v0 <= 1'b0; v1 <= 1'b0; v2 <= 1'b0;
-      doubled_q <= '0;
-      wide_q    <= '0;
-      out_q     <= '0;
-      skid_full <= 1'b0;
-      skid_q    <= '0;
+      v0 <= 1'b0; v1 <= 1'b0;
+      doubled_q   <= '0;
+      wide_q      <= '0;
+      e0          <= '0;
+      e1          <= '0;
+      src_rsalt_q <= 2'b00;
+      dst_wsalt_q <= 2'b00;
     end else begin
       if (shift) begin
-        v0 <= src_valid;
-        v1 <= v0;
+        v0        <= !in_empty;
+        v1        <= v0;
         doubled_q <= doubled;
         wide_q    <= wide;
       end
-
-      // `from_skid` and `to_head` cannot both hold: an offer needs an empty
-      // skid, and `from_skid` needs a full one.
-      v2 <= keep_head || from_skid || to_head;
-      if (from_skid)   out_q <= skid_q;
-      else if (to_head) out_q <= scaled;
-
-      skid_full <= (skid_full && !pop) || to_skid;
-      if (to_skid) skid_q <= scaled;
+      if (take) src_rsalt_q[in_ridx] <= ~src_rsalt_q[in_ridx];
+      if (push) begin
+        if (out_widx) e1 <= scaled; else e0 <= scaled;
+        dst_wsalt_q[out_widx] <= ~dst_wsalt_q[out_widx];
+      end
     end
   end
 
