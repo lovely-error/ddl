@@ -368,7 +368,15 @@ process k2g_decode (
               main_uop.kind = UOP_NOP
             else
               if ep2_op == EP2_TC then
-                main_uop.kind = UOP_PERFORM_JUMP
+                -- A predicated TC is rejected. The predicated-branch idiom
+                -- puts its condition on the PRIME, so an unprimed TC is the
+                -- defined no-op (spec 6.5); predicating the TC itself adds
+                -- nothing and makes the jump depend on state the front end
+                -- cannot see.
+                if pfx.cond != CCK_NONE then
+                  main_uop = uop_fault(FAULT_ILLEGAL_PREFIX_COMBO, cp)
+                else
+                  main_uop.kind = UOP_PERFORM_JUMP
               else
                 main_uop = uop_fault(FAULT_ILLEGAL_OPCODE, cp)
         else

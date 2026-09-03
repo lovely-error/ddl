@@ -55,10 +55,10 @@ module tb_k2g_decode_equiv;
   // ---- and the salt consumer on `uop` --------------------------------------
   logic [1:0]   tb_rsalt;
   logic [1:0]   ddl_uop_wsalt;
-  logic [253:0] ddl_uop_pair;
+  logic [255:0] ddl_uop_pair;
   wire  tb_ridx  = tb_rsalt[0] ^ tb_rsalt[1];
   wire  ddl_empty = (ddl_uop_wsalt == tb_rsalt);
-  wire [126:0] ddl_uop = tb_ridx ? ddl_uop_pair[253:127] : ddl_uop_pair[126:0];
+  wire [127:0] ddl_uop = tb_ridx ? ddl_uop_pair[255:128] : ddl_uop_pair[127:0];
   wire  pop = uop_ready && !ddl_empty;
 
   // THE BRIDGE. `push` is NOT the reference's `cp_valid`: push is when an item
@@ -105,8 +105,8 @@ module tb_k2g_decode_equiv;
   int errors = 0, checks = 0, cycles = 0;
   int ref_n = 0, ddl_n = 0, compared = 0, stalls = 0;
 
-  logic [126:0] ref_q[$];
-  logic [126:0] ddl_q[$];
+  logic [127:0] ref_q[$];
+  logic [127:0] ddl_q[$];
   int           ref_cyc[$];
   int           ddl_cyc[$];
 
@@ -119,12 +119,12 @@ module tb_k2g_decode_equiv;
   endfunction
 
   logic         held_valid_unused = 1'b0;
-  logic [126:0] held_uop;
+  logic [127:0] held_uop;
 
   task automatic drain();
     while (ref_q.size() > 0 && ddl_q.size() > 0) begin
-      automatic logic [126:0] a = ref_q.pop_front();
-      automatic logic [126:0] b = ddl_q.pop_front();
+      automatic logic [127:0] a = ref_q.pop_front();
+      automatic logic [127:0] b = ddl_q.pop_front();
       automatic int ca = ref_cyc.pop_front();
       automatic int cb = ddl_cyc.pop_front();
       checks++;
@@ -195,7 +195,7 @@ module tb_k2g_decode_equiv;
   // anything the other publishes.
   task automatic check_rule3();
     logic [1:0]   w0, r0, save_r, save_w;
-    logic [253:0] d0;
+    logic [255:0] d0;
     save_r = tb_rsalt; save_w = tb_wsalt;
 
     tb_rsalt = 2'b00; #1; w0 = ddl_uop_wsalt; d0 = ddl_uop_pair;

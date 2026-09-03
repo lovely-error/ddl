@@ -133,7 +133,7 @@ module tb_k2g_xstage_equiv;
       if (a !== b) begin
         errors++;
         if (errors <= 5)
-          $display("MISMATCH packet #%0d @%0d:\n  ref=%021x\n  ddl=%021x", compared, cycles, a, b);
+          $display("MISMATCH packet #%0d @%0d:\n  ref=%021x\n  ddl=%021x\n  mdl=%021x use_model=%0d", compared, cycles, a, b, m, use_model);
       end
       // The model only claims to know the packets whose value comes straight
       // from a forwarded register read.
