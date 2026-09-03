@@ -49,7 +49,6 @@ enum uop_kind_e: i5
   UOP_UNARY
   UOP_HALT
   UOP_FAULT
-  UOP_ICINVR
 
 enum cond_kind_e: i3
   CCK_NONE
@@ -117,6 +116,12 @@ struct uop_t
   jump_kind: jump_e
 
   -- Modifiers.
+  -- ISTORE + ST (spec 3.2.1): this store writes instruction memory. A FLAG on
+  -- the store rather than a kind of its own, because everything else about it
+  -- -- address, width from the source tag, predication, faults -- is a
+  -- store's and stays a store's. What it adds is where the bytes have to
+  -- become visible.
+  is_insn: i1
   on_flags: i1         -- FLAG prefix: operate on flag_bit
   uto_reg: i5          -- link register / widening-multiply high half
   uto_valid: i1

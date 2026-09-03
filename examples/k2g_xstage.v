@@ -6,24 +6,24 @@
 // function calls: all three make GowinSynthesis exit with an empty log.
 
 module uop_nop (
-    output [126:0] u
+    output [127:0] u
 );
 
-  assign u = 127'd0;
+  assign u = 128'd0;
 
 endmodule
 
 module uop_fault (
     input  [4:0]   cause,
     input  [15:0]  cp,
-    output [126:0] u
+    output [127:0] u
 );
 
-  wire [126:0] f = 127'd0;
-  wire [126:0] n5 = {5'h12, f[121:0]};
-  wire [126:0] n8 = {n5[126:37], cause, n5[31:0]};
+  wire [127:0] f = 128'd0;
+  wire [127:0] n5 = {5'h12, f[122:0]};
+  wire [127:0] n8 = {n5[127:37], cause, n5[31:0]};
 
-  assign u = {n8[126:112], {16'd0, cp}, n8[79:0]};
+  assign u = {n8[127:113], {16'd0, cp}, n8[80:0]};
 
 endmodule
 
@@ -175,7 +175,7 @@ module k2g_xstage (
     input          rst_n,
     input  [1:0]   uops_wsalt,
     output [1:0]   uops_rsalt,
-    input  [253:0] uops_data,
+    input  [255:0] uops_data,
     output [1:0]   wb_wsalt,
     input  [1:0]   wb_rsalt,
     output [167:0] wb_data
@@ -197,14 +197,14 @@ module k2g_xstage (
   integer flagbit_ix;
 
   wire uops_ridx = uops_rsalt_q[0] ^ uops_rsalt_q[1];
-  wire [126:0] uops_item = uops_ridx ? uops_data[253:127] : uops_data[126:0];
+  wire [127:0] uops_item = uops_ridx ? uops_data[255:128] : uops_data[127:0];
   wire wb_full = wb_wsalt_q == (~wb_rsalt);
   wire wb_room = !wb_full;
   wire uops_empty = uops_wsalt == uops_rsalt_q;
   wire uops_take = (!uops_empty) & wb_room;
-  wire [4:0] ra = uops_item[121:117];
-  wire [4:0] rb = uops_item[116:112];
-  wire [4:0] rc = uops_item[75:71];
+  wire [4:0] ra = uops_item[122:118];
+  wire [4:0] rb = uops_item[117:113];
+  wire [4:0] rc = uops_item[76:72];
   wire [31:0] ra_value = values[ra];
   wire [31:0] rb_value = values[rb];
   wire [31:0] rc_value = values[rc];
@@ -231,22 +231,22 @@ module k2g_xstage (
   wire xa_flg = (ma & w[80]) ? w[38] : ra_flg;
   wire xb_flg = (mb & w[80]) ? w[38] : rb_flg;
   wire xc_flg = (mc & w[80]) ? w[38] : rc_flg;
-  wire [2:0] n127 = uops_item[78:76];
+  wire [2:0] n127 = uops_item[79:77];
   reg n137;
-  wire unpredicated = uops_item[78:76] == 3'd0;
-  wire cond_met = unpredicated ? 1'b1 : (n137 ^ uops_item[70]);
-  wire [4:0] n151 = uops_item[126:122];
+  wire unpredicated = uops_item[79:77] == 3'd0;
+  wire cond_met = unpredicated ? 1'b1 : (n137 ^ uops_item[71]);
+  wire [4:0] n151 = uops_item[127:123];
   reg n166;
   reg n167;
   wire f32_a = n166 & (xa_tag == 3'd3);
   wire f32_b = n167 & (xb_tag == 3'd3);
   wire f32_cond = (!unpredicated) & (xc_tag == 3'd3);
-  wire [31:0] alu_b = uops_item[79] ? uops_item[111:80] : xb_value;
-  wire [2:0] alu_b_tag = uops_item[79] ? xa_tag : xb_tag;
-  wire [1:0] n190 = uops_item[69:68];
-  wire [1:0] n192 = uops_item[67:66];
-  wire [2:0] n194 = uops_item[63:61];
-  wire [1:0] n196 = uops_item[60:59];
+  wire [31:0] alu_b = uops_item[80] ? uops_item[112:81] : xb_value;
+  wire [2:0] alu_b_tag = uops_item[80] ? xa_tag : xb_tag;
+  wire [1:0] n190 = uops_item[70:69];
+  wire [1:0] n192 = uops_item[68:67];
+  wire [2:0] n194 = uops_item[64:62];
+  wire [1:0] n196 = uops_item[61:60];
   wire [32:0] a33 = {1'b0, xa_value};
   wire [32:0] b33 = {1'b0, alu_b};
   wire [32:0] sum = a33 + b33;
@@ -262,49 +262,49 @@ module k2g_xstage (
   wire signed [32:0] a_wide = {a_top, xa_value};
   wire signed [32:0] b_wide = {b_top, alu_b};
   reg cmp_result;
-  wire [31:0] n236 = uops_item[111:80];
-  wire [4:0] amount = uops_item[79] ? n236[4:0] : xb_value[4:0];
+  wire [31:0] n236 = uops_item[112:81];
+  wire [4:0] amount = uops_item[80] ? n236[4:0] : xb_value[4:0];
   wire [4:0] n242 = uops_item[46:42];
   wire [4:0] n243 = uops_item[41:37];
   wire signed [31:0] n254 = xa_value;
   wire signed [31:0] n255 = n254 >>> amount;
   wire [31:0] n256 = n255;
-  wire [31:0] shift_result = (uops_item[65:64] == 2'd0) ? (xa_value << amount) : ((uops_item[65:64] == 2'd1) ? (xa_value >> amount) : n256);
+  wire [31:0] shift_result = (uops_item[66:65] == 2'd0) ? (xa_value << amount) : ((uops_item[66:65] == 2'd1) ? (xa_value >> amount) : n256);
   wire [31:0] span_mask = (n243 == 5'd0) ? 32'd0 : ((32'd1 << n243) - 32'd1);
   wire [31:0] bext_result = (xb_value >> n242) & span_mask;
   wire [31:0] placed_mask = span_mask << n242;
   wire [31:0] placed_src = (xb_value & span_mask) << n242;
   wire [31:0] bins_result = (xa_value & (~placed_mask)) | placed_src;
-  wire [31:0] load_addr = xb_value + uops_item[111:80];
-  wire [31:0] store_addr = xa_value + uops_item[111:80];
-  wire is_load = uops_item[126:122] == 5'd4;
+  wire [31:0] load_addr = xb_value + uops_item[112:81];
+  wire [31:0] store_addr = xa_value + uops_item[112:81];
+  wire is_load = uops_item[127:123] == 5'd4;
   wire [31:0] access_addr = is_load ? load_addr : store_addr;
   wire [2:0] access_tag = is_load ? uops_item[49:47] : xb_tag;
-  wire [1:0] n291 = uops_item[67:66];
+  wire [1:0] n291 = uops_item[68:67];
   reg n295;
   wire [1:0] low = access_tag[1:0];
   wire [2:0] access_width = (low == 2'd0) ? 3'd1 : ((low == 2'd1) ? 3'd2 : 3'd4);
-  wire is_store = uops_item[126:122] == 5'd5;
+  wire is_store = uops_item[127:123] == 5'd5;
   wire is_access = is_load | is_store;
   wire [31:0] last_byte = access_addr + ({{29{1'b0}}, access_width});
   wire out_of_range = last_byte > 32'h800000;
   wire n331 = uops_take & f32_cond;
   wire n336 = uops_take & cond_met;
-  wire n342 = uops_item[126:122] == 5'h12;
+  wire n342 = uops_item[127:123] == 5'h12;
   wire n347 = f32_a | f32_b;
   wire n355 = is_access & ((access_width == 3'd1) ? 1'b0 : ((access_width == 3'd2) ? access_addr[0] : (access_addr[1] | access_addr[0])));
   wire n360 = is_access & out_of_range;
   wire n380 = n331 ? 1'b1 : (n336 ? (n342 ? 1'b1 : (n347 ? 1'b1 : (n355 ? 1'b1 : n360))) : 1'b0);
   wire commits = (uops_take & cond_met) & (!n380);
   wire [83:0] n = 84'd0;
-  wire [83:0] n390 = {n[83:80], uops_item[121:117], n[74:0]};
+  wire [83:0] n390 = {n[83:80], uops_item[122:118], n[74:0]};
   wire [83:0] n395 = {n390[83:43], uops_item[49:47], n390[39:0]};
   wire [83:0] n399 = {n395[83:40], 1'b0, n395[38:0]};
   wire [83:0] n403 = {n399[83:39], 1'b0, n399[37:0]};
   wire [83:0] n406 = {n403[83:38], n380, n403[36:0]};
   wire [83:0] n409 = {n406[83:37], (n331 ? 5'd5 : (n336 ? (n342 ? uops_item[36:32] : (n347 ? 5'd5 : (n355 ? (is_load ? 5'd6 : 5'd7) : (n360 ? 5'd9 : 5'd0)))) : 5'd0)), n406[31:0]};
-  wire [83:0] n411 = {n409[83:32], (n331 ? ({{27{1'b0}}, uops_item[75:71]}) : (n336 ? (n342 ? uops_item[111:80] : (n347 ? (f32_a ? ({{27{1'b0}}, uops_item[121:117]}) : ({{27{1'b0}}, uops_item[116:112]})) : (n355 ? access_addr : (n360 ? access_addr : 32'd0)))) : 32'd0))};
-  wire [4:0] n413 = uops_item[126:122];
+  wire [83:0] n411 = {n409[83:32], (n331 ? ({{27{1'b0}}, uops_item[76:72]}) : (n336 ? (n342 ? uops_item[112:81] : (n347 ? (f32_a ? ({{27{1'b0}}, uops_item[122:118]}) : ({{27{1'b0}}, uops_item[117:113]})) : (n355 ? access_addr : (n360 ? access_addr : 32'd0)))) : 32'd0))};
+  wire [4:0] n413 = uops_item[127:123];
   wire [83:0] n415 = {commits, n411[82:0]};
   wire [83:0] n418 = {n415[83], commits, n415[81:0]};
   wire [83:0] n421 = {n418[83:82], commits, n418[80:0]};
@@ -359,7 +359,7 @@ module k2g_xstage (
       5'd5, 5'd7, 5'hC: n166 = 1'b1;
       5'h10: n166 = 1'b1;
       5'd8, 5'd9, 5'hA, 5'hD: n166 = 1'b1;
-      5'hE: n166 = (uops_item[58:57] != 2'd0);
+      5'hE: n166 = (uops_item[59:58] != 2'd0);
       default: n166 = 1'b0;
     endcase
   end
@@ -368,7 +368,7 @@ module k2g_xstage (
     case (n151)
       5'd3, 5'd4, 5'd6, 5'hB: n167 = 1'b1;
       5'd5, 5'd7, 5'hC: n167 = 1'b1;
-      5'd8, 5'd9, 5'hA, 5'hD: n167 = (!uops_item[79]);
+      5'd8, 5'd9, 5'hA, 5'hD: n167 = (!uops_item[80]);
       default: n167 = 1'b0;
     endcase
   end
@@ -450,7 +450,7 @@ module k2g_xstage (
 
   always @* begin
     case (n413)
-      5'd1: n530 = uops_item[111:80];
+      5'd1: n530 = uops_item[112:81];
       5'd2: n530 = xa_value;
       5'd3: n530 = xb_value;
       5'd8: n530 = arith_result;

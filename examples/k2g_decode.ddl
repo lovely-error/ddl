@@ -8,9 +8,11 @@
 --
 -- Prefixes that *reinterpret* their main opcode are resolved here, so the
 -- execute stage never sees a prefix: BMX+SHL is an extract, UTO+MUL is a
--- widening multiply, CSP+LD is a port read, and MPD/MPI+TST, ICINVR+ST and
--- ESP+ST are no-ops rather than the compares and stores they would otherwise
--- be (spec 3.2).
+-- widening multiply, CSP+LD is a port read, and MPD/MPI+TST and ESP+ST are
+-- no-ops rather than the compares and stores they would otherwise be (spec
+-- 3.2). ISTORE+ST is the one that is NOT reinterpreted: it is a real store,
+-- and what the prefix adds is a flag saying where the bytes have to become
+-- visible (spec 3.2.1).
 --
 -- Reads of a `var` see the value at the start of the cycle plus whatever this
 -- body has already assigned, so the SystemVerilog's `pfx_next = pfx;` opening
@@ -37,7 +39,7 @@ struct pfx_t
 
   flag: i1
   csp: i1
-  icinvr: i1
+  istore: i1
   esp: i1
   prefetch_d: i1
   prefetch_i: i1
@@ -152,10 +154,10 @@ process k2g_decode (
     let pfx_csp: i1 = is_ep2 & (ep2_op == EP2_CSP)
     let pfx_mpi: i1 = is_ep2 & (ep2_op == EP2_MPI)
     let pfx_mpd: i1 = is_ep2 & (ep2_op == EP2_MPD)
-    let pfx_icinvr: i1 = is_ep2 & (ep2_op == EP2_ICINVR)
+    let pfx_istore: i1 = is_ep2 & (ep2_op == EP2_ISTORE)
 
     let is_prefix: i1 = pfx_xi | pfx_bmx | pfx_xc | pfx_uto | pfx_order |
-        pfx_esp | pfx_flag | pfx_csp | pfx_mpi | pfx_mpd | pfx_icinvr
+        pfx_esp | pfx_flag | pfx_csp | pfx_mpi | pfx_mpd | pfx_istore
 
     -- A condition code outside the assigned set makes XCP/XCN illegal. The
     -- emulator used to fall back to treating the code point as a main opcode,
@@ -258,23 +260,23 @@ process k2g_decode (
 
       -- ---- stores, and the prefixes that replace them ----
       .LB_ST =>
-        if pfx.icinvr then
-          -- Make this core's stores visible to its own instruction fetch
-          -- (spec 3.2).
-          main_uop.kind = UOP_ICINVR
+        if pfx.esp then
+          -- Still honoured as a no-op. Ignoring the prefix would perform a
+          -- real store, which is a silent wrong answer (spec 3.2, 10).
+          main_uop.kind = UOP_NOP
         else
-          if pfx.esp then
-            -- Still honoured as a no-op. Ignoring the prefix would perform a
-            -- real store, which is a silent wrong answer (spec 3.2, 10).
-            main_uop.kind = UOP_NOP
+          if pfx.csp then
+            -- CSP+ST: port number in arg1, data in arg2 -- the opposite
+            -- operand positions from the load form.
+            main_uop.kind = UOP_CSP_STORE
           else
-            if pfx.csp then
-              -- CSP+ST: port number in arg1, data in arg2 -- the opposite
-              -- operand positions from the load form.
-              main_uop.kind = UOP_CSP_STORE
-            else
-              main_uop.kind = UOP_STORE
-              main_uop.imm = imm_mem
+            -- A store either way. `is_insn` says the bytes are instructions,
+            -- so they must reach shared memory and the instruction side must
+            -- be told (spec 3.2.1) -- it does not change what is written or
+            -- where.
+            main_uop.kind = UOP_STORE
+            main_uop.imm = imm_mem
+            main_uop.is_insn = pfx.istore
 
       -- ---- arithmetic ----
       .LB_ADD | .LB_SUB | .LB_MUL | .LB_DIV =>
@@ -435,8 +437,8 @@ process k2g_decode (
               pfx.flag = 1'b1
             if pfx_csp then
               pfx.csp = 1'b1
-            if pfx_icinvr then
-              pfx.icinvr = 1'b1
+            if pfx_istore then
+              pfx.istore = 1'b1
             if pfx_esp then
               pfx.esp = 1'b1
             if pfx_mpd then
