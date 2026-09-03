@@ -38,6 +38,7 @@ module tb_k2g_xstage_equiv;
 
   logic [83:0] ref_packet;
 
+
   // ---- the testbench is the salt producer on `uops` ------------------------
   logic [1:0]   tb_wsalt;
   uop_t         tb_e [0:1];
@@ -60,8 +61,41 @@ module tb_k2g_xstage_equiv;
   // reference is driven from the DDL's own consume decision, and reads the
   // entry the DDL is reading.
   wire  xfer = u_ddl.uops_take;
+
   uop_t taken;
   assign taken = u_ddl.uops_ridx ? tb_e[1] : tb_e[0];
+
+  // ---- reading the reference a half-cycle late, and why -------------------
+  //
+  // `k2g_regfile.sv:108` reads the value arrays on the NEGEDGE:
+  //
+  //     always_ff @(negedge clk) ra_value <= values_a[ra_addr];
+  //
+  // so the reference's `packet` is combinational off a register that does not
+  // settle until the middle of the cycle. Everything else in this testbench is
+  // sampled just after the posedge, which for the reference is too early: it
+  // reads the PREVIOUS cycle's register read. While the stimulus walks
+  // `r0 <- r1`, `r0 <- r2`, ..., that looks exactly like the register file
+  // being off by one address, and is not.
+  //
+  // The DDL reads its arrays asynchronously (`lutram`), so its packet is good
+  // from the top of the cycle and is sampled up there with the handshake it
+  // belongs to.
+  //
+  // A clocked capture rather than a `@(negedge clk)` inside `step`: `step` is
+  // not always entered immediately after a posedge -- `check_rule3` advances
+  // time without one -- so a wait for the next negedge can straddle an edge
+  // and sample two different cycles at its two ends. `<=` at the posedge takes
+  // the value from just before it, which is the settled one, whatever phase
+  // the caller happens to be in.
+  logic [83:0] ref_packet_q;
+  logic        ref_due_q = 1'b0;
+  uop_t        taken_q;
+  always_ff @(posedge clk) begin
+    ref_packet_q <= ref_packet;
+    ref_due_q    <= xfer;
+    taken_q      <= taken;
+  end
 
   // Anti-footgun: the entry the reference is handed must be the one the DDL is
   // reading. If these ever differ the two are decoding different micro-ops and
@@ -166,14 +200,21 @@ module tb_k2g_xstage_equiv;
 
     if (offer && tb_full) stalls++;
 
-    // Everything in here is about the micro-op the DDL CONSUMED, which is
-    // `taken` -- the entry its own read index names -- and not whatever the
-    // testbench happens to be offering. Under valid/ready those were the
-    // same value; with two entries between the sides they are not.
-    if (xfer) begin
-      // ---- the model, as of the start of the cycle ----------------------
-      automatic logic [4:0]  ra = taken.dst;
-      automatic logic [4:0]  rb = taken.src;
+    // The reference's packet for the micro-op taken LAST cycle, which is the
+    // one that has settled. The model's W stage takes the same packet, so the
+    // two stay in step with each other and with the queue.
+    if (ref_due_q) begin
+      // Everything in here is about the micro-op the DDL CONSUMED, which is
+      // `taken` -- the entry its own read index names -- and not whatever the
+      // testbench happens to be offering. Under valid/ready those were the
+      // same value; with two entries between the sides they are not.
+      //
+      // It runs a cycle behind the transfer, with the packet, because the
+      // model is an independent implementation of what the reference should
+      // have produced and the two have to advance together.
+      // ---- the model, as of the start of that cycle ---------------------
+      automatic logic [4:0]  ra = taken_q.dst;
+      automatic logic [4:0]  rb = taken_q.src;
       automatic logic mwriting = mw_we_value | mw_we_tag | mw_we_overflow | mw_we_flag;
       automatic logic ma = mwriting && (mw_addr == ra);
       automatic logic mb = mwriting && (mw_addr == rb);
@@ -183,21 +224,21 @@ module tb_k2g_xstage_equiv;
       automatic logic        xb_flg   = (mb && mw_we_flag)     ? mw_flag     : m_flag[rb];
       // The model knows about forwarding, not about predication or the
       // reserved tag, so it only claims a COPY that neither of those touches.
-      automatic bit is_copy = (taken.kind == UOP_COPY)
-                              && (taken.cond == CCK_NONE)
+      automatic bit is_copy = (taken_q.kind == UOP_COPY)
+                              && (taken_q.cond == CCK_NONE)
                               && (xb_tag != RDT_F32);
 
-      if (taken.cond != CCK_NONE) predicated++;
+      if (taken_q.cond != CCK_NONE) predicated++;
       // The DDL implements `rdt_normalize` itself and the reference calls the
       // one in k2g_types.svh, so the comparison checks it -- but only on the
       // packets where it is not the identity. Count those.
-      if ((taken.kind == UOP_PUT_IMM)
-          && (rdt_normalize(taken.imm, taken.datakind) !== taken.imm)) narrowed++;
-      if (ref_packet[37]) faults++;
+      if ((taken_q.kind == UOP_PUT_IMM)
+          && (rdt_normalize(taken_q.imm, taken_q.datakind) !== taken_q.imm)) narrowed++;
+      if (ref_packet_q[37]) faults++;
       // A COPY commits all four fields or none, so a COPY that wrote nothing
       // is predication doing its job rather than an opcode that writes little.
-      if ((taken.cond != CCK_NONE) && (taken.kind == UOP_COPY)
-          && (ref_packet[83:80] == 4'd0)) suppressed++;
+      if ((taken_q.cond != CCK_NONE) && (taken_q.kind == UOP_COPY)
+          && (ref_packet_q[83:80] == 4'd0)) suppressed++;
 
       if (ma || mb) forwarded++;
       if (is_copy) begin
@@ -209,7 +250,7 @@ module tb_k2g_xstage_equiv;
       end
       mdl_check.push_back(is_copy);
 
-      ref_q.push_back(ref_packet);
+      ref_q.push_back(ref_packet_q);
 
       // ---- the model's arrays take W's write, at the edge ---------------
       if (mw_we_value)    m_value[mw_addr]    = mw_value;
@@ -217,16 +258,15 @@ module tb_k2g_xstage_equiv;
       if (mw_we_overflow) m_overflow[mw_addr] = mw_overflow;
       if (mw_we_flag)     m_flag[mw_addr]     = mw_flag;
 
-      // ...and the packet the reference just produced becomes the model's W.
-      mw_we_value    = ref_packet[83];
-      mw_we_tag      = ref_packet[82];
-      mw_we_overflow = ref_packet[81];
-      mw_we_flag     = ref_packet[80];
-      mw_addr        = ref_packet[79:75];
-      mw_value       = ref_packet[74:43];
-      mw_tag         = ref_packet[42:40];
-      mw_overflow    = ref_packet[39];
-      mw_flag        = ref_packet[38];
+      mw_we_value    = ref_packet_q[83];
+      mw_we_tag      = ref_packet_q[82];
+      mw_we_overflow = ref_packet_q[81];
+      mw_we_flag     = ref_packet_q[80];
+      mw_addr        = ref_packet_q[79:75];
+      mw_value       = ref_packet_q[74:43];
+      mw_tag         = ref_packet_q[42:40];
+      mw_overflow    = ref_packet_q[39];
+      mw_flag        = ref_packet_q[38];
     end
 
     if (pop) ddl_q.push_back(ddl_wb);
