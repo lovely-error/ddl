@@ -40,9 +40,9 @@ sequence mul3 (src: buffer in i16, dst: buffer out i32)
 ```
 
 `|||` is a stage cut. What comes out is a three-stage pipeline with a validity
-bit per stage, back-pressure from the sink, and `dst_valid` driven by a
+bit per stage, back-pressure from the sink, and a `dst_wsalt` driven by a
 register — see [examples/mul3.v](examples/mul3.v). Nothing in the source
-mentions `valid`, `ready`, or a clock.
+mentions a handshake or a clock.
 
 A `graph` connects blocks like that one to each other, and a `process` turns a
 sequential program with wait points into the state machine that implements it:
@@ -66,9 +66,10 @@ Three states, and the branch is decided in the cycle the command arrives — see
 
 **Declarations.** `fun` (combinational, becomes a module with `out`
 parameters as extra ports), `sequence` (becomes a pipeline, cut by `|||`),
-`process` (becomes a state machine, cut at blocking channel operations), and
+`process` (becomes a state machine, cut at blocking channel operations),
 `graph` (structural composition: instantiates the others and wires their pipes
-together). `struct` and `enum` lay out the same way SystemVerilog packs them,
+together), and `extern` (names a module DDL did not compile, so a graph can
+instantiate it). `struct` and `enum` lay out the same way SystemVerilog packs them,
 so a DDL type and its `.svh` counterpart meet at a module boundary without a
 cast.
 
@@ -81,6 +82,9 @@ A `[T; n]` without an `#[impl(...)]` is not storage but a packed value, so it
 can be a struct field, a pipe payload or a parameter; `a[k]` selects an
 element and `a[hi..lo]` a run of them, laid out the way SystemVerilog packs an
 array, and an index past the end is an error rather than a bit somewhere else.
+`a[k] = v` and `s.words[k] = v` assign one, at a constant index or a computed
+one; `@slice(x, base, w)` is the read side of the same idea on a plain `iN`,
+a `w`-bit window at a base this cycle decides.
 Widths are checked and never silently adjusted: mixed widths are an
 error naming the `@zext`/`@trunc` that fixes them, and an unsized literal takes
 its width from the other operand.
@@ -100,17 +104,90 @@ tag here while reading as the whole value. See
 [examples/tagged.ddl](examples/tagged.ddl).
 
 **Statements.** `let`, `var`, assignment (plain and compound: `+=`, `<<=`,
-`^=`, …), `if`/`else` — including with a blocking `@rcv`/`@send` inside, which
-becomes a fork in the state machine — `match` with exhaustiveness checking,
-`loop` and `break` in a process, `for i in 0..n` which unrolls, and calls to
-`fun`, which are inlined.
+`^=`, …), `if`/`else`, `match` with exhaustiveness checking, `for i in 0..n`
+which unrolls, and calls to `fun`, which are inlined.
+
+**Anything that waits can go in an `if`, a `match` or a `loop`.** A blocking
+`@rcv`/`@send`, a `break` and a `bram` read all cost a cycle, and
+all three constructs can hold one: an `if` forks the state machine, a `match`
+becomes a `case` on the tag choosing the next state, and a `loop` is a back
+edge. `loop`s nest to any depth and `break` leaves the innermost one; at the
+top of a process it stops the process (desc.md:37).
+
+A `match` mattered here more than it looks. `match` is the only way to reach a
+payload and `==` on an enum that carries one is refused, so before this a
+tagged union had no way to wait per variant at all — which is the shape of
+every dispatch. A name bound by more than one arm is one wire and therefore
+one type; two payload types under one name is refused rather than picked
+between.
 
 **Parameters.** By value, `out` (write-only, which is how a function returns
 more than one thing), and `inout` (by reference and readable: it updates the
 caller's variable, and at a module boundary becomes `x` plus `x_out`).
 
-**Pipes.** `buffer`, in and out, with `@rcv`, `@send`, `@try_rcv`,
+**Pipes.** Two kinds, reached the same way. A `buffer` has back-pressure: two
+entries, and a producer that waits. A **`port`** has none at all — a data
+port and an enable, and nothing coming back:
+
+```
+process relay (src: port in i32, dst: port out i32)
+  loop
+    let v = @rcv(src)
+    @send(dst, v + 32'd1)
+```
+
+`port in x: T` is `x` and `x_en` coming in; `port out y: T` is `y` and `y_en`
+going out. Both are read and written with the channel operations and not by
+name: `@rcv` to wait for one, `@try_rcv` or `@peek` to look at what is there
+this cycle, `@send` and `@try_send` to put one out. **A port is not a value.**
+Naming one where a value belongs is an error that says which operation to
+reach for instead — binding the name to the wire would make it the one
+channel in the language you read by naming it, and would lose the distinction
+between "the value" and "a value that means something this cycle" that
+`@try_rcv`'s pair carries.
+
+The operations mean what they mean on a `buffer`, with only the handshake
+underneath differing. `@rcv` waits on the enable rather than on two salts
+disagreeing. `@send` never waits at all, because there is no `ready` coming
+back to wait for, so its state costs its cycle and no more. `@try_rcv` answers
+with the enable itself: on a pipe the question is "did I take one", which
+needs this side to have accepted, and a port claims nothing anywhere.
+`@try_send` always succeeds. `@drop` is refused — it spends a pipe's one
+transfer for the cycle so the next item can arrive, and a port is not holding
+one back.
+
+`port` is deliberately not the bare `T` spelling, which already means
+something else and quietly — a plain parameter is configuration, folded at
+compile time and gone.
+
+**A process of nothing but ports is a plain Verilog module**, which is the
+point of it: a register, a clock and the ports the source asked for, with no
+salt and no entries anywhere. That is how the ordinary sequential blocks a
+design needs get written beside the dataflow ones.
+
+In a `sequence` a `port out` belongs to the STAGE that sent to it. A process
+drives one from the state that sent, gated on that state firing; a pipeline
+has no states, so what stands in for it is "this stage has a valid item and
+the pipeline is moving". Sending in two stages is refused — every stage is
+live at once holding a different item, so that would be two answers for one
+wire, and unlike a process there is nothing to choose between them.
+
+A `port` is for the EDGE of the program, where the thing on the other side
+cannot be made to wait: a pin, a PLL, a bus master that does not take `ready`
+for an answer. That is the case the rule below already names — the sink ties
+`ready` high and says so at the boundary — and `port` is how it is said.
+Between two things DDL compiled, a `buffer` is still the answer.
+
+**Buffer pipes.** `buffer`, in and out, with `@rcv`, `@send`, `@try_rcv`,
 `@try_send`, `@peek` and `@drop`.
+
+**Assertions.** `@assert(cond)`, `@assert(cond, "message")` and `@fatal`, which
+is the same with `$fatal` instead of `$error`. They are checked in simulation
+and absent from synthesis: the emitted block sits inside `` `ifdef SIMULATION ``,
+which is the guard this toolchain needs because GowinSynthesis does not define
+`SYNTHESIS`. In a clocked module the checks run on the edge and are held off
+during reset. A condition written inside an `if` is already guarded by the path
+it sits on, so it reads as an implication and is vacuously true elsewhere.
 
 **A pipe is claimed where the program asks for it, under the condition it
 asks.** One rule, and it is the same in a process that blocks and one that does
@@ -120,6 +197,25 @@ saying so where it is busy — there is no separate way to stall. An offer is
 made on the branch its `@try_send` is written on and no other, so a cycle that
 produces nothing publishes nothing, and a cycle that owes a result is free to
 produce one whether or not anything arrived.
+
+**What is on the wire is a pair of gray-coded pointers, not `valid`/`ready`.**
+Each pipe flattens to three ports: `<p>_wsalt` (2 bits, the producer's),
+`<p>_rsalt` (2 bits, the consumer's) and `<p>_data`, which carries both
+entries. Each side publishes only its own salt, and publishes it from a
+register:
+
+```verilog
+wire src_empty = src_wsalt == src_rsalt_q;      // nothing to take
+wire dst_full  = dst_wsalt_q == (~dst_rsalt);   // one lap ahead: both full
+```
+
+Empty is the two salts agreeing; full is their differing in both bits, which
+in gray code is one lap over a buffer that holds two. Toggling your own salt
+IS the transfer — there is no separate `valid` to assert and no `ready` to
+answer it in the same cycle, so "`valid` must not depend combinationally on
+`ready`" holds by construction rather than by review. A hand-written module
+meeting a generated one matches those three ports; `extern` (below) is how to
+say so without wiring them by hand.
 
 A pipe gets one transfer per cycle, and `@peek` is how you look without
 spending it: `let (v, present) = @peek(p)` reads the offer and takes nothing,
@@ -142,6 +238,37 @@ later and somewhere else as a machine one item out of step. Where a sink
 genuinely cannot refuse, the sink ties `ready` high and says so at the
 boundary, which puts the claim somewhere a reader can check.
 
+**Combinators.** `@merge` and `@split` are modules the compiler writes:
+
+```
+graph top (p: buffer in i32, q: buffer in i32, o1: buffer out i32, o2: buffer out i32)
+  let m: buffer i32
+  let d: buffer i32
+  @merge(p, q, m)      -- two producers onto one pipe, in rotation
+  dbl(m, d)
+  @split(d, o1, o2)    -- one producer to two consumers, each its own copy
+```
+
+`@merge` grants one input per cycle with a rotating priority, so a busy input 0
+cannot starve input 1. `@split` takes from its input only when EVERY sink has
+room, and gives each sink its own pair of entries — a slot per sink, rather
+than ANDing the sinks' readys together, which would rebuild exactly the
+combinational coupling the salt protocol removes. Both are a datapath and no
+states, because writing either as a `process` would cost a cycle per hop for
+something whose whole job is to pass an item along. One module is emitted per
+shape (`ddl_merge_2x32`) however many times it is instantiated.
+
+**Modules DDL did not compile.** `extern` names one, so a `graph` can be the
+top level instead of a guest inside a hand-written one:
+
+```
+extern psram (req: buffer in mem_req_t, rsp: buffer out mem_rsp_t)
+```
+
+The connections are checked like any other instance and no module is emitted.
+An `extern` declares pipes and nothing else: a graph connects pipes, so a
+parameter of any other kind would be a port left floating in the instantiation.
+
 **Multiple files.** Either several inputs on the command line, or one input
 naming the others:
 
@@ -163,10 +290,14 @@ Deliberately, with a diagnostic rather than a wrong answer:
 - a `match` that does not cover every variant, for the same reason
 - mixing widths, or mixing signedness, in one operator
 - a pipe in a `graph` with two producers, or with none
-- a `bram` read inside an expression, or in a process with no states to spend
-  a cycle in; and a `bram` with a reset, which cannot be inferred as one
+- a `bram` read in a process with no states to spend a cycle in, and a `bram`
+  with a reset, which cannot be inferred as one
 - a `for` whose trip count is not known at compile time
-- a blocking `@rcv`/`@send` inside a `match` (an `if` works)
+- a blocking `@rcv`/`@send` in the condition of an `if` or the scrutinee of a
+  `match`, which would have to be decided before it could be waited on
+- one name bound to two different payload types across the arms of a `match`
+  that waits, where the arms are states and the name is a single wire
+- a computed index anywhere but the last step of an assignment target
 - `==` on an enum that carries payloads, which would compare the padding too
 - a width annotation on an enum that carries payloads, which would name the tag
   and read as the value
@@ -205,7 +336,8 @@ MIRIFLAGS=-Zmiri-disable-isolation cargo miri test --test fuzz
 ```
 
 Tests that touch the filesystem are skipped there; Miri has no Windows path
-shims.
+shims. So is the fuzzer's hang check, which is a wall-clock timeout and under
+Miri measures the interpreter rather than the compiler.
 
 The suite includes a fuzzer, seeded so a failure is reproducible. It runs a
 short pass on every `cargo test`; the soak is an environment variable:
@@ -284,6 +416,7 @@ goes stale in silence.
 | `src/ir_pipe.rs` | `sequence` → pipeline |
 | `src/ir_fsm.rs` | `process` → state machine (a graph, not a chain) |
 | `src/ir_graph.rs` | `graph` → instances and wires |
+| `src/ir_comb.rs` | `@merge` and `@split` → modules the compiler writes |
 | `src/ir_match.rs` | `match` → case |
 | `src/verilog.rs` | the backend |
 | `src/diag.rs` | source locations and the caret rendering |

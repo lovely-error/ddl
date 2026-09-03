@@ -29,6 +29,91 @@
 // around it. Quoting the line you cite is what makes a citation checkable, and
 // is worth doing for that reason.
 
+/// Citations that name a compiler source file and a line, checked the same way.
+///
+/// The documents point INTO the compiler as well as at the design: port-k2g.md
+/// argues from two places in the graph lowering and one in the IR. Nothing
+/// consulted those either, and they had drifted exactly as the desc.md ones
+/// did -- one past the end of a file that had since shrunk, one onto a bare
+/// closing brace.
+///
+/// The check is weaker here than for desc.md, because a citation into code
+/// lands on a plausible-looking line far more often than one into prose: a
+/// closing brace is not blank. What it still catches is the class the desc.md
+/// sweep found most of -- a file grew or shrank above the citation and every
+/// number below it slid.
+///
+/// (Written out in words rather than in the form it scans for, because this
+/// file scans itself and an illustration would fail as a citation. The same
+/// reason the test above gives.)
+#[test]
+fn every_source_citation_points_at_something() {
+    for path in citing_files() {
+        let text = read(&path);
+        for (ix, line) in text.lines().enumerate() {
+            for cite in source_citations(line) {
+                let (file, n) = cite;
+                let cited = match std::fs::read_to_string(&file) {
+                    Ok(t) => t,
+                    Err(_) => panic!(
+                        "{}:{} cites {}, which is not a file",
+                        path,
+                        ix + 1,
+                        file
+                    ),
+                };
+                let lines: Vec<&str> = cited.lines().collect();
+                assert!(
+                    n >= 1 && n <= lines.len(),
+                    "{}:{} cites {}:{}, which has {} lines",
+                    path,
+                    ix + 1,
+                    file,
+                    n,
+                    lines.len()
+                );
+                assert!(
+                    !lines[n - 1].trim().is_empty(),
+                    "{}:{} cites {}:{}, which is blank",
+                    path,
+                    ix + 1,
+                    file,
+                    n
+                );
+            }
+        }
+    }
+}
+
+/// Every such citation in one line, as `(path, line)`.
+///
+/// A range cites its first line; that the rest exist follows from the file
+/// being at least that long, which checking the first already establishes.
+fn source_citations(line: &str) -> Vec<(String, usize)> {
+    let mut out = Vec::new();
+    let mut rest = line;
+    while let Some(at) = rest.find("src/") {
+        let tail = &rest[at..];
+        rest = &rest[at + 4..];
+        let Some(colon) = tail.find(".rs:") else {
+            continue;
+        };
+        let file = &tail[..colon + 3];
+        let is_a_path = file[4..].chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.');
+        if !is_a_path {
+            continue;
+        }
+        let digits: String = tail[colon + 4..].chars().take_while(|c| c.is_ascii_digit()).collect();
+        if digits.is_empty() {
+            continue;
+        }
+        if let Ok(n) = digits.parse::<usize>() {
+            out.push((file.to_string(), n));
+        }
+    }
+    out
+}
+
 fn read(path: &str) -> String {
     std::fs::read_to_string(path).unwrap_or_else(|e| panic!("cannot read {}: {}", path, e))
 }

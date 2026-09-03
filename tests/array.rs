@@ -162,3 +162,151 @@ fn an_unrolled_loop_indexes_by_element() {
     assert!(v.contains("[31:24]"), "{}", v);
     assert!(!v.contains("+:"), "{}", v);
 }
+
+// ---- assigning an element -------------------------------------------------
+//
+// Reading `l.words[1]` was fixed before writing it was, which left the two
+// halves of the same subscript disagreeing: `only a name or a field of one can
+// be assigned`. A cache line arriving over a burst wants to be filled a beat
+// at a time, and that is the whole of this.
+
+#[test]
+fn a_constant_element_is_spliced_in_place() {
+    let v = compile(&format!(
+        "{}{}",
+        LINE,
+        concat!(
+            "fun fill (l: line_t, w: i32, o: out line_t)\n",
+            "  var t: line_t = l\n",
+            "  t.words[1] = w\n",
+            "  o = t\n",
+        )
+    ));
+    // `words` is the low 128 bits of the struct and element 1 is bits 63:32,
+    // so the write keeps everything above 63 and everything below 32.
+    assert!(v.contains("l[144:64]"), "{}", v);
+    assert!(v.contains("l[31:0]"), "{}", v);
+    // A constant index costs no comparison.
+    assert!(!v.contains("=="), "{}", v);
+}
+
+#[test]
+fn a_computed_element_muxes_every_slot() {
+    let v = compile(concat!(
+        "fun put (a: [i8; 4], k: i2, x: i8, o: out [i8; 4])\n",
+        "  var t: [i8; 4] = a\n",
+        "  t[k] = x\n",
+        "  o = t\n",
+    ));
+    // One comparison per element, and the old value wherever the index misses.
+    for slot in ["2'd0", "2'd1", "2'd2", "2'd3"] {
+        assert!(v.contains(&format!("k == {}", slot)), "{} missing in {}", slot, v);
+    }
+    // A write is not a `+:`. Part-select on the left of an assignment is a
+    // procedural construct, and this backend emits a value graph.
+    assert!(!v.contains("+:"), "{}", v);
+}
+
+#[test]
+fn an_element_of_a_field_is_reached_through_both_steps() {
+    let v = compile(&format!(
+        "{}{}",
+        LINE,
+        concat!(
+            "fun fill (l: line_t, k: i2, w: i32, o: out line_t)\n",
+            "  var t: line_t = l\n",
+            "  t.words[k] = w\n",
+            "  o = t\n",
+        )
+    ));
+    // The tag survives untouched above the array it did not name.
+    assert!(v.contains("l[144:128]"), "{}", v);
+    assert!(v.contains("k == 2'd3"), "{}", v);
+}
+
+#[test]
+fn an_element_index_past_the_end_is_refused() {
+    let text = compile_err(concat!(
+        "fun put (a: [i8; 4], x: i8, o: out [i8; 4])\n",
+        "  var t: [i8; 4] = a\n",
+        "  t[4] = x\n",
+        "  o = t\n",
+    ));
+    assert!(text.contains("out of bounds"), "{}", text);
+}
+
+#[test]
+fn a_computed_index_must_be_the_last_step() {
+    // `a[i].f = x` would need a read-modify-write at an offset only the cycle
+    // knows, which is a `+:` on the left of an assignment.
+    let text = compile_err(concat!(
+        "struct pair_t\n",
+        "  lo: i8\n",
+        "  hi: i8\n",
+        "\n",
+        "fun put (a: [pair_t; 4], k: i2, x: i8, o: out [pair_t; 4])\n",
+        "  var t: [pair_t; 4] = a\n",
+        "  t[k].lo = x\n",
+        "  o = t\n",
+    ));
+    assert!(text.contains("must be the last step"), "{}", text);
+    assert!(text.contains("let e = a[i]"), "{}", text);
+}
+
+#[test]
+fn a_bit_of_an_integer_is_not_an_lvalue() {
+    let text = compile_err(concat!(
+        "fun put (v: i8, k: i3, o: out i8)\n",
+        "  var t: i8 = v\n",
+        "  t[k] = 1'b1\n",
+        "  o = t\n",
+    ));
+    assert!(text.contains("is not an array"), "{}", text);
+}
+
+// ---- @slice ---------------------------------------------------------------
+//
+// A multi-bit part-select at a computed base. The MECHANISM was always here --
+// an array element at a computed index lowers to a `+:` of the element width
+// -- but there was no way to write one on a plain `iN`, so the workaround was
+// to declare the thing `[i8; 4]`. That is usually what it was, and sometimes
+// it is a 32-bit word that a field offset points into.
+
+#[test]
+fn a_computed_base_is_a_part_select() {
+    let v = compile("fun ex (x: i32, b: i5, o: out i8)\n  o = @slice(x, b, 8)\n");
+    assert!(v.contains("x[b +: 8]"), "{}", v);
+}
+
+#[test]
+fn a_constant_base_is_an_ordinary_range() {
+    // `+:` with a literal base is correct and is also the construct this
+    // backend exists to keep away from GowinSynthesis.
+    let v = compile("fun ex (x: i32, o: out i8)\n  o = @slice(x, 8, 8)\n");
+    assert!(v.contains("x[15:8]"), "{}", v);
+    assert!(!v.contains("+:"), "{}", v);
+}
+
+#[test]
+fn a_slice_wider_than_its_operand_is_refused() {
+    let text = compile_err("fun ex (x: i8, b: i3, o: out i16)\n  o = @slice(x, b, 16)\n");
+    assert!(text.contains("does not fit"), "{}", text);
+}
+
+#[test]
+fn a_constant_slice_past_the_end_is_refused() {
+    let text = compile_err("fun ex (x: i32, o: out i8)\n  o = @slice(x, 28, 8)\n");
+    assert!(text.contains("runs past the end"), "{}", text);
+}
+
+#[test]
+fn a_slice_width_must_be_constant() {
+    let text = compile_err("fun ex (x: i32, b: i5, o: out i8)\n  o = @slice(x, 0, b)\n");
+    assert!(text.contains("must be a constant"), "{}", text);
+}
+
+#[test]
+fn a_signed_base_is_refused() {
+    let text = compile_err("fun ex (x: i32, b: s5, o: out i8)\n  o = @slice(x, b, 8)\n");
+    assert!(text.contains("must be unsigned"), "{}", text);
+}

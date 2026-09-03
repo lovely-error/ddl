@@ -211,8 +211,13 @@ fn a_linear_loop_is_scheduled_exactly_as_before() {
 }
 
 #[test]
-fn a_match_holding_a_wait_says_which_construct_does_work() {
-    let text = compile_err(concat!(
+fn a_match_can_hold_a_wait() {
+    // This was refused: "only an `if` can hold a blocking `@rcv`, a `@send`, a
+    // `break` or a `bram` read; a `match` cannot yet". Which left a payload
+    // enum with no way to wait per variant at all -- `match` is the only way
+    // to reach a payload, and `==` on an enum that carries one is refused
+    // because it would compare the padding.
+    let v = compile(concat!(
         "enum e: i1\n",
         "  A\n",
         "  B\n",
@@ -220,12 +225,141 @@ fn a_match_holding_a_wait_says_which_construct_does_work() {
         "  loop\n",
         "    let a = @rcv(src)\n",
         "    match k\n",
-        "      A =>\n",
+        "      .A =>\n",
         "        @send(dst, a)\n",
-        "      B =>\n",
+        "      .B =>\n",
         "        @send(dst, 32'd0)\n",
     ));
-    assert!(text.contains("only an `if` can hold a blocking"), "{}", text);
+    assert!(v.contains("endmodule"), "{}", v);
+}
+
+/// A tagged union dispatched on: each variant waits for something different.
+const DISPATCH: &str = concat!(
+    "enum req_e\n",
+    "  Nop\n",
+    "  Read(i8)\n",
+    "  Write(i8)\n",
+    "  Halt\n",
+    "process dispatch (cmd: buffer in req_e, din: buffer in i32, dout: buffer out i32)\n",
+    "  loop\n",
+    "    let r = @rcv(cmd)\n",
+    "    match r\n",
+    "      .Nop =>\n",
+    "        @send(dout, 32'd0)\n",
+    "      .Read a =>\n",
+    "        @send(dout, @zext(a, 32))\n",
+    "      .Write a =>\n",
+    "        let d = @rcv(din)\n",
+    "        @send(dout, d + @zext(a, 32))\n",
+    "      .Halt =>\n",
+    "        break\n",
+);
+
+#[test]
+fn the_next_state_is_a_case_over_the_tag() {
+    let v = compile(DISPATCH);
+    // A `case`, not a chain of comparisons. The same measurement that made a
+    // combinational `match` a `case` applies here: a ternary chain is a
+    // priority structure and synthesis has to honour the priority.
+    assert!(v.contains("case (sel_s0)"), "{}", v);
+    assert!(v.contains("2'd0: "), "{}", v);
+    assert!(v.contains("2'd1: "), "{}", v);
+    assert!(v.contains("2'd2: "), "{}", v);
+}
+
+#[test]
+fn an_arm_selects_on_the_tag_and_not_the_whole_value() {
+    let v = compile(DISPATCH);
+    // The payload differs from one item to the next, so comparing the whole
+    // value would mean no arm ever fired. Two bits of tag above eight of
+    // payload.
+    assert!(v.contains("sel_s0 = cmd_item[9:8]"), "{}", v);
+}
+
+#[test]
+fn a_matched_payload_survives_into_the_states_of_its_arm() {
+    let v = compile(DISPATCH);
+    // `a` is bound where the arm is chosen and read two states later, so it
+    // crosses and gets a register like any other such binding.
+    assert!(v.contains("a_r"), "{}", v);
+    assert!(v.contains("a_r <= (fire_s0 ?"), "{}", v);
+}
+
+#[test]
+fn break_in_an_arm_stops_the_process() {
+    let v = compile(DISPATCH);
+    // Five states plus the terminal one, which is where `.Halt` goes.
+    assert!(v.contains("default: n") && v.contains("3'd5"), "{}", v);
+}
+
+#[test]
+fn one_name_cannot_be_two_payload_types_across_arms() {
+    // A combinational `match` gives each arm its own environment, so one name
+    // can be a different type on each. An arm that waits is a state and the
+    // name is one wire across it, which has one type.
+    let text = compile_err(concat!(
+        "struct addr_t\n",
+        "  page: i8\n",
+        "  off: i8\n",
+        "enum req_e\n",
+        "  Nop\n",
+        "  Read(addr_t)\n",
+        "  Write(i8)\n",
+        "  Halt\n",
+        "process d (cmd: buffer in req_e, din: buffer in i32, dout: buffer out i32)\n",
+        "  loop\n",
+        "    let r = @rcv(cmd)\n",
+        "    match r\n",
+        "      .Nop =>\n",
+        "        @send(dout, 32'd0)\n",
+        "      .Read a =>\n",
+        "        @send(dout, @zext(a.page, 32))\n",
+        "      .Write a =>\n",
+        "        let x = @rcv(din)\n",
+        "        @send(dout, x)\n",
+        "      .Halt =>\n",
+        "        break\n",
+    ));
+    assert!(text.contains("binds `addr_t` on one arm and `i8` on another"), "{}", text);
+}
+
+#[test]
+fn a_scheduled_match_still_has_to_cover_its_scrutinee() {
+    // The coverage rules are the same analysis for both readings of a `match`,
+    // which is the point of sharing it rather than writing it twice.
+    let text = compile_err(concat!(
+        "enum e: i2\n",
+        "  A\n",
+        "  B\n",
+        "  C\n",
+        "  D\n",
+        "process p (src: buffer in i32, dst: buffer out i32, k: e = A)\n",
+        "  loop\n",
+        "    let a = @rcv(src)\n",
+        "    match k\n",
+        "      .A =>\n",
+        "        @send(dst, a)\n",
+        "      .B =>\n",
+        "        @send(dst, 32'd0)\n",
+    ));
+    assert!(text.contains("does not cover C, D"), "{}", text);
+}
+
+#[test]
+fn a_wait_in_the_scrutinee_is_refused() {
+    let text = compile_err(concat!(
+        "enum e: i1\n",
+        "  A\n",
+        "  B\n",
+        "process p (src: buffer in e, dst: buffer out i32)\n",
+        "  loop\n",
+        "    match @rcv(src)\n",
+        "      .A =>\n",
+        "        @send(dst, 32'd1)\n",
+        "      .B =>\n",
+        "        @send(dst, 32'd0)\n",
+    ));
+    assert!(text.contains("scrutinee cannot contain a blocking"), "{}", text);
 }
 
 #[test]
@@ -368,4 +502,123 @@ fn a_body_with_no_blocking_operation_still_takes_them() {
     ));
     assert!(!v.contains("state"), "{}", v);
     assert!(v.contains("assign o_wsalt = o_wsalt_q;"), "{}", v);
+}
+
+// ---- nested loops ---------------------------------------------------------
+//
+// "a `loop` belongs at the top of a `process` body, not nested inside it" was
+// the rule, and the workaround was to flatten the walk into one `loop` with
+// explicit indices -- which reads worse and expresses the same thing.
+//
+// A nested loop is a back edge, and the scheduler already builds graphs. What
+// it needed was somewhere for `break` to go other than the terminal state, and
+// a way to write an edge whose destination is not known until the body it
+// comes from has been scheduled.
+
+#[test]
+fn a_nested_loop_comes_back_to_its_own_entry() {
+    let v = compile(concat!(
+        "process drain (cmd: buffer in i8, src: buffer in i32, dst: buffer out i32)\n",
+        "  loop\n",
+        "    let c = @rcv(cmd)\n",
+        "    loop\n",
+        "      let v = @rcv(src)\n",
+        "      if v[31] then\n",
+        "        break\n",
+        "      @send(dst, v)\n",
+        "    @send(dst, @zext(c, 32))\n",
+    ));
+    // s0 receives the command, s1 receives an item and branches, s2 is the
+    // send after the loop and s3 the send inside it. The inner send goes back
+    // to s1 -- the loop's own entry, not to the top of the process.
+    assert!(v.contains("fire_s3 ? 2'd1"), "the back edge is missing:\n{}", v);
+    // And `break` leaves the inner loop for the statement after it.
+    assert!(v.contains("branch_s1 ? 2'd2"), "{}", v);
+}
+
+#[test]
+fn break_leaves_the_innermost_loop_only() {
+    let v = compile(concat!(
+        "process triple (a: buffer in i8, b: buffer in i8, o: buffer out i8)\n",
+        "  loop\n",
+        "    let x = @rcv(a)\n",
+        "    if x[7] then\n",
+        "      break\n",
+        "    loop\n",
+        "      let y = @rcv(b)\n",
+        "      if y[0] then\n",
+        "        break\n",
+        "      loop\n",
+        "        let z = @rcv(b)\n",
+        "        if z[1] then\n",
+        "          break\n",
+        "        @send(o, z)\n",
+        "      @send(o, y)\n",
+        "    @send(o, x)\n",
+    ));
+    // Six states and a terminal seventh. The outermost `break` is the only one
+    // that stops the process; the other two land on the send after their loop.
+    assert!(v.contains("branch_s0 ? 3'd6"), "the outer break does not halt:\n{}", v);
+    assert!(v.contains("branch_s1 ? 3'd2"), "{}", v);
+    assert!(v.contains("branch_s3 ? 3'd4"), "{}", v);
+    // Each inner loop returns to its own head.
+    assert!(v.contains("fire_s4 ? 3'd1"), "{}", v);
+    assert!(v.contains("fire_s5 ? 3'd3"), "{}", v);
+}
+
+#[test]
+fn a_loop_with_no_wait_still_counts() {
+    // Not every loop waits on a channel. A delay is a `var` and a comparison,
+    // and the state it spins in fires every cycle -- which is what makes the
+    // count advance.
+    let v = compile(concat!(
+        "process delay (a: buffer in i8, o: buffer out i8)\n",
+        "  var n: i8 = 8'd0\n",
+        "  loop\n",
+        "    let x = @rcv(a)\n",
+        "    n = 8'd0\n",
+        "    loop\n",
+        "      n += 8'd1\n",
+        "      if n == 8'd10 then\n",
+        "        break\n",
+        "    @send(o, x)\n",
+    ));
+    // The counting state is entered and left on its own branch, and the
+    // increment happens there rather than in the state that received.
+    assert!(v.contains("in_s1 ? (branch_s1 ? 2'd2 : 2'd1)"), "{}", v);
+    assert!(v.contains("n <= (in_s1 ?"), "{}", v);
+}
+
+#[test]
+fn a_loop_entry_is_not_absorbed_by_the_state_above_it() {
+    // A barrier state absorbs a bare branch that follows it, which is what
+    // makes `let c = @rcv(p)` then `if c` cost one cycle rather than two. A
+    // loop's entry looks exactly like a bare branch and must not be absorbed:
+    // the body jumps back to it, and absorbing it leaves that edge pointing at
+    // a state that has been emptied.
+    let v = compile(concat!(
+        "process guard (a: buffer in i8, o: buffer out i8)\n",
+        "  var n: i8 = 8'd0\n",
+        "  loop\n",
+        "    let x = @rcv(a)\n",
+        "    loop\n",
+        "      n += 8'd1\n",
+        "      if n[0] then\n",
+        "        break\n",
+        "    @send(o, x)\n",
+    ));
+    // Three states: receive, spin, send. The spin has its own.
+    assert!(v.contains("in_s1"), "{}", v);
+    assert!(v.contains("branch_s1"), "{}", v);
+    assert!(!v.contains("branch_s0"), "the loop head was absorbed:\n{}", v);
+}
+
+#[test]
+fn a_loop_outside_a_blocking_process_says_what_it_needs() {
+    let text = compile_err(concat!(
+        "fun spin (a: i8, o: out i8)\n",
+        "  loop\n",
+        "    o = a\n",
+    ));
+    assert!(text.contains("a `process` that blocks"), "{}", text);
 }

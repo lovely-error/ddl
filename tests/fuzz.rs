@@ -369,6 +369,16 @@ fn the_compiler_answers_or_diagnoses_but_never_panics() {
 /// Separate from the loop above so the timeout is meaningful: this runs a
 /// batch on its own thread and fails if the batch does not finish, rather
 /// than letting CI sit on it until something else gives up.
+///
+/// Not under Miri, where it measures the interpreter rather than the compiler.
+/// Miri runs this code roughly two orders of magnitude slower than native, so
+/// a two-thousand-case batch cannot finish inside any wall-clock limit that
+/// would mean anything natively -- the test failed there from the day it was
+/// written, which is why `cargo miri test --test fuzz` never came back clean.
+/// The two tests beside it are the ones Miri is FOR: they check the parser's
+/// pointer arithmetic for undefined behaviour, which is a property no amount
+/// of native running can rule out.
+#[cfg_attr(miri, ignore = "a wall-clock timeout measures Miri, not the compiler")]
 #[test]
 fn no_input_makes_the_compiler_stop_answering() {
     let seed = env_u64("DDL_FUZZ_SEED", 0x11A26);

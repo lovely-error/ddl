@@ -20,6 +20,16 @@ pub struct PrecArgTupleEntry {
     pub type_expr: PrecTypeExpr,
     pub default: Option<PrecResExpr>,
 }
+/// `extern Name (pipes)`, after type resolution.
+///
+/// It has no body, so there is nothing to resolve but the parameter list --
+/// which is the whole of what DDL knows about it.
+#[derive(Debug, Clone)]
+pub struct ExternDecl {
+    pub name: AlphanumSpan,
+    pub args: PrecArgDefTuple,
+}
+
 /// `graph Name (ports)`, after type resolution.
 #[derive(Debug, Clone)]
 pub struct GraphDecl {
@@ -297,6 +307,14 @@ pub enum BuiltinOp {
     Trunc,
     Signed,
     Unsigned,
+    /// `@slice(x, base, width)` -- `x[base +: width]`, where `base` is
+    /// computed this cycle and `width` is a constant.
+    ///
+    /// The mechanism was already here: an array element at a computed index
+    /// lowers to a `+:` of the element width. What was missing was a way to
+    /// SAY one on a plain `iN`, so the workaround was to declare the thing
+    /// `[i8; 4]` -- which is usually what it was, and sometimes is not.
+    Slice,
     // Bit plumbing: @concat(a, b, ..) high-to-low, @rep(x, n), @zeroed().
     Concat,
     Rep,
@@ -340,6 +358,7 @@ unsafe fn resolve_anum_span(anum_span: &AlphanumSpan) -> Result<AnumResolution, 
             "signed" => return Ok(AnumResolution::Builtin(BuiltinOp::Signed)),
             "unsigned" => return Ok(AnumResolution::Builtin(BuiltinOp::Unsigned)),
             // Bit plumbing.
+            "slice" => return Ok(AnumResolution::Builtin(BuiltinOp::Slice)),
             "concat" => return Ok(AnumResolution::Builtin(BuiltinOp::Concat)),
             "rep" => return Ok(AnumResolution::Builtin(BuiltinOp::Rep)),
             "zeroed" => return Ok(AnumResolution::Builtin(BuiltinOp::Zeroed)),
@@ -928,13 +947,32 @@ pub unsafe fn resolve_precedence_for_sequence(
     })
 }
 
+/// An `extern` has no body, so this only turns its parameter list into a
+/// resolved one -- which is the whole of what DDL knows about it.
+///
 /// # Safety
 ///
 /// `char_ptr` must be the base of the same buffer the raw AST was parsed
 /// from: the spans in it are pointers into that buffer, and resolving one
 /// dereferences them.
+pub unsafe fn resolve_precedence_for_extern(
+    char_ptr: *const u8,
+    decl: &crate::lex::RawExternDecl,
+) -> Result<ExternDecl, ()> {
+    Ok(ExternDecl {
+        name: decl.name,
+        args: unsafe { resolve_arg_tuple(char_ptr, &decl.args)? },
+    })
+}
+
 /// A graph body holds no expressions, so this only turns raw type
 /// expressions into resolved ones.
+///
+/// # Safety
+///
+/// `char_ptr` must be the base of the same buffer the raw AST was parsed
+/// from: the spans in it are pointers into that buffer, and resolving one
+/// dereferences them.
 pub unsafe fn resolve_precedence_for_graph(
     char_ptr: *const u8,
     graph_decl: &RawGraphDecl,
@@ -1272,7 +1310,7 @@ fn sized_and_radix_literals() {
     assert_eq!(shape(&resolve_expr_in("0b1010")), "10");
     assert_eq!(shape(&resolve_expr_in("0o17")), "15");
     assert_eq!(shape(&resolve_expr_in("1_000_000")), "1000000");
-    // desc.md:177 spells a clock frequency this way.
+    // desc.md:204, "clock ex1 = 12*10**6", spells a frequency this way.
     assert_eq!(shape(&resolve_expr_in("12*10**6")), "(Mul 12 (Pow 10 6))");
 }
 

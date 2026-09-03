@@ -197,8 +197,10 @@ fn two_producers_on_one_pipe_is_an_error() {
 
 #[test]
 fn two_consumers_says_what_it_would_take() {
-    // desc.md allows several consumers by duplicating the sink. Saying that is
-    // the point: the reader should know it is unbuilt, not disallowed.
+    // desc.md allows several consumers by duplicating the sink, and `@split`
+    // is that duplication. Naming one pipe twice is still not how to ask for
+    // it -- that is two drivers on one salt -- so the note names the thing
+    // that does it rather than saying it cannot be done.
     let text = compile_err(&format!(
         "{}{}",
         DBL,
@@ -211,7 +213,8 @@ fn two_consumers_says_what_it_would_take() {
         )
     ));
     assert!(text.contains("consumers"), "{}", text);
-    assert!(text.contains("duplicating the sink"), "{}", text);
+    assert!(text.contains("@split(p, a, b)"), "{}", text);
+    assert!(text.contains("its own pair of entries"), "{}", text);
 }
 
 #[test]
@@ -376,4 +379,241 @@ fn an_empty_graph_is_refused() {
         "  let mid: buffer i16\n",
     ));
     assert!(text.contains("instantiates nothing"), "{}", text);
+}
+
+// ---- extern ---------------------------------------------------------------
+//
+// A graph could only instantiate modules DDL had compiled, which left DDL a
+// guest inside a SystemVerilog top level: the SoC instantiated the generated
+// modules and wired the salt triples by hand. Hand-wiring a `valid`/`ready`
+// pair is something an RTL engineer does correctly from memory; hand-wiring a
+// pair of gray-coded salts is not, and the failure mode is a design that looks
+// connected and deadlocks.
+//
+// `extern` is the other direction: DDL owns the hierarchy, and the pieces that
+// stay SystemVerilog because they are the BOARD -- a PLL, a PSRAM controller,
+// two clock domains -- are named rather than reproduced.
+
+#[test]
+fn a_graph_can_instantiate_a_module_ddl_did_not_compile() {
+    let v = compile(concat!(
+        "extern psram (req: buffer in i32, rsp: buffer out i32)\n",
+        "sequence dbl (a: buffer in i32, b: buffer out i32)\n",
+        "  let x = @rcv(a)\n",
+        "  |||\n",
+        "  @send(b, x + x)\n",
+        "graph top (src: buffer in i32, dst: buffer out i32)\n",
+        "  let mid: buffer i32\n",
+        "  dbl(src, mid)\n",
+        "  psram(mid, dst)\n",
+    ));
+    // Instantiated with the port names the protocol gives it, so a hand-written
+    // module has one spelling to match rather than a convention to remember.
+    assert!(v.contains("psram u_psram ("), "{}", v);
+    assert!(v.contains(".req_wsalt (mid_wsalt),"), "{}", v);
+    assert!(v.contains(".rsp_data  (dst_data)"), "{}", v);
+}
+
+#[test]
+fn an_extern_emits_no_module_of_its_own() {
+    let v = compile(concat!(
+        "extern sink (a: buffer in i32)\n",
+        "sequence src_ (a: buffer in i32, b: buffer out i32)\n",
+        "  let x = @rcv(a)\n",
+        "  |||\n",
+        "  @send(b, x)\n",
+        "graph top (i: buffer in i32)\n",
+        "  let mid: buffer i32\n",
+        "  src_(i, mid)\n",
+        "  sink(mid)\n",
+    ));
+    // The body is somebody else's. Emitting a stub would be a module that
+    // silently does nothing, which is worse than a link error.
+    assert!(!v.contains("module sink"), "{}", v);
+    assert!(v.contains("sink u_sink ("), "{}", v);
+}
+
+#[test]
+fn the_connections_to_an_extern_are_still_checked() {
+    let text = compile_err(concat!(
+        "extern psram (req: buffer in i32, rsp: buffer out i32)\n",
+        "graph top (src: buffer in i32, dst: buffer out i32)\n",
+        "  psram(src)\n",
+    ));
+    assert!(text.contains("pipe parameter"), "{}", text);
+}
+
+#[test]
+fn two_producers_on_a_pipe_are_refused_even_when_one_is_extern() {
+    let text = compile_err(concat!(
+        "extern psram (req: buffer in i32, rsp: buffer out i32)\n",
+        "extern other (rsp: buffer out i32)\n",
+        "graph top (src: buffer in i32, dst: buffer out i32)\n",
+        "  let mid: buffer i32\n",
+        "  psram(src, mid)\n",
+        "  other(mid)\n",
+    ));
+    assert!(text.contains("producer"), "{}", text);
+}
+
+#[test]
+fn an_extern_declares_pipes_and_nothing_else() {
+    // A graph connects pipes. A parameter of any other kind would be a port
+    // the graph has no way to reach, left unconnected in the instantiation --
+    // a floating wire, which is the shape of bug that shows up as a hang.
+    let text = compile_err(concat!(
+        "extern pll (lock: port out i1, rsp: buffer out i32)\n",
+        "graph top (dst: buffer out i32)\n",
+        "  pll(dst)\n",
+    ));
+    assert!(text.contains("is not a pipe"), "{}", text);
+}
+
+// ---- @merge and @split ----------------------------------------------------
+//
+// Two requesters sharing one pipe, and one producer reaching two consumers.
+// Both could be written as a `process`, and both would then cost a cycle per
+// hop, because a process is a state machine and a state is a cycle. For
+// something whose whole job is to pass an item along that is the wrong price,
+// so these are modules the compiler writes: a datapath, no states.
+
+const DOUBLER: &str = concat!(
+    "sequence dbl (a: buffer in i32, b: buffer out i32)\n",
+    "  let x = @rcv(a)\n",
+    "  |||\n",
+    "  @send(b, x + x)\n",
+);
+
+#[test]
+fn a_merge_arbitrates_in_rotation() {
+    let v = compile(&format!(
+        "{}{}",
+        DOUBLER,
+        concat!(
+            "graph top (p: buffer in i32, q: buffer in i32, o: buffer out i32)\n",
+            "  let m: buffer i32\n",
+            "  @merge(p, q, m)\n",
+            "  dbl(m, o)\n",
+        )
+    ));
+    assert!(v.contains("module ddl_merge_2x32 ("), "{}", v);
+    // Rotating, not fixed. A fixed priority is smaller and starves input 1
+    // whenever input 0 is busy, which for two requesters sharing a bus is the
+    // bug an arbiter exists to not have.
+    assert!(v.contains("reg turn;"), "{}", v);
+    assert!(
+        v.contains("wire grant0 = i0_offered & ((turn == 1'b0) | ((turn == 1'b1) & (!i1_offered)));"),
+        "{}",
+        v
+    );
+    // Whoever went this time goes last next time.
+    assert!(v.contains("turn <="), "{}", v);
+}
+
+#[test]
+fn only_one_input_of_a_merge_is_granted() {
+    let v = compile(&format!(
+        "{}{}",
+        DOUBLER,
+        concat!(
+            "graph top (p: buffer in i32, q: buffer in i32, o: buffer out i32)\n",
+            "  let m: buffer i32\n",
+            "  @merge(p, q, m)\n",
+            "  dbl(m, o)\n",
+        )
+    ));
+    // Each input advances only on its OWN transfer. Advancing both would drop
+    // one of the two items, which is the failure `stream` was removed for.
+    assert!(v.contains("wire take0 = grant0 & push;"), "{}", v);
+    assert!(v.contains("wire take1 = grant1 & push;"), "{}", v);
+    assert!(v.contains("i0_rsalt_q <= (take0 ?"), "{}", v);
+    assert!(v.contains("i1_rsalt_q <= (take1 ?"), "{}", v);
+}
+
+#[test]
+fn a_split_takes_only_when_every_sink_has_room() {
+    let v = compile(&format!(
+        "{}{}",
+        DOUBLER,
+        concat!(
+            "graph top (p: buffer in i32, o1: buffer out i32, o2: buffer out i32)\n",
+            "  let d: buffer i32\n",
+            "  dbl(p, d)\n",
+            "  @split(d, o1, o2)\n",
+        )
+    ));
+    assert!(v.contains("module ddl_split_2x32 ("), "{}", v);
+    // A slot per sink, and the input waits for the slowest. ANDing the sinks'
+    // READYS instead would put each consumer's logic in every other one's
+    // timing path -- the coupling the salt protocol exists to remove.
+    assert!(v.contains("wire all_room = (!o0_full) & (!o1_full);"), "{}", v);
+    assert!(v.contains("wire take = (!i_empty) & all_room;"), "{}", v);
+    assert!(v.contains("reg [31:0] o0_e0;"), "{}", v);
+    assert!(v.contains("reg [31:0] o1_e0;"), "{}", v);
+}
+
+#[test]
+fn a_combinator_never_depends_on_the_ready_coming_back() {
+    let v = compile(&format!(
+        "{}{}",
+        DOUBLER,
+        concat!(
+            "graph top (p: buffer in i32, o1: buffer out i32, o2: buffer out i32)\n",
+            "  let d: buffer i32\n",
+            "  dbl(p, d)\n",
+            "  @split(d, o1, o2)\n",
+        )
+    ));
+    // Every published salt is a register read, which is what makes rule 3
+    // hold by construction rather than by review.
+    assert!(v.contains("assign o0_wsalt = o0_wsalt_q;"), "{}", v);
+    assert!(v.contains("assign o1_wsalt = o1_wsalt_q;"), "{}", v);
+    assert!(v.contains("assign i_rsalt = i_rsalt_q;"), "{}", v);
+}
+
+#[test]
+fn a_three_way_merge_rotates_over_three_starts() {
+    let v = compile(&format!(
+        "{}{}",
+        DOUBLER,
+        concat!(
+            "graph top (p: buffer in i32, q: buffer in i32, r: buffer in i32, o: buffer out i32)\n",
+            "  let m: buffer i32\n",
+            "  @merge(p, q, r, m)\n",
+            "  dbl(m, o)\n",
+        )
+    ));
+    assert!(v.contains("module ddl_merge_3x32 ("), "{}", v);
+    assert!(v.contains("grant2"), "{}", v);
+    // Under start 2 the order is 2, 0, 1: input 0 waits only on input 2.
+    assert!(v.contains("((turn == 2'd2) & (!i2_offered))"), "{}", v);
+}
+
+#[test]
+fn one_module_serves_every_use_of_the_same_shape() {
+    let v = compile(&format!(
+        "{}{}",
+        DOUBLER,
+        concat!(
+            "graph top (a: buffer in i32, b: buffer in i32, c: buffer in i32, d: buffer in i32, o: buffer out i32)\n",
+            "  let m1: buffer i32\n",
+            "  let m2: buffer i32\n",
+            "  let m3: buffer i32\n",
+            "  @merge(a, b, m1)\n",
+            "  @merge(c, d, m2)\n",
+            "  @merge(m1, m2, m3)\n",
+            "  dbl(m3, o)\n",
+        )
+    ));
+    assert_eq!(v.matches("module ddl_merge_2x32 (").count(), 1, "{}", v);
+    assert_eq!(v.matches("ddl_merge_2x32 u_").count(), 3, "{}", v);
+}
+
+#[test]
+fn a_combinator_needs_two_sides() {
+    let text = compile_err(concat!(
+        "graph top (p: buffer in i32, o: buffer out i32)\n",
+        "  @merge(p)\n",
+    ));
+    assert!(text.contains("needs at least two pipes"), "{}", text);
 }

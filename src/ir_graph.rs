@@ -71,6 +71,40 @@ pub fn signature_of(name: &str, kind: &'static str, args: &PrecArgDefTuple, syms
     BlockSig { name: name.to_string(), kind, pipes }
 }
 
+/// What an `extern` may declare.
+///
+/// Pipes only. A graph connects pipes and nothing else, so a parameter of any
+/// other kind would be a port the graph has no way to reach -- silently
+/// unconnected in the emitted instantiation, which is a wire left floating and
+/// the sort of thing that shows up as a hang on real silicon.
+pub fn check_extern(
+    map: &crate::diag::SourceMap,
+    decl: &crate::parse::ExternDecl,
+    sink: &mut DiagSink,
+) {
+    for arg in &decl.args.entries {
+        let is_pipe = matches!(
+            arg.qualifier,
+            ArgTypeQualifier::BufferIn | ArgTypeQualifier::BufferOut
+        );
+        if is_pipe {
+            continue;
+        }
+        sink.push(
+            Diag::error(
+                map.span_of(&arg.arg_name),
+                format!(
+                    "`{}` is not a pipe, and a graph can connect nothing else",
+                    anumspan_to_str(&arg.arg_name)
+                ),
+            )
+            .with_note(
+                "an `extern` declares the pipe interface of a module DDL did not compile; a constant, a `port` or a raw signal on one would be left unconnected",
+            ),
+        );
+    }
+}
+
 /// One pipe inside the graph: a port of the graph, or a `pipe` declaration.
 struct GraphPipeInfo {
     ty: Ty,
@@ -86,11 +120,23 @@ struct GraphPipeInfo {
     consumers: Vec<AlphanumSpan>,
 }
 
+/// One combinator a graph asked for: which, how wide, and carrying what.
+///
+/// Collected rather than emitted here, because two graphs asking for the same
+/// shape want one module instantiated twice.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CombUse {
+    pub kind: crate::ir_comb::Comb,
+    pub fan: usize,
+    pub ty: Ty,
+}
+
 pub fn lower_graph(
     map: &SourceMap,
     syms: &Symbols,
     sigs: &BTreeMap<String, BlockSig>,
     decl: &GraphDecl,
+    combs: &mut Vec<CombUse>,
     sink: &mut DiagSink,
 ) -> Option<Module> {
     let graph_name = anumspan_to_str(&decl.name).to_string();
@@ -233,11 +279,66 @@ pub fn lower_graph(
             GraphStmt::Pipe(_) => continue,
         };
         let module = anumspan_to_str(&inst.module).to_string();
+        let sigs_for_this_instance: Option<&BlockSig>;
         if module == graph_name {
             sink.err_at(&inst.module, format!("`{}` cannot instantiate itself", module));
             return None;
         }
-        let sig = match sigs.get(&module) {
+        // A combinator has no declaration to look up: its interface is
+        // decided by the pipes it is given. The payload comes from the first
+        // argument, and every other one has to agree -- which is the same
+        // check a declared module gets, applied to a signature derived rather
+        // than written.
+        let synthesised;
+        if let Some(kind) = crate::ir_comb::Comb::of(&module) {
+            let needs_two_sides = inst.args.len() >= 2;
+            if !needs_two_sides {
+                sink.push(
+                    Diag::error(
+                        map.span_of(&inst.module),
+                        format!("`{}` needs at least two pipes", module),
+                    )
+                    .with_note(match kind {
+                        crate::ir_comb::Comb::Merge => {
+                            "write `@merge(a, b, out)`: the sources, then the sink"
+                        }
+                        crate::ir_comb::Comb::Split => {
+                            "write `@split(src, a, b)`: the source, then the sinks"
+                        }
+                    }),
+                );
+                return None;
+            }
+            let first = anumspan_to_str(&inst.args[0]).to_string();
+            let ty = match pipes.get(&first) {
+                Some(info) => info.ty.clone(),
+                None => {
+                    sink.err_at(
+                        &inst.args[0],
+                        format!("`{}` is not a pipe of this graph", first),
+                    );
+                    return None;
+                }
+            };
+            let fan = kind.fan(inst.args.len());
+            let use_ = CombUse { kind, fan, ty: ty.clone() };
+            if !combs.contains(&use_) {
+                combs.push(use_);
+            }
+            synthesised = BlockSig {
+                name: crate::ir_comb::module_name(kind, fan, &ty),
+                kind: "combinator",
+                pipes: crate::ir_comb::pipe_names(kind, fan)
+                    .into_iter()
+                    .map(|(name, is_input)| PipeSig { name, is_input, ty: ty.clone() })
+                    .collect(),
+            };
+            sigs_for_this_instance = Some(&synthesised);
+        } else {
+            sigs_for_this_instance = None;
+        }
+
+        let sig = match sigs_for_this_instance.or_else(|| sigs.get(&module)) {
             Some(s) => s,
             None => {
                 let mut known: Vec<&str> = sigs.keys().map(|k| k.as_str()).collect();
@@ -287,6 +388,13 @@ pub fn lower_graph(
             );
             return None;
         }
+
+        // What gets INSTANTIATED. For everything the program declared that is
+        // the name it was declared under; for a combinator it is the module
+        // the compiler wrote, whose name says its shape -- `ddl_merge_2x32`
+        // rather than the `@merge` the source spelled, which is not an
+        // identifier a Verilog file could carry anyway.
+        let module = sig.name.clone();
 
         // `mul3`, then `mul3_1`, `mul3_2` -- stable, and readable in a
         // waveform, which a bare `u0` is not.
@@ -385,10 +493,11 @@ pub fn lower_graph(
 /// Exactly one producer and exactly one consumer for every pipe.
 ///
 /// desc.md:106 allows one producer and several consumers, by duplicating the
-/// sink. That duplication is real work -- each consumer needs its own copy of
-/// the data with its own `ready` -- and until it exists, saying so beats
-/// emitting a net with two drivers on its `ready` leg and letting the
-/// simulator resolve it to `x`.
+/// sink -- which is what `@split` does, and it is still not what naming a pipe
+/// twice means. The duplication is real: each consumer gets its own pair of
+/// entries and its own salt, so the pipe has somewhere to put the copies. Two
+/// instances on one net have nowhere, and what comes out is two drivers on a
+/// salt leg for the simulator to resolve to `x`.
 fn check_endpoints(
     map: &SourceMap,
     graph_name: &str,
@@ -432,7 +541,8 @@ fn check_endpoints(
         } else if producers > 1 {
             report(
                 format!("`{}` has {} producers", name, producers),
-                "a pipe has one producer. Two drivers on one net resolve to `x`",
+                "write `@merge(a, b, p)`, which grants one of them per cycle in rotation; \
+                 two drivers on one net resolve to `x`",
             );
         }
 
@@ -444,8 +554,8 @@ fn check_endpoints(
         } else if consumers > 1 {
             report(
                 format!("`{}` has {} consumers", name, consumers),
-                "desc.md allows several, by duplicating the sink so each gets its own copy. \
-                 That duplication is not built yet",
+                "write `@split(p, a, b)`, which gives each consumer its own copy and its \
+                 own pair of entries; naming one pipe twice puts two drivers on one salt",
             );
         }
     }

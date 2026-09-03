@@ -318,6 +318,16 @@ pub enum ArgTypeQualifier {
     Inout,
     BufferIn,
     BufferOut,
+    /// `port in T` / `port out T` -- a plain data port with an enable beside
+    /// it, and no back-pressure at all.
+    ///
+    /// Spelled with a word rather than reusing the bare `T` because the bare
+    /// form already means something else and quietly: a plain parameter is
+    /// CONFIGURATION, folded at compile time and gone. Two spellings one space
+    /// apart, one a constant and one a per-cycle wire, is the kind of thing
+    /// this language exists to not have.
+    PortIn,
+    PortOut,
     /// `stream in` / `stream out`, which the language no longer has.
     ///
     /// Still lexed, and refused during lowering with a message that says what
@@ -366,6 +376,7 @@ pub enum TopLevelDecl {
     StructDecl(RawStructDecl),
     EnumDecl(RawEnumDecl),
     GraphDecl(RawGraphDecl),
+    ExternDecl(RawExternDecl),
 }
 
 /// `graph Name (ports)` -- structural composition and nothing else.
@@ -374,6 +385,17 @@ pub enum TopLevelDecl {
 /// declares internal pipes and instantiates processes and sequences on them,
 /// which is why it has its own tiny statement parser rather than reusing the
 /// one that knows about arithmetic.
+/// `extern name (pipes)` -- a module DDL did not compile.
+///
+/// No body: the Verilog is written by hand and lives outside this program.
+/// What DDL keeps is the pipe interface, which is enough for a `graph` to
+/// instantiate it and enough to check the connections.
+#[derive(Debug, Clone)]
+pub struct RawExternDecl {
+    pub name: AlphanumSpan,
+    pub args: RawArgDefTuple,
+}
+
 #[derive(Debug)]
 pub struct RawGraphDecl {
     pub name: AlphanumSpan,
@@ -797,6 +819,20 @@ fn try_parse_arg_type_qualifier(
             if is_out {
                 char_ptr = ptr;
                 break 'qualifier ArgTypeQualifier::StreamOut
+            }
+            return Err(());
+        }
+        let (is_port, new_ptr) = strip_prefix_on_match(char_ptr, char_end_ptr, "port ");
+        if is_port {
+            let (is_in, ptr) = strip_prefix_on_match(new_ptr, char_end_ptr, "in ");
+            if is_in {
+                char_ptr = ptr;
+                break 'qualifier ArgTypeQualifier::PortIn
+            }
+            let (is_out, ptr) = strip_prefix_on_match(new_ptr, char_end_ptr, "out ");
+            if is_out {
+                char_ptr = ptr;
+                break 'qualifier ArgTypeQualifier::PortOut
             }
             return Err(());
         }
@@ -1441,7 +1477,7 @@ unsafe fn try_parse_var_decl_stmt(
 
     // `let (val, ok) = @try_rcv(p)`. A non-blocking receive answers with the
     // item and whether there was one, and there is no way to use it without
-    // taking both (desc.md:162).
+    // taking both -- desc.md:189, "let (val2, is_valid) = @try_rcv(arg2)".
     let mut rest: Vec<AlphanumSpan> = Vec::new();
     let (is_tuple, tail) = strip_prefix_on_match(char_ptr, char_end_ptr, "(");
     let var_name;
@@ -2529,6 +2565,32 @@ pub unsafe fn try_parse_graph_decl(
     Ok((RawGraphDecl { name: graph_name, args, body }, char_ptr))
 }
 
+/// `extern name (pipes)`, on one line and with nothing under it.
+///
+/// # Safety
+/// See `try_parse_graph_decl`.
+pub unsafe fn try_parse_extern_decl(
+    mut char_ptr: *const u8,
+    char_end_ptr: *const u8,
+) -> Result<(RawExternDecl, *const u8), ()> {
+    let (matched, tail) = strip_prefix_on_match(char_ptr, char_end_ptr, "extern ");
+    if !matched {
+        return Err(());
+    }
+    char_ptr = tail;
+    let (_, tail) = skip_whitespaces(char_ptr, char_end_ptr);
+    char_ptr = tail;
+    let (name, tail) = try_parse_alphanum(char_ptr, char_end_ptr)?;
+    char_ptr = tail;
+    let (_, tail) = skip_whitespaces(char_ptr, char_end_ptr);
+    char_ptr = tail;
+    let (args, tail) = parse_arg_tuple(char_ptr, char_end_ptr)?;
+    if !line_is_finished(tail, char_end_ptr) {
+        return Err(());
+    }
+    Ok((RawExternDecl { name, args }, tail))
+}
+
 /// One line of a graph body: a pipe declaration or an instantiation.
 unsafe fn try_parse_graph_stmt(
     char_ptr: *const u8,
@@ -2854,6 +2916,12 @@ pub unsafe fn parse_top_level(
         if let Ok((graph_decl, tail)) = try_parse_graph_decl(tail, end, depth, &mut fail) {
             char_ptr = tail;
             items.push(TopLevelDecl::GraphDecl(graph_decl));
+            continue;
+        }
+
+        if let Ok((extern_decl, tail)) = try_parse_extern_decl(tail, end) {
+            char_ptr = tail;
+            items.push(TopLevelDecl::ExternDecl(extern_decl));
             continue;
         }
 

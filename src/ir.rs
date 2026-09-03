@@ -536,8 +536,59 @@ enum PathTerm {
 /// separates DDL from a nicer Verilog -- a process cannot present a raw wire
 /// and hand-roll a protocol over it, because the protocol is the compiler's
 /// job and hand-rolling it is the thing this language exists to stop.
+/// A `port in` parameter: the value on the wire, and the enable beside it.
+///
+/// NOT a binding. A port is a pipe -- one without back-pressure -- so it is
+/// reached the way every other pipe is: `@rcv` to wait for one, `@try_rcv` or
+/// `@peek` to look at what is there this cycle. Binding the name to the wire
+/// instead would make it the one channel in the language you read by naming
+/// it, and would quietly lose the distinction between "the value" and "a value
+/// that means something this cycle" that `@try_rcv`'s pair exists to carry.
+#[derive(Debug, Clone)]
+pub struct PortIn {
+    pub name: String,
+    pub ty: Ty,
+    /// The data port, read directly: there is one entry, not two, because
+    /// there is no slot to skid into.
+    pub data: ValueId,
+    /// The enable, which is what `@try_rcv` answers and what `@rcv` waits on.
+    pub en: ValueId,
+}
+
+/// A `port out` parameter: the value, and the enable that says it is new.
+///
+/// `sent` and `send_guard` are the same two facts a `PipeInfo` carries and are
+/// reset in the same places -- once per cycle for a body with no states, once
+/// per state for one with them. Keeping the shape identical is what lets
+/// `@send` and `@try_send` mean the same thing on a port that they mean on a
+/// pipe, with only the handshake underneath them differing.
+#[derive(Debug, Clone)]
+pub struct PortOut {
+    pub name: String,
+    pub ty: Ty,
+    pub data_port: PortId,
+    pub en_port: PortId,
+    /// What this body offered, if it offered anything.
+    pub sent: Option<ValueId>,
+    /// The branch the offer was written on, or `None` for the top of the body.
+    /// An offer made inside an `if` is made on that branch and no other.
+    pub send_guard: Option<ValueId>,
+}
+
 pub enum ParamKind {
     Pipe { is_input: bool },
+    /// A plain data port and an enable, with no back-pressure.
+    ///
+    /// desc.md:29 draws the line this is for -- "compute only logic in ddl, io
+    /// in verilog" -- and everything on the far side of it is SystemVerilog
+    /// that cannot be made to wait: a pin, a PLL, a bus whose master does not
+    /// take `ready` for an answer. README's rule for that case is that the
+    /// sink ties `ready` high AND SAYS SO AT THE BOUNDARY, which puts the
+    /// claim where a reader can check it. `port` is how it is said.
+    ///
+    /// A `buffer` remains the right answer between two things DDL compiled.
+    /// This one is for the edge of the program.
+    Port { is_input: bool },
     Constant,
 }
 
@@ -587,6 +638,8 @@ pub fn classify_param(
             sink.push(stream_was_removed(low.span_of(&arg.arg_name), "stream out"));
             None
         }
+        ArgTypeQualifier::PortIn => Some(ParamKind::Port { is_input: true }),
+        ArgTypeQualifier::PortOut => Some(ParamKind::Port { is_input: false }),
         ArgTypeQualifier::Inout => {
             sink.err_at(&arg.arg_name, "`inout` parameters are not supported");
             None
@@ -619,6 +672,10 @@ pub struct Lowerer<'a> {
     pub call_stack: Vec<String>,
     /// Pipe parameters in declaration order.
     pub pipes: Vec<PipeInfo>,
+    /// `port in` parameters in declaration order.
+    pub port_ins: Vec<PortIn>,
+    /// `port out` parameters in declaration order.
+    pub port_outs: Vec<PortOut>,
     /// Memories in declaration order. Reads name one by index.
     pub mems: Vec<Memory>,
     /// Immediate assertions, in source order.
@@ -661,6 +718,8 @@ impl<'a> Lowerer<'a> {
             bodies,
             call_stack: Vec::new(),
             pipes: Vec::new(),
+            port_ins: Vec::new(),
+            port_outs: Vec::new(),
             mems: Vec::new(),
             asserts: Vec::new(),
             params: Vec::new(),
@@ -674,6 +733,64 @@ impl<'a> Lowerer<'a> {
 
     /// Declares the pipe parameters of a process or sequence.
     ///
+    /// `port in x: T` / `port out y: T` -- a data port and an enable.
+    ///
+    /// An INPUT is two ports the body may read: the value, and `x_en` saying
+    /// whether it means anything this cycle. Nothing is captured and nothing
+    /// is refused; a producer that needs to be told to wait wants a `buffer`.
+    ///
+    /// An OUTPUT is two ports the body drives: the value it last assigned, and
+    /// `y_en`, true on the cycles it assigned one.
+    pub fn declare_port(
+        &mut self,
+        arg: &crate::parse::PrecArgTupleEntry,
+        is_input: bool,
+        sink: &mut DiagSink,
+    ) -> Option<()> {
+        let name = anumspan_to_str(&arg.arg_name).to_string();
+        let ty = match resolve_type_expr(&arg.type_expr, self.syms) {
+            Ok(t) => t,
+            Err(e) => {
+                sink.err_at(&arg.arg_name, e.message());
+                return None;
+            }
+        };
+        if ty.is_memory() {
+            sink.push(
+                Diag::error(
+                    self.span_of(&arg.arg_name),
+                    format!("`{}` is a memory, which cannot be a parameter", name),
+                )
+                .with_note("declare it inside the process with `var`"),
+            );
+            return None;
+        }
+        let dir = if is_input { PortDir::In } else { PortDir::Out };
+        let data_port = PortId(self.ports.len() as u32);
+        self.ports.push(Port { name: name.clone(), dir, ty: ty.clone() });
+        let en_port = PortId(self.ports.len() as u32);
+        self.ports.push(Port { name: format!("{}_en", name), dir, ty: Ty::BOOL });
+
+        if is_input {
+            let data = self.emit(ty.clone(), Op::Port(data_port));
+            self.values[data.0 as usize].name = Some(name.clone());
+            let en = self.emit(Ty::BOOL, Op::Port(en_port));
+            self.values[en.0 as usize].name = Some(format!("{}_en", name));
+            self.port_ins.push(PortIn { name, ty, data, en });
+            return Some(());
+        }
+
+        self.port_outs.push(PortOut {
+            name,
+            ty,
+            data_port,
+            en_port,
+            sent: None,
+            send_guard: None,
+        });
+        Some(())
+    }
+
     /// A pipe becomes three flat ports, which is the flattening k3g_chan.sv:60
     /// already pre-commits to for the yosys-slang risk.
     pub fn declare_pipes(
@@ -690,6 +807,10 @@ impl<'a> Lowerer<'a> {
                     self.declare_constant(arg, env, sink)?;
                     continue;
                 }
+                ParamKind::Port { is_input } => {
+                    self.declare_port(arg, is_input, sink)?;
+                    continue;
+                }
                 ParamKind::Pipe { is_input } => is_input,
             };
             let ty = match resolve_type_expr(&arg.type_expr, self.syms) {
@@ -699,47 +820,83 @@ impl<'a> Lowerer<'a> {
                     return None;
                 }
             };
-            let (vd, rd, dd) = if is_input {
-                (PortDir::In, PortDir::Out, PortDir::In)
-            } else {
-                (PortDir::Out, PortDir::In, PortDir::Out)
-            };
-            let mk = |low: &mut Self, suffix: &str, dir: PortDir, t: Ty| {
-                let id = PortId(low.ports.len() as u32);
-                low.ports.push(Port { name: format!("{}_{}", name, suffix), dir, ty: t });
-                id
-            };
-            let wsalt_port = mk(self, "wsalt", vd, SALT);
-            let rsalt_port = mk(self, "rsalt", rd, SALT);
-            let pair = Ty::Array(Box::new(ty.clone()), 2);
-            let data_port = mk(self, "data", dd, pair.clone());
-            let data_value = if is_input {
-                let v = self.emit(pair, Op::Port(data_port));
-                self.values[v.0 as usize].name = Some(format!("{}_data", name));
-                Some(v)
-            } else {
-                None
-            };
-            self.pipes.push(PipeInfo {
-                name,
-                ty,
-                is_input,
-                wsalt_port,
-                rsalt_port,
-                data_port,
-                data_value,
-                item: None,
-                salt_reg: None,
-                idx: None,
-                movable: None,
-                used: false,
-                sent: None,
-                send_guard: None,
-                fired: None,
-                slot_reg: None,
-            });
+            self.declare_pipe(name, ty, is_input);
         }
         Some(())
+    }
+
+    /// `clk` and `rst_n`, which every clocked module has and none declares.
+    ///
+    /// "A process has channel ports and clock/reset. Nothing else."
+    /// -- k3g_chan.sv:31.
+    pub fn declare_clock(&mut self, env: &mut Env) {
+        for implicit in ["clk", "rst_n"] {
+            let port_id = PortId(self.ports.len() as u32);
+            self.ports.push(Port {
+                name: implicit.to_string(),
+                dir: PortDir::In,
+                ty: Ty::BOOL,
+            });
+            let v = self.emit(Ty::BOOL, Op::Port(port_id));
+            self.values[v.0 as usize].name = Some(implicit.to_string());
+            env.insert(implicit.to_string(), Binding::constant(v, Ty::BOOL));
+        }
+    }
+
+    pub fn port_in_index(&self, name: &str) -> Option<usize> {
+        self.port_ins.iter().position(|p| p.name == name)
+    }
+
+    pub fn port_out_index(&self, name: &str) -> Option<usize> {
+        self.port_outs.iter().position(|p| p.name == name)
+    }
+
+    /// One pipe: three flat ports, and the bookkeeping that goes with them.
+    ///
+    /// Factored out of the parameter walk so a module the compiler writes --
+    /// a `@merge` or a `@split` -- gets the same interface as one a program
+    /// declares. Two spellings of the port list is how the two would drift.
+    pub fn declare_pipe(&mut self, name: String, ty: Ty, is_input: bool) -> usize {
+        let (vd, rd, dd) = if is_input {
+            (PortDir::In, PortDir::Out, PortDir::In)
+        } else {
+            (PortDir::Out, PortDir::In, PortDir::Out)
+        };
+        let mk = |low: &mut Self, suffix: &str, dir: PortDir, t: Ty| {
+            let id = PortId(low.ports.len() as u32);
+            low.ports.push(Port { name: format!("{}_{}", name, suffix), dir, ty: t });
+            id
+        };
+        let wsalt_port = mk(self, "wsalt", vd, SALT);
+        let rsalt_port = mk(self, "rsalt", rd, SALT);
+        let pair = Ty::Array(Box::new(ty.clone()), 2);
+        let data_port = mk(self, "data", dd, pair.clone());
+        let data_value = if is_input {
+            let v = self.emit(pair, Op::Port(data_port));
+            self.values[v.0 as usize].name = Some(format!("{}_data", name));
+            Some(v)
+        } else {
+            None
+        };
+        self.pipes.push(PipeInfo {
+            name,
+            ty,
+            is_input,
+            wsalt_port,
+            rsalt_port,
+            data_port,
+            data_value,
+            item: None,
+            salt_reg: None,
+            idx: None,
+            movable: None,
+            used: false,
+            sent: None,
+            send_guard: None,
+            fired: None,
+            slot_reg: None,
+        });
+        self.pipes.len() - 1
     }
 
     /// Binds a constant parameter, folding its value at elaboration.
@@ -1637,19 +1794,8 @@ pub fn lower_process(
     let mut low = Lowerer::new(map, syms, bodies);
     let mut env: Env = Env::new();
 
-    // Clock and reset are implicit. "A process has channel ports and
-    // clock/reset. Nothing else." -- k3g_chan.sv:31.
-    for implicit in ["clk", "rst_n"] {
-        let port_id = PortId(low.ports.len() as u32);
-        low.ports.push(Port {
-            name: implicit.to_string(),
-            dir: PortDir::In,
-            ty: Ty::BOOL,
-        });
-        let v = low.emit(Ty::BOOL, Op::Port(port_id));
-        low.values[v.0 as usize].name = Some(implicit.to_string());
-        env.insert(implicit.to_string(), Binding::constant(v, Ty::BOOL));
-    }
+    // Clock and reset are implicit.
+    low.declare_clock(&mut env);
 
     for arg in &decl.args.entries {
         let name = anumspan_to_str(&arg.arg_name).to_string();
@@ -1663,6 +1809,10 @@ pub fn lower_process(
         let is_input = match kind {
             ParamKind::Constant => {
                 low.declare_constant(arg, &mut env, sink)?;
+                continue;
+            }
+            ParamKind::Port { is_input } => {
+                low.declare_port(arg, is_input, sink)?;
                 continue;
             }
             ParamKind::Pipe { is_input } => is_input,
@@ -1867,14 +2017,23 @@ pub fn lower_process(
         body_start += 1;
     }
 
-    let has_pipes = !low.pipes.is_empty();
-    if !has_pipes {
+    // What the check is really asking is whether the process is observable.
+    // A `port` is a way to be observed -- fewer guarantees than a pipe, and
+    // still a wire leaving the module -- so a process made only of them is a
+    // boundary block rather than a mistake.
+    let has_ports = low
+        .ports
+        .iter()
+        .any(|p| p.name != "clk" && p.name != "rst_n");
+    if !has_ports {
         sink.push(
             Diag::error(
                 map.span_of(&decl.name),
-                "a process needs at least one pipe",
+                "a process needs at least one pipe or `port`",
             )
-            .with_note("a process with no channels computes nothing anything else can see"),
+            .with_note(
+                "a process with no channels and no ports computes nothing anything else can see; a plain parameter is folded at compile time and is not one",
+            ),
         );
         return None;
     }
@@ -2061,6 +2220,40 @@ pub fn lower_process(
 
     let mut drivers = Vec::new();
 
+    // One pass per cycle, so what the body offered IS what the port carries
+    // this cycle. A `port` has no handshake to register against.
+    //
+    // A port nothing sent to still drives: zero, with the enable low, which is
+    // the whole of what the enable is for. An output left undriven would be a
+    // floating wire, and the `if` rule exists to keep those out.
+    for (pix, port) in low.port_outs.clone().into_iter().enumerate() {
+        let (value, en) = match port.sent {
+            None => {
+                let zero = low.emit(port.ty.clone(), Op::Const(0));
+                let off = low.emit(Ty::BOOL, Op::Const(0));
+                (zero, off)
+            }
+            Some(v) => {
+                let on = low.emit(Ty::BOOL, Op::Const(1));
+                let en = narrow_to_path(&mut low, on, port.send_guard);
+                (v, en)
+            }
+        };
+        // Once the pass is over the process refuses everything, and a port is
+        // not exempt: an enable held high past the end would keep publishing
+        // the last value as though it were new. A port nothing sent to is
+        // already false and needs no help staying that way.
+        let en = match (running, port.sent) {
+            (Some(r), Some(_)) => low.emit(Ty::BOOL, Op::Bin { op: BinOp::And, lhs: en, rhs: r }),
+            _ => en,
+        };
+        low.name_value_safe(value, port.name.clone());
+        low.name_value_safe(en, format!("{}_en", port.name));
+        drivers.push((port.data_port, value));
+        drivers.push((port.en_port, en));
+        let _ = pix;
+    }
+
 
     for ix in 0..low.pipes.len() {
         let pipe = low.pipes[ix].clone();
@@ -2243,6 +2436,31 @@ fn lower_try_rcv_binding(
             return None;
         }
     };
+    // A `port in` answers both questions at once and spends nothing doing it.
+    // There is no slot to advance and no producer to inform, so `@try_rcv` and
+    // `@peek` are the same operation on one -- and neither uses up the pipe's
+    // one transfer per cycle, because a port has no transfer to use up.
+    if let Some(pix) = low.port_in_index(&pipe_name) {
+        let port = low.port_ins[pix].clone();
+        // The enable as it stands, not narrowed to the branch this sits on. On
+        // a pipe the answer is "did I TAKE one", which is false on a path that
+        // did not run because nothing was claimed there. A port claims nothing
+        // anywhere, so the honest answer is what the wire says.
+        let item = anumspan_to_str(&decl.name).to_string();
+        let got = anumspan_to_str(&decl.rest[0]).to_string();
+        env.insert(item, Binding::constant(port.data, port.ty));
+        env.insert(got, Binding::constant(port.en, Ty::BOOL));
+        return Some(());
+    }
+    if low.port_out_index(&pipe_name).is_some() {
+        let verb = if takes { "received from" } else { "peeked at" };
+        sink.err_at(
+            &decl.name,
+            format!("`{}` is a `port out`; it cannot be {}", pipe_name, verb),
+        );
+        return None;
+    }
+
     let ix = match low.pipes.iter().position(|p| p.name == pipe_name) {
         Some(i) => i,
         None => {
@@ -2548,6 +2766,10 @@ fn lower_stmt_at(
             let binding = match env.get(&name) {
                 Some(b) => b.clone(),
                 None => {
+                    if let Some(diag) = port_is_not_a_value(low, &target, &name) {
+                        sink.push(diag);
+                        return None;
+                    }
                     sink.err_at(&target, format!("`{}` is not declared", name));
                     return None;
                 }
@@ -2611,11 +2833,108 @@ fn lower_stmt_at(
                 }
             };
 
-            // Resolve the field chain to one absolute bit range.
+            // Resolve the step chain to one absolute bit range.
+            //
+            // Every step is static except possibly the last, which may be an
+            // array index this cycle computes. A dynamic step has no bit range
+            // to be part of, so nothing may follow it: the whole point of the
+            // range is that the steps after it know where they are.
             let mut want = base_ty.clone();
             let mut offset = 0u32;
             let mut span: Option<(u32, u32)> = None;
-            for field in &path.fields {
+            let mut dynamic: Option<(ValueId, Ty, u32)> = None;
+            for (step_ix, step) in path.steps.iter().enumerate() {
+                let field = match step {
+                    LvalueStep::Field(f) => f,
+                    LvalueStep::Index(index) => {
+                        let (elem, n) = match &want {
+                            Ty::Array(elem, n) => ((**elem).clone(), *n),
+                            other => {
+                                sink.push(
+                                    Diag::error(
+                                        low.here(),
+                                        format!("`{}` is not an array", other.display()),
+                                    )
+                                    .with_note(
+                                        "only an `[T; n]` can have an element assigned; a bit of an `iN` is not an lvalue",
+                                    ),
+                                );
+                                return None;
+                            }
+                        };
+                        let w = elem.bit_width();
+                        let last = step_ix + 1 == path.steps.len();
+                        // A constant index is an ordinary bit range and stays
+                        // one wherever it sits: `a[1].f = x` knows exactly
+                        // where it is writing.
+                        //
+                        // `const_eval` reads the syntax, so it misses a
+                        // constant parameter and misses the induction variable
+                        // of an unrolled `for`. Both arrive as an `Op::Const`
+                        // and must not cost a mux tree, so the fallback lowers
+                        // once and asks.
+                        let konst = match const_eval(index) {
+                            Ok(k) => Some(k),
+                            Err(_) => {
+                                let idx = lower_expr(low, index, env, sink)?;
+                                match low.values[idx.0 as usize].op {
+                                    Op::Const(k) => Some(k),
+                                    _ => {
+                                        if !last {
+                                            sink.push(
+                                                Diag::error(
+                                                    low.here(),
+                                                    "a computed index must be the last step of an assignment target",
+                                                )
+                                                .with_note(
+                                                    "bind the element first -- `let e = a[i]` -- then assign its parts and write `a[i] = e` back",
+                                                ),
+                                            );
+                                            return None;
+                                        }
+                                        let idx_ty = low.ty_of(idx);
+                                        if idx_ty.is_signed() {
+                                            sink.push(
+                                                Diag::error(
+                                                    low.here(),
+                                                    format!(
+                                                        "an index must be unsigned, found `{}`",
+                                                        idx_ty.display()
+                                                    ),
+                                                )
+                                                .with_note("convert with `@unsigned(x)`"),
+                                            );
+                                            return None;
+                                        }
+                                        dynamic = Some((idx, elem.clone(), n));
+                                        want = elem;
+                                        continue;
+                                    }
+                                }
+                            }
+                        };
+                        let k = konst.expect("the dynamic path continued above");
+                        if k >= n as u128 {
+                            sink.push(
+                                Diag::error(
+                                    low.here(),
+                                    format!(
+                                        "element {} is out of bounds for `{}`",
+                                        k,
+                                        want.display()
+                                    ),
+                                )
+                                .with_note(format!("it has {} element(s), indexed from 0", n)),
+                            );
+                            return None;
+                        }
+                        let k = k as u32;
+                        span = Some((offset + (k + 1) * w - 1, offset + k * w));
+                        offset += k * w;
+                        want = elem;
+                        continue;
+                    }
+                };
                 let struct_name = match &want {
                     Ty::Struct { name, .. } => name.clone(),
                     other => {
@@ -2669,6 +2988,52 @@ fn lower_stmt_at(
                         return None;
                     }
                 }
+            }
+
+            // A computed index has no bit range, so the read-modify-write
+            // below cannot place it. It becomes a whole-array value instead:
+            // every element muxed against the index, which is the same shape
+            // the synthesizer would build from a `case` and does not need a
+            // procedural block to express.
+            //
+            // `+:` is what a computed READ lowers to (`lower_array_index`),
+            // and there is no `+:` on the left of an assignment in a pure
+            // value graph -- the array is a wire here, not a variable.
+            if let Some((idx, elem, n)) = dynamic {
+                let array_ty = Ty::Array(Box::new(elem.clone()), n);
+                let w = elem.bit_width();
+                let current = match env.get(&name).and_then(|b| b.value) {
+                    Some(v) => v,
+                    None => {
+                        sink.err_at(
+                            &target,
+                            format!("`{}` is assigned an element before it has a value", name),
+                        );
+                        return None;
+                    }
+                };
+                let whole = match span {
+                    None => current,
+                    Some((hi, lo)) => low.emit(array_ty.clone(), Op::Slice { arg: current, hi, lo }),
+                };
+                let idx_ty = low.ty_of(idx);
+                // High-to-low, matching `Op::Concat` and the packed layout the
+                // reads use: element k is bits [(k+1)*w-1 : k*w].
+                let mut parts = Vec::with_capacity(n as usize);
+                for k in (0..n).rev() {
+                    let old_k =
+                        low.emit(elem.clone(), Op::Slice { arg: whole, hi: (k + 1) * w - 1, lo: k * w });
+                    let konst = low.emit(idx_ty.clone(), Op::Const(k as u128));
+                    let hit = low.emit(
+                        Ty::BOOL,
+                        Op::Cmp { op: CmpOp::Eq, lhs: idx, rhs: konst },
+                    );
+                    parts.push(low.emit(
+                        elem.clone(),
+                        Op::Mux { cond: hit, then_val: value, else_val: old_k },
+                    ));
+                }
+                value = low.emit(array_ty, Op::Concat(parts));
             }
 
             // Writing a field is a read-modify-write on the whole value: keep
@@ -2855,9 +3220,19 @@ fn lower_stmt_at(
         }
 
         PrecResInnerStmt::Loop(_) => {
-            sink.err_span(
-                low.here(),
-                "a `loop` belongs at the top of a `process` body, not nested inside it",
+            // A `loop` nested inside another one is scheduled -- its back edge
+            // is a state graph, and `ir_fsm` builds those. Reaching HERE means
+            // there is no state graph to put it in: a `fun`, a `sequence`, or a
+            // process whose body never blocks and is therefore one pass per
+            // cycle.
+            sink.push(
+                Diag::error(
+                    low.here(),
+                    "a `loop` needs a `process` that blocks, so its repetition has a cycle to spend",
+                )
+                .with_note(
+                    "a `fun` and a `sequence` settle once; a process with no `@rcv`/`@send` has no states to come back to",
+                ),
             );
             None
         }
@@ -2968,18 +3343,69 @@ fn cast_hint(have: &Ty, want: &Ty) -> String {
 
 
 /// A name, plus the chain of fields written after it.
+/// One step of an assignment target, as written.
+///
+/// `uop.cond_reg` is one `Field`; `line.words[1]` is a `Field` then an
+/// `Index`. Both resolve to a bit range of the same base name, which is what
+/// makes a write to either a splice rather than a separate storage location.
+enum LvalueStep {
+    Field(AlphanumSpan),
+    Index(PrecResExpr),
+}
+
 struct LvaluePath {
     base: AlphanumSpan,
     /// As written, outermost first: `u.a.b` gives `[a, b]`.
-    fields: Vec<AlphanumSpan>,
+    steps: Vec<LvalueStep>,
+}
+
+/// A port named where a value was expected.
+///
+/// A port is a pipe, and a pipe is not read by naming it. Saying "not declared"
+/// would be true of the NAME and useless about the mistake, which is a reader
+/// reaching for the wire instead of the channel.
+fn port_is_not_a_value(low: &Lowerer, at: &AlphanumSpan, name: &str) -> Option<Diag> {
+    if low.port_in_index(name).is_some() {
+        return Some(
+            Diag::error(
+                low.span_of(at),
+                format!("`{}` is a `port in`, which is a pipe rather than a value", name),
+            )
+            .with_note(format!(
+                "read it with `let (v, got) = @try_rcv({})`, or wait for one with `let v = @rcv({})`",
+                name, name
+            )),
+        );
+    }
+    if low.port_out_index(name).is_some() {
+        return Some(
+            Diag::error(
+                low.span_of(at),
+                format!("`{}` is a `port out`, which is a pipe rather than a value", name),
+            )
+            .with_note(format!(
+                "write to it with `@send({}, v)`, or `@try_send({}, v)` where the cycle is not to be spent",
+                name, name
+            )),
+        );
+    }
+    None
 }
 
 fn lvalue_path(expr: &PrecResExpr) -> Option<LvaluePath> {
     match expr {
-        PrecResExpr::Ref(base) => Some(LvaluePath { base: *base, fields: Vec::new() }),
+        PrecResExpr::Ref(base) => Some(LvaluePath { base: *base, steps: Vec::new() }),
         PrecResExpr::FieldAccess { base, field_name } => {
             let mut path = lvalue_path(base)?;
-            path.fields.push(*field_name);
+            path.steps.push(LvalueStep::Field(*field_name));
+            Some(path)
+        }
+        // `a[k] = v`. A memory write is caught before this and never arrives
+        // here: `m[i] = v` reaches the one write port, where `a[i] = v` on an
+        // array VALUE is a splice of the value the name already holds.
+        PrecResExpr::SubscriptAccess(sub) => {
+            let mut path = lvalue_path(&sub.base)?;
+            path.steps.push(LvalueStep::Index(sub.index.clone()));
             Some(path)
         }
         _ => None,
@@ -3101,6 +3527,10 @@ pub fn lower_expr(
                     None
                 }
                 None => {
+                    if let Some(diag) = port_is_not_a_value(low, span, name) {
+                        sink.push(diag);
+                        return None;
+                    }
                     sink.err_at(span, format!("`{}` is not defined", name));
                     None
                 }
@@ -3613,6 +4043,22 @@ fn lower_builtin(
             return None;
         };
         let pipe_name = anumspan_to_str(n).to_string();
+        // Nothing to drop. `@drop` exists because a pipe gets one transfer per
+        // cycle and taking one without binding it is how you decline what is
+        // there; a `port` has no transfer to spend, so declining is reading it
+        // and not using the answer.
+        if low.port_in_index(&pipe_name).is_some() || low.port_out_index(&pipe_name).is_some() {
+            sink.push(
+                Diag::error(
+                    low.here(),
+                    format!("`{}` is a `port`, which has nothing to drop", pipe_name),
+                )
+                .with_note(
+                    "a `@drop` spends a pipe's one transfer for the cycle so the next item can arrive; a port is not holding one back, so reading it with `@try_rcv` and ignoring the answer is the whole of it",
+                ),
+            );
+            return None;
+        }
         let Some(ix) = low.pipes.iter().position(|p| p.name == pipe_name) else {
             sink.err_span(
                 low.here(),
@@ -3654,6 +4100,21 @@ fn lower_builtin(
                 return None;
             }
         };
+        // A `port out` always takes it: there is no `ready` coming back, which
+        // is the whole of what a `port` declares. So the answer is true, and
+        // what the enable carries is the PATH -- an offer made on one branch of
+        // an `if` is made on that branch and no other, exactly as for a pipe.
+        if let Some(pix) = low.port_out_index(&pipe_name) {
+            return lower_port_send(low, pix, &args[1], env, sink);
+        }
+        if low.port_in_index(&pipe_name).is_some() {
+            sink.err_span(
+                low.here(),
+                format!("`{}` is a `port in`; it cannot be sent to", pipe_name),
+            );
+            return None;
+        }
+
         let ix = match low.pipes.iter().position(|p| p.name == pipe_name) {
             Some(i) => i,
             None => {
@@ -3812,6 +4273,78 @@ fn lower_builtin(
             let ty = if op == Signed { Ty::SInt(w) } else { Ty::UInt(w) };
             return Some(low.emit(ty, Op::Cast { arg }));
         }
+        Slice => {
+            // `@slice(x, base, width)`. The width is constant because the type
+            // of the result is: a value whose width the cycle decides has no
+            // type this compiler can check anything against.
+            if args.len() != 3 {
+                sink.err_span(
+                    low.here(),
+                    "`@slice` takes three arguments: a value, a base and a constant width",
+                );
+                return None;
+            }
+            let arg = lower_expr(low, &args[0], env, sink)?;
+            let arg_ty = low.ty_of(arg);
+            let total = arg_ty.bit_width();
+            let width = match const_eval(&args[2]) {
+                Ok(k) => k,
+                Err(_) => {
+                    sink.err_span(low.here(), "the width of a `@slice` must be a constant");
+                    return None;
+                }
+            };
+            let width_fits = width > 0 && width <= total as u128;
+            if !width_fits {
+                sink.err_span(
+                    low.here(),
+                    format!(
+                        "a `@slice` of {} bits does not fit in `{}`",
+                        width,
+                        arg_ty.display()
+                    ),
+                );
+                return None;
+            }
+            let width = width as u32;
+            let base = lower_expr(low, &args[1], env, sink)?;
+            let base_ty = low.ty_of(base);
+            if base_ty.is_signed() {
+                sink.push(
+                    Diag::error(
+                        low.here(),
+                        format!("a `@slice` base must be unsigned, found `{}`", base_ty.display()),
+                    )
+                    .with_note("convert with `@unsigned(x)`"),
+                );
+                return None;
+            }
+            // A constant base is an ordinary bit range, and an ordinary bit
+            // range is what the reader wanted to write. `+:` with a literal
+            // base is correct and is also the construct this backend exists to
+            // keep away from GowinSynthesis.
+            if let Op::Const(k) = low.values[base.0 as usize].op {
+                let range_fits = k + width as u128 <= total as u128;
+                if !range_fits {
+                    sink.err_span(
+                        low.here(),
+                        format!(
+                            "`@slice({}, {})` runs past the end of `{}`",
+                            k,
+                            width,
+                            arg_ty.display()
+                        ),
+                    );
+                    return None;
+                }
+                let lo = k as u32;
+                return Some(low.emit(
+                    Ty::UInt(width),
+                    Op::Slice { arg, hi: lo + width - 1, lo },
+                ));
+            }
+            return Some(low.emit(Ty::UInt(width), Op::DynSlice { arg, base, width }));
+        }
         Concat => {
             if args.is_empty() {
                 sink.err_span(low.here(), "`@concat` needs at least one argument");
@@ -3962,6 +4495,56 @@ fn lower_builtin(
 }
 
 /// `(value, constant)` argument pair shared by `@zext`/`@sext`/`@trunc`/`@rep`.
+/// Drives a `port out` with `value`, on whatever path the caller is on.
+///
+/// Shared by `@try_send`, which is this and an answer of true, and by the
+/// `@send` a state machine schedules -- the two differ in whether a cycle is
+/// spent, not in what reaches the wire.
+pub fn lower_port_send(
+    low: &mut Lowerer,
+    pix: usize,
+    value_expr: &PrecResExpr,
+    env: &Env,
+    sink: &mut DiagSink,
+) -> Option<ValueId> {
+    let port = low.port_outs[pix].clone();
+    if port.sent.is_some() {
+        sink.err_span(
+            low.here(),
+            format!("`{}` is sent to more than once in one cycle", port.name),
+        );
+        return None;
+    }
+    let mut value = lower_expr_expecting(low, value_expr, Some(&port.ty), env, sink)?;
+    let have = low.ty_of(value);
+    if have != port.ty {
+        match low.coerce_const(value, &port.ty) {
+            Some(v) => value = v,
+            None => {
+                sink.push(
+                    Diag::error(
+                        low.here(),
+                        format!(
+                            "`{}` carries `{}` but `{}` was sent",
+                            port.name,
+                            port.ty.display(),
+                            have.display()
+                        ),
+                    )
+                    .with_note(cast_hint(&have, &port.ty)),
+                );
+                return None;
+            }
+        }
+    }
+    low.port_outs[pix].sent = Some(value);
+    low.port_outs[pix].send_guard = low.materialise_path();
+    // Always true: there is no `ready` coming back, which is the whole of what
+    // a `port` declares. `@try_send` on one answers the question it is asked
+    // and the answer never varies.
+    Some(low.emit(Ty::BOOL, Op::Const(1)))
+}
+
 fn cast_args(
     low: &mut Lowerer,
     args: &[PrecResExpr],

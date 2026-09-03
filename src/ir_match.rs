@@ -20,18 +20,52 @@ fn first_variant_span(pattern: &BindingPattern) -> Option<AlphanumSpan> {
     }
 }
 
-/// Lowers a `match` on an enum into a chain of muxes.
+/// What one arm of a `match` selects on, and what it binds.
 ///
-/// The arms are evaluated into separate environments -- exactly as `if`/`else`
-/// does -- and then folded from the last arm backwards, so the first arm ends
-/// up outermost and therefore highest priority. That matches the reading order
-/// of the source and the `unique case` it replaces.
-pub fn lower_match(
+/// Purely syntactic plus a symbol lookup: no environment, no lowering. That is
+/// what lets the same analysis serve both readings of a `match` -- the
+/// combinational one, which folds the arms into a `case` over VALUES, and the
+/// scheduled one, where the arms are states and the `case` is over the next
+/// state. The two used to be one function and only the first existed, which is
+/// why a `match` could not hold a wait.
+pub struct CasePlan {
+    /// The discriminants that select this arm. Empty for a catch-all.
+    pub labels: Vec<u128>,
+    /// `_` or a plain name: binds the whole scrutinee.
+    pub catch_all: Option<AlphanumSpan>,
+    /// `Read(a)` -- the variant, and the name its payload takes.
+    pub payload: Option<(AlphanumSpan, AlphanumSpan)>,
+    /// `_ => @unreachable`: selects nothing and supplies nothing.
+    pub is_unreachable: bool,
+}
+
+/// Every arm of a `match`, checked for coverage.
+pub struct MatchShape {
+    pub enum_name: String,
+    pub tag_width: u32,
+    pub payload_width: u32,
+    pub total_width: u32,
+    /// One per case of the source `match`, in order.
+    pub cases: Vec<CasePlan>,
+    /// Where to blame the `match` as a whole.
+    pub span: crate::diag::Span,
+}
+
+impl MatchShape {
+    /// The arms that can be selected, in source order, paired with the index
+    /// of the case they came from.
+    pub fn selectable(&self) -> impl Iterator<Item = (usize, &CasePlan)> {
+        self.cases.iter().enumerate().filter(|(_, c)| !c.is_unreachable)
+    }
+}
+
+/// Resolves the patterns of a `match` and checks that it covers its scrutinee.
+pub fn plan_match(
     low: &mut Lowerer,
     stmt: &MatchStmt,
-    env: &mut Env,
+    scrutinee_ty: &Ty,
     sink: &mut DiagSink,
-) -> Option<()> {
+) -> Option<MatchShape> {
     let has_one_scrutinee = stmt.scrutinees.len() == 1;
     if !has_one_scrutinee {
         sink.err_span(
@@ -44,10 +78,7 @@ pub fn lower_match(
         return None;
     }
 
-    let scrutinee = crate::ir::lower_expr(low, &stmt.scrutinees[0], env, sink)?;
-    let scrutinee_ty = low.ty_of(scrutinee);
-
-    let (enum_name, total_width) = match &scrutinee_ty {
+    let (enum_name, total_width) = match scrutinee_ty {
         Ty::Enum { name, width } => (name.clone(), *width),
         other => {
             sink.push(
@@ -66,34 +97,7 @@ pub fn lower_match(
         None => (total_width, 0),
     };
 
-    // A tagged union is matched on its TAG, not on the whole value: the
-    // payload is different from one item to the next and comparing it would
-    // mean no arm ever fired. The tag sits in the high bits, so this is a
-    // slice, and for an enum with no payloads it is the value itself.
-    let tag = if payload_width > 0 {
-        let t = low.emit(
-            Ty::UInt(tag_width),
-            Op::Slice { arg: scrutinee, hi: total_width - 1, lo: payload_width },
-        );
-        low.name_value_safe(t, format!("{}_tag", enum_name));
-        t
-    } else {
-        scrutinee
-    };
-
-    // Each arm becomes (selector, environment-after-the-arm). A `None`
-    // selector is a catch-all and ends the chain.
-    struct Arm {
-        /// The discriminants that select this arm. Empty for a catch-all.
-        labels: Vec<u128>,
-        env: Env,
-    }
-    let mut arms: Vec<Arm> = Vec::new();
     let mut covered: Vec<String> = Vec::new();
-    // A `_` arm with a body supplies a value for anything unmatched. An
-    // `@unreachable` arm supplies nothing -- it only asserts that nothing
-    // reaches it -- so it waives the bit-pattern requirement but not the
-    // requirement to handle every declared variant.
     let mut saw_value_catch_all = false;
     let mut saw_unreachable = false;
     // `match` itself carries no span, so the first pattern stands in for it.
@@ -107,6 +111,7 @@ pub fn lower_match(
         }
     }
 
+    let mut cases: Vec<CasePlan> = Vec::new();
     for case in &stmt.cases {
         let has_one_pattern = case.binding_patterns.len() == 1;
         if !has_one_pattern {
@@ -144,10 +149,14 @@ pub fn lower_match(
                 return None;
             }
             saw_unreachable = true;
+            cases.push(CasePlan {
+                labels: Vec::new(),
+                catch_all: None,
+                payload: None,
+                is_unreachable: true,
+            });
             continue;
         }
-
-        let mut arm_env = env.clone();
 
         // An or-pattern offers several alternatives for ONE scrutinee
         // position. A lone pattern is the one-alternative case, so both take
@@ -159,7 +168,6 @@ pub fn lower_match(
 
         let mut catch_all_binding: Option<AlphanumSpan> = None;
         let mut named: Vec<AlphanumSpan> = Vec::new();
-        // `Read(a) =>` -- the variant, and the name its payload takes.
         let mut payload_bind: Option<(AlphanumSpan, AlphanumSpan)> = None;
         for alt in &alternatives {
             match alt {
@@ -186,20 +194,8 @@ pub fn lower_match(
             return None;
         }
 
-        let labels = if let Some(name) = catch_all_binding {
-            // A plain name is an irrefutable binding: it matches anything and
-            // binds the scrutinee, which is how the wildcard works too.
+        let labels = if catch_all_binding.is_some() {
             saw_value_catch_all = true;
-            let bound = anumspan_to_str(&name).to_string();
-            arm_env.insert(
-                bound,
-                Binding {
-                    is_mutable: false,
-                    value: Some(scrutinee),
-                    ty: scrutinee_ty.clone(),
-                    is_output: false,
-                },
-            );
             Vec::new()
         } else {
             // Every alternative contributes a case label. Each also counts
@@ -242,72 +238,44 @@ pub fn lower_match(
             labels
         };
 
-        // The payload, if the arm asked for it. It is the low bits of the
-        // scrutinee -- the whole point of a fixed layout is that the arm knows
-        // where to look once the tag has told it what is there.
         if let Some((variant_span, bind_span)) = payload_bind {
-            if named.len() != 1 {
+            let binds_one_variant = named.len() == 1;
+            if !binds_one_variant {
                 sink.err_at(
                     &bind_span,
                     "an alternative with several variants cannot bind a payload",
                 );
                 return None;
             }
-            let variant = anumspan_to_str(&variant_span).to_string();
-            let payload_ty = low
+            let carries_one = low
                 .syms
                 .enums
                 .get(&enum_name)
-                .and_then(|d| d.payload_of(&variant))
-                .cloned();
-            let payload_ty = match payload_ty {
-                Some(t) => t,
-                None => {
-                    sink.push(
-                        Diag::error(
-                            low.span_of(&variant_span),
-                            format!("`{}` carries no payload to bind", variant),
-                        )
-                        .with_note(format!("match it as `{} =>`", variant)),
-                    );
-                    return None;
-                }
-            };
-            let bits = payload_ty.bit_width();
-            let raw = low.emit(
-                Ty::UInt(bits),
-                Op::Slice { arg: scrutinee, hi: bits - 1, lo: 0 },
-            );
-            // The slice is a bag of bits; give it back the payload's own type
-            // so a struct payload keeps its fields and a signed one stays
-            // signed. Same reason a struct field is retyped after its slice.
-            let value = if low.ty_of(raw) == payload_ty {
-                raw
-            } else {
-                low.emit(payload_ty.clone(), Op::Cast { arg: raw })
-            };
-            let bound = anumspan_to_str(&bind_span).to_string();
-            low.name_value_safe(value, bound.clone());
-            arm_env.insert(bound, Binding::constant(value, payload_ty));
+                .and_then(|d| d.payload_of(anumspan_to_str(&variant_span)))
+                .is_some();
+            if !carries_one {
+                let variant = anumspan_to_str(&variant_span).to_string();
+                sink.push(
+                    Diag::error(
+                        low.span_of(&variant_span),
+                        format!("`{}` carries no payload to bind", variant),
+                    )
+                    .with_note(format!("match it as `{} =>`", variant)),
+                );
+                return None;
+            }
         }
 
-        // An arm runs when the scrutinee carries one of its labels. The
-        // catch-all arm runs when no EARLIER arm claimed the value, which is
-        // what the `case` default does, so its guard is the negation of every
-        // label taken so far.
-        let depth = if labels.is_empty() {
-            let claimed: Vec<u128> =
-                arms.iter().flat_map(|a: &Arm| a.labels.iter().copied()).collect();
-            low.push_labels(tag, claimed, false)
-        } else {
-            low.push_labels(tag, labels.clone(), true)
-        };
-        lower_branch(low, &case.rhs, &mut arm_env, sink)?;
-        low.pop_path(depth);
-        arms.push(Arm { labels, env: arm_env });
+        cases.push(CasePlan {
+            labels,
+            catch_all: catch_all_binding,
+            payload: payload_bind,
+            is_unreachable: false,
+        });
     }
 
-    if arms.is_empty() {
+    let has_arms = cases.iter().any(|c| !c.is_unreachable);
+    if !has_arms {
         sink.err_span(low.here(), "`match` needs at least one arm");
         return None;
     }
@@ -362,9 +330,141 @@ pub fn lower_match(
         return None;
     }
 
+    Some(MatchShape {
+        enum_name,
+        tag_width,
+        payload_width,
+        total_width,
+        cases,
+        span: match_span,
+    })
+}
+
+/// The tag a `match` selects on.
+///
+/// A tagged union is matched on its TAG, not on the whole value: the payload
+/// is different from one item to the next and comparing it would mean no arm
+/// ever fired. The tag sits in the high bits, so this is a slice, and for an
+/// enum with no payloads it is the value itself.
+pub fn match_tag(low: &mut Lowerer, shape: &MatchShape, scrutinee: ValueId) -> ValueId {
+    if shape.payload_width == 0 {
+        return scrutinee;
+    }
+    let t = low.emit(
+        Ty::UInt(shape.tag_width),
+        Op::Slice {
+            arg: scrutinee,
+            hi: shape.total_width - 1,
+            lo: shape.payload_width,
+        },
+    );
+    low.name_value_safe(t, format!("{}_tag", shape.enum_name));
+    t
+}
+
+/// The payload an arm binds, as a value of the payload's own type.
+///
+/// The slice is a bag of bits; giving it back the payload's type is what keeps
+/// a struct payload's fields reachable and a signed one signed -- the same
+/// reason a struct field is retyped after its slice.
+pub fn payload_value(
+    low: &mut Lowerer,
+    shape: &MatchShape,
+    scrutinee: ValueId,
+    variant: &AlphanumSpan,
+) -> Option<(ValueId, Ty)> {
+    let payload_ty = low
+        .syms
+        .enums
+        .get(&shape.enum_name)
+        .and_then(|d| d.payload_of(anumspan_to_str(variant)))
+        .cloned()?;
+    let bits = payload_ty.bit_width();
+    let raw = low.emit(
+        Ty::UInt(bits),
+        Op::Slice { arg: scrutinee, hi: bits - 1, lo: 0 },
+    );
+    let value = if low.ty_of(raw) == payload_ty {
+        raw
+    } else {
+        low.emit(payload_ty.clone(), Op::Cast { arg: raw })
+    };
+    Some((value, payload_ty))
+}
+
+/// Lowers a `match` on an enum into a chain of muxes.
+///
+/// The arms are evaluated into separate environments -- exactly as `if`/`else`
+/// does -- and then folded from the last arm backwards, so the first arm ends
+/// up outermost and therefore highest priority. That matches the reading order
+/// of the source and the `unique case` it replaces.
+pub fn lower_match(
+    low: &mut Lowerer,
+    stmt: &MatchStmt,
+    env: &mut Env,
+    sink: &mut DiagSink,
+) -> Option<()> {
+    let scrutinee = crate::ir::lower_expr(low, &stmt.scrutinees[0], env, sink)?;
+    let scrutinee_ty = low.ty_of(scrutinee);
+    let shape = plan_match(low, stmt, &scrutinee_ty, sink)?;
+    let tag = match_tag(low, &shape, scrutinee);
+
+    struct Arm {
+        labels: Vec<u128>,
+        env: Env,
+    }
+    let mut arms: Vec<Arm> = Vec::new();
+
+    for (ix, plan) in shape.cases.iter().enumerate() {
+        if plan.is_unreachable {
+            continue;
+        }
+        let case = &stmt.cases[ix];
+        let mut arm_env = env.clone();
+
+        // A plain name is an irrefutable binding: it matches anything and
+        // binds the scrutinee, which is how the wildcard works too.
+        if let Some(name) = plan.catch_all {
+            arm_env.insert(
+                anumspan_to_str(&name).to_string(),
+                Binding {
+                    is_mutable: false,
+                    value: Some(scrutinee),
+                    ty: scrutinee_ty.clone(),
+                    is_output: false,
+                },
+            );
+        }
+
+        // The payload, if the arm asked for it. It is the low bits of the
+        // scrutinee -- the whole point of a fixed layout is that the arm knows
+        // where to look once the tag has told it what is there.
+        if let Some((variant_span, bind_span)) = plan.payload {
+            let (value, payload_ty) = payload_value(low, &shape, scrutinee, &variant_span)?;
+            let bound = anumspan_to_str(&bind_span).to_string();
+            low.name_value_safe(value, bound.clone());
+            arm_env.insert(bound, Binding::constant(value, payload_ty));
+        }
+
+        // An arm runs when the scrutinee carries one of its labels. The
+        // catch-all arm runs when no EARLIER arm claimed the value, which is
+        // what the `case` default does, so its guard is the negation of every
+        // label taken so far.
+        let depth = if plan.labels.is_empty() {
+            let claimed: Vec<u128> =
+                arms.iter().flat_map(|a: &Arm| a.labels.iter().copied()).collect();
+            low.push_labels(tag, claimed, false)
+        } else {
+            low.push_labels(tag, plan.labels.clone(), true)
+        };
+        lower_branch(low, &case.rhs, &mut arm_env, sink)?;
+        low.pop_path(depth);
+        arms.push(Arm { labels: plan.labels.clone(), env: arm_env });
+    }
+
     // The last arm is the default: either it is the catch-all, or coverage is
     // complete and it is reached by elimination.
-    let default_arm = arms.last().expect("checked non-empty");
+    let default_arm = arms.last().expect("plan_match rejects a match with no arms");
     let names: Vec<String> = env.keys().cloned().collect();
 
     for name in names {

@@ -133,20 +133,18 @@ fn a_for_bound_points_at_the_loop() {
 fn a_scheduler_refusal_points_at_the_statement_it_refuses() {
     // The scheduler runs before lowering, so it has no anchor stack -- it
     // reads the same anchor off the statement in front of it.
+    //
+    // A blocking receive buried in an expression is what it refuses now. An
+    // `if`, a `match` and a `loop` can all hold one as a statement; what none
+    // of them can do is say that the rest of an expression waits for it.
     assert_at(
-        7,
+        4,
         concat!(
-            "enum e: i1\n",
-            "  A\n",
-            "  B\n",
-            "process p (src: buffer in i32, dst: buffer out i32, k: e = A)\n",
+            "process p (src: buffer in i32, dst: buffer out i32)\n",
             "  loop\n",
             "    let a = @rcv(src)\n",
-            "    match k\n",
-            "      .A =>\n",
-            "        @send(dst, a)\n",
-            "      .B =>\n",
-            "        @send(dst, 32'd0)\n",
+            "    let b = @rcv(src) + a\n",
+            "    @send(dst, b)\n",
         ),
     );
 }

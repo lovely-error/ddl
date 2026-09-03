@@ -171,18 +171,36 @@ fn a_bram_takes_reads_and_writes_on_different_paths() {
 }
 
 #[test]
-fn a_bram_read_inside_an_expression_says_how_to_bind_it() {
-    // There is no way to say that the rest of the expression waits a cycle,
-    // so the read has to be its own statement.
-    let text = compile_err(concat!(
+fn a_bram_read_inside_an_expression_gets_a_state_of_its_own() {
+    // This used to be a diagnostic: "a read of `table` takes a cycle, so it
+    // cannot sit inside an expression". The cycle is real, but a state to
+    // spend it in is something the compiler can supply -- the read is lifted
+    // onto a line of its own and the expression reads the name.
+    let v = compile(concat!(
         "process p (req: buffer in i8, resp: buffer out i32)\n",
         "  var table: #[impl(bram)] [i32; 256]\n",
         "  loop\n",
         "    let a = @rcv(req)\n",
         "    @send(resp, table[a])\n",
     ));
-    assert!(text.contains("cannot sit inside an expression"), "{}", text);
-    assert!(text.contains("let x = table[i]"), "{}", text);
+    // Receive, fetch, send -- the fetch is the state the cycle went into.
+    assert!(v.contains("in_s2"), "{}", v);
+    assert!(!v.contains("in_s3"), "{}", v);
+    assert!(v.contains("if (in_s1) table__q <= table_[a_r];"), "{}", v);
+}
+
+#[test]
+fn a_lifted_read_is_still_refused_where_there_is_no_state() {
+    // Lifting needs somewhere to lift TO. A process with no blocking operation
+    // has one pass per cycle and no states, so the cycle has nowhere to go and
+    // the answer is still no -- with the diagnostic that says which.
+    let text = compile_err(concat!(
+        "process p (req: buffer in i8, resp: buffer out i32)\n",
+        "  var table: #[impl(bram)] [i32; 256]\n",
+        "  let (a, got) = @try_rcv(req)\n",
+        "  let _s = @try_send(resp, table[a] + 32'd1)\n",
+    ));
+    assert!(text.contains("no state to put it in"), "{}", text);
 }
 
 #[test]
@@ -221,4 +239,162 @@ fn bkram_is_still_refused_and_says_why() {
     ));
     assert!(text.contains("`#[impl(bkram)]` is not supported yet"), "{}", text);
     assert!(text.contains("conflict model"), "{}", text);
+}
+
+// ---- more than one synchronous read ---------------------------------------
+//
+// One read hid three bugs, because with one read nothing overwrites the
+// memory's output register and a name holding it stays accidentally correct.
+//
+//   * the read's binding was not counted as something the state DEFINES, so
+//     it never got a register and `x + y` came out as `y + y`;
+//   * the read port's address and enable were not roots of the live-value
+//     walk, so with two reads the memory's clocked block referred to wires the
+//     file never declared;
+//   * statements after the read were absorbed into the state that PRESENTS the
+//     address, where the value has not arrived yet.
+
+/// Two reads of one `bram`, added together.
+const TWO_READS: &str = concat!(
+    "process two (a: buffer in i8, o: buffer out i32)\n",
+    "  var m: #[impl(bram)] [i32; 256]\n",
+    "  loop\n",
+    "    let i = @rcv(a)\n",
+    "    let x = m[i]\n",
+    "    let y = m[8'd7]\n",
+    "    @send(o, x + y)\n",
+);
+
+#[test]
+fn two_reads_do_not_collapse_onto_one_register() {
+    let v = compile(TWO_READS);
+    // The sum is of two saved values, not of the output register twice.
+    assert!(!v.contains("m_q + m_q"), "the two reads collapsed:\n{}", v);
+    assert!(v.contains("x_r"), "{}", v);
+    assert!(v.contains("y_r"), "{}", v);
+}
+
+#[test]
+fn a_saved_read_is_captured_the_cycle_after_its_state() {
+    let v = compile(TWO_READS);
+    // The array is read at the clock edge that ENDS the state presenting the
+    // address, so a copy taken on that state's firing takes the previous read.
+    assert!(v.contains("rd_valid_s1 <= in_s1"), "{}", v);
+    assert!(v.contains("x_r <= (rd_valid_s1 ?"), "{}", v);
+    // And for the one cycle before the copy lands, the name is the register
+    // itself -- otherwise the state right after the fetch could not use it.
+    assert!(v.contains("x_live = rd_valid_s1 ?"), "{}", v);
+}
+
+#[test]
+fn one_read_costs_no_register_of_its_own() {
+    // The saving is only needed where another read can overwrite the port.
+    // With one read the output register IS the answer, and a flop plus a mux
+    // per read would be real area in every process that reads a `bram` once.
+    let v = compile(concat!(
+        "process one (a: buffer in i8, o: buffer out i32)\n",
+        "  var m: #[impl(bram)] [i32; 256]\n",
+        "  loop\n",
+        "    let i = @rcv(a)\n",
+        "    let x = m[i]\n",
+        "    @send(o, x)\n",
+    ));
+    assert!(!v.contains("rd_valid"), "{}", v);
+    assert!(!v.contains("x_r"), "{}", v);
+}
+
+#[test]
+fn the_read_port_is_declared_when_two_states_share_it() {
+    let v = compile(TWO_READS);
+    // Everything the memory's clocked block names has to be declared. The
+    // enable is an OR and the address a mux, and nothing else reaches either.
+    for line in v.lines() {
+        let Some(rest) = line.trim().strip_prefix("if (") else {
+            continue;
+        };
+        let Some(cond) = rest.split(')').next() else {
+            continue;
+        };
+        let is_temp = cond.starts_with('n') && cond[1..].chars().all(|c| c.is_ascii_digit());
+        if is_temp {
+            assert!(
+                v.contains(&format!("wire {} =", cond)),
+                "{} is used and never declared:\n{}",
+                cond,
+                v
+            );
+        }
+    }
+}
+
+// ---- a read inside an expression ------------------------------------------
+//
+// "a read of `m` takes a cycle, so it cannot sit inside an expression" was a
+// scheduling limit dressed as a language rule. The reads in an expression are
+// ordinary reads in a fixed order, so each gets a state and the expression
+// reads the names.
+
+#[test]
+fn reads_in_an_expression_each_get_a_state() {
+    let v = compile(concat!(
+        "process expr (a: buffer in i8, o: buffer out i32)\n",
+        "  var m: #[impl(bram)] [i32; 256]\n",
+        "  loop\n",
+        "    let i = @rcv(a)\n",
+        "    let s = m[i] + m[8'd7]\n",
+        "    @send(o, s)\n",
+    ));
+    // Four states: receive, fetch, fetch, send.
+    assert!(v.contains("in_s3"), "{}", v);
+    assert!(!v.contains("in_s4"), "{}", v);
+    assert!(v.contains("rd_valid_s1"), "{}", v);
+    assert!(v.contains("rd_valid_s2"), "{}", v);
+}
+
+#[test]
+fn a_read_in_a_sent_value_is_lifted() {
+    let v = compile(concat!(
+        "process sendread (a: buffer in i8, o: buffer out i32)\n",
+        "  var m: #[impl(bram)] [i32; 256]\n",
+        "  loop\n",
+        "    let i = @rcv(a)\n",
+        "    @send(o, m[i])\n",
+    ));
+    assert!(v.contains("m_q"), "{}", v);
+    // Receive, fetch, send.
+    assert!(v.contains("in_s2"), "{}", v);
+}
+
+#[test]
+fn a_read_inside_a_branch_stays_in_that_branch() {
+    // The cycle a read costs is spent only on the path that reads, so lifting
+    // one out of an arm would make the other arm pay for it.
+    let v = compile(concat!(
+        "process armed (a: buffer in i8, o: buffer out i32)\n",
+        "  var m: #[impl(bram)] [i32; 256]\n",
+        "  loop\n",
+        "    let i = @rcv(a)\n",
+        "    if i[7] then\n",
+        "      @send(o, m[i] + 32'd1)\n",
+        "    else\n",
+        "      @send(o, 32'd0)\n",
+    ));
+    assert!(v.contains("m_q"), "{}", v);
+    assert!(v.contains("branch_s0"), "{}", v);
+}
+
+#[test]
+fn a_write_target_is_not_lifted_as_a_read() {
+    // `m[a] = d` is the write port. Lifting the subscript would turn every
+    // store into a load and then assign to what it loaded.
+    let v = compile(concat!(
+        "process store (a: buffer in i8, d: buffer in i32, o: buffer out i32)\n",
+        "  var m: #[impl(bram)] [i32; 256]\n",
+        "  loop\n",
+        "    let i = @rcv(a)\n",
+        "    let x = @rcv(d)\n",
+        "    m[i] = x\n",
+        "    @send(o, 32'd0)\n",
+    ));
+    assert!(v.contains("m[i_r] <="), "{}", v);
 }

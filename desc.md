@@ -119,13 +119,40 @@ Two aspects:
       which puts the claim where a reader can check it.
    7. `buffer in T` read only pipe of Ts
    8. `buffer out T` write only pipe of Ts
+4. `port in T` / `port out T`
+   1. the second pipe kind: a data port and an enable, and no back-pressure
+      at all
+   2. reached by the same operations a `buffer` is, and NOT by naming it. a
+      port is not a value
+      1. `@rcv` waits on the enable; `@send` never waits, because there is no
+         `ready` coming back to wait for
+      2. `@try_rcv` answers with the enable itself -- a port claims nothing,
+         so there is no "did I take one" separate from "was there one"
+      3. `@try_send` always succeeds; `@drop` is refused, having nothing to
+         drop
+   3. for the EDGE of the program: a pin, a PLL, a bus master that cannot be
+      made to wait. the line above -- compute in ddl, io in verilog -- is what
+      this is the boundary of, and a `port` is where a sink that cannot refuse
+      says so
+   4. between two things DDL compiled, a `buffer` is still the answer
+   5. a `process` of nothing but ports is a plain verilog module, which is
+      what these are for: the ordinary sequential blocks a design needs,
+      written beside the dataflow ones instead of in verilog
+   6. in a `sequence` a `port out` belongs to the stage that sent to it, and
+      may be sent to from one stage only -- every stage is live at once
 
 ### implemented so far
 The compiler in this repository accepts: `fun`, `sequence`, `process`,
-`graph`, `struct`, `enum` (with payloads), `import`, `for in` (unrolled),
-`break`, compound assignment, `inout` parameters, `buffer` pipes, and
-`lutram` and `bram` memories. README.md is the current list; what follows
-is the design, including the parts that are not built.
+`graph`, `extern`, `struct`, `enum` (with payloads), `import`, `for in`
+(unrolled), `loop` nested to any depth with `break` leaving the innermost,
+compound assignment, element assignment (`a[k] = v`, at a constant or computed
+index), `inout` parameters, `buffer` pipes, `port in`/`port out` with an
+an enable and no back-pressure, `@slice`, the `@merge` and `@split`
+combinators, and `lutram` and `bram` memories — where several reads, including
+reads inside an expression, each get a state of their own. A blocking
+operation, a `break` or a `bram` read may sit in an `if`, a `match` or a
+`loop`. README.md is the current list; what follows is the design, including
+the parts that are not built.
 
 ### unresolved issues
 1. io procs

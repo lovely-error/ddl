@@ -29,17 +29,54 @@ use std::collections::HashSet;
 
 use crate::diag::DiagSink;
 use crate::ir::{BinOp, Binding, CmpOp, Env, Lowerer, Op, Reg, SALT, UnOp, ValueId};
+use crate::lex::{AlphanumSpan, BindingPattern};
 use crate::parse::{BuiltinOp, PrecResExpr, PrecResInnerStmt, anumspan_to_str};
 use crate::ty::Ty;
 
+/// What a switching state resolved its patterns to: the tag it selects on,
+/// and the labels of each case in source order.
+///
+/// `None` for a case that selects nothing -- an `@unreachable` arm.
+type SwitchSel = (ValueId, Vec<Option<Vec<u128>>>);
+
 /// A blocking operation: what the state it ends waits on.
 pub struct Barrier {
-    pub pipe_ix: usize,
+    /// Which channel, and of which kind.
+    ///
+    /// A port is a pipe without back-pressure, so `@rcv` and `@send` mean on
+    /// one what they mean on the other and cost the same cycle. What differs
+    /// is underneath: a receive waits on the enable instead of on two salts
+    /// disagreeing, and a send never waits at all, because there is no `ready`
+    /// coming back to wait for.
+    pub on: BarrierOn,
     pub is_recv: bool,
     /// The name a receive binds.
     pub bind: Option<String>,
     /// The value a send offers.
     pub value: Option<PrecResExpr>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BarrierOn {
+    Pipe(usize),
+    Port(usize),
+}
+
+impl Barrier {
+    /// The pipe this waits on, or `None` when it waits on a port.
+    pub fn pipe(&self) -> Option<usize> {
+        match self.on {
+            BarrierOn::Pipe(ix) => Some(ix),
+            BarrierOn::Port(_) => None,
+        }
+    }
+
+    pub fn port(&self) -> Option<usize> {
+        match self.on {
+            BarrierOn::Port(ix) => Some(ix),
+            BarrierOn::Pipe(_) => None,
+        }
+    }
 }
 
 /// Where control goes.
@@ -60,6 +97,12 @@ pub enum Next {
     /// `cond` is lowered in the state's own scope, after its barrier binds, so
     /// a branch on a just-received value costs no extra cycle.
     Branch { cond: PrecResExpr, then_t: Target, else_t: Target },
+    /// A `match` whose arms need states of their own.
+    ///
+    /// The patterns are kept rather than resolved here: turning a variant name
+    /// into a discriminant needs the symbol table, and the scheduler runs
+    /// before lowering. `targets` is one per case of `stmt`, in order.
+    Switch { stmt: crate::parse::MatchStmt, targets: Vec<Target> },
 }
 
 /// A synchronous memory read: the address is presented in this state and the
@@ -85,13 +128,19 @@ pub struct State<'a> {
     /// bound already in scope. Only a barrier state has these.
     pub post: Vec<&'a PrecResInnerStmt>,
     pub next: Next,
+    /// Something already jumps here, so this state cannot be folded into the
+    /// one before it. A loop's entry is the case: the body's last statement
+    /// comes back to it, and absorbing it would leave that edge pointing at a
+    /// state that had been emptied out.
+    pub pinned: bool,
 }
 
 impl<'a> State<'a> {
     /// A state that exists only to hold a branch: no barrier of its own, so a
     /// barrier state immediately before it can absorb it and save the cycle.
     fn is_bare_branch(&self) -> bool {
-        self.barrier.is_none() && matches!(self.next, Next::Branch { .. })
+        let forks = matches!(self.next, Next::Branch { .. } | Next::Switch { .. });
+        !self.pinned && self.barrier.is_none() && forks
     }
 
     /// A placeholder left where an absorbed state used to be. Unreachable by
@@ -103,6 +152,7 @@ impl<'a> State<'a> {
             mem_read: None,
             post: Vec::new(),
             next: Next::Straight(Target::Exit),
+            pinned: false,
         }
     }
 }
@@ -188,6 +238,7 @@ pub fn contains_barrier(stmt: &PrecResInnerStmt) -> bool {
             m.scrutinees.iter().any(in_expr) || m.cases.iter().any(|c| in_expr(&c.rhs))
         }
         PrecResInnerStmt::TailVal(e) => in_expr(e),
+        PrecResInnerStmt::Loop(l) => in_expr(&l.repeat_expr),
         _ => false,
     }
 }
@@ -219,6 +270,241 @@ fn as_sync_read<'a>(
         addr: &sub.index,
         bind: anumspan_to_str(&decl.name).to_string(),
     })
+}
+
+/// Every synchronous memory read, lifted out of the expression it sits in.
+///
+/// A `bram` read costs a cycle, and a cycle has to be a state. `let x = m[i]`
+/// on its own line always could be one; `m[i] + m[j]` could not, and said so
+/// -- "a read of `m` takes a cycle, so it cannot sit inside an expression".
+/// That was a scheduling limit dressed as a language rule. The reads in an
+/// expression are ordinary reads in a fixed order, so the compiler can put
+/// each in its own state and leave the expression reading the names.
+///
+/// Rewriting rather than scheduling in place, because the scheduler walks
+/// borrowed statements and a lifted read is a statement that was not written.
+/// The generated names are kept beside the statements that use them: an
+/// `AlphanumSpan` is a pointer into text, so the text has to outlive the AST.
+///
+/// A read is lifted to just before the statement that used it and no further.
+/// Inside an `if` arm it stays in that arm, because the cycle it costs is only
+/// spent on that path; out of an `if` CONDITION it lifts to before the branch,
+/// which is where a value the branch depends on has to be.
+pub struct Hoisted {
+    pub stmts: Vec<PrecResInnerStmt>,
+    /// Backing text for the generated names. Dropping this while `stmts` is
+    /// alive would leave every generated `Ref` dangling.
+    _names: Vec<Box<str>>,
+}
+
+struct Hoister<'m> {
+    sync_mem_of: &'m dyn Fn(&str) -> Option<usize>,
+    names: Vec<Box<str>>,
+    next: u32,
+}
+
+impl Hoister<'_> {
+    /// A name no source can collide with: `@` cannot start a DDL identifier,
+    /// and a builtin is resolved before a reference ever reaches here.
+    fn fresh(&mut self) -> AlphanumSpan {
+        let text: Box<str> = format!("@rd{}", self.next).into_boxed_str();
+        self.next += 1;
+        // The Box's contents do not move when the Box itself is pushed, so
+        // this pointer stays good for as long as `names` is held.
+        let span = AlphanumSpan { byte_ptr: text.as_ptr(), len: text.len() as u32 };
+        self.names.push(text);
+        span
+    }
+
+    /// `m[i]` where `m` reads synchronously.
+    fn is_sync_read(&self, e: &PrecResExpr) -> bool {
+        let PrecResExpr::SubscriptAccess(sub) = e else {
+            return false;
+        };
+        let PrecResExpr::Ref(name) = &sub.base else {
+            return false;
+        };
+        (self.sync_mem_of)(anumspan_to_str(name)).is_some()
+    }
+
+    fn expr(&mut self, e: &PrecResExpr, pre: &mut Vec<PrecResInnerStmt>) -> PrecResExpr {
+        if self.is_sync_read(e) {
+            let PrecResExpr::SubscriptAccess(sub) = e else {
+                unreachable!("checked by is_sync_read")
+            };
+            // The index first: a read whose address is itself a read needs the
+            // inner one to have happened, and the order the states come out in
+            // is the order they are pushed.
+            let index = self.expr(&sub.index, pre);
+            let name = self.fresh();
+            pre.push(PrecResInnerStmt::VarDecl(crate::parse::VarDeclStmt {
+                is_mutable: false,
+                name,
+                rest: Vec::new(),
+                ty_expr: None,
+                assign_val: Some(PrecResExpr::SubscriptAccess(Box::new(
+                    crate::parse::SubscriptAccess { base: sub.base.clone(), index },
+                ))),
+            }));
+            return PrecResExpr::Ref(name);
+        }
+        match e {
+            PrecResExpr::FieldAccess { base, field_name } => PrecResExpr::FieldAccess {
+                base: Box::new(self.expr(base, pre)),
+                field_name: *field_name,
+            },
+            PrecResExpr::Call { base, args } => PrecResExpr::Call {
+                base: Box::new(self.expr(base, pre)),
+                args: args.iter().map(|a| self.expr(a, pre)).collect(),
+            },
+            PrecResExpr::SubscriptAccess(sub) => {
+                PrecResExpr::SubscriptAccess(Box::new(crate::parse::SubscriptAccess {
+                    base: self.expr(&sub.base, pre),
+                    index: self.expr(&sub.index, pre),
+                }))
+            }
+            PrecResExpr::Splice(parts) => {
+                PrecResExpr::Splice(parts.iter().map(|p| self.expr(p, pre)).collect())
+            }
+            PrecResExpr::Span(sp) => PrecResExpr::Span(Box::new(crate::parse::Span {
+                left: self.expr(&sp.left, pre),
+                right: self.expr(&sp.right, pre),
+            })),
+            // A block is statements, and statements are the other half of this
+            // walk: a read inside one belongs to that block, not out here.
+            PrecResExpr::StmtBlock(b) => PrecResExpr::StmtBlock(crate::parse::StmtBlock {
+                components: self.block(&b.components),
+            }),
+            other => other.clone(),
+        }
+    }
+
+    fn block(&mut self, stmts: &[PrecResInnerStmt]) -> Vec<PrecResInnerStmt> {
+        let mut out = Vec::with_capacity(stmts.len());
+        for stmt in stmts {
+            self.stmt(stmt, &mut out);
+        }
+        out
+    }
+
+    fn stmt(&mut self, stmt: &PrecResInnerStmt, out: &mut Vec<PrecResInnerStmt>) {
+        // `let x = m[i]` on its own line is already a read state, spelled the
+        // way the language documents it. Lifting it would only rename it.
+        if let PrecResInnerStmt::VarDecl(d) = stmt
+            && d.rest.is_empty()
+            && !d.is_mutable
+            && d.assign_val.as_ref().is_some_and(|e| self.is_sync_read(e))
+        {
+            out.push(stmt.clone());
+            return;
+        }
+
+        let mut pre: Vec<PrecResInnerStmt> = Vec::new();
+        let rewritten = match stmt {
+            PrecResInnerStmt::VarDecl(d) => {
+                let assign_val = d.assign_val.as_ref().map(|e| self.expr(e, &mut pre));
+                PrecResInnerStmt::VarDecl(crate::parse::VarDeclStmt {
+                    is_mutable: d.is_mutable,
+                    name: d.name,
+                    rest: d.rest.clone(),
+                    ty_expr: d.ty_expr.clone(),
+                    assign_val,
+                })
+            }
+            PrecResInnerStmt::CallStmt(c) => PrecResInnerStmt::CallStmt(crate::parse::CallStmt {
+                base: c.base.clone(),
+                args: c.args.iter().map(|a| self.expr(a, &mut pre)).collect(),
+            }),
+            PrecResInnerStmt::AssignStmt(a) => {
+                PrecResInnerStmt::AssignStmt(crate::parse::AssignStmt {
+                    lvalue: self.lvalue(&a.lvalue, &mut pre),
+                    rvalue: self.expr(&a.rvalue, &mut pre),
+                    kind: a.kind,
+                })
+            }
+            PrecResInnerStmt::IfThenElse(i) => {
+                let condition = self.expr(&i.condition, &mut pre);
+                PrecResInnerStmt::IfThenElse(crate::parse::ITEStmt {
+                    condition,
+                    then_case: self.arm(&i.then_case),
+                    else_case: i.else_case.as_ref().map(|e| self.arm(e)),
+                })
+            }
+            PrecResInnerStmt::MatchStmt(m) => {
+                let scrutinees = m.scrutinees.iter().map(|e| self.expr(e, &mut pre)).collect();
+                PrecResInnerStmt::MatchStmt(crate::parse::MatchStmt {
+                    scrutinees,
+                    cases: m
+                        .cases
+                        .iter()
+                        .map(|c| crate::parse::MatchArm {
+                            binding_patterns: c.binding_patterns.clone(),
+                            rhs: self.arm(&c.rhs),
+                        })
+                        .collect(),
+                })
+            }
+            PrecResInnerStmt::Loop(l) => PrecResInnerStmt::Loop(crate::parse::LoopStmt {
+                repeat_expr: self.arm(&l.repeat_expr),
+            }),
+            PrecResInnerStmt::ForLoop(f) => {
+                PrecResInnerStmt::ForLoop(Box::new(crate::parse::ForLoopStmt {
+                    binding: f.binding,
+                    target: f.target.clone(),
+                    body: self.arm(&f.body),
+                }))
+            }
+            PrecResInnerStmt::TailVal(e) => PrecResInnerStmt::TailVal(self.expr(e, &mut pre)),
+            other => other.clone(),
+        };
+        out.append(&mut pre);
+        out.push(rewritten);
+    }
+
+    /// An assignment target. `m[a] = d` is the memory's WRITE port, not a
+    /// read of it, so the subscript stays where it is -- lifting it would turn
+    /// every store into a load and then assign to the loaded value. Anything
+    /// inside the address is still an ordinary expression.
+    fn lvalue(&mut self, e: &PrecResExpr, pre: &mut Vec<PrecResInnerStmt>) -> PrecResExpr {
+        if self.is_sync_read(e) {
+            let PrecResExpr::SubscriptAccess(sub) = e else {
+                unreachable!("checked by is_sync_read")
+            };
+            return PrecResExpr::SubscriptAccess(Box::new(crate::parse::SubscriptAccess {
+                base: sub.base.clone(),
+                index: self.expr(&sub.index, pre),
+            }));
+        }
+        self.expr(e, pre)
+    }
+
+    /// A branch arm: its reads stay inside it.
+    fn arm(&mut self, e: &PrecResExpr) -> PrecResExpr {
+        match e {
+            PrecResExpr::StmtBlock(b) => PrecResExpr::StmtBlock(crate::parse::StmtBlock {
+                components: self.block(&b.components),
+            }),
+            other => {
+                let mut pre = Vec::new();
+                let rewritten = self.expr(other, &mut pre);
+                if pre.is_empty() {
+                    return rewritten;
+                }
+                pre.push(PrecResInnerStmt::TailVal(rewritten));
+                PrecResExpr::StmtBlock(crate::parse::StmtBlock { components: pre })
+            }
+        }
+    }
+}
+
+/// Lifts every synchronous read in `body` onto a line of its own.
+pub fn hoist_sync_reads(
+    body: &[PrecResInnerStmt],
+    sync_mem_of: &dyn Fn(&str) -> Option<usize>,
+) -> Hoisted {
+    let mut h = Hoister { sync_mem_of, names: Vec::new(), next: 0 };
+    let stmts = h.block(body);
+    Hoisted { stmts, _names: h.names }
 }
 
 /// Where to blame a statement the scheduler refuses.
@@ -258,6 +544,12 @@ fn needs_states(stmt: &PrecResInnerStmt, sync_mem_of: &dyn Fn(&str) -> Option<us
         if matches!(stmt, PrecResInnerStmt::Break) {
             return true;
         }
+        // A `loop` is a back edge, and a back edge is a state graph. Even a
+        // body of nothing but combinational work has to be able to come round
+        // again, which a mux cannot express.
+        if matches!(stmt, PrecResInnerStmt::Loop(_)) {
+            return true;
+        }
         if as_sync_read(stmt, sync_mem_of).is_some() {
             return true;
         }
@@ -284,6 +576,72 @@ fn arm_stmts(arm: &PrecResExpr) -> Option<&[PrecResInnerStmt]> {
     }
 }
 
+/// Places statements that have no state of their own yet.
+///
+/// They run before whatever `target` is, so they join that state -- combinational
+/// work costs no cycle wherever it sits. Unless `target` is `cont`, which a
+/// sibling arm shares: putting them there would run them on its path too, so
+/// those get a state of their own and the cycle that costs.
+fn place_pending<'a>(
+    pending: &mut Vec<&'a PrecResInnerStmt>,
+    target: Target,
+    cont: Target,
+    states: &mut Vec<State<'a>>,
+) -> Target {
+    if pending.is_empty() {
+        return target;
+    }
+    let leading: Vec<&'a PrecResInnerStmt> = pending.drain(..).rev().collect();
+    match target {
+        Target::State(ix) if target != cont => {
+            let mut merged = leading;
+            merged.extend(std::mem::take(&mut states[ix].stmts));
+            states[ix].stmts = merged;
+            Target::State(ix)
+        }
+        other => {
+            states.push(State {
+                stmts: leading,
+                barrier: None,
+                mem_read: None,
+                post: Vec::new(),
+                next: Next::Straight(other),
+                pinned: false,
+            });
+            Target::State(states.len() - 1)
+        }
+    }
+}
+
+/// Repoints every edge that goes to `from` at `to`.
+///
+/// A loop's back edge cannot be written when the body is scheduled: the walk
+/// is backwards, so the body's last statement needs the loop's FIRST state and
+/// that is the last thing decided. The body is scheduled against a placeholder
+/// instead, and this closes the loop once the entry is known. The placeholder
+/// is then unreachable, and the renumbering in `schedule_body` drops it.
+fn retarget(states: &mut [State], from: usize, to: Target) {
+    fn swap(t: &mut Target, from: usize, to: Target) {
+        if *t == Target::State(from) {
+            *t = to;
+        }
+    }
+    for st in states.iter_mut() {
+        match &mut st.next {
+            Next::Straight(t) => swap(t, from, to),
+            Next::Branch { then_t, else_t, .. } => {
+                swap(then_t, from, to);
+                swap(else_t, from, to);
+            }
+            Next::Switch { targets, .. } => {
+                for t in targets.iter_mut() {
+                    swap(t, from, to);
+                }
+            }
+        }
+    }
+}
+
 /// Builds the state graph for one block of statements.
 ///
 /// Walks BACKWARDS, so the continuation of every statement is already known by
@@ -292,11 +650,18 @@ fn arm_stmts(arm: &PrecResExpr) -> Option<&[PrecResInnerStmt]> {
 /// runs off its end; the returned target is where control enters it.
 ///
 /// States are pushed in reverse order and renumbered afterwards.
+///
+/// `brk` is where `break` goes: the terminal state at the top of a process, and
+/// the statement after the loop inside a nested one. Carried rather than
+/// global, because "the innermost loop" is exactly what a parameter threaded
+/// through the recursion says and a flag would not.
 fn schedule<'a>(
     stmts: &'a [PrecResInnerStmt],
     cont: Target,
+    brk: Target,
     states: &mut Vec<State<'a>>,
     pipe_of: &dyn Fn(&str) -> Option<usize>,
+    port_of: &dyn Fn(&str) -> Option<(usize, bool)>,
     sync_mem_of: &dyn Fn(&str) -> Option<usize>,
     sink: &mut DiagSink,
 ) -> Option<Target> {
@@ -305,7 +670,7 @@ fn schedule<'a>(
     let mut pending: Vec<&'a PrecResInnerStmt> = Vec::new();
 
     for stmt in stmts.iter().rev() {
-        if let Some(barrier) = as_barrier(stmt, pipe_of, sink)? {
+        if let Some(barrier) = as_barrier(stmt, pipe_of, port_of, sink)? {
             let mut post: Vec<&PrecResInnerStmt> = pending.drain(..).rev().collect();
             // A branch state sitting right after this barrier has no wait of
             // its own, so its work belongs in this state's post scope and its
@@ -327,30 +692,37 @@ fn schedule<'a>(
                 mem_read: None,
                 post,
                 next,
+                pinned: false,
             });
             target = Target::State(states.len() - 1);
             continue;
         }
 
         if let Some(read) = as_sync_read(stmt, sync_mem_of) {
-            // Same absorption as a barrier: statements between this read and a
-            // branch belong to the state that presents the address, because
-            // the value they need arrives at its clock edge.
-            let mut post: Vec<&PrecResInnerStmt> = pending.drain(..).rev().collect();
-            let next = match target {
-                Target::State(ix) if states[ix].is_bare_branch() => {
-                    let absorbed = std::mem::replace(&mut states[ix], State::dead());
-                    post.extend(absorbed.stmts);
-                    absorbed.next
-                }
-                other => Next::Straight(other),
-            };
+            // A read state has NO `post`, and absorbs no branch.
+            //
+            // This is where it differs from a barrier, and the difference is
+            // the clock edge. What `@rcv` binds is a wire off the pipe, there
+            // in the cycle the transfer completes, so statements after it --
+            // and a branch on what it bound -- run in that same cycle. What a
+            // `bram` read binds is the memory's output register, and the array
+            // is read at the END of the state that presents the address: for
+            // the whole of that state the register still holds the PREVIOUS
+            // read.
+            //
+            // So everything after the read goes to the next state, where the
+            // value exists. Merged into it rather than given one of its own,
+            // because combinational work costs no cycle wherever it sits --
+            // only the branch, which has to have a state to be decided in,
+            // costs the cycle the absorption used to save wrongly.
+            target = place_pending(&mut pending, target, cont, states);
             states.push(State {
                 stmts: Vec::new(),
                 barrier: None,
                 mem_read: Some(read),
-                post,
-                next,
+                post: Vec::new(),
+                next: Next::Straight(target),
+                pinned: false,
             });
             target = Target::State(states.len() - 1);
             continue;
@@ -371,7 +743,7 @@ fn schedule<'a>(
                     return None;
                 }
             };
-            let then_t = schedule(then_stmts, target, states, pipe_of, sync_mem_of, sink)?;
+            let then_t = schedule(then_stmts, target, brk, states, pipe_of, port_of, sync_mem_of, sink)?;
             let else_t = match &ite.else_case {
                 None => target,
                 Some(arm) => {
@@ -385,7 +757,7 @@ fn schedule<'a>(
                             return None;
                         }
                     };
-                    schedule(else_stmts, target, states, pipe_of, sync_mem_of, sink)?
+                    schedule(else_stmts, target, brk, states, pipe_of, port_of, sync_mem_of, sink)?
                 }
             };
             states.push(State {
@@ -394,6 +766,43 @@ fn schedule<'a>(
                 mem_read: None,
                 post: Vec::new(),
                 next: Next::Branch { cond: ite.condition.clone(), then_t, else_t },
+                pinned: false,
+            });
+            target = Target::State(states.len() - 1);
+            continue;
+        }
+
+        if let PrecResInnerStmt::MatchStmt(m) = stmt
+            && needs_states(stmt, sync_mem_of)
+        {
+            if m.scrutinees.iter().any(contains_barrier_in_expr) {
+                sink.err_span(
+                    anchor_of(stmt, sink),
+                    "a `match` scrutinee cannot contain a blocking `@rcv` or `@send`",
+                );
+                return None;
+            }
+            // Every arm rejoins at whatever followed the `match`, exactly as
+            // the two arms of an `if` do. An arm with no statements -- a bare
+            // expression, or `@unreachable` -- falls straight through, which
+            // for `@unreachable` is a target nothing ever selects.
+            let mut targets = Vec::with_capacity(m.cases.len());
+            for case in &m.cases {
+                let t = match arm_stmts(&case.rhs) {
+                    Some(arm) => {
+                        schedule(arm, target, brk, states, pipe_of, port_of, sync_mem_of, sink)?
+                    }
+                    None => target,
+                };
+                targets.push(t);
+            }
+            states.push(State {
+                stmts: pending.drain(..).rev().collect(),
+                barrier: None,
+                mem_read: None,
+                post: Vec::new(),
+                next: Next::Switch { stmt: m.clone(), targets },
+                pinned: false,
             });
             target = Target::State(states.len() - 1);
             continue;
@@ -402,16 +811,53 @@ fn schedule<'a>(
         if matches!(stmt, PrecResInnerStmt::Break) {
             // Everything after a `break` on this path is unreachable, and
             // `pending` is exactly the statements after it -- the walk is
-            // backwards. Dropping them is what makes `break` mean stop.
+            // backwards. Dropping them is what makes `break` mean leave.
             pending.clear();
-            target = Target::Halt;
+            target = brk;
+            continue;
+        }
+
+        if let PrecResInnerStmt::Loop(l) = stmt {
+            let body = match arm_stmts(&l.repeat_expr) {
+                Some(b) => b,
+                None => {
+                    sink.err_span(anchor_of(stmt, sink), "a `loop` needs an indented body");
+                    return None;
+                }
+            };
+            // Statements after the loop are reachable only by `break`, so they
+            // are placed first: the loop's exit is where they start.
+            let after = place_pending(&mut pending, target, cont, states);
+            // A placeholder for the top of this loop. Its index is known now;
+            // where it points is known once the body has been scheduled.
+            states.push(State::dead());
+            let head = states.len() - 1;
+            let entry =
+                schedule(body, Target::State(head), after, states, pipe_of, port_of, sync_mem_of, sink)?;
+            let body_has_no_states = entry == Target::State(head);
+            if body_has_no_states {
+                sink.err_span(
+                    anchor_of(stmt, sink),
+                    "a `loop` with no blocking operation would never advance",
+                );
+                return None;
+            }
+            retarget(states, head, entry);
+            // The body now jumps back here, so the state before the loop must
+            // not absorb it. Without the pin, `let x = @rcv(p)` above a loop
+            // folds the loop's own branch into the receive state and the back
+            // edge lands on what is left.
+            if let Target::State(ix) = entry {
+                states[ix].pinned = true;
+            }
+            target = entry;
             continue;
         }
 
         if needs_states(stmt, sync_mem_of) {
             sink.err_span(
                 anchor_of(stmt, sink),
-                "only an `if` can hold a blocking `@rcv`, a `@send`, a `break` or a `bram` read; a `match` cannot yet",
+                "a blocking `@rcv`, a `@send`, a `break` or a `bram` read needs a statement that can hold states: an `if`, a `match` or a `loop`",
             );
             return None;
         }
@@ -429,25 +875,7 @@ fn schedule<'a>(
     // Unless the entry is `cont`, which the other arm of a branch shares --
     // putting them there would run them on both paths. Those get a state of
     // their own, which costs a cycle and is the only way to guard them.
-    let leading: Vec<&PrecResInnerStmt> = pending.drain(..).rev().collect();
-    match target {
-        Target::State(ix) if target != cont => {
-            let mut merged = leading;
-            merged.extend(std::mem::take(&mut states[ix].stmts));
-            states[ix].stmts = merged;
-            Some(Target::State(ix))
-        }
-        other => {
-            states.push(State {
-                stmts: leading,
-                barrier: None,
-                mem_read: None,
-                post: Vec::new(),
-                next: Next::Straight(other),
-            });
-            Some(Target::State(states.len() - 1))
-        }
-    }
+    Some(place_pending(&mut pending, target, cont, states))
 }
 
 /// The barrier a statement is, if it is one.
@@ -456,6 +884,7 @@ fn schedule<'a>(
 fn as_barrier(
     stmt: &PrecResInnerStmt,
     pipe_of: &dyn Fn(&str) -> Option<usize>,
+    port_of: &dyn Fn(&str) -> Option<(usize, bool)>,
     sink: &mut DiagSink,
 ) -> Option<Option<Barrier>> {
     let (pipe, bind, value) = if let Some((bind, pipe)) = as_blocking_recv(stmt) {
@@ -465,22 +894,27 @@ fn as_barrier(
     } else {
         return Some(None);
     };
+    let is_recv = bind.is_some();
 
-    match pipe_of(&pipe) {
-        Some(pipe_ix) => Some(Some(Barrier {
-            pipe_ix,
-            is_recv: bind.is_some(),
-            bind,
-            value,
-        })),
-        None => {
+    if let Some(pipe_ix) = pipe_of(&pipe) {
+        return Some(Some(Barrier { on: BarrierOn::Pipe(pipe_ix), is_recv, bind, value }));
+    }
+    if let Some((port_ix, is_input)) = port_of(&pipe) {
+        if is_recv != is_input {
+            let what = if is_input { "received from" } else { "sent to" };
             sink.err_span(
                 anchor_of(stmt, sink),
-                format!("`{}` is not a pipe of this process", pipe),
+                format!("`{}` can only be {}", pipe, what),
             );
-            None
+            return None;
         }
+        return Some(Some(Barrier { on: BarrierOn::Port(port_ix), is_recv, bind, value }));
     }
+    sink.err_span(
+        anchor_of(stmt, sink),
+        format!("`{}` is not a pipe or `port` of this process", pipe),
+    );
+    None
 }
 
 /// Whether an expression holds a blocking operation.
@@ -496,11 +930,15 @@ fn contains_barrier_in_expr(e: &PrecResExpr) -> bool {
 pub fn schedule_body<'a>(
     body: &'a [PrecResInnerStmt],
     pipe_of: &dyn Fn(&str) -> Option<usize>,
+    port_of: &dyn Fn(&str) -> Option<(usize, bool)>,
     sync_mem_of: &dyn Fn(&str) -> Option<usize>,
     sink: &mut DiagSink,
 ) -> Option<Vec<State<'a>>> {
     let mut built: Vec<State<'a>> = Vec::new();
-    let entry = schedule(body, Target::Exit, &mut built, pipe_of, sync_mem_of, sink)?;
+    // At the top of a process, `break` is what makes it stop: desc.md:37, "may
+    // stop (reach terminal state)". Inside a nested loop it means leave that
+    // loop, which is what the `brk` parameter carries down.
+    let entry = schedule(body, Target::Exit, Target::Halt, &mut built, pipe_of, port_of, sync_mem_of, sink)?;
 
     let entry = match entry {
         Target::State(ix) => ix,
@@ -537,6 +975,13 @@ pub fn schedule_body<'a>(
                     stack.push(*j);
                 }
             }
+            Next::Switch { targets, .. } => {
+                for t in targets.iter().rev() {
+                    if let Target::State(j) = t {
+                        stack.push(*j);
+                    }
+                }
+            }
             _ => {}
         }
     }
@@ -560,6 +1005,10 @@ pub fn schedule_body<'a>(
             Next::Branch { cond, then_t, else_t } => {
                 Next::Branch { cond, then_t: remap(then_t), else_t: remap(else_t) }
             }
+            Next::Switch { stmt, targets } => Next::Switch {
+                stmt,
+                targets: targets.into_iter().map(remap).collect(),
+            },
         };
         states.push(st);
     }
@@ -636,11 +1085,20 @@ pub fn reads_of(stmt: &PrecResInnerStmt, out: &mut HashSet<String>) {
             }
         }
         PrecResInnerStmt::TailVal(e) => in_expr(e, out),
+        PrecResInnerStmt::Loop(l) => in_expr(&l.repeat_expr, out),
         _ => {}
     }
 }
 
-/// Names a state defines: its plain `let`s plus whatever its barrier binds.
+/// Names a state defines: its plain `let`s, whatever its barrier binds, and
+/// whatever its synchronous read fetches.
+///
+/// The read binding matters as much as the others and was missing. A `bram`
+/// read binds the MEMORY's output register, and there is one of those per
+/// port however many states read it -- so a name still holding it two reads
+/// later is not holding its own value any more, it is holding the later
+/// read's. One read hid this: nothing overwrote the register, so the name
+/// stayed accidentally correct. Two reads and `x + y` became `y + y`.
 pub fn defines_of(st: &State) -> HashSet<String> {
     let mut out = HashSet::new();
     for stmt in st.stmts.iter().chain(st.post.iter()) {
@@ -651,7 +1109,39 @@ pub fn defines_of(st: &State) -> HashSet<String> {
     if let Some(b) = st.barrier.as_ref().and_then(|b| b.bind.as_ref()) {
         out.insert(b.clone());
     }
+    if let Some(read) = &st.mem_read {
+        out.insert(read.bind.clone());
+    }
+    // A `match` arm's pattern binds in the state that decides the arm, and is
+    // read in the states that arm scheduled -- so it crosses, like anything
+    // else defined in one state and read in another.
+    if let Next::Switch { stmt, .. } = &st.next {
+        for case in &stmt.cases {
+            for pattern in &case.binding_patterns {
+                pattern_binds(pattern, &mut out);
+            }
+        }
+    }
     out
+}
+
+/// Names a pattern brings into scope.
+pub fn pattern_binds(pattern: &BindingPattern, out: &mut HashSet<String>) {
+    match pattern {
+        BindingPattern::Alphanum(n) => {
+            out.insert(anumspan_to_str(n).to_string());
+        }
+        BindingPattern::EnumCase { subbinding, .. } => {
+            if let Some(n) = subbinding {
+                out.insert(anumspan_to_str(n).to_string());
+            }
+        }
+        BindingPattern::AnyOf(alts) => {
+            for alt in alts {
+                pattern_binds(alt, out);
+            }
+        }
+    }
 }
 
 /// Everything a state reads, including the value its barrier sends and the
@@ -673,6 +1163,11 @@ fn reads_in(st: &State) -> HashSet<String> {
     }
     if let Next::Branch { cond, .. } = &st.next {
         reads_of(&PrecResInnerStmt::TailVal(cond.clone()), &mut r);
+    }
+    if let Next::Switch { stmt, .. } = &st.next {
+        for scrutinee in &stmt.scrutinees {
+            reads_of(&PrecResInnerStmt::TailVal(scrutinee.clone()), &mut r);
+        }
     }
     r
 }
@@ -800,7 +1295,33 @@ pub fn lower_blocking(
             .position(|m| m == n)
             .filter(|ix| sync_mems.contains(ix))
     };
-    let states_sched = schedule_body(body, &pipe_of, &sync_mem_of, sink)?;
+    // Lifted before scheduling, so the scheduler sees one read per statement
+    // however the source spelled them. `hoisted` is borrowed by every state
+    // below and must outlive them, which is why it is bound here.
+    let hoisted = hoist_sync_reads(body, &sync_mem_of);
+    let body = &hoisted.stmts[..];
+    // `@rcv`/`@send` reach a `port` by the same names they reach a pipe by, so
+    // the scheduler has to be able to tell which it is looking at.
+    let port_names: Vec<(String, bool)> = low
+        .port_ins
+        .iter()
+        .map(|p| (p.name.clone(), true))
+        .chain(low.port_outs.iter().map(|p| (p.name.clone(), false)))
+        .collect();
+    let port_of = |n: &str| {
+        port_names.iter().position(|(name, _)| name == n).map(|ix| {
+            let (_, is_input) = port_names[ix];
+            // Re-indexed into whichever list it came from: the two are separate
+            // vectors and a `BarrierOn::Port` names a position in one of them.
+            let own = if is_input {
+                ix
+            } else {
+                ix - port_names.iter().filter(|(_, i)| *i).count()
+            };
+            (own, is_input)
+        })
+    };
+    let states_sched = schedule_body(body, &pipe_of, &port_of, &sync_mem_of, sink)?;
     let n_states = states_sched.len();
 
     // Reject a pipe used in a direction it was not declared for.
@@ -809,7 +1330,12 @@ pub fn lower_blocking(
             Some(b) => b,
             None => continue,
         };
-        let pipe = &low.pipes[barrier.pipe_ix];
+        let Some(pipe_ix) = barrier.pipe() else {
+            // A port barrier had its direction settled when the name was
+            // resolved, because a port's direction is which list it is in.
+            continue;
+        };
+        let pipe = &low.pipes[pipe_ix];
         if barrier.is_recv != pipe.is_input {
             let what = if pipe.is_input { "received from" } else { "sent to" };
             sink.err_span(
@@ -832,6 +1358,7 @@ pub fn lower_blocking(
         Next::Branch { then_t, else_t, .. } => {
             *then_t == Target::Halt || *else_t == Target::Halt
         }
+        Next::Switch { targets, .. } => targets.contains(&Target::Halt),
     });
     let done_state = n_states as u128;
     let needs_terminal = !repeats || halts;
@@ -916,12 +1443,24 @@ pub fn lower_blocking(
                 continue;
             }
         };
-        let ix = barrier.pipe_ix;
-        // What says the transfer can happen: something to take, or somewhere
-        // to put one. Both are two registers compared -- ours and theirs.
-        let handshake = low.pipes[ix].movable.expect("computed once above");
-        let fire = low.emit(Ty::BOOL, Op::Bin { op: BinOp::And, lhs: in_st[k], rhs: handshake });
-        low.name_value(fire, format!("fire_s{}", k));
+        // What says the transfer can happen. On a pipe it is two registers
+        // compared -- ours and theirs. On a `port in` it is the enable, which
+        // is the only thing a port has to say. On a `port out` it is nothing:
+        // there is no `ready` coming back, so a send never waits and the state
+        // costs its cycle and no more.
+        let handshake = match barrier.on {
+            BarrierOn::Pipe(ix) => Some(low.pipes[ix].movable.expect("computed once above")),
+            BarrierOn::Port(pix) if barrier.is_recv => Some(low.port_ins[pix].en),
+            BarrierOn::Port(_) => None,
+        };
+        let fire = match handshake {
+            None => in_st[k],
+            Some(h) => {
+                let f = low.emit(Ty::BOOL, Op::Bin { op: BinOp::And, lhs: in_st[k], rhs: h });
+                low.name_value(f, format!("fire_s{}", k));
+                f
+            }
+        };
         fires.push(fire);
     }
 
@@ -936,10 +1475,56 @@ pub fn lower_blocking(
 
     // Allocate a register for every binding that crosses a state, before any
     // state runs, so another one can read the registered copy.
-    let cross = crossing(&states_sched);
+    let mut cross = crossing(&states_sched);
+    // A read binding needs saving only where another read can overwrite the
+    // port it names. With ONE read state per memory the output register is
+    // written only while that state is current, so the name stays good until
+    // the machine comes back round to the read that defined it -- and coming
+    // back round redefines it. Registering it anyway would cost a real flop
+    // per read, and the mux beside it, in every process that reads a `bram`
+    // once: the synthesizer cannot remove either, because both are used.
+    let mut reads_per_mem = vec![0usize; low.mems.len()];
+    for st in &states_sched {
+        if let Some(read) = &st.mem_read {
+            reads_per_mem[read.mem_ix] += 1;
+        }
+    }
+    for (k, st) in states_sched.iter().enumerate() {
+        if let Some(read) = &st.mem_read
+            && reads_per_mem[read.mem_ix] == 1
+        {
+            cross[k].remove(&read.bind);
+        }
+    }
     let mut slot_of: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     let mut cross_order: Vec<String> = Vec::new();
+    // A READ-VALID FLOP per synchronous read whose binding crosses a state.
+    //
+    // A `bram` read presents its address while its state is current and the
+    // array is read at that state's clock edge, so the memory's output
+    // register holds the value from the NEXT state on -- not during the state
+    // that asked. A crossing register capturing on `fires[k]` therefore
+    // captures the previous read.
+    //
+    // One flop says "the read fired last cycle", which is exactly when the
+    // output register is fresh. It is also what lets the name be forwarded:
+    // in that one cycle it means the memory's register, and from then on the
+    // saved copy. Reserved only where the binding actually crosses, because
+    // where it does not the output register is the whole of the answer.
+    let mut read_delay_slot: Vec<Option<usize>> = vec![None; n_states];
+    let mut read_delay_order: Vec<usize> = Vec::new();
     let mut next_slot = pipe_base + pipe_slots;
+    for (k, st) in states_sched.iter().enumerate() {
+        let crosses = st
+            .mem_read
+            .as_ref()
+            .is_some_and(|r| cross[k].contains(&r.bind));
+        if crosses {
+            read_delay_slot[k] = Some(next_slot);
+            read_delay_order.push(k);
+            next_slot += 1;
+        }
+    }
     for set in &cross {
         let mut names: Vec<String> = set.iter().cloned().collect();
         names.sort();
@@ -967,9 +1552,13 @@ pub fn lower_blocking(
     // Several states may define the same name, one per arm of a branch, so
     // this is a list rather than a map: the register takes whichever of them
     // fired.
-    let mut cross_writes: Vec<(String, usize, ValueId, Ty)> = Vec::new();
+    // `(name, capture condition, value, type)`. The condition is the state's
+    // own firing for everything except a synchronous read, which is a cycle
+    // later -- so it is carried rather than re-derived from the state index.
+    let mut cross_writes: Vec<(String, ValueId, ValueId, Ty)> = Vec::new();
     // Where each state's branch condition ended up.
     let mut branch_conds: Vec<Option<ValueId>> = vec![None; n_states];
+    let mut switch_sel: Vec<Option<SwitchSel>> = vec![None; n_states];
     // A `var` reads its register at the start of every state, and what a state
     // leaves in it is committed only when that state fires. Without the
     // per-state reset, an assignment written in one state would be the
@@ -980,6 +1569,15 @@ pub fn lower_blocking(
         .map(|n| env.get(n).and_then(|b| b.value))
         .collect();
     let mut var_writes: Vec<Vec<(usize, ValueId)>> = vec![Vec::new(); reg_names.len()];
+
+    // A `port out` is per-state exactly as a pipe's offer is: cleared at the
+    // top of every state, and whatever a state left on it belongs to that
+    // state. What comes out at the end is a driver rather than a register,
+    // because a port has no entries to push into -- the wire IS the offer.
+    //
+    // Per port: which state offered, what it offered, and on which branch.
+    let mut port_sends: Vec<Vec<(usize, ValueId, Option<ValueId>)>> =
+        vec![Vec::new(); low.port_outs.len()];
 
     // A memory's write port is per-state exactly as a `var` is: the address
     // and data a state computed take effect only when that state fires.
@@ -1019,7 +1617,7 @@ pub fn lower_blocking(
             // so anything else consuming from it here would be a second
             // transfer in a cycle that has one. Marking it used is what makes
             // `@drop(p)` beside `@rcv(p)` an error instead of a no-op.
-            low.pipes[ix].used = st.barrier.as_ref().is_some_and(|b| b.pipe_ix == ix);
+            low.pipes[ix].used = st.barrier.as_ref().is_some_and(|b| b.pipe() == Some(ix));
             low.pipes[ix].sent = None;
             low.pipes[ix].send_guard = None;
         }
@@ -1028,6 +1626,10 @@ pub fn lower_blocking(
             if let (Some(v), Some(b)) = (var_start[ix], env.get_mut(name)) {
                 b.value = Some(v);
             }
+        }
+        for port in low.port_outs.iter_mut() {
+            port.sent = None;
+            port.send_guard = None;
         }
         for port in &mem_port_start {
             for (key, start) in port.keys() {
@@ -1057,10 +1659,20 @@ pub fn lower_blocking(
             env.insert(read.bind.clone(), Binding::constant(q, elem));
         }
         if let Some(bind) = st.barrier.as_ref().and_then(|b| b.bind.as_ref()) {
-            let pipe = low.pipes[st.barrier.as_ref().expect("a bind implies a barrier").pipe_ix]
-                .clone();
-            let data = pipe.item.expect("an input pipe has an item");
-            env.insert(bind.clone(), Binding::constant(data, pipe.ty.clone()));
+            let barrier = st.barrier.as_ref().expect("a bind implies a barrier");
+            let (data, ty) = match barrier.on {
+                BarrierOn::Pipe(ix) => {
+                    let pipe = low.pipes[ix].clone();
+                    (pipe.item.expect("an input pipe has an item"), pipe.ty)
+                }
+                // One entry, read straight off the wire: a `port` has no slot
+                // to skid into, so there is no pair to select from.
+                BarrierOn::Port(pix) => {
+                    let port = low.port_ins[pix].clone();
+                    (port.data, port.ty)
+                }
+            };
+            env.insert(bind.clone(), Binding::constant(data, ty));
         }
         // Statements between the barrier and a branch. They see what the
         // barrier bound, which is what lets the branch decide in the same
@@ -1083,6 +1695,89 @@ pub fn lower_blocking(
             low.name_value(v, format!("branch_s{}", k));
             branch_conds[k] = Some(v);
         }
+        if let Next::Switch { stmt, .. } = &st.next {
+            let scrutinee = crate::ir::lower_expr(&mut low, &stmt.scrutinees[0], &env, sink)?;
+            let scrutinee_ty = low.ty_of(scrutinee);
+            let shape = crate::ir_match::plan_match(&mut low, stmt, &scrutinee_ty, sink)?;
+            let tag = crate::ir_match::match_tag(&mut low, &shape, scrutinee);
+            low.name_value_safe(tag, format!("sel_s{}", k));
+
+            // What each arm's pattern binds.
+            //
+            // A name can be bound by more than one arm -- `.Read a` and
+            // `.Write a`. Each arm of a COMBINATIONAL `match` keeps its own
+            // environment, so there one name can be a different type on each.
+            // Here the arms are states and the name is one wire that crosses
+            // them, so it is one type; and once the types agree the value is
+            // the same slice of the same scrutinee, so there is nothing to
+            // select between.
+            let mut bound: Vec<(String, Vec<Option<AlphanumSpan>>)> = Vec::new();
+            for plan in shape.cases.iter().filter(|c| !c.is_unreachable) {
+                let mut note = |name: String, from: Option<AlphanumSpan>| {
+                    match bound.iter_mut().find(|(n, _)| *n == name) {
+                        Some((_, froms)) => froms.push(from),
+                        None => bound.push((name, vec![from])),
+                    }
+                };
+                if let Some(name) = plan.catch_all {
+                    note(anumspan_to_str(&name).to_string(), None);
+                }
+                if let Some((variant, bind)) = plan.payload {
+                    note(anumspan_to_str(&bind).to_string(), Some(variant));
+                }
+            }
+            for (name, froms) in bound {
+                let ty_of = |low: &Lowerer, from: &Option<AlphanumSpan>| match from {
+                    None => scrutinee_ty.clone(),
+                    Some(v) => low
+                        .syms
+                        .enums
+                        .get(&shape.enum_name)
+                        .and_then(|d| d.payload_of(anumspan_to_str(v)))
+                        .cloned()
+                        .expect("plan_match checked this variant carries a payload"),
+                };
+                let first = &froms[0];
+                let want = ty_of(&low, first);
+                for other in &froms[1..] {
+                    let have = ty_of(&low, other);
+                    if have != want {
+                        sink.push(
+                            crate::diag::Diag::error(
+                                shape.span,
+                                format!(
+                                    "`{}` binds `{}` on one arm and `{}` on another",
+                                    name,
+                                    want.display(),
+                                    have.display()
+                                ),
+                            )
+                            .with_note(
+                                "an arm that waits is a state, and a name that crosses one is a single wire; give the two payloads different names",
+                            ),
+                        );
+                        return None;
+                    }
+                }
+                let value = match first {
+                    None => scrutinee,
+                    Some(variant) => {
+                        let (v, _) =
+                            crate::ir_match::payload_value(&mut low, &shape, scrutinee, variant)?;
+                        v
+                    }
+                };
+                low.name_value_safe(value, name.clone());
+                env.insert(name, crate::ir::Binding::constant(value, want));
+            }
+
+            let labels = shape
+                .cases
+                .iter()
+                .map(|c| if c.is_unreachable { None } else { Some(c.labels.clone()) })
+                .collect();
+            switch_sel[k] = Some((tag, labels));
+        }
 
         // A non-blocking operation asks for the handshake in this state
         // without making the state wait for it, so the state contributes to
@@ -1090,7 +1785,7 @@ pub fn lower_blocking(
         // does NOT contribute to `fires`, which is what "does not wait" means.
         for (ix, uses) in nonblocking.iter_mut().enumerate() {
             let used_here = low.pipes[ix].used;
-            let barriered_here = st.barrier.as_ref().is_some_and(|b| b.pipe_ix == ix);
+            let barriered_here = st.barrier.as_ref().is_some_and(|b| b.pipe() == Some(ix));
             if !used_here || barriered_here {
                 continue;
             }
@@ -1102,11 +1797,24 @@ pub fn lower_blocking(
             }
         }
 
+        // The cycle after a synchronous read is when its value is there to
+        // capture; everything else is captured in the state that computed it.
+        let read_ready = read_delay_slot[k].map(|slot| {
+            let d = low.emit(Ty::BOOL, Op::RegRead(slot as u32));
+            low.name_value_safe(d, format!("rd_valid_s{}", k));
+            d
+        });
+        let read_bind = st.mem_read.as_ref().map(|r| r.bind.clone());
+
         // What this state leaves behind for the others.
         for name in &cross[k] {
+            let capture = match (&read_bind, read_ready) {
+                (Some(bind), Some(d)) if bind == name => d,
+                _ => fires[k],
+            };
             if let Some(b) = env.get(name).cloned()
                 && let Some(v) = b.value {
-                    cross_writes.push((name.clone(), k, v, b.ty.clone()));
+                    cross_writes.push((name.clone(), capture, v, b.ty.clone()));
                 }
         }
         for (ix, name) in reg_names.iter().enumerate() {
@@ -1115,6 +1823,11 @@ pub fn lower_blocking(
                 && let Some(v) = now {
                     var_writes[ix].push((k, v));
                 }
+        }
+        for (port, sends) in low.port_outs.iter().zip(port_sends.iter_mut()) {
+            if let Some(v) = port.sent {
+                sends.push((k, v, port.send_guard));
+            }
         }
         for (ix, port) in mem_port_start.iter().enumerate() {
             let we = env.get(&port.we_key).and_then(|b| b.value);
@@ -1133,8 +1846,13 @@ pub fn lower_blocking(
         }
 
         if let Some(expr) = st.barrier.as_ref().and_then(|b| b.value.as_ref()) {
-            let pipe =
-                low.pipes[st.barrier.as_ref().expect("a value implies a barrier").pipe_ix].clone();
+            let barrier = st.barrier.as_ref().expect("a value implies a barrier");
+            let (name, want) = match barrier.on {
+                BarrierOn::Pipe(ix) => (low.pipes[ix].name.clone(), low.pipes[ix].ty.clone()),
+                BarrierOn::Port(pix) => {
+                    (low.port_outs[pix].name.clone(), low.port_outs[pix].ty.clone())
+                }
+            };
             // The send is not a statement as far as lowering is concerned --
             // the scheduler took it apart -- so its anchor has to be pushed
             // here or the type error lands at line 1.
@@ -1144,23 +1862,25 @@ pub fn lower_blocking(
             });
             let v = crate::ir::lower_expr(&mut low, expr, &env, sink)?;
             let have = low.ty_of(v);
-            if have != pipe.ty {
+            if have != want {
                 sink.err_span(
                     low.here(),
                     format!(
                         "`{}` carries `{}` but `{}` was sent",
-                        pipe.name,
-                        pipe.ty.display(),
+                        name,
+                        want.display(),
                         have.display()
                     ),
                 );
                 return None;
             }
-            send_values.push((
-                st.barrier.as_ref().expect("a value implies a barrier").pipe_ix,
-                k,
-                v,
-            ));
+            match barrier.on {
+                BarrierOn::Pipe(ix) => send_values.push((ix, k, v)),
+                // No guard: a scheduled send is the whole of what its state
+                // does, so the state firing is the condition and there is no
+                // branch inside it to narrow to.
+                BarrierOn::Port(pix) => port_sends[pix].push((k, v, None)),
+            }
             if let Some(depth) = depth {
                 low.pop_anchor(depth);
             }
@@ -1176,10 +1896,31 @@ pub fn lower_blocking(
                 if let Some(ty) = ty {
                     let r = low.emit(ty.clone(), Op::RegRead(slot as u32));
                     low.name_value(r, format!("{}_r", name));
+                    // A read's copy lands at the end of the cycle the value
+                    // appears in, so for that one cycle the name still has to
+                    // mean the memory's output register. Forwarding it is what
+                    // makes a read usable in the state right after the fetch
+                    // AND in every state after that, with one register rather
+                    // than a rule about which states may use it.
+                    let live = match (&read_bind, read_ready) {
+                        (Some(bind), Some(d)) if bind == name => {
+                            let fresh = env
+                                .get(name)
+                                .and_then(|b| b.value)
+                                .expect("a read binding has a value");
+                            let m = low.emit(
+                                ty.clone(),
+                                Op::Mux { cond: d, then_val: fresh, else_val: r },
+                            );
+                            low.name_value_safe(m, format!("{}_live", name));
+                            m
+                        }
+                        _ => r,
+                    };
                     let stays_mutable = env.get(name).is_some_and(|b| b.is_mutable);
                     env.insert(
                         name.clone(),
-                        Binding { value: Some(r), ty, is_output: false, is_mutable: stays_mutable },
+                        Binding { value: Some(live), ty, is_output: false, is_mutable: stays_mutable },
                     );
                 }
             }
@@ -1198,7 +1939,7 @@ pub fn lower_blocking(
         let mut asks: Vec<ValueId> = states_sched
             .iter()
             .enumerate()
-            .filter(|(_, s)| s.barrier.as_ref().is_some_and(|b| b.pipe_ix == ix))
+            .filter(|(_, s)| s.barrier.as_ref().is_some_and(|b| b.pipe() == Some(ix)))
             .map(|(k, _)| fires[k])
             .collect();
         for (k, guard) in uses {
@@ -1370,6 +2111,40 @@ pub fn lower_blocking(
                 let cond = branch_conds[k].expect("a branching state lowered its condition");
                 low.emit(st_ty.clone(), Op::Mux { cond, then_val, else_val })
             }
+            // A `case` over the tag, not a chain of comparisons. The same
+            // measurement that made a combinational `match` a `case` applies
+            // to the next-state logic: a ternary chain is a PRIORITY structure
+            // and synthesis has to honour the priority, where a `case` says
+            // the arms are parallel.
+            Next::Switch { targets, .. } => {
+                let (tag, labels) =
+                    switch_sel[k].clone().expect("a switching state resolved its patterns");
+                // Selectable arms, in source order. The last one is the
+                // default -- either it is the catch-all, or coverage is
+                // complete and it is reached by elimination. Exactly the rule
+                // the combinational `match` follows.
+                let selectable: Vec<(Vec<u128>, Target)> = labels
+                    .iter()
+                    .zip(targets.iter())
+                    .filter_map(|(l, t)| l.clone().map(|l| (l, *t)))
+                    .collect();
+                let (_, default_t) =
+                    selectable.last().expect("plan_match rejects a match with no arms");
+                let default = target_of(&mut low, *default_t);
+                let mut arms: Vec<(Vec<u128>, ValueId)> = Vec::new();
+                for (l, t) in &selectable[..selectable.len() - 1] {
+                    if l.is_empty() {
+                        continue;
+                    }
+                    let v = target_of(&mut low, *t);
+                    arms.push((l.clone(), v));
+                }
+                if arms.is_empty() {
+                    default
+                } else {
+                    low.emit(st_ty.clone(), Op::Case { scrutinee: tag, arms, default })
+                }
+            }
         };
         next_state = low.emit(
             st_ty.clone(),
@@ -1392,11 +2167,22 @@ pub fn lower_blocking(
         generated.push(Reg { name: name.clone(), ty: ty.clone(), reset: 0, next: *next });
     }
 
+    // In slot order, immediately after the pipe registers, which is where they
+    // were reserved.
+    for k in &read_delay_order {
+        generated.push(Reg {
+            name: format!("rd_valid_s{}", k),
+            ty: Ty::BOOL,
+            reset: 0,
+            next: fires[*k],
+        });
+    }
+
     for name in &cross_order {
-        let writes: Vec<(usize, ValueId, Ty)> = cross_writes
+        let writes: Vec<(ValueId, ValueId, Ty)> = cross_writes
             .iter()
             .filter(|(n, _, _, _)| n == name)
-            .map(|(_, k, v, t)| (*k, *v, t.clone()))
+            .map(|(_, cond, v, t)| (*cond, *v, t.clone()))
             .collect();
         let ty = match writes.first() {
             Some((_, _, t)) => t.clone(),
@@ -1406,10 +2192,10 @@ pub fn lower_blocking(
         let mut next = low.emit(ty.clone(), Op::RegRead(slot as u32));
         // Later writers are muxed outermost, but only one state is ever
         // active, so the order between them does not matter.
-        for (k, v, _) in &writes {
+        for (cond, v, _) in &writes {
             next = low.emit(
                 ty.clone(),
-                Op::Mux { cond: fires[*k], then_val: *v, else_val: next },
+                Op::Mux { cond: *cond, then_val: *v, else_val: next },
             );
         }
         generated.push(Reg { name: format!("{}_r", name), ty, reset: 0, next });
@@ -1435,6 +2221,32 @@ pub fn lower_blocking(
             addr = low.emit(addr_ty, Op::Mux { cond: in_st[*k], then_val: *a, else_val: addr });
         }
         low.mems[ix].read = Some(crate::ir::ReadPort { addr, en });
+    }
+
+    for (port, sends) in low.port_outs.clone().into_iter().zip(port_sends.clone()) {
+        // A port nothing sent to still drives: zero, with the enable low. An
+        // output left undriven would be a floating wire.
+        let mut value = low.emit(port.ty.clone(), Op::Const(0));
+        let mut enable = low.emit(Ty::BOOL, Op::Const(0));
+        for (k, v, guard) in &sends {
+            // FIRING, not merely being in the state. A state with a barrier
+            // does its work in the cycle that barrier completes, so a port it
+            // sends to is sent to then and not while it is still waiting --
+            // and a send written inside an `if` happens on that branch only.
+            let asks = match guard {
+                None => fires[*k],
+                Some(g) => low.emit(Ty::BOOL, Op::Bin { op: BinOp::And, lhs: fires[*k], rhs: *g }),
+            };
+            value = low.emit(
+                port.ty.clone(),
+                Op::Mux { cond: asks, then_val: *v, else_val: value },
+            );
+            enable = low.emit(Ty::BOOL, Op::Bin { op: BinOp::Or, lhs: enable, rhs: asks });
+        }
+        low.name_value_safe(value, port.name.clone());
+        low.name_value_safe(enable, format!("{}_en", port.name));
+        drivers.push((port.data_port, value));
+        drivers.push((port.en_port, enable));
     }
 
     for (port_id, name) in &out_ports {

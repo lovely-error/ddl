@@ -277,9 +277,33 @@ pub fn lower_sequence(
 
     let mut pending: Vec<(String, Ty, ValueId, usize)> = Vec::new();
 
+    // A `port out` in a pipeline belongs to the STAGE that assigns it.
+    //
+    // A process drives one from the state that assigned it, gated on that
+    // state firing. There are no states here -- every stage is live at once,
+    // each holding a different item -- so what stands in for "the state fired"
+    // is "the stage has a valid item and the pipeline is moving". Which stage
+    // that is has to be recorded as the stages are lowered, because afterwards
+    // the environment holds one value and not which cut it came from.
+    //
+    // Per port: the stage that sent to it, what it offered and on which
+    // branch.
+    let mut port_sends: Vec<Vec<(usize, ValueId, Option<ValueId>)>> =
+        vec![Vec::new(); low.port_outs.len()];
+
     for (k, stage) in plain.iter().enumerate() {
         for stmt in stage {
             crate::ir::lower_stmt_pub(&mut low, stmt, &mut env, sink)?;
+        }
+        // What this stage offered, and then cleared so the next stage's answer
+        // is its own. Without the reset a send in stage 0 would read as a send
+        // in every stage after it.
+        for (port, sends) in low.port_outs.iter_mut().zip(port_sends.iter_mut()) {
+            if let Some(v) = port.sent {
+                sends.push((k, v, port.send_guard));
+            }
+            port.sent = None;
+            port.send_guard = None;
         }
         let is_last = k + 1 == n;
         if is_last {
@@ -404,11 +428,67 @@ pub fn lower_sequence(
     }
 
     let pair = low.pack_entries(e0, e1, &out_ty);
-    let drivers: Vec<(PortId, ValueId)> = vec![
+    let mut drivers: Vec<(PortId, ValueId)> = vec![
         (low.pipes[in_ix].rsalt_port, in_rsalt_q),
         (low.pipes[out_ix].wsalt_port, wsalt_q),
         (low.pipes[out_ix].data_port, pair),
     ];
+
+    // ---- `port out`, driven from the stage that sent to it ----------------
+    //
+    // Stage 0 holds an item when the input is offering one; stage k holds one
+    // when `v{k-1}` says the cut behind it passed one on. The port's enable is
+    // that, ANDed with the branch the send was written on and with the shift --
+    // because a stalled pipeline is not producing anything, it is holding.
+    for (port, sends) in low.port_outs.clone().into_iter().zip(port_sends.clone()) {
+        // ONE stage, not several. Every stage is live at once and each holds a
+        // different item, so two stages driving one port is two answers for
+        // one wire -- and unlike a process, where only one state is current,
+        // there is nothing to choose between them.
+        if sends.len() > 1 {
+            let stages: Vec<String> =
+                sends.iter().map(|(k, _, _)| format!("stage {}", k)).collect();
+            sink.push(
+                crate::diag::Diag::error(
+                    map.span_of(&decl.name),
+                    format!("`{}` is sent to in {}", port.name, stages.join(" and ")),
+                )
+                .with_note(
+                    "a `port out` is driven by the stage that sends to it, and every stage of a pipeline is live at once holding a different item; send in one stage, or use one port per stage",
+                ),
+            );
+            return None;
+        }
+        let (value, enable) = match sends.first() {
+            None => {
+                let zero = low.emit(port.ty.clone(), Op::Const(0));
+                let off = low.emit(Ty::BOOL, Op::Const(0));
+                (zero, off)
+            }
+            Some((k, v, guard)) => {
+                // The value is stage `k`'s own combinational result and needs
+                // no gating; only the enable says which cycles it means
+                // anything.
+                let held = if *k == 0 {
+                    offered
+                } else {
+                    let bit = low.emit(Ty::BOOL, Op::RegRead((valid_base + k - 1) as u32));
+                    low.name_value_safe(bit, format!("v{}", k - 1));
+                    bit
+                };
+                let live = match guard {
+                    None => held,
+                    Some(g) => low.emit(Ty::BOOL, Op::Bin { op: BinOp::And, lhs: *g, rhs: held }),
+                };
+                let gated = low.emit(Ty::BOOL, Op::Bin { op: BinOp::And, lhs: live, rhs: en });
+                (*v, gated)
+            }
+        };
+        low.name_value_safe(value, port.name.clone());
+        low.name_value_safe(enable, format!("{}_en", port.name));
+        drivers.push((port.data_port, value));
+        drivers.push((port.en_port, enable));
+    }
 
     if sink.has_errors() {
         return None;

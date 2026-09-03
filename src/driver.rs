@@ -205,6 +205,7 @@ fn compile_on_this_stack(
     let mut procs = Vec::new();
     let mut seqs = Vec::new();
     let mut graphs = Vec::new();
+    let mut externs = Vec::new();
 
     for decl in &parsed.decls {
         match decl {
@@ -218,6 +219,12 @@ fn compile_on_this_stack(
                 match unsafe { resolve_precedence_for_enum(base, e) } {
                     Ok(r) => enums.push(r),
                     Err(_) => sink.err_at(&e.name, "could not resolve this enum"),
+                }
+            }
+            TopLevelDecl::ExternDecl(e) => {
+                match unsafe { crate::parse::resolve_precedence_for_extern(base, e) } {
+                    Ok(r) => externs.push(r),
+                    Err(_) => sink.err_at(&e.name, "could not resolve this extern"),
                 }
             }
             TopLevelDecl::StructDecl(st) => {
@@ -328,6 +335,19 @@ fn compile_on_this_stack(
     if !graphs.is_empty() {
         let mut sigs: std::collections::BTreeMap<String, crate::ir_graph::BlockSig> =
             std::collections::BTreeMap::new();
+        // An `extern` contributes a signature and no module. That is the whole
+        // of the feature: a graph can instantiate something DDL did not
+        // compile, and the connections are still checked, because what a graph
+        // can see of anything it instantiates is its pipe interface and
+        // nothing else.
+        for ext in &externs {
+            let name = anumspan_to_str(&ext.name).to_string();
+            crate::ir_graph::check_extern(map, ext, &mut sink);
+            sigs.insert(
+                name.clone(),
+                crate::ir_graph::signature_of(&name, "extern", &ext.args, &syms),
+            );
+        }
         for seq in &seqs {
             let name = anumspan_to_str(&seq.name).to_string();
             sigs.insert(name.clone(), crate::ir_graph::signature_of(&name, "sequence", &seq.args, &syms));
@@ -340,11 +360,29 @@ fn compile_on_this_stack(
             let name = anumspan_to_str(&graph.name).to_string();
             sigs.insert(name.clone(), crate::ir_graph::signature_of(&name, "graph", &graph.args, &syms));
         }
+        // Combinators first, in the file: a graph instantiates them, and the
+        // rule for this file is that everything a graph names has been emitted
+        // above it so the whole thing reads top to bottom.
+        let mut combs: Vec<crate::ir_graph::CombUse> = Vec::new();
+        let mut lowered = Vec::new();
         for graph in &graphs {
-            if let Some(module) = crate::ir_graph::lower_graph(map, &syms, &sigs, graph, &mut sink) {
+            if let Some(module) =
+                crate::ir_graph::lower_graph(map, &syms, &sigs, graph, &mut combs, &mut sink)
+            {
+                lowered.push(module);
+            }
+        }
+        for use_ in &combs {
+            if let Some(module) =
+                crate::ir_comb::build(map, &syms, use_.kind, use_.fan, &use_.ty, &mut sink)
+            {
                 render(&mut out, &module);
                 emitted += 1;
             }
+        }
+        for module in &lowered {
+            render(&mut out, module);
+            emitted += 1;
         }
     }
 

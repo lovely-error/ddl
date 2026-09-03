@@ -140,6 +140,15 @@ fn live_values(module: &Module) -> Vec<bool> {
         stack.push(mem.we);
         stack.push(mem.addr);
         stack.push(mem.data);
+        // The READ port too. With one read state its address and enable are
+        // already live through the state logic, which is why this was missing
+        // and nothing said so; with two they are a mux and an OR that nothing
+        // else reaches, and the memory's clocked block referred to wires the
+        // file never declared.
+        if let Some(read) = &mem.read {
+            stack.push(read.addr);
+            stack.push(read.en);
+        }
     }
     // An assertion is a use even though nothing downstream reads it, or the
     // whole cone feeding it would look dead and be stripped.

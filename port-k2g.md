@@ -196,26 +196,58 @@ Everything above is K2G changing. This is the residue -- places where the DDL
 design is right and the compiler has not built it yet. It is a short list, and
 that is the finding.
 
-1. **Broadcast.** One producer, several consumers (`src/ir_graph.rs:482`).
-   `desc.md` specifies it by duplicating the sink; it is not built. Wanted for
-   `retire` reaching both the machine's own bookkeeping and the cosimulation
-   harness. Costs a slot per sink -- ANDing readys would rebuild the
-   combinational coupling `k2g_chan.sv:26` rule 3 exists to prevent.
-2. **Pipe combinators.** Merge, split, arbitrate, lowered structurally rather
-   than as a `process` costing a cycle per hop. Deleting `k2g_membus_mux`
-   removes the urgent case, but a merge is what lets two requesters share one
-   pipe without a hand-written round-robin.
-3. **Element assignment on an array value.** `s.words[1] = x` is still "only a
-   name or a field of one can be assigned". Reading was fixed; a cache line
-   arriving over a burst wants to be filled a beat at a time.
+**Six of the eight that were here are built.** What follows the line is what is
+left.
+
+1. ~~**Broadcast.**~~ Built, as `@split(src, a, b)`. One producer, several
+   consumers, each with its own pair of entries and its own salt -- the slot
+   per sink this predicted it would cost. ANDing readys was never on the table
+   for the reason recorded here: it rebuilds the combinational coupling
+   `k2g_chan.sv:26` rule 3 exists to prevent.
+2. ~~**Pipe combinators.**~~ Built, as `@merge` and `@split`, and structurally
+   rather than as a `process`: one transfer per cycle through either, no
+   states. `@merge` grants in rotation, so two requesters sharing one pipe do
+   not need a hand-written round-robin and the busier one cannot starve the
+   other.
+3. ~~**Element assignment on an array value.**~~ Built. `s.words[1] = x` and
+   `a[i] = x` both work, at a constant index or a computed one. A cache line
+   arriving over a burst can be filled a beat at a time.
 4. **Pipe depth.** `let p: buffer i32 [4]`. Two entries is a credit of two.
-   Enough behind a cache that hits; not enough to cover a miss.
-5. **Multi-bit dynamic slice, as syntax.** The mechanism exists -- an array
-   element at a computed index lowers to a `+:` of the element width -- but
-   there is no way to write one on a plain `iN`. Declaring the thing `[i8; 4]`
-   is the workaround and is usually what it was.
-6. **`while`, or nested `loop`.** The data cache's flush walk flattens into one
-   `loop` with explicit indices. Reads worse; expresses the same thing.
+   Enough behind a cache that hits; not enough to cover a miss. Still the
+   largest thing on this list, and cheaper now than it will be later: the salt
+   is already a gray-coded pointer, so depth 2^k is k+1 bits of salt and the
+   same compares, and doing it while the port list is already churning costs
+   one regeneration rather than two.
+5. ~~**Multi-bit dynamic slice, as syntax.**~~ Built, as `@slice(x, base, w)`.
+   A constant base still lowers to an ordinary range rather than a `+:`.
+6. ~~**`while`, or nested `loop`.**~~ Built. `loop`s nest to any depth and
+   `break` leaves the innermost one; at the top of a process it still stops the
+   process. The data cache's flush walk no longer has to flatten.
+
+Two more that were not on this list and were in the way:
+
+7. ~~**A blocking operation inside a `match`.**~~ Built. It was the sharpest of
+   the lot and nothing here had noticed: `match` is the only way to reach a
+   payload and `==` on an enum carrying one is refused, so a tagged union had
+   NO way to wait per variant. That is the shape of `mem_rsp_t` in phase C and
+   of uop dispatch everywhere.
+8. ~~**More than one `bram` read.**~~ Built, and it was three bugs rather than a
+   feature: the read's binding was not counted as something a state defines, so
+   `x + y` came out as `y + y`; the read port's address and enable were not
+   roots of the live-value walk, so the memory's clocked block named wires the
+   file never declared; and statements after a read were scheduled into the
+   state that presents the address, where the value has not arrived. One read
+   hid all three. Reads inside an expression are lifted onto lines of their own
+   now, so phase E's `let a = tags[i]` beside `let b = data[i]` is writable.
+
+And one that is new rather than closed:
+
+9. **A `port` is not a `pin`.** `port in`/`port out` is a second pipe kind --
+   a data port and an enable, no back-pressure -- reached by the same `@rcv`,
+   `@try_rcv`, `@send` and `@try_send` a `buffer` is. `desc.md:29` draws the
+   boundary it is for, and it covers a bus master that will not take `ready`
+   for an answer. It does not cover tri-state, a default on reset, or a pin
+   constraint, so `k2g_soc.sv` still owns the pins.
 
 ## 3. The board
 
@@ -225,18 +257,25 @@ is the board, not because DDL fell short.
 
 | | Why it stays |
 |---|---|
-| `k2g_psram.sv`, `k2g_cdc_fifo.sv` | two clock domains. `src/ir.rs:1489` gives one, implicit and unnameable. Multi-clock DDL is a clock-domain type system, a `syn_preserve` equivalent and a constraints story -- a language project |
+| `k2g_psram.sv`, `k2g_cdc_fifo.sv` | two clock domains. `src/ir.rs:822` gives one, implicit and unnameable. Multi-clock DDL is a clock-domain type system, a `syn_preserve` equivalent and a constraints story -- a language project |
 | `board/k2g_pll.sv` | `rPLL`. No primitive instantiation |
 | `k2g_mem.sv` | true dual-port, four `DPB` instances, because inference produced a write mode place-and-route rejects |
 | `board/k2g_soc.sv` | pins, tri-state `IO_psram_dq`, the PSRAM IP, the LEDs |
 | `board/k2g_uart.sv` | bit timing against a pin, plus the holding register above |
 | the bring-up probes | scaffolding |
 
-One thing here is a real gap rather than a boundary: **a `graph` cannot
-instantiate a module DDL did not compile** (`src/ir_graph.rs:258`). That is
-smaller than `pin` and it is what would let DDL own the hierarchy instead of
-being a guest in it. Until then the SoC instantiates the generated modules and
-wires `_valid`/`_ready`/`_data` triples by hand.
+The one real gap here rather than a boundary -- **a `graph` cannot instantiate
+a module DDL did not compile** -- is closed. `extern psram (req: buffer in
+mem_req_t, rsp: buffer out mem_rsp_t)` names one, and a graph instantiates it
+with its connections checked like any other. DDL can own the hierarchy now
+instead of being a guest in it.
+
+That mattered more after the protocol changed than before it. Hand-wiring a
+`valid`/`ready` pair is something an RTL engineer does correctly from memory;
+hand-wiring a pair of gray-coded 2-bit salts at every boundary is not, and the
+failure mode is a design that looks connected and deadlocks. The protocol got
+better and the hand-written seam got worse in the same commit, which is exactly
+when the seam should stop being hand-written.
 
 ## 4. Phases
 
