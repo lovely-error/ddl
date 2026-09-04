@@ -43,7 +43,7 @@ fn split_stages(body: &[PrecSeqInnerStmt]) -> Vec<Vec<&PrecResInnerStmt>> {
 /// `let x = @rcv(p)`, the head stage's input.
 fn as_recv(stmt: &PrecResInnerStmt) -> Option<(String, String)> {
     let decl = match stmt {
-        PrecResInnerStmt::VarDecl(d) if d.rest.is_empty() => d,
+        PrecResInnerStmt::VarDecl(d) if d.names().len() == 1 => d,
         _ => return None,
     };
     let (base, args) = match decl.assign_val.as_ref()? {
@@ -56,7 +56,7 @@ fn as_recv(stmt: &PrecResInnerStmt) -> Option<(String, String)> {
     }
     match &args[0] {
         PrecResExpr::Ref(n) => Some((
-            anumspan_to_str(&decl.name).to_string(),
+            anumspan_to_str(&decl.head_name()).to_string(),
             anumspan_to_str(n).to_string(),
         )),
         _ => None,
@@ -84,7 +84,7 @@ fn defines(stage: &[&PrecResInnerStmt], recv_bind: Option<&String>) -> HashSet<S
     let mut out = HashSet::new();
     for stmt in stage {
         if let PrecResInnerStmt::VarDecl(d) = stmt {
-            out.insert(anumspan_to_str(&d.name).to_string());
+            out.extend(d.names().iter().map(|n| anumspan_to_str(n).to_string()));
         }
     }
     if let Some(b) = recv_bind {

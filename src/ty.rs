@@ -142,12 +142,12 @@ pub enum TyError {
     UnknownType(String),
     /// `i0` / `s0`, or a width that does not fit in u32.
     BadWidth(String),
-    /// Array length was not a constant.
-    NonConstArrayLen,
+    /// Array length that would not fold, and what stopped it.
+    BadArrayLen(ConstError),
+    /// Folded, and not a length: zero, or past what an index could address.
+    ArrayLenOutOfRange(u128),
     /// Arrays are parsed but not yet lowered.
     Unsupported(String),
-    /// `#[impl(...)]` naming something that is not a backing store.
-    UnknownImpl(String),
 }
 
 impl TyError {
@@ -158,14 +158,19 @@ impl TyError {
                 n
             ),
             TyError::BadWidth(n) => format!("`{}` has an invalid width", n),
-            TyError::NonConstArrayLen => {
-                "array length must be a constant known at compile time".to_string()
+            TyError::BadArrayLen(e) => format!("array length {}", e.reason()),
+            // Two ends, and they are different mistakes: nothing to hold, and
+            // more than an index could reach. One message covering both would
+            // be wrong at whichever end the reader was standing at.
+            TyError::ArrayLenOutOfRange(0) => {
+                "an array length of 0 holds nothing; it must be 1 or more".to_string()
             }
-            TyError::Unsupported(what) => format!("{} is not supported yet", what),
-            TyError::UnknownImpl(n) => format!(
-                "`{}` is not a memory implementation; expected `lutram`, `bram` or `bkram`",
-                n
+            TyError::ArrayLenOutOfRange(n) => format!(
+                "array length {} is past what an index can address; the limit is {}",
+                n,
+                u32::MAX
             ),
+            TyError::Unsupported(what) => format!("{} is not supported yet", what),
         }
     }
 
@@ -224,10 +229,10 @@ pub fn resolve_type_expr(expr: &PrecTypeExpr, syms: &Symbols) -> Result<Ty, TyEr
         }
         PrecTypeExpr::Array(elem, len) => {
             let elem = resolve_type_expr(elem, syms)?;
-            let len = const_eval(len).map_err(|_| TyError::NonConstArrayLen)?;
+            let len = const_eval(len).map_err(TyError::BadArrayLen)?;
             let len_is_usable = len > 0 && len <= u32::MAX as u128;
             if !len_is_usable {
-                return Err(TyError::NonConstArrayLen);
+                return Err(TyError::ArrayLenOutOfRange(len));
             }
             Ok(Ty::Array(Box::new(elem), len as u32))
         }
@@ -238,19 +243,12 @@ pub fn resolve_type_expr(expr: &PrecTypeExpr, syms: &Symbols) -> Result<Ty, TyEr
             if elem_ty.is_memory() {
                 return Err(TyError::Unsupported("a memory of memories".to_string()));
             }
-            let len = const_eval(len).map_err(|_| TyError::NonConstArrayLen)?;
+            let len = const_eval(len).map_err(TyError::BadArrayLen)?;
             let len_is_usable = len > 0 && len <= u32::MAX as u128;
             if !len_is_usable {
-                return Err(TyError::NonConstArrayLen);
+                return Err(TyError::ArrayLenOutOfRange(len));
             }
-            let kind_name = anumspan_to_str(kind);
-            let kind = match MemKind::parse(kind_name) {
-                Some(k) => k,
-                None => {
-                    return Err(TyError::UnknownImpl(kind_name.to_string()));
-                }
-            };
-            Ok(Ty::Mem { elem: Box::new(elem_ty), len: len as u32, kind })
+            Ok(Ty::Mem { elem: Box::new(elem_ty), len: len as u32, kind: *kind })
         }
     }
 }
@@ -262,6 +260,24 @@ pub enum ConstError {
     NotConstant,
     DivideByZero,
     Overflow,
+}
+
+impl ConstError {
+    /// Completes a sentence naming what was being folded: "array length ...",
+    /// "discriminant ...". The caller knows what it asked for and this knows
+    /// what became of it, and neither knows the other half.
+    ///
+    /// Worth keeping apart because they are different mistakes. `[i32; n]` is
+    /// waiting for a value the compiler does not have; `[i32; 8 / 0]` has every
+    /// value it needs and no answer. Reporting the second as the first sends a
+    /// reader looking for a runtime variable that is not there.
+    pub fn reason(&self) -> &'static str {
+        match self {
+            ConstError::NotConstant => "must be a constant known at compile time",
+            ConstError::DivideByZero => "divides by zero",
+            ConstError::Overflow => "overflows a 128-bit constant",
+        }
+    }
 }
 
 /// Folds an expression to a compile-time constant.
@@ -296,12 +312,14 @@ pub fn const_eval(expr: &PrecResExpr) -> Result<u128, ConstError> {
                 BuiltinOp::Add => a.checked_add(b).ok_or(ConstError::Overflow),
                 BuiltinOp::Sub => a.checked_sub(b).ok_or(ConstError::Overflow),
                 BuiltinOp::Mul => a.checked_mul(b).ok_or(ConstError::Overflow),
-                BuiltinOp::Div => {
-                    if b == 0 { Err(ConstError::DivideByZero) } else { Ok(a / b) }
-                }
-                BuiltinOp::Mod => {
-                    if b == 0 { Err(ConstError::DivideByZero) } else { Ok(a % b) }
-                }
+                // `checked_*` like the four around it, and not only for the
+                // symmetry: `/` and `%` by zero panic in every profile, so the
+                // guard is load-bearing, and on a signed type the hand-written
+                // `b == 0` would still miss `MIN / -1`, which overflows and
+                // panics too. This folds in `u128`, where that case does not
+                // exist -- but the spelling that cannot be wrong costs nothing.
+                BuiltinOp::Div => a.checked_div(b).ok_or(ConstError::DivideByZero),
+                BuiltinOp::Mod => a.checked_rem(b).ok_or(ConstError::DivideByZero),
                 BuiltinOp::Pow => {
                     let exp: u32 = b.try_into().map_err(|_| ConstError::Overflow)?;
                     a.checked_pow(exp).ok_or(ConstError::Overflow)

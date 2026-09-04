@@ -1312,7 +1312,7 @@ fn zeroed_takes_the_type_of_an_assignment_target() {
 // boundary: `src` carries the stimulus and `got` is "an item arrived this
 // cycle" -- which is exactly what a bare `go: i1` input used to mean, spelled
 // so the compiler owns the protocol. `o` is a `buffer out` because these are
-// observations of state, and a stream sink never stalls its producer.
+// observations of state.
 
 /// The header every register test uses, plus the receive that drives it.
 const PROC_IN: &str = concat!(
@@ -1607,9 +1607,9 @@ fn a_buffer_is_two_deep() {
 
 #[test]
 fn every_output_pipe_is_two_deep() {
-    // There is one kind of pipe now, so there is one depth: two entries.
-    // `stream` used to be the exception that stayed one deep, and the reason
-    // it is gone is that the exception was the lossy one.
+    // There is one kind of pipe, so there is one depth: two entries. A shallower
+    // one could not hold the item its producer had already committed to when
+    // the sink stalled, which is the whole reason the second entry is there.
     let v = compile(concat!(
         "process p (src: buffer in i32, o: buffer out i32)\n",
         "  let (x, got) = @try_rcv(src)\n",
@@ -1936,19 +1936,6 @@ fn neither_side_reaches_the_other_combinationally() {
 }
 
 #[test]
-fn a_stream_qualifier_is_refused_with_a_note_on_what_it_cost() {
-    // Recognised rather than deleted from the lexer: `dst: stream out i32`
-    // failing as an unrecognised type would blame the wrong word.
-    let text = compile_err(concat!(
-        "sequence s (src: buffer in i16, dst: stream out i32)\n",
-        "  let a = @rcv(src)\n",
-        "  @send(dst, @zext(a, 32))\n",
-    ));
-    assert!(text.contains("`stream out` is not a pipe kind; DDL has `buffer`"), "{}", text);
-    assert!(text.contains("A `buffer` holds two and stalls instead"), "{}", text);
-}
-
-#[test]
 fn the_item_leaving_is_registered_alongside_its_validity_bit() {
     // Without this the pipeline would offer the CURRENT input while
     // advertising the validity of one three cycles older.
@@ -2102,13 +2089,20 @@ fn a_narrow_index_is_widened_and_a_wide_one_is_refused() {
 
 #[test]
 fn an_unknown_impl_is_rejected() {
+    // The three backing stores are the whole of the annotation's grammar, so
+    // `sram` is a malformed type and the line does not parse. Past `#[` there
+    // is no other construct it could be, so the parser names what is wrong
+    // rather than leaving the driver to guess from the first word on the line.
     let text = compile_err(concat!(
         "process rf (addr: buffer in i5, rd: buffer out i32)\n",
         "  var vals: #[impl(sram)] [i32; 32] = @zeroed()\n",
         "  let (a, got) = @try_rcv(addr)\n",
         "  let _s = @try_send(rd, vals[a])\n",
     ));
-    assert!(text.contains("lutram"), "{}", text);
+    assert!(text.contains("`sram` is not a memory implementation"), "{}", text);
+    assert!(text.contains("`lutram`, `bram` or `bkram`"), "{}", text);
+    // At the kind, not at the statement the annotation happens to sit in.
+    assert!(text.contains("t.ddl:2:20"), "{}", text);
 }
 
 #[test]

@@ -231,12 +231,12 @@ had already committed to goes. A chain of blocks is therefore a chain of
 registers, not one combinational path as long as the chain. The depth cannot
 be changed.
 
-There was a second kind, `stream`, whose producer never waited because the
-oldest item was overwritten instead. It is gone. Overwriting is a dropped
-transfer, and a dropped transfer is not visible where it happens — it surfaces
-later and somewhere else as a machine one item out of step. Where a sink
-genuinely cannot refuse, the sink ties `ready` high and says so at the
-boundary, which puts the claim somewhere a reader can check.
+There is no lossy kind, and no way to ask for one. A pipe whose producer never
+waited would have to overwrite its oldest item when the sink fell behind, and
+an overwrite is a dropped transfer — not visible where it happens, but later
+and somewhere else, as a machine one item out of step. Where a sink genuinely
+cannot refuse, it ties `ready` high and says so at the boundary, which puts the
+claim somewhere a reader can check.
 
 **Combinators.** `@merge` and `@split` are modules the compiler writes:
 
@@ -302,7 +302,6 @@ Deliberately, with a diagnostic rather than a wrong answer:
 - a width annotation on an enum that carries payloads, which would name the tag
   and read as the value
 - reading a variant's payload without matching on its tag first
-- `stream` pipes, which the language had and no longer does
 - `bkram` memories, `~=`
 
 `desc.md` lists more that is designed but not built — `io process`, `pin`,
@@ -353,6 +352,31 @@ the house style predates it and adopting it would rewrite every file.
 Unit and integration tests: the compiler's own behaviour, `import` against
 real files on disk, that every example still compiles, and that the checked-in
 `.v` files match what the compiler produces now.
+
+Every checked-in `.v` is also linted, if Verilator is installed. That is an
+oracle needing no reference: it reads the output as a synthesis tool would and
+objects to width mismatches, inferred latches, undriven or multiply-driven
+nets, combinational loops and nets flopped on both edges -- none of which an
+assertion about the text can see, because it would have to know what to look
+for. The output is clean at `-Wall`, so anything not waived in
+`examples/lint.vlt` is a change in what the compiler emits. Verilator absent
+means the check says so and passes; a check that cannot run must not be a
+check that fails.
+
+On Linux and macOS the package manager's `verilator` needs no configuration.
+On Windows, MSYS2 has one, but its `verilator` is a Perl wrapper Git Bash's
+Perl cannot load and the binary beside it carries an MSYS2-internal data path,
+so both want saying:
+
+```bash
+pacman -S mingw-w64-x86_64-verilator      # in the MSYS2 shell
+export VERILATOR=/c/msys64/mingw64/bin/verilator_bin.exe
+export VERILATOR_ROOT=/c/msys64/mingw64/share/verilator
+```
+
+Under WSL it is an ordinary Linux install and neither variable applies. The
+paths above are environment on the machine that has it, not facts in this
+repository: `tests/lint.rs` knows only `$VERILATOR`, and falls back to PATH.
 
 Equivalence and area against the hand-written SystemVerilog these examples
 replace is a separate script, because it needs Questa and the Gowin toolchain:

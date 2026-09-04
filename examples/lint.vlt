@@ -1,0 +1,35 @@
+// Lint waivers for the generated Verilog, read by Verilator.
+//
+// Used by tests/lint.rs, which runs `verilator --lint-only -Wall` over every
+// example that DDL emits. The point of that gate is regressions: the output is
+// clean today, so any warning it does not waive here is something the compiler
+// started doing and did not used to.
+//
+// Every waiver below is a property of GENERATED code rather than a defect
+// being tolerated. A rule waived for convenience would defeat the gate, so
+// each one says why it cannot apply.
+`verilator_config
+
+// One `.v` holds every module the source file declared, and DDL flattens: a
+// `fun` is inlined at its call site, so several modules in one file commonly
+// instantiate none of each other and are all tops. examples/tagged.v has three.
+// Naming one with `--top-module` would leave the others unlinted, which is the
+// opposite of what this gate is for.
+lint_off -rule MULTITOP
+
+// An `extern` is by definition a module DDL did not compile -- the Verilog is
+// hand-written and lives outside the program. examples/fanout.v instantiates
+// `sink_ext`, and no file Verilator can be given will contain it.
+lint_off -rule MODMISSING
+
+// The module name is the DDL declaration's name and the file name is whatever
+// the build was asked to write. `ddl build a.ddl -o b.v` is a normal thing to
+// run, so these disagree by design.
+lint_off -rule DECLFILENAME
+
+// A pipe carries its payload type, and a consumer that reads one field of it
+// leaves the rest unread -- `reg_port`'s `cmd_item[7:1]` is a 1-bit command in
+// an 8-bit item. That is a fact about the DDL program, not about the lowering,
+// and the lowering has no business narrowing a declared type behind the
+// author's back.
+lint_off -rule UNUSEDSIGNAL

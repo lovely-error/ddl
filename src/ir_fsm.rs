@@ -160,7 +160,7 @@ impl<'a> State<'a> {
 /// Recognises `let x = @rcv(p)`.
 fn as_blocking_recv(stmt: &PrecResInnerStmt) -> Option<(String, String)> {
     let decl = match stmt {
-        PrecResInnerStmt::VarDecl(d) if d.rest.is_empty() => d,
+        PrecResInnerStmt::VarDecl(d) if d.names().len() == 1 => d,
         _ => return None,
     };
     let init = decl.assign_val.as_ref()?;
@@ -176,7 +176,7 @@ fn as_blocking_recv(stmt: &PrecResInnerStmt) -> Option<(String, String)> {
         PrecResExpr::Ref(n) => anumspan_to_str(n).to_string(),
         _ => return None,
     };
-    Some((anumspan_to_str(&decl.name).to_string(), pipe))
+    Some((anumspan_to_str(&decl.head_name()).to_string(), pipe))
 }
 
 /// Recognises `@send(p, v)`.
@@ -253,7 +253,7 @@ fn as_sync_read<'a>(
     sync_mem_of: &dyn Fn(&str) -> Option<usize>,
 ) -> Option<MemRead<'a>> {
     let decl = match stmt {
-        PrecResInnerStmt::VarDecl(d) if d.rest.is_empty() && !d.is_mutable => d,
+        PrecResInnerStmt::VarDecl(d) if d.names().len() == 1 && !d.is_mutable => d,
         _ => return None,
     };
     let sub = match decl.assign_val.as_ref()? {
@@ -268,7 +268,7 @@ fn as_sync_read<'a>(
     Some(MemRead {
         mem_ix,
         addr: &sub.index,
-        bind: anumspan_to_str(&decl.name).to_string(),
+        bind: anumspan_to_str(&decl.head_name()).to_string(),
     })
 }
 
@@ -339,8 +339,7 @@ impl Hoister<'_> {
             let name = self.fresh();
             pre.push(PrecResInnerStmt::VarDecl(crate::parse::VarDeclStmt {
                 is_mutable: false,
-                name,
-                rest: Vec::new(),
+                binding: crate::lex::VarBindingKind::PlainName(name),
                 ty_expr: None,
                 assign_val: Some(PrecResExpr::SubscriptAccess(Box::new(
                     crate::parse::SubscriptAccess { base: sub.base.clone(), index },
@@ -391,7 +390,7 @@ impl Hoister<'_> {
         // `let x = m[i]` on its own line is already a read state, spelled the
         // way the language documents it. Lifting it would only rename it.
         if let PrecResInnerStmt::VarDecl(d) = stmt
-            && d.rest.is_empty()
+            && d.names().len() == 1
             && !d.is_mutable
             && d.assign_val.as_ref().is_some_and(|e| self.is_sync_read(e))
         {
@@ -405,8 +404,7 @@ impl Hoister<'_> {
                 let assign_val = d.assign_val.as_ref().map(|e| self.expr(e, &mut pre));
                 PrecResInnerStmt::VarDecl(crate::parse::VarDeclStmt {
                     is_mutable: d.is_mutable,
-                    name: d.name,
-                    rest: d.rest.clone(),
+                    binding: d.binding.clone(),
                     ty_expr: d.ty_expr.clone(),
                     assign_val,
                 })
@@ -1103,7 +1101,10 @@ pub fn defines_of(st: &State) -> HashSet<String> {
     let mut out = HashSet::new();
     for stmt in st.stmts.iter().chain(st.post.iter()) {
         if let PrecResInnerStmt::VarDecl(d) = stmt {
-            out.insert(anumspan_to_str(&d.name).to_string());
+            // Every name, not just the first: a `let (x, got) = @try_rcv(p)`
+            // defines both, and a `got` read in a later state needs the same
+            // register `x` does.
+            out.extend(d.names().iter().map(|n| anumspan_to_str(n).to_string()));
         }
     }
     if let Some(b) = st.barrier.as_ref().and_then(|b| b.bind.as_ref()) {

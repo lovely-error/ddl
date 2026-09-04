@@ -428,7 +428,7 @@ fn finish_enum(
     let mut payload_width = 0u32;
 
     for variant in &decl.variants {
-        let payload = match &variant.payload {
+        let payload = match variant.payload() {
             Some(p) => p,
             None => continue,
         };
@@ -485,12 +485,12 @@ fn build_enum_shell(decl: &EnumDecl, sink: &mut DiagSink) -> Option<EnumShell> {
 
     for variant in &decl.variants {
         let vname = anumspan_to_str(&variant.name).to_string();
-        let discriminant = match &variant.discriminant {
+        let discriminant = match variant.discriminant() {
             None => next_discriminant,
             Some(expr) => match const_eval(expr) {
                 Ok(v) => v,
-                Err(_) => {
-                    sink.err_at(&variant.name, "discriminant must be a constant");
+                Err(e) => {
+                    sink.err_at(&variant.name, format!("discriminant {}", e.reason()));
                     return None;
                 }
             },

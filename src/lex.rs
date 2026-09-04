@@ -201,12 +201,40 @@ pub struct ITEStmt {
 #[derive(Debug, Clone)]
 pub struct VarDeclStmt {
     pub is_mutable: bool,
-    pub name: AlphanumSpan,
-    /// The remaining names of a tuple binding: `let (val, ok) = ...` puts
-    /// `val` in `name` and `ok` here. Empty for an ordinary declaration.
-    pub rest: Vec<AlphanumSpan>,
+    pub binding: VarBindingKind,
     pub ty_expr: Option<RawTypeExpr>,
     pub assign_val: Option<RawExpr>,
+}
+
+/// What a `let` or `var` writes on its left-hand side.
+///
+/// The two forms are not one form with an optional tail: a parenthesised
+/// pattern takes one name per result and an ordinary declaration takes one
+/// name for one value, and only the first can be wrong about how many results
+/// there are. Keeping them apart is what lets that be a diagnostic rather than
+/// an empty vector standing in for "no tuple here".
+#[derive(Debug, Clone)]
+pub enum VarBindingKind {
+    /// `let x = ...`
+    PlainName(AlphanumSpan),
+    /// `let (val, ok) = ...` -- one name per result, never empty: the parser
+    /// demands an identifier after the `(`.
+    TuplePattern(Vec<AlphanumSpan>),
+}
+
+impl VarBindingKind {
+    /// Every name bound, in source order.
+    pub fn names(&self) -> &[AlphanumSpan] {
+        match self {
+            VarBindingKind::PlainName(name) => core::slice::from_ref(name),
+            VarBindingKind::TuplePattern(names) => names,
+        }
+    }
+
+    /// The name a diagnostic about the declaration points at.
+    pub fn head(&self) -> AlphanumSpan {
+        self.names()[0]
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -303,7 +331,12 @@ pub enum RawTypeExpr {
     Array(Box<RawTypeExpr>, RawExpr),
     /// `#[impl(lutram)] [T; n]` -- an array that asks for a particular backing
     /// store rather than being a packed vector. desc.md:98.
-    MemArray { elem: Box<RawTypeExpr>, len: RawExpr, kind: AlphanumSpan },
+    ///
+    /// The kind is resolved here rather than carried as a span: there are
+    /// three of them and they are spelled out in the annotation, so a name
+    /// that is not one of them is a malformed type rather than a type whose
+    /// meaning is looked up later.
+    MemArray { elem: Box<RawTypeExpr>, len: RawExpr, kind: crate::ty::MemKind },
 }
 #[derive(Debug, Clone, Copy)]
 pub enum ArgTypeQualifier {
@@ -316,14 +349,6 @@ pub enum ArgTypeQualifier {
     /// it, and no back-pressure at all.
     PortIn,
     PortOut,
-    /// `stream in` / `stream out`, which the language no longer has.
-    ///
-    /// Still lexed, and refused during lowering with a message that says what
-    /// to write instead -- the same treatment `#[impl(bkram)]` gets. Deleting
-    /// it from the lexer instead would make `a: stream in i8` fail as an
-    /// unrecognised type, which blames the wrong word.
-    StreamIn,
-    StreamOut,
 }
 #[derive(Debug, Clone)]
 pub struct RawStructField {
@@ -339,11 +364,24 @@ pub struct RawStructDecl {
 #[derive(Debug, Clone)]
 pub struct RawEnumField {
     pub name: AlphanumSpan,
-    /// `= <const>`. Absent means one more than the previous variant, so the
-    /// common case of a dense enum needs no numbers at all.
-    pub discriminant: Option<RawExpr>,
-    /// `: T` payload, the tagged-union form
-    pub payload: Option<RawTypeExpr>,
+    /// What the variant carries, if the line says. Absent means a dense
+    /// enum's next value: one more than the variant above it, so the common
+    /// case needs no numbers at all.
+    pub value: Option<RawEnumFieldValueKind>,
+}
+
+/// What a variant's name may be followed by.
+///
+/// The two are alternatives rather than two optional halves: a tag value
+/// names the bits the variant IS, and a payload names the bits it carries
+/// beside a tag the compiler assigns. A variant that tried to say both would
+/// be fixing a number in a layout it does not control.
+#[derive(Debug, Clone)]
+pub enum RawEnumFieldValueKind {
+    /// `= <const>` -- an explicit tag value.
+    Numeric(RawExpr),
+    /// `(T)` -- a payload, the tagged-union form.
+    Datatype(RawTypeExpr),
 }
 #[derive(Debug, Clone)]
 pub struct RawEnumDecl {
@@ -402,21 +440,19 @@ pub enum RawGraphStmt {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PipeWord {
     Buffer,
-    /// Recognised only so lowering can say the language has no streams.
-    Stream,
     Missing,
 }
 
 #[derive(Debug)]
 pub struct RawGraphPipe {
     pub name: AlphanumSpan,
-    /// `stream` was written where `buffer` belongs, or neither word was.
+    /// Whether the `let` said `buffer`, or said nothing at all.
     ///
-    /// Parsed rather than rejected so that lowering can say which word is
-    /// missing and point at the line -- the parser has no diagnostics, and
+    /// A missing word is recorded rather than rejected so that lowering can
+    /// name it and point at the line -- the parser has no diagnostics, and
     /// failing here blames the whole `graph` declaration for a typo on one
     /// line of it.
-    pub said: PipeWord,
+    pub pipe_word: PipeWord,
     pub type_expr: RawTypeExpr,
 }
 
@@ -795,20 +831,6 @@ fn try_parse_arg_type_qualifier(
             char_ptr = new_ptr;
             break 'qualifier ArgTypeQualifier::Out
         }
-        let (is_stream, new_ptr) = strip_prefix_on_match(new_ptr, char_end_ptr, "stream ");
-        if is_stream {
-            let (is_in, ptr) = strip_prefix_on_match(new_ptr, char_end_ptr, "in ");
-            if is_in {
-                char_ptr = ptr;
-                break 'qualifier ArgTypeQualifier::StreamIn
-            }
-            let (is_out, ptr) = strip_prefix_on_match(new_ptr, char_end_ptr, "out ");
-            if is_out {
-                char_ptr = ptr;
-                break 'qualifier ArgTypeQualifier::StreamOut
-            }
-            return Err(());
-        }
         let (is_port, new_ptr) = strip_prefix_on_match(char_ptr, char_end_ptr, "port ");
         if is_port {
             let (is_in, ptr) = strip_prefix_on_match(new_ptr, char_end_ptr, "in ");
@@ -843,6 +865,17 @@ fn try_parse_arg_type_qualifier(
     Ok((qualifier, char_ptr))
 }
 
+/// The note under every `#[impl(...)]` failure.
+///
+/// The annotation is small enough that spelling the whole of it out is shorter
+/// than explaining which part of it went wrong.
+fn impl_note() -> Option<String> {
+    Some(
+        "an annotation is `#[impl(<kind>)] [T; n]`, where <kind> is `lutram`, `bram` or `bkram`"
+            .to_string(),
+    )
+}
+
 unsafe fn try_parse_type_expr(
     mut char_ptr: *const u8,
     char_end_ptr: *const u8,
@@ -852,35 +885,86 @@ unsafe fn try_parse_type_expr(
     // the type IS, not a property of the name it is given.
     let (is_annotated, new_ptr) = strip_prefix_on_match(char_ptr, char_end_ptr, "#[");
     if is_annotated {
+        // Past the `#[` this is an annotation and can be nothing else, so
+        // every failure below is a real mistake rather than "not this
+        // construct" -- which is what makes it worth naming. See
+        // `ParseDiagnosis`.
+        let at = char_ptr;
         char_ptr = new_ptr;
-        let (word, new_ptr) = try_parse_alphanum(char_ptr, char_end_ptr)?;
+        let (word, new_ptr) = match try_parse_alphanum(char_ptr, char_end_ptr) {
+            Ok(v) => v,
+            Err(()) => {
+                diagnose(at, "`#[` starts an annotation, which needs a name".to_string(), impl_note());
+                return Err(());
+            }
+        };
         char_ptr = new_ptr;
         // `impl` is the only annotation there is; anything else is a typo, and
         // silently ignoring it would silently ignore a memory shape request.
         let word_text = core::str::from_raw_parts(word.byte_ptr, word.len as usize);
         if word_text != "impl" {
+            diagnose(
+                word.byte_ptr,
+                format!("`{}` is not an annotation; `impl` is the only one", word_text),
+                impl_note(),
+            );
             return Err(());
         }
         let (open, new_ptr) = strip_prefix_on_match(char_ptr, char_end_ptr, "(");
         if !open {
+            diagnose(char_ptr, "`impl` names its backing store in brackets".to_string(), impl_note());
             return Err(());
         }
         char_ptr = new_ptr;
-        let (kind, new_ptr) = try_parse_alphanum(char_ptr, char_end_ptr)?;
+        let kind_at = char_ptr;
+        let (kind_name, new_ptr) = match try_parse_alphanum(char_ptr, char_end_ptr) {
+            Ok(v) => v,
+            Err(()) => {
+                diagnose(kind_at, "`impl` needs the name of a backing store".to_string(), impl_note());
+                return Err(());
+            }
+        };
         char_ptr = new_ptr;
+        // `lutram`, `bram` or `bkram` and nothing else. An unrecognised one is
+        // rejected here rather than carried along as a span, because there is
+        // no later stage that could give it a meaning.
+        let kind_text = core::str::from_raw_parts(kind_name.byte_ptr, kind_name.len as usize);
+        let Some(kind) = crate::ty::MemKind::parse(kind_text) else {
+            diagnose(
+                kind_at,
+                format!("`{}` is not a memory implementation", kind_text),
+                impl_note(),
+            );
+            return Err(());
+        };
         let (close, new_ptr) = strip_prefix_on_match(char_ptr, char_end_ptr, ")]");
         if !close {
+            diagnose(char_ptr, "an `impl` annotation closes with `)]`".to_string(), impl_note());
             return Err(());
         }
         char_ptr = new_ptr;
         let (_, new_ptr) = skip_whitespaces(char_ptr, char_end_ptr);
         char_ptr = new_ptr;
+        let arr_at = char_ptr;
         let (inner, new_ptr) = try_parse_type_expr(char_ptr, char_end_ptr)?;
         let (elem, len) = match inner {
             RawTypeExpr::Array(elem, len) => (elem, len),
             // `#[impl(bram)] i32` asks for a memory that holds one thing; the
             // annotation only means anything on an array.
-            _ => return Err(()),
+            _ => {
+                diagnose(
+                    arr_at,
+                    format!(
+                        "`#[impl({})]` asks for a backing store, so it needs an array",
+                        kind.display()
+                    ),
+                    Some(
+                        "write it as `#[impl(<kind>)] [T; n]`; a single value is a register and needs no store"
+                            .to_string(),
+                    ),
+                );
+                return Err(());
+            }
         };
         return Ok((RawTypeExpr::MemArray { elem, len, kind }, new_ptr));
     }
@@ -1459,9 +1543,8 @@ unsafe fn try_parse_var_decl_stmt(
 
     // `let (val, ok) = @try_rcv(p)`. A non-blocking receive answers with the
     // item and whether there was one
-    let mut rest: Vec<AlphanumSpan> = Vec::new();
     let (is_tuple, tail) = strip_prefix_on_match(char_ptr, char_end_ptr, "(");
-    let var_name;
+    let binding;
     if is_tuple {
         char_ptr = tail;
         let (_, tail) = skip_whitespaces(char_ptr, char_end_ptr);
@@ -1470,8 +1553,8 @@ unsafe fn try_parse_var_decl_stmt(
             Ok(val) => val,
             Err(_) => return Err(true),
         };
-        var_name = first;
         char_ptr = tail;
+        let mut names = vec![first];
         loop {
             let (_, tail) = skip_whitespaces(char_ptr, char_end_ptr);
             char_ptr = tail;
@@ -1486,7 +1569,7 @@ unsafe fn try_parse_var_decl_stmt(
                 Ok(val) => val,
                 Err(_) => return Err(true),
             };
-            rest.push(next);
+            names.push(next);
             char_ptr = tail;
         }
         let (closed, tail) = strip_prefix_on_match(char_ptr, char_end_ptr, ")");
@@ -1494,13 +1577,14 @@ unsafe fn try_parse_var_decl_stmt(
             return Err(true);
         }
         char_ptr = tail;
+        binding = VarBindingKind::TuplePattern(names);
     } else {
         let (name, tail) = match try_parse_alphanum(char_ptr, char_end_ptr) {
             Ok(val) => val,
             Err(_) => return Err(true),
         };
-        var_name = name;
         char_ptr = tail;
+        binding = VarBindingKind::PlainName(name);
     }
     let (_, tail) = skip_whitespaces(char_ptr, char_end_ptr);
     char_ptr = tail;
@@ -1541,8 +1625,7 @@ unsafe fn try_parse_var_decl_stmt(
     }
     let result = VarDeclStmt {
         is_mutable,
-        name: var_name,
-        rest,
+        binding,
         ty_expr,
         assign_val,
     };
@@ -2165,6 +2248,9 @@ pub unsafe fn try_parse_enum_decl(
 /// LB_EP1 = 6'b111111     -- variant with explicit associated value
 /// Some(i32)              -- variant with payload
 /// ```
+///
+/// The last two are alternatives. A line that writes both is not accepted
+/// here, and the caller's end-of-line check reports it against the line.
 unsafe fn try_parse_enum_field(
     mut char_ptr: *const u8,
     char_end_ptr: *const u8,
@@ -2180,7 +2266,7 @@ unsafe fn try_parse_enum_field(
     // be a third spelling of one idea, and would look like the tag width in
     // the line above it.
     let (has_payload, tail) = strip_prefix_on_match(char_ptr, char_end_ptr, "(");
-    let payload = if has_payload {
+    if has_payload {
         char_ptr = tail;
         let (_, tail) = skip_whitespaces(char_ptr, char_end_ptr);
         char_ptr = tail;
@@ -2195,26 +2281,35 @@ unsafe fn try_parse_enum_field(
         char_ptr = tail;
         let (_, tail) = skip_whitespaces(char_ptr, char_end_ptr);
         char_ptr = tail;
-        Some(ty)
+        let f = RawEnumField {
+            name: field_name,
+            value: Some(RawEnumFieldValueKind::Datatype(ty)),
+        };
+        return Ok((f, char_ptr));
+    }
+
+    // A `=` whose right-hand side is not an expression leaves `char_ptr` on
+    // the `=` rather than failing the field. The caller checks the line ended
+    // and blames where this stopped, so backtracking points at the `=` -- and
+    // failing here would point at the variant name, which is the one part that
+    // was fine. `A == B` is the case that matters: the `=` below matches the
+    // first half of it, and `= B` is not an expression.
+    let (has_value, tail) = strip_prefix_on_match(char_ptr, char_end_ptr, "=");
+    let value = if has_value {
+        let after_eq = tail;
+        let (_, tail) = skip_whitespaces(after_eq, char_end_ptr);
+        match try_parse_expr(tail, char_end_ptr, depth) {
+            Ok((expr, tail)) => {
+                char_ptr = tail;
+                Some(RawEnumFieldValueKind::Numeric(expr))
+            }
+            Err(()) => None,
+        }
     } else {
         None
     };
 
-    // `==` is a comparison, not a discriminant, so it must not match here.
-    let (is_eq_eq, _) = strip_prefix_on_match(char_ptr, char_end_ptr, "==");
-    let (has_discriminant, tail) = strip_prefix_on_match(char_ptr, char_end_ptr, "=");
-    let discriminant = if has_discriminant && !is_eq_eq {
-        char_ptr = tail;
-        let (_, tail) = skip_whitespaces(char_ptr, char_end_ptr);
-        char_ptr = tail;
-        let (expr, tail) = try_parse_expr(char_ptr, char_end_ptr, depth)?;
-        char_ptr = tail;
-        Some(expr)
-    } else {
-        None
-    };
-
-    let f = RawEnumField { name: field_name, discriminant, payload };
+    let f = RawEnumField { name: field_name, value };
     Ok((f, char_ptr))
 }
 /// # Safety
@@ -2405,13 +2500,58 @@ unsafe fn line_is_finished(mut char_ptr: *const u8, char_end_ptr: *const u8) -> 
 // blocks), and threading a depth through all of them to be checked in two
 // places is a lot of signature for one number.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 
 thread_local! {
     static NESTING: Cell<u32> = const { Cell::new(0) };
     /// Set when the limit is hit, so the failure reports as what it is rather
     /// than as whatever token happened to be next.
     static TOO_DEEP: Cell<bool> = const { Cell::new(false) };
+    /// The furthest failure a parser could name. See `ParseDiagnosis`.
+    static DIAGNOSED: RefCell<Option<ParseDiagnosis>> = const { RefCell::new(None) };
+}
+
+/// A failure a parser could name but could not return.
+///
+/// The parsers answer `Result<T, ()>`, so a failure carries a position at
+/// best and usually not even that. For most of them that is the right trade:
+/// they are tried speculatively, most failures are just "not this construct",
+/// and a message would be noise. A few are not like that -- once `#[impl(`
+/// has been read there is no other construct it could have been, so the
+/// parser knows exactly what is wrong and the reader deserves to be told.
+///
+/// Same shape as `TOO_DEEP`, and for the same reason: threading a diagnostic
+/// channel through every parser to carry the handful of failures that can be
+/// named would be a lot of signature for three messages.
+///
+/// Read only when the parse actually failed, and only when it sits at or past
+/// the position the parse gave up on -- so a diagnosis left behind by a
+/// speculative parse that some other parser went on to succeed at is never
+/// reported.
+pub struct ParseDiagnosis {
+    pub at: *const u8,
+    pub message: String,
+    pub note: Option<String>,
+}
+
+/// Records a named failure, keeping the furthest -- the same rule
+/// `note_body_fail` uses, and for the same reason.
+fn diagnose(at: *const u8, message: String, note: Option<String>) {
+    DIAGNOSED.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        let is_further = match &*slot {
+            None => true,
+            Some(d) => at as usize > d.at as usize,
+        };
+        if is_further {
+            *slot = Some(ParseDiagnosis { at, message, note });
+        }
+    });
+}
+
+/// The named failure from the last parse, if one was recorded.
+pub fn taken_diagnosis() -> Option<ParseDiagnosis> {
+    DIAGNOSED.with(|slot| slot.borrow_mut().take())
 }
 
 /// How deep the source may nest.
@@ -2443,9 +2583,12 @@ fn enter_nesting() -> Option<Nesting> {
     })
 }
 
-fn reset_nesting() {
+/// Clears everything the parser carries between calls rather than in its
+/// arguments. `parse_top_level` is the only caller, and calls it first.
+fn reset_parse_state() {
     NESTING.with(|n| n.set(0));
     TOO_DEEP.with(|f| f.set(false));
+    DIAGNOSED.with(|slot| *slot.borrow_mut() = None);
 }
 
 /// Whether the last parse gave up because the source nested too deeply.
@@ -2628,25 +2771,19 @@ unsafe fn try_parse_graph_pipe(
     let (_, tail) = skip_whitespaces(char_ptr, char_end_ptr);
     char_ptr = tail;
 
-    let (stream, tail) = strip_prefix_on_match(char_ptr, char_end_ptr, "stream ");
-    let said = if stream {
+    let (is_buffer, tail) = strip_prefix_on_match(char_ptr, char_end_ptr, "buffer ");
+    let pipe_word = if is_buffer {
         char_ptr = tail;
-        PipeWord::Stream
+        PipeWord::Buffer
     } else {
-        let (is_buffer, tail) = strip_prefix_on_match(char_ptr, char_end_ptr, "buffer ");
-        if is_buffer {
-            char_ptr = tail;
-            PipeWord::Buffer
-        } else {
-            PipeWord::Missing
-        }
+        PipeWord::Missing
     };
     let (_, tail) = skip_whitespaces(char_ptr, char_end_ptr);
     char_ptr = tail;
     let (type_expr, tail) = try_parse_type_expr(char_ptr, char_end_ptr)?;
     char_ptr = tail;
 
-    Ok((RawGraphPipe { name, said, type_expr }, char_ptr))
+    Ok((RawGraphPipe { name, pipe_word, type_expr }, char_ptr))
 }
 
 /// `Name(a, b, c)`.
@@ -2855,7 +2992,7 @@ pub unsafe fn parse_top_level(
     char_ptr: *const u8,
     length: u32,
 ) -> Result<Vec<TopLevelDecl>, ParseError> {
-    reset_nesting();
+    reset_parse_state();
     let mut items = Vec::new();
     let mut char_ptr = char_ptr;
     let end = unsafe { char_ptr.add(length as usize) };
@@ -3036,7 +3173,7 @@ fn seqv_parsing_test() {
 #[test]
 fn basic_stuff() {
     let str = concat!(
-        "process Name (arg1: stream out Ty)\n",
+        "process Name (arg1: buffer out Ty)\n",
         "   \n    \n",
         // "  let name: Ty = (x[a | b] << 132) * 172[1 + 2 .. a.b]\n",
         "  for i in 1..0\n",
@@ -3055,7 +3192,7 @@ fn basic_stuff() {
     assert_eq!(crate::parse::anumspan_to_str(&decl.name), "Name");
     assert!(matches!(
         decl.args.entries[0].qualifier,
-        ArgTypeQualifier::StreamOut
+        ArgTypeQualifier::BufferOut
     ));
     assert_eq!(decl.body.len(), 1, "the for-loop is the only statement");
     assert!(matches!(decl.body[0], InnerStmt::ForLoopStmt(_)));
@@ -3065,7 +3202,7 @@ fn basic_stuff() {
 fn w3() {
     use crate::lex::parse_top_level;
     let str = concat!(
-        "sequence Name (smth: stream in Ty)\n",
+        "sequence Name (smth: buffer in Ty)\n",
         "   \n    \n",
         // "  for i in 1..0\n",
         // "    let _ = \n",
@@ -3106,7 +3243,7 @@ fn line_comments_are_trivia() {
     // Every example in desc.md uses `--` comments; none of them parsed before.
     let src = concat!(
         "-- leading comment\n",
-        "process Name (arg1: stream in i1) -- trailing comment\n",
+        "process Name (arg1: buffer in i1) -- trailing comment\n",
         "  -- comment-only line, indented differently to the body\n",
         "        \n",
         "  let x = arg1 -- comment after code\n",
@@ -3123,7 +3260,7 @@ fn line_comments_are_trivia() {
 #[test]
 fn crlf_parses_the_same_as_lf() {
     let lf = concat!(
-        "process Name (arg1: stream in i1)\n",
+        "process Name (arg1: buffer in i1)\n",
         "  let x = arg1\n",
         "  return\n",
     );
@@ -3145,7 +3282,7 @@ fn crlf_parses_the_same_as_lf() {
 fn trailing_spaces_at_eof_do_not_read_past_the_buffer() {
     // skip_trivia used to dereference without re-testing for the end here.
     // Under Miri this was UB; in release it read whatever followed the string.
-    let src = "process Name (arg1: stream in i1)\n  return\n   ";
+    let src = "process Name (arg1: buffer in i1)\n  return\n   ";
     let _ = parse_str(src);
 }
 
@@ -3171,11 +3308,11 @@ fn break_demands_a_delimiter() {
 
 #[test]
 fn tabs_are_detected() {
-    let src = "process Name (a: stream in i1)\n\treturn\n";
+    let src = "process Name (a: buffer in i1)\n\treturn\n";
     let range = src.as_bytes().as_ptr_range();
     assert!(find_tab(range.start, range.end).is_some());
 
-    let src = "process Name (a: stream in i1)\n  return\n";
+    let src = "process Name (a: buffer in i1)\n  return\n";
     let range = src.as_bytes().as_ptr_range();
     assert!(find_tab(range.start, range.end).is_none());
 }
@@ -3188,7 +3325,7 @@ fn a_struct_parses_anywhere_not_only_first() {
     let src = concat!(
         "struct First\n",
         "  a: i1\n",
-        "process Name (p: stream in i1)\n",
+        "process Name (p: buffer in i1)\n",
         "  return\n",
         "struct Second\n",
         "  b: i1\n",

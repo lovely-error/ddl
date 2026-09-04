@@ -70,6 +70,20 @@ pub fn parse_source<'a>(map: &'a SourceMap) -> Result<Parsed<'a>, Vec<Diag>> {
                         )),
                 ]);
             }
+            // A parser that knew what was wrong said so. Only used when it
+            // sits at or past where the parse gave up, so a diagnosis left
+            // behind by a speculative parse some other parser then succeeded
+            // at is never what gets reported.
+            if let Some(d) = crate::lex::taken_diagnosis()
+                && d.at as usize >= err.at as usize
+            {
+                let diag = Diag::error(map.span_at_ptr(d.at), d.message);
+                return Err(vec![match d.note {
+                    Some(note) => diag.with_note(note),
+                    None => diag,
+                }]);
+            }
+
             let span = map.span_at_ptr(err.at);
             let offset = map.offset_of(err.at);
             let word: String = if offset >= map.len() {
@@ -122,7 +136,7 @@ fn a_kind(kind: &str) -> String {
 fn body_hint(kind: &str) -> &'static str {
     match kind {
         "graph" => "a graph body declares a pipe with `let <name>: buffer <T>`, or instantiates one with `Name(a, b)`",
-        "enum" => "an enum body names one variant per line, optionally with `(<payload type>)` or `= <discriminant>`",
+        "enum" => "an enum body names one variant per line, with either `(<payload type>)` or `= <discriminant>` after the name, and never both",
         "struct" => "a struct body names one field per line, as `<name>: <type>`",
         "sequence" => "a sequence body holds statements and `|||` stage cuts",
         _ => "a body holds one statement per line, indented past the declaration",
@@ -420,7 +434,7 @@ mod tests {
     #[test]
     fn a_parse_error_reports_a_real_location() {
         let src = concat!(
-            "process Good (a: stream in i1)\n",
+            "process Good (a: buffer in i1)\n",
             "  return\n",
             "\n",
             "gibberish Bad\n",
@@ -436,7 +450,7 @@ mod tests {
 
     #[test]
     fn tabs_are_rejected_with_an_explanation() {
-        let src = "process Name (a: stream in i1)\n\treturn\n";
+        let src = "process Name (a: buffer in i1)\n\treturn\n";
         let map = SourceMap::new("t.ddl", src);
         let diags = parse_source(&map).err().expect("tabs should be rejected");
         let text = map.render_all(&diags);
@@ -450,7 +464,7 @@ mod tests {
     fn a_clean_source_parses() {
         let src = concat!(
             "-- a comment, which desc.md uses everywhere\n",
-            "process Name (a: stream in i1)\n",
+            "process Name (a: buffer in i1)\n",
             "  let x = a\n",
             "  return\n",
         );
@@ -633,57 +647,5 @@ mod emit_tests {
             "  o = a[i]\n",
         ));
         assert!(v.contains("+: 1"), "{}", v);
-    }
-
-    #[test]
-    fn a_stream_parameter_is_refused() {
-        // What `stream out` was for -- a running count published for whoever
-        // is watching, where a reader that misses a sample loses nothing --
-        // and what it cost: a sink that fell behind lost a transfer and
-        // nothing said so. Anything whose loss changes the result wanted a
-        // `buffer`, and now everything does.
-        let text = compile_err(concat!(
-            "process event_counter (ev: buffer in i1, count: stream out i32)
-",
-            "  var seen: i32 = @zeroed()
-",
-            "  loop
-",
-            "    let (_e, happened) = @try_rcv(ev)
-",
-            "    if happened then
-",
-            "      seen = seen + 32'd1
-",
-            "    @try_send(count, seen)
-",
-        ));
-        assert!(text.contains("is not a pipe kind"), "{}", text);
-        assert!(text.contains("overwrote its oldest item"), "{}", text);
-    }
-
-    #[test]
-    fn a_stream_in_a_sequence_is_refused_too() {
-        // Both ends, and both declaration kinds: the qualifier is gone from
-        // the language rather than from one position in it.
-        let text = compile_err(concat!(
-            "sequence s (a: stream in i16, dst: buffer out i16)
-",
-            "  let x = @rcv(a)
-",
-            "  @send(dst, x)
-",
-        ));
-        assert!(text.contains("`stream in` is not a pipe kind"), "{}", text);
-
-        let text = compile_err(concat!(
-            "sequence s (src: buffer in i16, dst: stream out i16)
-",
-            "  let x = @rcv(src)
-",
-            "  @send(dst, x)
-",
-        ));
-        assert!(text.contains("`stream out` is not a pipe kind"), "{}", text);
     }
 }

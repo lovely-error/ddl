@@ -1,6 +1,6 @@
 use crate::lex::{
     AlphanumSpan, AssignStmtKind, BasicInfixOp, BindingPattern, InfixExprComponent, InnerStmt,
-    PostfixOp, RawArgDefTuple as RawArgTuple, RawExpr, RawProcessDecl, RawTypeExpr, StrLiteral, ArgTypeQualifier, RawFunctionDecl, RawSequenceDecl, RawSeqInnerStmt, RawStructDecl, RawEnumDecl, RawNum, UnaryOp, RawGraphDecl, RawGraphStmt
+    PostfixOp, RawArgDefTuple as RawArgTuple, RawExpr, RawProcessDecl, RawTypeExpr, StrLiteral, ArgTypeQualifier, RawFunctionDecl, RawSequenceDecl, RawSeqInnerStmt, RawStructDecl, RawEnumDecl, RawNum, UnaryOp, RawGraphDecl, RawGraphStmt, VarBindingKind, RawEnumFieldValueKind
 };
 
 
@@ -8,9 +8,9 @@ use crate::lex::{
 pub enum PrecTypeExpr {
     Ident(AlphanumSpan),
     Array(Box<PrecTypeExpr>, PrecResExpr),
-    /// `#[impl(lutram)] [T; n]`. The kind span is kept rather than resolved to
-    /// an enum here so an unknown one reports at its own source position.
-    MemArray { elem: Box<PrecTypeExpr>, len: PrecResExpr, kind: AlphanumSpan },
+    /// `#[impl(lutram)] [T; n]`, with the backing store already resolved --
+    /// the lexer will not build one for a name that is not a `MemKind`.
+    MemArray { elem: Box<PrecTypeExpr>, len: PrecResExpr, kind: crate::ty::MemKind },
 }
 
 #[derive(Debug, Clone)]
@@ -48,7 +48,7 @@ pub enum GraphStmt {
 pub struct GraphPipe {
     pub name: AlphanumSpan,
     /// Which word the `let` used, if any; lowering says what is wrong with it.
-    pub said: crate::lex::PipeWord,
+    pub pipe_word: crate::lex::PipeWord,
     pub ty: PrecTypeExpr,
 }
 
@@ -106,9 +106,34 @@ pub struct EnumDecl {
 #[derive(Debug)]
 pub struct EnumVariant {
     pub name: AlphanumSpan,
+    /// What the line said the variant carries, if it said anything.
+    pub value: Option<EnumVariantValueKind>,
+}
+
+/// The resolved form of `lex::RawEnumFieldValueKind`.
+#[derive(Debug)]
+pub enum EnumVariantValueKind {
     /// Resolved but not yet folded; const evaluation happens in ty.rs.
-    pub discriminant: Option<PrecResExpr>,
-    pub payload: Option<PrecTypeExpr>,
+    Numeric(PrecResExpr),
+    Datatype(PrecTypeExpr),
+}
+
+impl EnumVariant {
+    /// `= <const>`, if this variant pinned its tag value.
+    pub fn discriminant(&self) -> Option<&PrecResExpr> {
+        match &self.value {
+            Some(EnumVariantValueKind::Numeric(e)) => Some(e),
+            _ => None,
+        }
+    }
+
+    /// `(T)`, if this variant carries one.
+    pub fn payload(&self) -> Option<&PrecTypeExpr> {
+        match &self.value {
+            Some(EnumVariantValueKind::Datatype(t)) => Some(t),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -233,11 +258,21 @@ pub struct ITEStmt {
 #[derive(Debug, Clone)]
 pub struct VarDeclStmt {
     pub is_mutable: bool,
-    pub name: AlphanumSpan,
-    /// The remaining names of a tuple binding; see `lex::VarDeclStmt`.
-    pub rest: Vec<AlphanumSpan>,
+    pub binding: VarBindingKind,
     pub ty_expr: Option<PrecTypeExpr>,
     pub assign_val: Option<PrecResExpr>,
+}
+
+impl VarDeclStmt {
+    /// Every name bound, in source order.
+    pub fn names(&self) -> &[AlphanumSpan] {
+        self.binding.names()
+    }
+
+    /// The name a diagnostic about this declaration points at.
+    pub fn head_name(&self) -> AlphanumSpan {
+        self.binding.head()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -457,8 +492,7 @@ unsafe fn resolve_stmt(char_ptr: *const u8, stmt: &InnerStmt) -> Result<PrecResI
             };
             Ok(PrecResInnerStmt::VarDecl(VarDeclStmt {
                 is_mutable: var_decl_stmt.is_mutable,
-                name: var_decl_stmt.name,
-                rest: var_decl_stmt.rest.clone(),
+                binding: var_decl_stmt.binding.clone(),
                 ty_expr: tyval,
                 assign_val: aval,
             }))
@@ -982,7 +1016,7 @@ pub unsafe fn resolve_precedence_for_graph(
         let item = match item {
             RawGraphStmt::Pipe(pipe) => GraphStmt::Pipe(GraphPipe {
                 name: pipe.name,
-                said: pipe.said,
+                pipe_word: pipe.pipe_word,
                 ty: resolve_type(char_ptr, &pipe.type_expr)?,
             }),
             RawGraphStmt::Instance(inst) => GraphStmt::Instance(GraphInstance {
@@ -1032,15 +1066,16 @@ pub unsafe fn resolve_precedence_for_enum(
     };
     let mut variants = Vec::new();
     for field in &enum_decl.fields {
-        let discriminant = match &field.discriminant {
-            Some(e) => Some(resolve_precedence(char_ptr, e)?),
+        let value = match &field.value {
+            Some(RawEnumFieldValueKind::Numeric(e)) => {
+                Some(EnumVariantValueKind::Numeric(resolve_precedence(char_ptr, e)?))
+            }
+            Some(RawEnumFieldValueKind::Datatype(t)) => {
+                Some(EnumVariantValueKind::Datatype(resolve_type(char_ptr, t)?))
+            }
             None => None,
         };
-        let payload = match &field.payload {
-            Some(t) => Some(resolve_type(char_ptr, t)?),
-            None => None,
-        };
-        variants.push(EnumVariant { name: field.name, discriminant, payload });
+        variants.push(EnumVariant { name: field.name, value });
     }
     Ok(EnumDecl { name: enum_decl.name, tag_type, variants })
 }
@@ -1117,7 +1152,7 @@ fn t2() {
     // the numeric lexer rather than the member-access reassembly hack.
     use crate::lex::parse_top_level;
     let str = concat!(
-        "sequence Name (smth: stream in Ty)\n",
+        "sequence Name (smth: buffer in Ty)\n",
         "   \n    \n",
         "  let a = 0.717\n",
         "  let b = @try_rcv(smth).1\n",

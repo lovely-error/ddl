@@ -110,13 +110,13 @@ Two aspects:
       2. `@try_rcv` -> (T, i1) , if data item present, consume it (ok in seq & proc)
       3. `@rcv` -> T , blocking read (ok in proc, banned in seq)
       4. `@send` blocking send (ok in proc, banned in seq)
-   6. there was a second kind, `stream`, whose producer never stalled because
-      the oldest value was overwritten. REMOVED. Overwriting is a dropped
-      transfer, and a dropped transfer is not visible where it happens -- it
-      surfaces later and elsewhere as a machine one item out of step, which is
-      the failure mode this whole language exists to design out. A sink that
-      genuinely cannot refuse ties `ready` high at the boundary and says so,
-      which puts the claim where a reader can check it.
+   6. there is no lossy kind and no way to ask for one. A producer that never
+      stalled would overwrite its oldest value, and an overwrite is a dropped
+      transfer -- not visible where it happens, but later and elsewhere, as a
+      machine one item out of step, which is the failure mode this whole
+      language exists to design out. A sink that genuinely cannot refuse ties
+      `ready` high at the boundary and says so, which puts the claim where a
+      reader can check it.
    7. `buffer in T` read only pipe of Ts
    8. `buffer out T` write only pipe of Ts
 4. `port in T` / `port out T`

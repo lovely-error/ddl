@@ -398,3 +398,44 @@ fn a_write_target_is_not_lifted_as_a_read() {
     ));
     assert!(v.contains("m[i_r] <="), "{}", v);
 }
+
+// ---- what the annotation says when it is wrong ---------------------------
+//
+// Past the `#[` there is no other construct the text could be, so every
+// failure below is a real mistake rather than "not this one". The parser
+// answers `Result<T, ()>`, so it leaves the message behind for `parse_source`
+// to pick up rather than returning it.
+
+#[test]
+fn an_annotation_that_is_not_impl_names_itself() {
+    let text = compile_err(concat!(
+        "process p (rd: buffer out i32)\n",
+        "  var v: #[inline(lutram)] [i32; 4] = @zeroed()\n",
+        "  let _s = @try_send(rd, v[2'd0])\n",
+    ));
+    assert!(text.contains("`inline` is not an annotation"), "{}", text);
+    assert!(text.contains("t.ddl:2:12"), "{}", text);
+}
+
+#[test]
+fn an_annotation_on_a_single_value_says_it_wanted_an_array() {
+    // `#[impl(bram)] i32` asks for a memory holding one thing, which is a
+    // register with extra words.
+    let text = compile_err(concat!(
+        "process p (rd: buffer out i32)\n",
+        "  var v: #[impl(lutram)] i32 = @zeroed()\n",
+        "  let _s = @try_send(rd, v)\n",
+    ));
+    assert!(text.contains("needs an array"), "{}", text);
+    assert!(text.contains("a single value is a register"), "{}", text);
+}
+
+#[test]
+fn an_unclosed_annotation_points_at_where_the_bracket_belongs() {
+    let text = compile_err(concat!(
+        "process p (rd: buffer out i32)\n",
+        "  var v: #[impl(lutram] [i32; 4] = @zeroed()\n",
+        "  let _s = @try_send(rd, v[2'd0])\n",
+    ));
+    assert!(text.contains("closes with `)]`"), "{}", text);
+}

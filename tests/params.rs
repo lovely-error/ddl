@@ -3,11 +3,10 @@
 // `inout` is desc.md:57 -- by reference and readable, which is what lets a
 // helper update its argument instead of returning a new copy of it.
 //
-// The other half of this file used to be `stream`, a pipe whose producer was
-// never told to wait because the oldest item was overwritten instead. It is
-// gone from the language: a sink that fell behind lost a transfer and nothing
-// said so. What is left here is that the word is refused everywhere it used
-// to be accepted.
+// The rest of it is what a parameter may be qualified with. There is one pipe
+// kind and it always has back-pressure, so the list is short and everything
+// outside it is refused -- there is no lossy pipe to ask for and no spelling
+// that quietly gets you one.
 
 use ddl::diag::SourceMap;
 use ddl::driver::compile_to_verilog;
@@ -145,12 +144,16 @@ fn a_call_that_produces_nothing_says_so() {
     assert!(text.contains("produces nothing"), "{}", text);
 }
 
-// ---- what is no longer a pipe kind ---------------------------------------
+// ---- what is not a pipe kind ---------------------------------------------
 
 #[test]
-fn a_stream_is_refused_on_a_sequence() {
+fn an_unrecognised_pipe_qualifier_is_refused() {
+    // `buffer in`, `buffer out`, `port in`, `port out`, `in`, `out`, `inout`
+    // and nothing else. An unknown word ahead of the type is not silently a
+    // plain parameter: the qualifier parser falls through to `in`, the word
+    // itself is then read as the type, and what follows it has nowhere to go.
     let text = compile_err(concat!(
-        "sequence widen (src: buffer in i16, dst: stream out i32)
+        "sequence widen (src: buffer in i16, dst: fifo out i32)
 ",
         "  let a = @rcv(src)
 ",
@@ -161,35 +164,14 @@ fn a_stream_is_refused_on_a_sequence() {
         "  @send(dst, w)
 ",
     ));
-    assert!(text.contains("`stream out` is not a pipe kind; DDL has `buffer`"), "{}", text);
-}
-
-#[test]
-fn a_stream_is_refused_on_a_graph_parameter() {
-    // A graph's own ports go through their own path, so refusing the word on a
-    // process says nothing about refusing it here.
-    let text = compile_err(concat!(
-        "sequence dbl (src: buffer in i16, dst: buffer out i16)
-",
-        "  let a = @rcv(src)
-",
-        "  |||
-",
-        "  @send(dst, a + a)
-",
-        "graph g (src: stream in i16, dst: buffer out i16)
-",
-        "  dbl(src, dst)
-",
-    ));
-    assert!(text.contains("is not a pipe kind; DDL has `buffer`"), "{}", text);
+    assert!(text.contains("expected a top-level"), "{}", text);
 }
 
 #[test]
 fn every_pipe_has_all_three_legs() {
-    // The anti-vacuous half: `ready` used to be the leg a stream did not have,
-    // so its absence was a real difference in the emitted module. Now there is
-    // no shape of pipe that emits two legs.
+    // The anti-vacuous half: the test above says what is refused, and this
+    // says the thing that is accepted really does carry all three legs. There
+    // is no shape of pipe that emits two.
     let v = compile(concat!(
         "sequence widen (src: buffer in i16, dst: buffer out i32)
 ",

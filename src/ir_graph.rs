@@ -58,8 +58,8 @@ pub fn signature_of(name: &str, kind: &'static str, args: &PrecArgDefTuple, syms
         let is_input = match arg.qualifier {
             ArgTypeQualifier::BufferIn => true,
             ArgTypeQualifier::BufferOut => false,
-            // A constant parameter, a `stream`, or an error the callee will
-            // report. All three are reported against the callee itself.
+            // A constant parameter, or an error the callee will report. Both
+            // are reported against the callee itself.
             _ => continue,
         };
         let ty = match resolve_type_expr(&arg.type_expr, syms) {
@@ -160,13 +160,6 @@ pub fn lower_graph(
         let is_input = match arg.qualifier {
             ArgTypeQualifier::BufferIn => true,
             ArgTypeQualifier::BufferOut => false,
-            ArgTypeQualifier::StreamIn | ArgTypeQualifier::StreamOut => {
-                sink.push(crate::ir::stream_was_removed(
-                    map.span_of(&arg.arg_name),
-                    "stream",
-                ));
-                return None;
-            }
             _ => {
                 sink.push(
                     Diag::error(
@@ -233,12 +226,8 @@ pub fn lower_graph(
         // `buffer` is written out rather than assumed. `let mid: i16` is the
         // shape of a mistake people will make now that the keyword is `let`,
         // and a pipe declaration that names no kind reads as a wire.
-        match pipe.said {
+        match pipe.pipe_word {
             PipeWord::Buffer => {}
-            PipeWord::Stream => {
-                sink.push(crate::ir::stream_was_removed(map.span_of(&pipe.name), "stream"));
-                return None;
-            }
             PipeWord::Missing => {
                 sink.push(
                     Diag::error(

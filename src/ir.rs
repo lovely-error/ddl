@@ -592,23 +592,6 @@ pub enum ParamKind {
     Constant,
 }
 
-/// The one place that says what happened to `stream`.
-///
-/// It overwrote its oldest item when the sink fell behind, which is a dropped
-/// transfer -- and a dropped transfer is not visible where it happens. It
-/// surfaces much later as a machine that is one item out of step, which is the
-/// same class of failure as the response queue in k2g_membus.sv:10 going out
-/// of order. Every pipe carries back-pressure now, and a `buffer` is two
-/// entries deep with a registered `ready`, so declining to have back-pressure
-/// bought nothing that a slot did not.
-pub fn stream_was_removed(span: crate::diag::Span, what: &str) -> Diag {
-    Diag::error(span, format!("`{}` is not a pipe kind; DDL has `buffer`", what)).with_note(
-        "a `stream` overwrote its oldest item rather than making the producer \
-         wait, so a sink that fell behind lost a transfer and nothing said so. \
-         A `buffer` holds two and stalls instead",
-    )
-}
-
 /// `got`, narrowed to the branch the operation sat on.
 ///
 /// The pipe is only CLAIMED on that branch, so on any other one no transfer
@@ -630,14 +613,6 @@ pub fn classify_param(
     match arg.qualifier {
         ArgTypeQualifier::BufferIn => Some(ParamKind::Pipe { is_input: true }),
         ArgTypeQualifier::BufferOut => Some(ParamKind::Pipe { is_input: false }),
-        ArgTypeQualifier::StreamIn => {
-            sink.push(stream_was_removed(low.span_of(&arg.arg_name), "stream in"));
-            None
-        }
-        ArgTypeQualifier::StreamOut => {
-            sink.push(stream_was_removed(low.span_of(&arg.arg_name), "stream out"));
-            None
-        }
         ArgTypeQualifier::PortIn => Some(ParamKind::Port { is_input: true }),
         ArgTypeQualifier::PortOut => Some(ParamKind::Port { is_input: false }),
         ArgTypeQualifier::Inout => {
@@ -1264,7 +1239,7 @@ impl<'a> Lowerer<'a> {
         // a redundant mux into synthesis.
         // `x & 1'b1` and `x | 1'b0` are `x`. The generated handshake produces
         // both -- an input's readiness is an AND over output slots, and with a
-        // single stream output that identity is all there is.
+        // single output pipe that identity is all there is.
         if let Op::Bin { op: bin, lhs, rhs } = &op {
             let (bin, lhs, rhs) = (*bin, *lhs, *rhs);
             let identity = match bin {
@@ -1893,17 +1868,17 @@ pub fn lower_process(
             PrecResInnerStmt::VarDecl(d) if d.is_mutable => d,
             _ => break,
         };
-        let name = anumspan_to_str(&var_decl.name).to_string();
+        let name = anumspan_to_str(&var_decl.head_name()).to_string();
         let ty = match &var_decl.ty_expr {
             Some(t) => match resolve_type_expr(t, syms) {
                 Ok(t) => t,
                 Err(e) => {
-                    sink.err_at(&var_decl.name, e.message());
+                    sink.err_at(&var_decl.head_name(), e.message());
                     return None;
                 }
             },
             None => {
-                sink.err_at(&var_decl.name, "a register needs a declared type");
+                sink.err_at(&var_decl.head_name(), "a register needs a declared type");
                 return None;
             }
         };
@@ -1924,7 +1899,7 @@ pub fn lower_process(
             if kind == MemKind::BankedRam {
                 sink.push(
                     Diag::error(
-                        map.span_of(&var_decl.name),
+                        map.span_of(&var_decl.head_name()),
                         "`#[impl(bkram)]` is not supported yet",
                     )
                     .with_note(
@@ -1936,7 +1911,7 @@ pub fn lower_process(
             if kind == MemKind::BlockRam && !blocks_somewhere(&decl.body) {
                 sink.push(
                     Diag::error(
-                        map.span_of(&var_decl.name),
+                        map.span_of(&var_decl.head_name()),
                         "a `bram` read takes a cycle, and this process has no state to put it in",
                     )
                     .with_note(
@@ -1954,7 +1929,7 @@ pub fn lower_process(
                         _ => {
                             sink.push(
                                 Diag::error(
-                                    map.span_of(&var_decl.name),
+                                    map.span_of(&var_decl.head_name()),
                                     "a memory resets every element to the same constant",
                                 )
                                 .with_note(
@@ -1975,7 +1950,7 @@ pub fn lower_process(
             if kind == MemKind::BlockRam && reset.is_some() {
                 sink.push(
                     Diag::error(
-                        map.span_of(&var_decl.name),
+                        map.span_of(&var_decl.head_name()),
                         format!("`{}` is a block RAM, which cannot be reset", name),
                     )
                     .with_note(
@@ -1992,7 +1967,7 @@ pub fn lower_process(
         let init = match &var_decl.assign_val {
             Some(e) => e,
             None => {
-                sink.err_at(&var_decl.name, "a register needs a reset value");
+                sink.err_at(&var_decl.head_name(), "a register needs a reset value");
                 return None;
             }
         };
@@ -2001,7 +1976,7 @@ pub fn lower_process(
             Op::Const(k) => *k,
             _ => {
                 sink.err_at(
-                    &var_decl.name,
+                    &var_decl.head_name(),
                     "a register's reset value must be a constant",
                 );
                 return None;
@@ -2399,15 +2374,15 @@ fn lower_try_rcv_binding(
     env: &mut Env,
     sink: &mut DiagSink,
 ) -> Option<()> {
-    let takes_two = decl.rest.len() == 1;
+    let takes_two = decl.names().len() == 2;
     if !takes_two {
-        sink.err_at(&decl.name, "a tuple binding takes exactly two names here");
+        sink.err_at(&decl.head_name(), "a tuple binding takes exactly two names here");
         return None;
     }
     let init = match &decl.assign_val {
         Some(e) => e,
         None => {
-            sink.err_at(&decl.name, "a tuple binding needs an initialiser");
+            sink.err_at(&decl.head_name(), "a tuple binding needs an initialiser");
             return None;
         }
     };
@@ -2424,7 +2399,7 @@ fn lower_try_rcv_binding(
         _ => (init, None),
     };
     let Some(kind) = kind else {
-        sink.err_at(&decl.name, "only `@try_rcv(p)` and `@peek(p)` produce a pair");
+        sink.err_at(&decl.head_name(), "only `@try_rcv(p)` and `@peek(p)` produce a pair");
         return None;
     };
     let takes = kind == BuiltinOp::TryRecieve;
@@ -2432,7 +2407,7 @@ fn lower_try_rcv_binding(
     let pipe_name = match pipe_expr {
         PrecResExpr::Ref(n) => anumspan_to_str(n).to_string(),
         _ => {
-            sink.err_at(&decl.name, format!("`{}` needs a pipe name", what));
+            sink.err_at(&decl.head_name(), format!("`{}` needs a pipe name", what));
             return None;
         }
     };
@@ -2446,8 +2421,8 @@ fn lower_try_rcv_binding(
         // a pipe the answer is "did I TAKE one", which is false on a path that
         // did not run because nothing was claimed there. A port claims nothing
         // anywhere, so the honest answer is what the wire says.
-        let item = anumspan_to_str(&decl.name).to_string();
-        let got = anumspan_to_str(&decl.rest[0]).to_string();
+        let item = anumspan_to_str(&decl.head_name()).to_string();
+        let got = anumspan_to_str(&decl.names()[1]).to_string();
         env.insert(item, Binding::constant(port.data, port.ty));
         env.insert(got, Binding::constant(port.en, Ty::BOOL));
         return Some(());
@@ -2455,7 +2430,7 @@ fn lower_try_rcv_binding(
     if low.port_out_index(&pipe_name).is_some() {
         let verb = if takes { "received from" } else { "peeked at" };
         sink.err_at(
-            &decl.name,
+            &decl.head_name(),
             format!("`{}` is a `port out`; it cannot be {}", pipe_name, verb),
         );
         return None;
@@ -2464,20 +2439,20 @@ fn lower_try_rcv_binding(
     let ix = match low.pipes.iter().position(|p| p.name == pipe_name) {
         Some(i) => i,
         None => {
-            sink.err_at(&decl.name, format!("`{}` is not a pipe of this process", pipe_name));
+            sink.err_at(&decl.head_name(), format!("`{}` is not a pipe of this process", pipe_name));
             return None;
         }
     };
     if !low.pipes[ix].is_input {
         let verb = if takes { "received from" } else { "peeked at" };
         sink.err_at(
-            &decl.name,
+            &decl.head_name(),
             format!("`{}` is an `out` pipe; it cannot be {}", pipe_name, verb),
         );
         return None;
     }
     if takes && low.pipes[ix].used {
-        sink.err_at(&decl.name, format!("`{}` is received from more than once in one cycle", pipe_name));
+        sink.err_at(&decl.head_name(), format!("`{}` is received from more than once in one cycle", pipe_name));
         return None;
     }
 
@@ -2505,8 +2480,8 @@ fn lower_try_rcv_binding(
         v
     };
 
-    let item = anumspan_to_str(&decl.name).to_string();
-    let got = anumspan_to_str(&decl.rest[0]).to_string();
+    let item = anumspan_to_str(&decl.head_name()).to_string();
+    let got = anumspan_to_str(&decl.names()[1]).to_string();
     env.insert(item, Binding::constant(data, ty));
     env.insert(got, Binding::constant(answer, Ty::BOOL));
     Some(())
@@ -2549,7 +2524,7 @@ pub fn lower_stmts(
 /// and the line is what a reader needs to find the statement.
 pub fn stmt_anchor(stmt: &PrecResInnerStmt) -> Option<AlphanumSpan> {
     match stmt {
-        PrecResInnerStmt::VarDecl(d) => Some(d.name),
+        PrecResInnerStmt::VarDecl(d) => Some(d.head_name()),
         PrecResInnerStmt::AssignStmt(a) => expr_anchor(&a.lvalue).or_else(|| expr_anchor(&a.rvalue)),
         PrecResInnerStmt::CallStmt(c) => {
             expr_anchor(&c.base).or_else(|| c.args.iter().find_map(expr_anchor))
@@ -2616,12 +2591,12 @@ fn lower_stmt_at(
 ) -> Option<()> {
     match stmt {
         PrecResInnerStmt::VarDecl(decl) => {
-            let name = anumspan_to_str(&decl.name).to_string();
+            let name = anumspan_to_str(&decl.head_name()).to_string();
 
             // A tuple binding takes one name per result. There are two things
             // that produce several: `@try_rcv`, which answers with the item and
             // whether there was one, and a `fun` with several `out` parameters.
-            if !decl.rest.is_empty() {
+            if decl.names().len() > 1 {
                 let callee = match &decl.assign_val {
                     Some(PrecResExpr::Call { base, .. }) => match &**base {
                         PrecResExpr::Ref(n) => Some(*n),
@@ -2634,8 +2609,7 @@ fn lower_stmt_at(
                         Some(PrecResExpr::Call { args, .. }) => args.clone(),
                         _ => unreachable!("matched a call above"),
                     };
-                    let mut names = vec![decl.name];
-                    names.extend(decl.rest.iter().copied());
+                    let names = decl.names().to_vec();
                     return crate::ir_match::inline_call_multi(
                         low, &callee, &args, &names, env, sink,
                     );
@@ -2655,7 +2629,7 @@ fn lower_stmt_at(
                         .get(anumspan_to_str(callee))
                         .is_some_and(|sig| sig.inouts().next().is_some());
                     if has_inouts {
-                        let names = vec![decl.name];
+                        let names = vec![decl.head_name()];
                         return crate::ir_match::inline_call_multi(
                             low, callee, args, &names, env, sink,
                         );
@@ -2666,7 +2640,7 @@ fn lower_stmt_at(
                 Some(t) => match resolve_type_expr(t, low.syms) {
                     Ok(t) => Some(t),
                     Err(e) => {
-                        sink.err_at(&decl.name, e.message());
+                        sink.err_at(&decl.head_name(), e.message());
                         return None;
                     }
                 },
@@ -2675,7 +2649,7 @@ fn lower_stmt_at(
             if declared.as_ref().is_some_and(|t| t.is_memory()) {
                 sink.push(
                     Diag::error(
-                        low.span(&decl.name),
+                        low.span(&decl.head_name()),
                         format!("`{}` is a memory, which is state rather than a value", name),
                     )
                     .with_note(
@@ -2688,7 +2662,7 @@ fn lower_stmt_at(
                 Some(e) => e,
                 None => {
                     sink.err_at(
-                        &decl.name,
+                        &decl.head_name(),
                         "a binding in combinational logic must have an initialiser",
                     );
                     return None;
@@ -2703,7 +2677,7 @@ fn lower_stmt_at(
                         None => {
                             sink.push(
                                 Diag::error(
-                                    low.span(&decl.name),
+                                    low.span(&decl.head_name()),
                                     format!(
                                         "`{}` is declared `{}` but its initialiser is `{}`",
                                         name,
@@ -4289,8 +4263,11 @@ fn lower_builtin(
             let total = arg_ty.bit_width();
             let width = match const_eval(&args[2]) {
                 Ok(k) => k,
-                Err(_) => {
-                    sink.err_span(low.here(), "the width of a `@slice` must be a constant");
+                Err(e) => {
+                    sink.err_span(
+                        low.here(),
+                        format!("the width of a `@slice` {}", e.reason()),
+                    );
                     return None;
                 }
             };
@@ -4561,8 +4538,8 @@ fn cast_args(
     let value = lower_expr(low, &args[0], env, sink)?;
     let k = match const_eval(&args[1]) {
         Ok(k) => k,
-        Err(_) => {
-            sink.err_span(low.here(), "the second argument must be a constant");
+        Err(e) => {
+            sink.err_span(low.here(), format!("the second argument {}", e.reason()));
             return None;
         }
     };

@@ -424,3 +424,35 @@ fn exhaustiveness_still_counts_variants_not_bit_patterns() {
     ));
     assert!(text.contains("does not cover Write, Halt"), "{}", text);
 }
+
+#[test]
+fn a_variant_cannot_pin_a_tag_value_and_carry_a_payload() {
+    // The two forms are alternatives. A tag value names the bits the variant
+    // IS; a payload sits beside a tag the compiler assigns and whose width it
+    // picks, so a variant writing both would be fixing a number in a layout it
+    // does not control.
+    let text = compile_err(concat!(
+        "enum e\n",
+        "  A(i8) = 5\n",
+        "  B\n",
+        "fun f (x: e, o: out i1)\n",
+        "  o = 1'd1\n",
+    ));
+    assert!(text.contains("does not belong in an `enum` body"), "{}", text);
+    // It points at the `=`, which is the half that does not belong.
+    assert!(text.contains("t.ddl:2:9"), "{}", text);
+    assert!(text.contains("never both"), "{}", text);
+}
+
+#[test]
+fn a_discriminant_that_divides_by_zero_says_so() {
+    // Not "discriminant must be a constant": `8 / 0` is one, and has no value.
+    let text = compile_err(concat!(
+        "enum e\n",
+        "  A = 8 / 0\n",
+        "  B\n",
+        "fun f (x: e, o: out i1)\n",
+        "  o = 1'd1\n",
+    ));
+    assert!(text.contains("discriminant divides by zero"), "{}", text);
+}

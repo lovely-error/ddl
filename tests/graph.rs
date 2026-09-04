@@ -263,23 +263,24 @@ fn a_width_mismatch_at_an_instance_port_is_caught_here() {
 }
 
 #[test]
-fn a_stream_pipe_is_refused() {
-    // The two kinds used to have to agree at both ends of a pipe, because
-    // only one of them had a `ready`. There is one kind now, so the check is
-    // gone and the word is what is refused.
+fn a_pipe_naming_a_kind_that_does_not_exist_is_refused() {
+    // `buffer` is the only pipe kind, so a `let` naming another one is not a
+    // pipe declaration at all -- it does not reach the graph lowering, and the
+    // body-item loop blames the line rather than the `graph`.
     let text = compile_err(&format!(
         "{}{}",
         DBL,
         concat!(
             "graph g (src: buffer in i16, dst: buffer out i16)\n",
-            "  let mid: stream i16\n",
+            "  let mid: fifo i16\n",
             "  dbl(src, mid)\n",
             "  dbl(mid, dst)\n",
         )
     ));
-    assert!(text.contains("is not a pipe kind; DDL has `buffer`"), "{}", text);
+    assert!(text.contains("does not belong in a `graph` body"), "{}", text);
+    assert!(text.contains("`let <name>: buffer <T>`"), "{}", text);
     // It blames the line, not the whole `graph` declaration.
-    assert!(text.contains("let mid: stream i16"), "{}", text);
+    assert!(text.contains("let mid: fifo i16"), "{}", text);
 }
 
 #[test]
@@ -523,7 +524,8 @@ fn only_one_input_of_a_merge_is_granted() {
         )
     ));
     // Each input advances only on its OWN transfer. Advancing both would drop
-    // one of the two items, which is the failure `stream` was removed for.
+    // one of the two items, which is the failure the whole handshake exists to
+    // make impossible.
     assert!(v.contains("wire take0 = grant0 & push;"), "{}", v);
     assert!(v.contains("wire take1 = grant1 & push;"), "{}", v);
     assert!(v.contains("i0_rsalt_q <= (take0 ?"), "{}", v);

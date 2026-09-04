@@ -310,3 +310,57 @@ fn a_signed_base_is_refused() {
     let text = compile_err("fun ex (x: i32, b: s5, o: out i8)\n  o = @slice(x, b, 8)\n");
     assert!(text.contains("must be unsigned"), "{}", text);
 }
+
+// ---- what an unusable length says ----------------------------------------
+//
+// `const_eval` answers with WHY it could not fold, and these are the four
+// answers. They used to collapse into one -- "array length must be a constant
+// known at compile time" -- which is true of only the first: `8 / 0` is a
+// constant expression, and telling its author to make it constant sends them
+// looking for a runtime variable that is not there.
+
+#[test]
+fn a_length_that_divides_by_zero_says_so() {
+    let text = compile_err(concat!(
+        "process p (rd: buffer out i32)\n",
+        "  var vals: [i32; 8 / 0] = @zeroed()\n",
+        "  let _s = @try_send(rd, vals[3'd0])\n",
+    ));
+    assert!(text.contains("array length divides by zero"), "{}", text);
+    // The `%` beside it folds through the same guard.
+    let text = compile_err(concat!(
+        "process p (rd: buffer out i32)\n",
+        "  var vals: [i32; 8 % 0] = @zeroed()\n",
+        "  let _s = @try_send(rd, vals[3'd0])\n",
+    ));
+    assert!(text.contains("array length divides by zero"), "{}", text);
+}
+
+#[test]
+fn a_length_that_overflows_says_so() {
+    let text = compile_err(concat!(
+        "process p (rd: buffer out i32)\n",
+        "  var vals: [i32; 2 ** 200] = @zeroed()\n",
+        "  let _s = @try_send(rd, vals[3'd0])\n",
+    ));
+    assert!(text.contains("overflows"), "{}", text);
+}
+
+#[test]
+fn the_two_ends_of_an_unusable_length_read_differently() {
+    // Nothing to hold, and more than an index could reach. One message for
+    // both would be wrong at whichever end the reader was standing at.
+    let empty = compile_err(concat!(
+        "process p (rd: buffer out i32)\n",
+        "  var vals: [i32; 0] = @zeroed()\n",
+        "  let _s = @try_send(rd, vals[3'd0])\n",
+    ));
+    assert!(empty.contains("holds nothing"), "{}", empty);
+
+    let huge = compile_err(concat!(
+        "process p (rd: buffer out i32)\n",
+        "  var vals: [i32; 8000000000] = @zeroed()\n",
+        "  let _s = @try_send(rd, vals[3'd0])\n",
+    ));
+    assert!(huge.contains("past what an index can address"), "{}", huge);
+}
