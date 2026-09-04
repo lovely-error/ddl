@@ -3,5 +3,5 @@
 # renamed or removed between nightlies, and "it stopped building today" is not
 # a diagnosis anyone should have to make twice.
 [toolchain]
-channel = "nightly-2025-08-01"
+channel = "nightly-2026-06-25"
 components = ["rustfmt", "clippy"]
