@@ -11,16 +11,16 @@
 import "k2g_types.ddl"
 
 fun k2g_shift (
-    value: i32,          -- shift operand, and the BINS destination
-    src: i32,            -- BEXT source, and the BINS insert source
-    amount: i5,          -- shift amount, already masked to 5 bits
+    value: u32,          -- shift operand, and the BINS destination
+    src: u32,            -- BEXT source, and the BINS insert source
+    amount: u5,          -- shift amount, already masked to 5 bits
     shift_op: shift_e,
-    bm_start: i5,
-    bm_span: i5,
+    bm_start: u5,
+    bm_span: u5,
 
-    shift_result: out i32,
-    bext_result: out i32,
-    bins_result: out i32)
+    shift_result: out u32,
+    bext_result: out u32,
+    bins_result: out u32)
 
   -- ---- shifts ------------------------------------------------------------
   --
@@ -43,7 +43,7 @@ fun k2g_shift (
   -- A span of 32 would overflow a 5-bit field, so span is 0..31 by
   -- construction; span 0 yields an all-zero mask, which makes BINS a no-op --
   -- the defined behaviour (spec 5.8). BEXT with span 0 is caught in decode.
-  let span_mask: i32 = if bm_span == 5'd0
+  let span_mask: u32 = if bm_span == 5'd0
       then 32'd0
       else (32'd1 << bm_span) - 32'd1
 
@@ -53,7 +53,7 @@ fun k2g_shift (
   -- passed against wrong RTL.
   bext_result = (src >> bm_start) & span_mask
 
-  let placed_mask: i32 = span_mask << bm_start
-  let placed_src: i32 = (src & span_mask) << bm_start
+  let placed_mask: u32 = span_mask << bm_start
+  let placed_src: u32 = (src & span_mask) << bm_start
 
   bins_result = (value & ~placed_mask) | placed_src

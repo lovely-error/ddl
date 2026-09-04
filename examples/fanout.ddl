@@ -24,18 +24,18 @@
 -- SystemVerilog one. Its three ports per pipe are the ones every other module
 -- here has, so the hand-written file has one spelling to match.
 
-extern sink_ext (a: buffer in i32)
+extern sink_ext (a: buffer in u32)
 
-sequence scale (src: buffer in i32, dst: buffer out i32)
+sequence scale (src: buffer in u32, dst: buffer out u32)
   let x = @rcv(src)
   |||
-  let doubled: i32 = x + x
+  let doubled: u32 = x + x
   @send(dst, doubled)
 
-graph fanout (hi: buffer in i32, lo: buffer in i32, out_a: buffer out i32)
-  let picked: buffer i32
-  let scaled: buffer i32
-  let copy: buffer i32
+graph fanout (hi: buffer in u32, lo: buffer in u32, out_a: buffer out u32)
+  let picked: buffer u32
+  let scaled: buffer u32
+  let copy: buffer u32
 
   @merge(hi, lo, picked)
   scale(picked, scaled)

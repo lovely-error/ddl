@@ -305,7 +305,7 @@ mod tests {
 
     #[test]
     fn an_import_line_becomes_a_comment_of_the_same_length() {
-        let src = "import \"types.ddl\"\nfun f (o: out i1)\n  o = 1'd1\n";
+        let src = "import \"types.ddl\"\nfun f (o: out u1)\n  o = 1'd1\n";
         let (out, imports) = strip_imports(src);
 
         assert_eq!(out.len(), src.len(), "{:?}", out);
@@ -322,7 +322,7 @@ mod tests {
     fn an_indented_import_is_left_alone() {
         // Inside a block, `import` is an ordinary identifier and blanking the
         // line would silently delete code.
-        let src = "process p (a: buffer in i1)\n  import \"x.ddl\"\n";
+        let src = "process p (a: buffer in u1)\n  import \"x.ddl\"\n";
         let (out, imports) = strip_imports(src);
         assert_eq!(out, src);
         assert!(imports.is_empty());
@@ -360,7 +360,7 @@ mod tests {
 
     #[test]
     fn crlf_survives_blanking() {
-        let src = "import \"t.ddl\"\r\nfun f (o: out i1)\r\n";
+        let src = "import \"t.ddl\"\r\nfun f (o: out u1)\r\n";
         let (out, imports) = strip_imports(src);
         assert_eq!(out.len(), src.len());
         assert_eq!(imports.len(), 1);

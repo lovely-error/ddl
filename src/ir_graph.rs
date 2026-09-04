@@ -223,7 +223,7 @@ pub fn lower_graph(
                 return None;
             }
         };
-        // `buffer` is written out rather than assumed. `let mid: i16` is the
+        // `buffer` is written out rather than assumed. `let mid: u16` is the
         // shape of a mistake people will make now that the keyword is `let`,
         // and a pipe declaration that names no kind reads as a wire.
         match pipe.pipe_word {

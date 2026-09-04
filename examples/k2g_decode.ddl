@@ -22,34 +22,34 @@
 import "k2g_types.ddl"
 
 struct pfx_t
-  xi_valid: i1
-  xi_zext: i1              -- XIZEXT rather than XI (spec 4.1)
-  xi_value: i32            -- already sign- or zero-extended
+  xi_valid: u1
+  xi_zext: u1              -- XIZEXT rather than XI (spec 4.1)
+  xi_value: u32            -- already sign- or zero-extended
 
   cond: cond_kind_e
-  cond_reg: i5
-  cond_invert: i1
+  cond_reg: u5
+  cond_invert: u1
 
-  uto_valid: i1
-  uto_reg: i5
+  uto_valid: u1
+  uto_reg: u5
 
-  bmx_valid: i1
-  bm_start: i5
-  bm_span: i5
+  bmx_valid: u1
+  bm_start: u5
+  bm_span: u5
 
-  flag: i1
-  csp: i1
-  istore: i1
-  esp: i1
-  prefetch_d: i1
-  prefetch_i: i1
-  ordering: i1             -- any of LTL/SL/SS/SR: ignored, but recorded
+  flag: u1
+  csp: u1
+  istore: u1
+  esp: u1
+  prefetch_d: u1
+  prefetch_i: u1
+  ordering: u1             -- any of LTL/SL/SS/SR: ignored, but recorded
 
-  count: i4                -- prefix code points consumed
-  bytes: i32               -- total code point bytes consumed
+  count: u4                -- prefix code points consumed
+  bytes: u32               -- total code point bytes consumed
 
 -- LLC forms need trailing literal code points; the FSM waits for them.
-enum state_e: i2
+enum state_e: u2
   S_PREFIX
   S_LLC_HI
   S_LLC_LO
@@ -75,8 +75,8 @@ enum state_e: i2
 -- leave the accumulator holding prefixes from an abandoned path and decode the
 -- new stream as a continuation of it.
 struct cp_item_t
-  code: i16
-  restart: i1
+  code: u16
+  restart: u1
 
 process k2g_decode (
     -- The code point stream. `cps_valid` / `cps_ready` / `cps_data` are
@@ -98,9 +98,9 @@ process k2g_decode (
 
   var pfx: pfx_t = @zeroed()
   var state: state_e = S_PREFIX
-  var llc_dst: i5 = @zeroed()
+  var llc_dst: u5 = @zeroed()
   var llc_kind: rdt_e = RDT_U32
-  var llc_hi: i16 = @zeroed()
+  var llc_hi: u16 = @zeroed()
 
   -- The process is a program: it runs once and stops. `loop` is what makes
   -- it repeat, once per cycle, for as long as the design runs.
@@ -111,59 +111,59 @@ process k2g_decode (
     -- false on a cycle the sink is refusing -- which is exactly what
     -- `cp_valid && !hold` used to spell out.
     let (item, cp_valid) = @try_rcv(cps)
-    let cp: i16 = item.code
+    let cp: u16 = item.code
 
     -- The redirect rides with the code point that begins the new stream, so it
     -- cannot arrive out of order with it and cannot be lost.
-    let flushing: i1 = cp_valid & item.restart
+    let flushing: u1 = cp_valid & item.restart
 
     -- The register values as of this clock edge. The body mutates the registers
     -- freely; these are what gets restored when the update is not taken, which
     -- is how `hold` freezes the accumulator without suppressing the decode.
     let pfx_held: pfx_t = pfx
     let state_held: state_e = state
-    let llc_dst_held: i5 = llc_dst
+    let llc_dst_held: u5 = llc_dst
     let llc_kind_held: rdt_e = llc_kind
-    let llc_hi_held: i16 = llc_hi
-    let bytes_held: i32 = pfx.bytes
+    let llc_hi_held: u16 = llc_hi
+    let bytes_held: u32 = pfx.bytes
 
     -- ---- field extraction --------------------------------------------------
     let lb: lb_e = @cast(cp[15..10])
-    let arg1: i5 = cp[9..5]
-    let arg2: i5 = cp[4..0]
-    let imm10: i10 = cp[9..0]
+    let arg1: u5 = cp[9..5]
+    let arg2: u5 = cp[4..0]
+    let imm10: u10 = cp[9..0]
 
     -- ---- prefix classification ---------------------------------------------
     -- EP1 selects on arg2; EP2 escapes again and selects on arg1. Note the field
     -- swap between the two levels (spec 2).
-    let is_ep1: i1 = lb == LB_EP1
+    let is_ep1: u1 = lb == LB_EP1
     let ep1_op: ep1_e = @cast(arg2)
     let ep2_op: ep2_e = @cast(arg1)
-    let is_ep2: i1 = is_ep1 & (ep1_op == EP1_EP2)
-    let is_ep1_only: i1 = is_ep1 & !is_ep2
+    let is_ep2: u1 = is_ep1 & (ep1_op == EP1_EP2)
+    let is_ep1_only: u1 = is_ep1 & !is_ep2
 
-    let pfx_xi: i1 = (lb == LB_XI) | (lb == LB_XIZEXT)
-    let pfx_bmx: i1 = lb == LB_BMX_0_0
-    let pfx_xc: i1 = (lb == LB_XCP) | (lb == LB_XCN)
-    let pfx_uto: i1 = is_ep1_only & (ep1_op == EP1_UTO)
-    let pfx_order: i1 = is_ep1_only &
+    let pfx_xi: u1 = (lb == LB_XI) | (lb == LB_XIZEXT)
+    let pfx_bmx: u1 = lb == LB_BMX_0_0
+    let pfx_xc: u1 = (lb == LB_XCP) | (lb == LB_XCN)
+    let pfx_uto: u1 = is_ep1_only & (ep1_op == EP1_UTO)
+    let pfx_order: u1 = is_ep1_only &
         ((ep1_op == EP1_SS) | (ep1_op == EP1_SR) |
          (ep1_op == EP1_SL) | (ep1_op == EP1_LTL))
-    let pfx_esp: i1 = is_ep1_only & (ep1_op == EP1_ESP)
-    let pfx_flag: i1 = is_ep2 & (ep2_op == EP2_FLAG)
-    let pfx_csp: i1 = is_ep2 & (ep2_op == EP2_CSP)
-    let pfx_mpi: i1 = is_ep2 & (ep2_op == EP2_MPI)
-    let pfx_mpd: i1 = is_ep2 & (ep2_op == EP2_MPD)
-    let pfx_istore: i1 = is_ep2 & (ep2_op == EP2_ISTORE)
+    let pfx_esp: u1 = is_ep1_only & (ep1_op == EP1_ESP)
+    let pfx_flag: u1 = is_ep2 & (ep2_op == EP2_FLAG)
+    let pfx_csp: u1 = is_ep2 & (ep2_op == EP2_CSP)
+    let pfx_mpi: u1 = is_ep2 & (ep2_op == EP2_MPI)
+    let pfx_mpd: u1 = is_ep2 & (ep2_op == EP2_MPD)
+    let pfx_istore: u1 = is_ep2 & (ep2_op == EP2_ISTORE)
 
-    let is_prefix: i1 = pfx_xi | pfx_bmx | pfx_xc | pfx_uto | pfx_order |
+    let is_prefix: u1 = pfx_xi | pfx_bmx | pfx_xc | pfx_uto | pfx_order |
         pfx_esp | pfx_flag | pfx_csp | pfx_mpi | pfx_mpd | pfx_istore
 
     -- A condition code outside the assigned set makes XCP/XCN illegal. The
     -- emulator used to fall back to treating the code point as a main opcode,
     -- which then decoded as garbage; here it faults (spec 7).
     var xc_cond: cond_kind_e = CCK_NONE
-    var xc_cond_ok: i1 = 1'b1
+    var xc_cond_ok: u1 = 1'b1
     let cc: cc_e = @cast(arg2)
     match cc
       .CC_OVERFLOW_SET =>
@@ -182,30 +182,30 @@ process k2g_decode (
 
     -- ---- immediate assembly ------------------------------------------------
     -- XI sign-extends from bit 9, XIZEXT zero-extends (spec 4.1).
-    let imm10_sext: i32 = @concat(@rep(imm10[9], 22), imm10)
-    let imm10_zext: i32 = @concat(22'd0, imm10)
-    let xi_ext: i32 = if lb == LB_XI then imm10_sext else imm10_zext
+    let imm10_sext: u32 = @concat(@rep(imm10[9], 22), imm10)
+    let imm10_zext: u32 = @concat(22'd0, imm10)
+    let xi_ext: u32 = if lb == LB_XI then imm10_sext else imm10_zext
 
     -- Three different combining rules depending on the main opcode (spec 4).
-    let imm_alu: i32 = if pfx.xi_valid
+    let imm_alu: u32 = if pfx.xi_valid
         then @concat(pfx.xi_value[26..0], arg2)
         else @concat(@rep(arg2[4], 27), arg2)
-    let imm_mem: i32 = if pfx.xi_valid then pfx.xi_value else 32'd0
+    let imm_mem: u32 = if pfx.xi_valid then pfx.xi_value else 32'd0
 
     -- DISPI assembles a 20-bit displacement then shifts left by one. The
     -- extension follows the prefix that supplied it -- previously this
     -- sign-extended unconditionally, so XIZEXT could yield a negative
     -- displacement (spec 4.1).
-    let disp20: i20 = @concat(pfx.xi_value[9..0], imm10)
-    let disp_from_xi: i32 = if pfx.xi_zext
+    let disp20: u20 = @concat(pfx.xi_value[9..0], imm10)
+    let disp_from_xi: u32 = if pfx.xi_zext
         then @concat(12'd0, disp20)
         else @concat(@rep(disp20[19], 12), disp20)
-    let disp_ext: i32 = if pfx.xi_valid then disp_from_xi else imm10_sext
-    let disp_bytes: i32 = @concat(disp_ext[30..0], 1'b0)
+    let disp_ext: u32 = if pfx.xi_valid then disp_from_xi else imm10_sext
+    let disp_bytes: u32 = @concat(disp_ext[30..0], 1'b0)
 
     -- ---- main decode -------------------------------------------------------
     var main_uop: uop_t = @zeroed()
-    var main_is_llc: i1 = 1'b0
+    var main_is_llc: u1 = 1'b0
     var main_llc_kind: rdt_e = RDT_U32
 
     main_uop = @zeroed()
@@ -405,7 +405,7 @@ process k2g_decode (
 
     -- ---- next-state logic --------------------------------------------------
     var out_uop: uop_t = @zeroed()
-    var emit: i1 = 1'b0
+    var emit: u1 = 1'b0
 
     out_uop = @zeroed()
     emit = 1'b0
@@ -498,7 +498,7 @@ process k2g_decode (
     -- Mirrors the always_ff of k2g_decode.sv: `flush` abandons a partially
     -- accumulated instruction on a branch redirect and resets everything;
     -- otherwise nothing moves unless a code point is actually consumed.
-    let update: i1 = cp_valid
+    let update: u1 = cp_valid
 
     if flushing then
       pfx = @zeroed()

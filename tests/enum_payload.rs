@@ -32,12 +32,12 @@ fn compile_err(src: &str) -> String {
 /// Two bits of tag, and the widest payload is 16 bits, so `req_e` is 18.
 const REQ: &str = concat!(
     "struct addr_t\n",
-    "  page: i8\n",
-    "  off: i8\n",
+    "  page: u8\n",
+    "  off: u8\n",
     "enum req_e\n",
     "  Nop\n",
     "  Read(addr_t)\n",
-    "  Write(i8)\n",
+    "  Write(u8)\n",
     "  Halt\n",
 );
 
@@ -63,8 +63,8 @@ fn a_match_reads_the_tag_and_only_the_tag() {
         "{}{}",
         REQ,
         concat!(
-            "fun kind_of (r: req_e, o: out i2)\n",
-            "  var k: i2 = 2'd0\n",
+            "fun kind_of (r: req_e, o: out u2)\n",
+            "  var k: u2 = 2'd0\n",
             "  match r\n",
             "    .Nop =>\n",
             "      k = 2'd0\n",
@@ -87,8 +87,8 @@ fn a_payload_binding_is_the_low_bits_at_its_own_width() {
         "{}{}",
         REQ,
         concat!(
-            "fun payload (r: req_e, o: out i16)\n",
-            "  var v: i16 = @zeroed()\n",
+            "fun payload (r: req_e, o: out u16)\n",
+            "  var v: u16 = @zeroed()\n",
             "  match r\n",
             "    .Read a =>\n",
             "      v = @cast(a)\n",
@@ -99,7 +99,7 @@ fn a_payload_binding_is_the_low_bits_at_its_own_width() {
             "  o = v\n",
         )
     ));
-    // `addr_t` is 16 bits and `i8` is 8, and each arm takes exactly its own.
+    // `addr_t` is 16 bits and `u8` is 8, and each arm takes exactly its own.
     assert!(v.contains("r[15:0]"), "{}", v);
     assert!(v.contains("= r[7:0];"), "{}", v);
 }
@@ -112,8 +112,8 @@ fn a_struct_payload_keeps_its_fields() {
         "{}{}",
         REQ,
         concat!(
-            "fun page_of (r: req_e, o: out i8)\n",
-            "  var p: i8 = @zeroed()\n",
+            "fun page_of (r: req_e, o: out u8)\n",
+            "  var p: u8 = @zeroed()\n",
             "  match r\n",
             "    .Read a =>\n",
             "      p = a.page\n",
@@ -134,7 +134,7 @@ fn a_variant_is_built_with_its_payload() {
         "{}{}",
         REQ,
         concat!(
-            "fun mk (p: i8, off: i8, o: out req_e)\n",
+            "fun mk (p: u8, off: u8, o: out req_e)\n",
             "  o = Read(addr_t(p, off))\n",
         )
     ));
@@ -151,7 +151,7 @@ fn a_narrow_payload_is_padded_below_itself() {
         "{}{}",
         REQ,
         concat!(
-            "fun mk (d: i8, o: out req_e)\n",
+            "fun mk (d: u8, o: out req_e)\n",
             "  o = Write(d)\n",
         )
     ));
@@ -177,16 +177,16 @@ fn a_payload_free_variant_is_its_tag_shifted_up() {
 
 #[test]
 fn a_tagged_union_may_not_be_given_a_width() {
-    // `enum req_e: i2` reads as "two bits wide" and the value is 18, because
+    // `enum req_e: u2` reads as "two bits wide" and the value is 18, because
     // the payload sits under the tag. Reading the number as the TAG width
     // instead is worse: the same syntax would mean the whole value for one
     // enum and part of it for the next, and a struct field budgeted from the
     // declaration would be short by the width of the payload.
     let text = compile_err(concat!(
         "struct addr_t\n",
-        "  page: i8\n",
-        "  off: i8\n",
-        "enum req_e: i2\n",
+        "  page: u8\n",
+        "  off: u8\n",
+        "enum req_e: u2\n",
         "  Nop\n",
         "  Read(addr_t)\n",
         "  Halt\n",
@@ -202,8 +202,8 @@ fn refusing_the_width_does_not_cascade() {
     // The enum is still registered with its derived width, so everything
     // naming it resolves and the annotation is the only complaint.
     let text = compile_err(concat!(
-        "enum e_t: i4\n",
-        "  X(i8)\n",
+        "enum e_t: u4\n",
+        "  X(u8)\n",
         "  Y\n",
         "fun f (x: e_t, o: out e_t)\n",
         "  o = x\n",
@@ -218,10 +218,10 @@ fn a_width_on_an_enum_with_no_payloads_is_still_honoured() {
     // still the width of the value, which is what k2g_types.ddl depends on to
     // match its SystemVerilog counterpart.
     let v = compile(concat!(
-        "enum fault_e: i5\n",
+        "enum fault_e: u5\n",
         "  NONE\n",
         "  BAD\n",
-        "fun f (x: fault_e, o: out i1)\n",
+        "fun f (x: fault_e, o: out u1)\n",
         "  o = x == BAD\n",
     ));
     assert!(v.contains("input  [4:0] x,"), "{}", v);
@@ -232,12 +232,12 @@ fn an_enum_with_no_payloads_is_unchanged() {
     // The whole point of shifting by the payload width is that it is zero when
     // there are no payloads, so nothing that worked before moves.
     let v = compile(concat!(
-        "enum op_e: i2\n",
+        "enum op_e: u2\n",
         "  ADD\n",
         "  SUB\n",
         "  AND_\n",
         "  OR_\n",
-        "fun f (o: op_e, r: out i1)\n",
+        "fun f (o: op_e, r: out u1)\n",
         "  r = o == SUB\n",
     ));
     assert!(v.contains("assign r = (o == 2'd1);"), "{}", v);
@@ -254,10 +254,10 @@ fn a_payload_may_name_a_struct_declared_after_it() {
         "  X(later_t)\n",
         "  Y\n",
         "struct later_t\n",
-        "  a: i8\n",
-        "  b: i8\n",
-        "fun f (x: e_t, o: out i8)\n",
-        "  var v: i8 = @zeroed()\n",
+        "  a: u8\n",
+        "  b: u8\n",
+        "fun f (x: e_t, o: out u8)\n",
+        "  var v: u8 = @zeroed()\n",
         "  match x\n",
         "    .X p =>\n",
         "      v = p.a\n",
@@ -272,10 +272,10 @@ fn a_payload_may_name_a_struct_declared_after_it() {
 fn a_struct_field_may_name_a_payload_carrying_enum() {
     let v = compile(concat!(
         "enum e_t\n",
-        "  X(i8)\n",
+        "  X(u8)\n",
         "  Y\n",
         "struct wrap_t\n",
-        "  tag: i4\n",
+        "  tag: u4\n",
         "  inner: e_t\n",
         "fun f (w: wrap_t, o: out e_t)\n",
         "  o = w.inner\n",
@@ -294,7 +294,7 @@ fn a_payload_that_contains_its_own_enum_cannot_be_sized() {
         "enum e_t\n",
         "  X(s_t)\n",
         "  Y\n",
-        "fun f (x: e_t, o: out i1)\n",
+        "fun f (x: e_t, o: out u1)\n",
         "  o = 1'd0\n",
     ));
     assert!(text.contains("cannot be sized"), "{}", text);
@@ -310,7 +310,7 @@ fn a_payload_naming_nothing_still_reads_as_a_typo() {
         "enum e_t\n",
         "  X(nosuch_t)\n",
         "  Y\n",
-        "fun f (x: e_t, o: out i1)\n",
+        "fun f (x: e_t, o: out u1)\n",
         "  o = 1'd0\n",
     ));
     assert!(text.contains("`nosuch_t` is not a type"), "{}", text);
@@ -326,7 +326,7 @@ fn comparing_a_tagged_union_compares_its_payload_too() {
         "{}{}",
         REQ,
         concat!(
-            "fun is_nop (r: req_e, o: out i1)\n",
+            "fun is_nop (r: req_e, o: out u1)\n",
             "  o = r == Nop\n",
         )
     ));
@@ -354,7 +354,7 @@ fn a_variant_that_carries_nothing_takes_no_arguments() {
         "{}{}",
         REQ,
         concat!(
-            "fun mk (d: i8, o: out req_e)\n",
+            "fun mk (d: u8, o: out req_e)\n",
             "  o = Nop(d)\n",
         )
     ));
@@ -367,11 +367,11 @@ fn a_payload_of_the_wrong_type_is_caught() {
         "{}{}",
         REQ,
         concat!(
-            "fun mk (d: i16, o: out req_e)\n",
+            "fun mk (d: u16, o: out req_e)\n",
             "  o = Write(d)\n",
         )
     ));
-    assert!(text.contains("carries a `i8` but a `i16` was given"), "{}", text);
+    assert!(text.contains("carries a `u8` but a `u16` was given"), "{}", text);
 }
 
 #[test]
@@ -380,8 +380,8 @@ fn binding_a_payload_a_variant_does_not_have_is_an_error() {
         "{}{}",
         REQ,
         concat!(
-            "fun f (r: req_e, o: out i8)\n",
-            "  var v: i8 = @zeroed()\n",
+            "fun f (r: req_e, o: out u8)\n",
+            "  var v: u8 = @zeroed()\n",
             "  match r\n",
             "    .Nop x =>\n",
             "      v = 8'd0\n",
@@ -398,9 +398,9 @@ fn a_memory_cannot_be_a_payload() {
     // It is storage rather than a value, so there is nothing to pack.
     let text = compile_err(concat!(
         "enum e_t\n",
-        "  X(#[impl(lutram)] [i8; 4])\n",
+        "  X(#[impl(lutram)] [u8; 4])\n",
         "  Y\n",
-        "fun f (x: e_t, o: out i1)\n",
+        "fun f (x: e_t, o: out u1)\n",
         "  o = 1'd0\n",
     ));
     assert!(text.contains("a memory cannot be an enum payload"), "{}", text);
@@ -412,8 +412,8 @@ fn exhaustiveness_still_counts_variants_not_bit_patterns() {
         "{}{}",
         REQ,
         concat!(
-            "fun f (r: req_e, o: out i2)\n",
-            "  var k: i2 = 2'd0\n",
+            "fun f (r: req_e, o: out u2)\n",
+            "  var k: u2 = 2'd0\n",
             "  match r\n",
             "    .Nop =>\n",
             "      k = 2'd0\n",
@@ -433,9 +433,9 @@ fn a_variant_cannot_pin_a_tag_value_and_carry_a_payload() {
     // does not control.
     let text = compile_err(concat!(
         "enum e\n",
-        "  A(i8) = 5\n",
+        "  A(u8) = 5\n",
         "  B\n",
-        "fun f (x: e, o: out i1)\n",
+        "fun f (x: e, o: out u1)\n",
         "  o = 1'd1\n",
     ));
     assert!(text.contains("does not belong in an `enum` body"), "{}", text);
@@ -451,7 +451,7 @@ fn a_discriminant_that_divides_by_zero_says_so() {
         "enum e\n",
         "  A = 8 / 0\n",
         "  B\n",
-        "fun f (x: e, o: out i1)\n",
+        "fun f (x: e, o: out u1)\n",
         "  o = 1'd1\n",
     ));
     assert!(text.contains("discriminant divides by zero"), "{}", text);

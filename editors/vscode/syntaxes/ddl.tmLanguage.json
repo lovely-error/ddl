@@ -89,8 +89,8 @@
       "name": "constant.numeric.ddl"
     },
     "type": {
-      "comment": "`iN` unsigned, `sN` signed, at any width.",
-      "match": "\\b([is][0-9]+)\\b",
+      "comment": "`uN` unsigned, `iN` signed, at any width.",
+      "match": "\\b([iu][0-9]+)\\b",
       "name": "support.type.ddl"
     },
     "variant-pattern": {

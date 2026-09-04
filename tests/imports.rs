@@ -48,17 +48,17 @@ fn build(roots: &[String], search: Vec<PathBuf>) -> Result<String, String> {
     compile_to_verilog(&map, &EmitOptions::default()).map_err(|d| map.render_all(&d))
 }
 
-const ADDER: &str = "fun adder (a: i8, b: i8, sum: out i8)\n  sum = a + b\n";
+const ADDER: &str = "fun adder (a: u8, b: u8, sum: out u8)\n  sum = a + b\n";
 
 #[test]
 fn an_imported_declaration_is_visible_without_being_named() {
     // There are no namespaces: an import says "this file is part of the
     // program", and everything in it is in scope everywhere.
     let s = Scratch::new("basic");
-    s.write("types.ddl", "enum op_e: i2\n  OP_ADD\n  OP_SUB\n");
+    s.write("types.ddl", "enum op_e: u2\n  OP_ADD\n  OP_SUB\n");
     let main = s.write(
         "main.ddl",
-        "import \"types.ddl\"\n\nfun pick (o: op_e, r: out i1)\n  r = o == OP_SUB\n",
+        "import \"types.ddl\"\n\nfun pick (o: op_e, r: out u1)\n  r = o == OP_SUB\n",
     );
 
     let v = build(&[main], Vec::new()).expect("should compile");
@@ -75,7 +75,7 @@ fn an_import_resolves_against_the_importing_file_not_the_working_directory() {
     s.write("lib/mid.ddl", "import \"helper.ddl\"\n");
     let main = s.write(
         "main.ddl",
-        "import \"lib/mid.ddl\"\n\nfun use_it (a: i8, o: out i8)\n  o = adder(a, 8'd1)\n",
+        "import \"lib/mid.ddl\"\n\nfun use_it (a: u8, o: out u8)\n  o = adder(a, 8'd1)\n",
     );
 
     let v = build(&[main], Vec::new()).expect("should compile");
@@ -90,7 +90,7 @@ fn a_search_directory_is_the_fallback() {
     s.write("vendor/lib.ddl", ADDER);
     let main = s.write(
         "main.ddl",
-        "import \"lib.ddl\"\n\nfun use_it (a: i8, o: out i8)\n  o = adder(a, 8'd1)\n",
+        "import \"lib.ddl\"\n\nfun use_it (a: u8, o: out u8)\n  o = adder(a, 8'd1)\n",
     );
 
     let err = build(std::slice::from_ref(&main), Vec::new()).expect_err("not findable yet");
@@ -106,14 +106,14 @@ fn a_file_reached_twice_is_included_once() {
     // be a duplicate-declaration error, which is exactly the failure mode the
     // `cat` build had.
     let s = Scratch::new("diamond");
-    s.write("types.ddl", "enum op_e: i2\n  OP_ADD\n  OP_SUB\n");
+    s.write("types.ddl", "enum op_e: u2\n  OP_ADD\n  OP_SUB\n");
     s.write(
         "left.ddl",
-        "import \"types.ddl\"\n\nfun is_add (o: op_e, r: out i1)\n  r = o == OP_ADD\n",
+        "import \"types.ddl\"\n\nfun is_add (o: op_e, r: out u1)\n  r = o == OP_ADD\n",
     );
     s.write(
         "right.ddl",
-        "import \"types.ddl\"\n\nfun is_sub (o: op_e, r: out i1)\n  r = o == OP_SUB\n",
+        "import \"types.ddl\"\n\nfun is_sub (o: op_e, r: out u1)\n  r = o == OP_SUB\n",
     );
     let main = s.write("main.ddl", "import \"left.ddl\"\nimport \"right.ddl\"\n");
 
@@ -147,7 +147,7 @@ fn an_import_comes_before_the_file_that_asked_for_it() {
     s.write("dep.ddl", ADDER);
     let main = s.write(
         "main.ddl",
-        "fun use_it (a: i8, o: out i8)\n  o = adder(a, 8'd1)\n\nimport \"dep.ddl\"\n",
+        "fun use_it (a: u8, o: out u8)\n  o = adder(a, 8'd1)\n\nimport \"dep.ddl\"\n",
     );
 
     let (map, diags) = load_program(&[main], Vec::new()).expect("readable");
@@ -194,7 +194,7 @@ fn an_error_in_an_imported_file_names_that_file_and_its_own_line_number() {
     // The whole point of concatenating into one buffer with a file table: the
     // `cat` build reported this at line 43 of a temporary nobody wrote.
     let s = Scratch::new("blame");
-    s.write("dep.ddl", "fun broken (a: i8, b: i32, o: out i8)\n  o = a + b\n");
+    s.write("dep.ddl", "fun broken (a: u8, b: u32, o: out u8)\n  o = a + b\n");
     let main = s.write("main.ddl", "import \"dep.ddl\"\n");
 
     let err = build(&[main], Vec::new()).expect_err("should fail");
@@ -209,10 +209,10 @@ fn offsets_after_an_import_line_are_the_offsets_in_the_file() {
     // this true, and a column that is off by the length of a path is the kind
     // of wrongness that gets noticed late.
     let s = Scratch::new("offsets");
-    s.write("a/very/long/path/to/types.ddl", "enum op_e: i2\n  OP_ADD\n");
+    s.write("a/very/long/path/to/types.ddl", "enum op_e: u2\n  OP_ADD\n");
     let main = s.write(
         "main.ddl",
-        "import \"a/very/long/path/to/types.ddl\"\nfun f (a: i8, o: out i8)\n  o = nope\n",
+        "import \"a/very/long/path/to/types.ddl\"\nfun f (a: u8, o: out u8)\n  o = nope\n",
     );
 
     // Line 3 column 7 is where `nope` starts, and it stays there however long
@@ -226,8 +226,8 @@ fn several_inputs_compile_as_one_program() {
     // What `ddl build a.ddl b.ddl` has to mean, and what verify.sh used `cat`
     // for before there was an import.
     let s = Scratch::new("several");
-    let types = s.write("types.ddl", "enum op_e: i2\n  OP_ADD\n  OP_SUB\n");
-    let user = s.write("user.ddl", "fun pick (o: op_e, r: out i1)\n  r = o == OP_SUB\n");
+    let types = s.write("types.ddl", "enum op_e: u2\n  OP_ADD\n  OP_SUB\n");
+    let user = s.write("user.ddl", "fun pick (o: op_e, r: out u1)\n  r = o == OP_SUB\n");
 
     let v = build(&[types, user], Vec::new()).expect("should compile");
     assert!(v.contains("module pick ("), "{}", v);
@@ -237,7 +237,7 @@ fn several_inputs_compile_as_one_program() {
 fn one_banner_covers_the_whole_program() {
     let s = Scratch::new("banner");
     let a = s.write("a.ddl", ADDER);
-    let b = s.write("b.ddl", "fun other (a: i8, o: out i8)\n  o = a\n");
+    let b = s.write("b.ddl", "fun other (a: u8, o: out u8)\n  o = a\n");
 
     let v = build(&[a, b], Vec::new()).expect("should compile");
     assert_eq!(v.matches("GENERATED FILE").count(), 1, "{}", v);

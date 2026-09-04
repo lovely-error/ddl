@@ -29,13 +29,13 @@ generated. There is no global memory: a declaration touches its own state and
 nothing else, and everything crossing a boundary goes through a pipe.
 
 ```
-sequence mul3 (src: buffer in i16, dst: buffer out i32)
+sequence mul3 (src: buffer in u16, dst: buffer out u32)
   let a = @rcv(src)
-  let doubled: i16 = a + a
+  let doubled: u16 = a + a
   |||
-  let wide: i32 = @zext(doubled, 32)
+  let wide: u32 = @zext(doubled, 32)
   |||
-  let scaled: i32 = wide + wide
+  let scaled: u32 = wide + wide
   @send(dst, scaled)
 ```
 
@@ -48,8 +48,8 @@ A `graph` connects blocks like that one to each other, and a `process` turns a
 sequential program with wait points into the state machine that implements it:
 
 ```
-process reg_port (cmd: buffer in i8, din: buffer in i32, dout: buffer out i32)
-  var cell: i32 = @zeroed()
+process reg_port (cmd: buffer in u8, din: buffer in u32, dout: buffer out u32)
+  var cell: u32 = @zeroed()
   loop
     let c = @rcv(cmd)
     if c[0] then
@@ -73,7 +73,7 @@ instantiate it). `struct` and `enum` lay out the same way SystemVerilog packs th
 so a DDL type and its `.svh` counterpart meet at a module boundary without a
 cast.
 
-**Types.** `iN` and `sN` at any width, structs, enums — including tagged
+**Types.** `uN` and `iN` at any width, structs, enums — including tagged
 unions, where a variant carries a payload and `match` is the only way to reach
 it — and arrays backed by `lutram` (asynchronous reads) or `bram` (synchronous:
 the read costs a state, and is emitted inside the memory's own clocked block so
@@ -83,7 +83,7 @@ can be a struct field, a pipe payload or a parameter; `a[k]` selects an
 element and `a[hi..lo]` a run of them, laid out the way SystemVerilog packs an
 array, and an index past the end is an error rather than a bit somewhere else.
 `a[k] = v` and `s.words[k] = v` assign one, at a constant index or a computed
-one; `@slice(x, base, w)` is the read side of the same idea on a plain `iN`,
+one; `@slice(x, base, w)` is the read side of the same idea on a plain `uN`,
 a `w`-bit window at a base this cycle decides.
 Widths are checked and never silently adjusted: mixed widths are an
 error naming the `@zext`/`@trunc` that fixes them, and an unsized literal takes
@@ -93,12 +93,12 @@ its width from the other operand.
 enum req_e
   Nop
   Read(addr_t)
-  Write(i8)
+  Write(u8)
   Halt
 ```
 
 Laid out as `{tag, payload}` with the tag in the high bits, every variant the
-same width. A tagged union's width is derived, not declared -- `enum e: iN`
+same width. A tagged union's width is derived, not declared -- `enum e: uN`
 sets the width of an enum whose variants carry nothing, and would name only the
 tag here while reading as the whole value. See
 [examples/tagged.ddl](examples/tagged.ddl).
@@ -130,7 +130,7 @@ entries, and a producer that waits. A **`port`** has none at all — a data
 port and an enable, and nothing coming back:
 
 ```
-process relay (src: port in i32, dst: port out i32)
+process relay (src: port in u32, dst: port out u32)
   loop
     let v = @rcv(src)
     @send(dst, v + 32'd1)
@@ -241,9 +241,9 @@ claim somewhere a reader can check.
 **Combinators.** `@merge` and `@split` are modules the compiler writes:
 
 ```
-graph top (p: buffer in i32, q: buffer in i32, o1: buffer out i32, o2: buffer out i32)
-  let m: buffer i32
-  let d: buffer i32
+graph top (p: buffer in u32, q: buffer in u32, o1: buffer out u32, o2: buffer out u32)
+  let m: buffer u32
+  let d: buffer u32
   @merge(p, q, m)      -- two producers onto one pipe, in rotation
   dbl(m, d)
   @split(d, o1, o2)    -- one producer to two consumers, each its own copy

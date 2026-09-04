@@ -62,7 +62,7 @@ pub enum UnaryOp {
     Neg,
     /// `~x`, bitwise inversion. Also spelled `x.~` as a postfix.
     BitNot,
-    /// `!x`, logical negation, always yields `i1`.
+    /// `!x`, logical negation, always yields `u1`.
     LogNot,
 }
 
@@ -386,7 +386,7 @@ pub enum RawEnumFieldValueKind {
 #[derive(Debug, Clone)]
 pub struct RawEnumDecl {
     pub name: AlphanumSpan,
-    /// `enum Name: i2`. Absent means the width is inferred from the largest
+    /// `enum Name: u2`. Absent means the width is inferred from the largest
     /// discriminant.
     pub tag_type: Option<RawTypeExpr>,
     pub fields: Vec<RawEnumField>
@@ -949,7 +949,7 @@ unsafe fn try_parse_type_expr(
         let (inner, new_ptr) = try_parse_type_expr(char_ptr, char_end_ptr)?;
         let (elem, len) = match inner {
             RawTypeExpr::Array(elem, len) => (elem, len),
-            // `#[impl(bram)] i32` asks for a memory that holds one thing; the
+            // `#[impl(bram)] u32` asks for a memory that holds one thing; the
             // annotation only means anything on an array.
             _ => {
                 diagnose(
@@ -2188,7 +2188,7 @@ pub unsafe fn try_parse_enum_decl(
     let (enum_name, tail) = try_parse_alphanum(char_ptr, char_end_ptr)?;
     char_ptr = tail;
     
-    // Optional explicit tag width: `enum arith_e: i2`. A newline stops the
+    // Optional explicit tag width: `enum arith_e: u2`. A newline stops the
     // whitespace skip, so a plain `enum Name` cannot match this by accident.
     let (_, tail) = skip_whitespaces(char_ptr, char_end_ptr);
     char_ptr = tail;
@@ -2246,7 +2246,7 @@ pub unsafe fn try_parse_enum_decl(
 /// ```text
 /// ARITH_ADD              -- variant with no payload or associated value
 /// LB_EP1 = 6'b111111     -- variant with explicit associated value
-/// Some(i32)              -- variant with payload
+/// Some(u32)              -- variant with payload
 /// ```
 ///
 /// The last two are alternatives. A line that writes both is not accepted
@@ -3078,8 +3078,8 @@ pub unsafe fn parse_top_level(
 fn enum_parsing_test() {
     let str = concat!(
         "enum IntOr\n",
-        "  left(i1)\n",
-        "  right(i1)\n",
+        "  left(u1)\n",
+        "  right(u1)\n",
     );
 
     let inp_str = str.as_bytes().as_ptr_range();
@@ -3099,8 +3099,8 @@ fn enum_parsing_test() {
 fn struct_parsing_test() {
     let str = concat!(
         "struct IntPair\n",
-        "  fst: i1\n",
-        "  snd: i1\n",
+        "  fst: u1\n",
+        "  snd: u1\n",
     );
 
     let inp_str = str.as_bytes().as_ptr_range();
@@ -3120,7 +3120,7 @@ fn struct_parsing_test() {
 fn function_parsing_test() {
     let str = concat!(
         "fun ok_ident(arg1: Ty, arg2: inout Ty2) -> RetTy\n",
-        "  var x : [i1;1] = 1\n",
+        "  var x : [u1;1] = 1\n",
         "  loop\n",
         "    x += 1\n",
         "    break\n",
@@ -3144,7 +3144,7 @@ fn function_parsing_test() {
 fn seqv_parsing_test() {
     let str = concat!(
         "sequence MyFunc(arg1: Ty, arg2: inout Ty2)\n",
-        "  let x : [i1;0] = 1\n",
+        "  let x : [u1;0] = 1\n",
         "  |||\n",
         "  loop\n",
         "    break\n",
@@ -3209,9 +3209,9 @@ fn w3() {
         // "      break\n",
         // "    return\n",
         // "  expr\n",
-        // "  let _ : [[i1;2];2] = expr\n",
+        // "  let _ : [[u1;2];2] = expr\n",
         // "  |||\n",
-        // "  let _ : [[i1;2];2] = expr\n",
+        // "  let _ : [[u1;2];2] = expr\n",
         "  let _ = @try_pop(smth) .is_ok\n",
     );
     let inp_str = str.as_bytes().as_ptr_range();
@@ -3243,7 +3243,7 @@ fn line_comments_are_trivia() {
     // Every example in desc.md uses `--` comments; none of them parsed before.
     let src = concat!(
         "-- leading comment\n",
-        "process Name (arg1: buffer in i1) -- trailing comment\n",
+        "process Name (arg1: buffer in u1) -- trailing comment\n",
         "  -- comment-only line, indented differently to the body\n",
         "        \n",
         "  let x = arg1 -- comment after code\n",
@@ -3260,7 +3260,7 @@ fn line_comments_are_trivia() {
 #[test]
 fn crlf_parses_the_same_as_lf() {
     let lf = concat!(
-        "process Name (arg1: buffer in i1)\n",
+        "process Name (arg1: buffer in u1)\n",
         "  let x = arg1\n",
         "  return\n",
     );
@@ -3282,7 +3282,7 @@ fn crlf_parses_the_same_as_lf() {
 fn trailing_spaces_at_eof_do_not_read_past_the_buffer() {
     // skip_trivia used to dereference without re-testing for the end here.
     // Under Miri this was UB; in release it read whatever followed the string.
-    let src = "process Name (arg1: buffer in i1)\n  return\n   ";
+    let src = "process Name (arg1: buffer in u1)\n  return\n   ";
     let _ = parse_str(src);
 }
 
@@ -3308,11 +3308,11 @@ fn break_demands_a_delimiter() {
 
 #[test]
 fn tabs_are_detected() {
-    let src = "process Name (a: buffer in i1)\n\treturn\n";
+    let src = "process Name (a: buffer in u1)\n\treturn\n";
     let range = src.as_bytes().as_ptr_range();
     assert!(find_tab(range.start, range.end).is_some());
 
-    let src = "process Name (a: buffer in i1)\n  return\n";
+    let src = "process Name (a: buffer in u1)\n  return\n";
     let range = src.as_bytes().as_ptr_range();
     assert!(find_tab(range.start, range.end).is_none());
 }
@@ -3324,11 +3324,11 @@ fn a_struct_parses_anywhere_not_only_first() {
     // ever matched as the very first item in a file.
     let src = concat!(
         "struct First\n",
-        "  a: i1\n",
-        "process Name (p: buffer in i1)\n",
+        "  a: u1\n",
+        "process Name (p: buffer in u1)\n",
         "  return\n",
         "struct Second\n",
-        "  b: i1\n",
+        "  b: u1\n",
     );
     let decls = parse_str(src).expect("a struct after a process should parse");
     assert_eq!(decls.len(), 3, "got {:#?}", decls);

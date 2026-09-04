@@ -11,7 +11,7 @@
 -- rule exists to prevent -- routing a stall back into `cp_valid` closed a loop
 -- through stall -> decode -> CSP request -> stall.
 
-enum kind_e: i3
+enum kind_e: u3
   K_NOP
   K_ADD
   K_SUB
@@ -20,19 +20,19 @@ enum kind_e: i3
   K_JUMP
 
 struct in_item_t
-  epoch: i3
+  epoch: u3
   kind: kind_e
-  dst: i5
-  src: i5
-  imm: i16
+  dst: u5
+  src: u5
+  imm: u16
 
 struct out_item_t
-  epoch: i3
+  epoch: u3
   kind: kind_e
-  dst: i5
-  src: i5
-  imm: i32
-  is_mem: i1
+  dst: u5
+  src: u5
+  imm: u32
+  is_mem: u1
 
 process k3g_stage (iops: buffer in in_item_t, uops: buffer out out_item_t)
 

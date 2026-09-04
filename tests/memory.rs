@@ -30,12 +30,12 @@ fn compile_err(src: &str) -> String {
 
 /// A scratchpad behind a command pipe: write on one path, read on the other.
 const SCRATCH: &str = concat!(
-    "process scratch (cmd: buffer in i8, din: buffer in i32, dout: buffer out i32)\n",
-    "  var cells: #[impl(lutram)] [i32; 16] = @zeroed()\n",
+    "process scratch (cmd: buffer in u8, din: buffer in u32, dout: buffer out u32)\n",
+    "  var cells: #[impl(lutram)] [u32; 16] = @zeroed()\n",
     "  loop\n",
     "    let c = @rcv(cmd)\n",
-    "    let addr: i4 = c[3..0]\n",
-    "    let is_write: i1 = c[7]\n",
+    "    let addr: u4 = c[3..0]\n",
+    "    let is_write: u1 = c[7]\n",
     "    if is_write then\n",
     "      let d = @rcv(din)\n",
     "      cells[addr] = d\n",
@@ -78,8 +78,8 @@ fn a_lutram_read_stays_asynchronous() {
 // ---- block RAM -----------------------------------------------------------
 
 const LOOKUP: &str = concat!(
-    "process lookup (req: buffer in i8, resp: buffer out i32)\n",
-    "  var table: #[impl(bram)] [i32; 256]\n",
+    "process lookup (req: buffer in u8, resp: buffer out u32)\n",
+    "  var table: #[impl(bram)] [u32; 256]\n",
     "  loop\n",
     "    let a = @rcv(req)\n",
     "    let v = table[a]\n",
@@ -148,12 +148,12 @@ fn the_address_is_registered_before_the_fetch_state_uses_it() {
 #[test]
 fn a_bram_takes_reads_and_writes_on_different_paths() {
     let v = compile(concat!(
-        "process cache (cmd: buffer in i16, din: buffer in i32, dout: buffer out i32)\n",
-        "  var table: #[impl(bram)] [i32; 256]\n",
+        "process cache (cmd: buffer in u16, din: buffer in u32, dout: buffer out u32)\n",
+        "  var table: #[impl(bram)] [u32; 256]\n",
         "  loop\n",
         "    let c = @rcv(cmd)\n",
-        "    let addr: i8 = c[7..0]\n",
-        "    let is_write: i1 = c[15]\n",
+        "    let addr: u8 = c[7..0]\n",
+        "    let is_write: u1 = c[15]\n",
         "    if is_write then\n",
         "      let d = @rcv(din)\n",
         "      table[addr] = d\n",
@@ -177,8 +177,8 @@ fn a_bram_read_inside_an_expression_gets_a_state_of_its_own() {
     // spend it in is something the compiler can supply -- the read is lifted
     // onto a line of its own and the expression reads the name.
     let v = compile(concat!(
-        "process p (req: buffer in i8, resp: buffer out i32)\n",
-        "  var table: #[impl(bram)] [i32; 256]\n",
+        "process p (req: buffer in u8, resp: buffer out u32)\n",
+        "  var table: #[impl(bram)] [u32; 256]\n",
         "  loop\n",
         "    let a = @rcv(req)\n",
         "    @send(resp, table[a])\n",
@@ -195,8 +195,8 @@ fn a_lifted_read_is_still_refused_where_there_is_no_state() {
     // has one pass per cycle and no states, so the cycle has nowhere to go and
     // the answer is still no -- with the diagnostic that says which.
     let text = compile_err(concat!(
-        "process p (req: buffer in i8, resp: buffer out i32)\n",
-        "  var table: #[impl(bram)] [i32; 256]\n",
+        "process p (req: buffer in u8, resp: buffer out u32)\n",
+        "  var table: #[impl(bram)] [u32; 256]\n",
         "  let (a, got) = @try_rcv(req)\n",
         "  let _s = @try_send(resp, table[a] + 32'd1)\n",
     ));
@@ -206,8 +206,8 @@ fn a_lifted_read_is_still_refused_where_there_is_no_state() {
 #[test]
 fn a_bram_needs_a_process_with_states() {
     let text = compile_err(concat!(
-        "process p (addr: buffer in i5, rd: buffer out i32)\n",
-        "  var vals: #[impl(bram)] [i32; 32]\n",
+        "process p (addr: buffer in u5, rd: buffer out u32)\n",
+        "  var vals: #[impl(bram)] [u32; 32]\n",
         "  let (a, got) = @try_rcv(addr)\n",
         "  let _s = @try_send(rd, vals[a])\n",
     ));
@@ -217,8 +217,8 @@ fn a_bram_needs_a_process_with_states() {
 #[test]
 fn a_bram_with_a_reset_is_refused_with_the_cost_named() {
     let text = compile_err(concat!(
-        "process p (req: buffer in i8, resp: buffer out i32)\n",
-        "  var table: #[impl(bram)] [i32; 256] = @zeroed()\n",
+        "process p (req: buffer in u8, resp: buffer out u32)\n",
+        "  var table: #[impl(bram)] [u32; 256] = @zeroed()\n",
         "  loop\n",
         "    let a = @rcv(req)\n",
         "    let v = table[a]\n",
@@ -230,8 +230,8 @@ fn a_bram_with_a_reset_is_refused_with_the_cost_named() {
 #[test]
 fn bkram_is_still_refused_and_says_why() {
     let text = compile_err(concat!(
-        "process p (req: buffer in i8, resp: buffer out i32)\n",
-        "  var table: #[impl(bkram)] [i32; 256]\n",
+        "process p (req: buffer in u8, resp: buffer out u32)\n",
+        "  var table: #[impl(bkram)] [u32; 256]\n",
         "  loop\n",
         "    let a = @rcv(req)\n",
         "    let v = table[a]\n",
@@ -256,8 +256,8 @@ fn bkram_is_still_refused_and_says_why() {
 
 /// Two reads of one `bram`, added together.
 const TWO_READS: &str = concat!(
-    "process two (a: buffer in i8, o: buffer out i32)\n",
-    "  var m: #[impl(bram)] [i32; 256]\n",
+    "process two (a: buffer in u8, o: buffer out u32)\n",
+    "  var m: #[impl(bram)] [u32; 256]\n",
     "  loop\n",
     "    let i = @rcv(a)\n",
     "    let x = m[i]\n",
@@ -292,8 +292,8 @@ fn one_read_costs_no_register_of_its_own() {
     // With one read the output register IS the answer, and a flop plus a mux
     // per read would be real area in every process that reads a `bram` once.
     let v = compile(concat!(
-        "process one (a: buffer in i8, o: buffer out i32)\n",
-        "  var m: #[impl(bram)] [i32; 256]\n",
+        "process one (a: buffer in u8, o: buffer out u32)\n",
+        "  var m: #[impl(bram)] [u32; 256]\n",
         "  loop\n",
         "    let i = @rcv(a)\n",
         "    let x = m[i]\n",
@@ -337,8 +337,8 @@ fn the_read_port_is_declared_when_two_states_share_it() {
 #[test]
 fn reads_in_an_expression_each_get_a_state() {
     let v = compile(concat!(
-        "process expr (a: buffer in i8, o: buffer out i32)\n",
-        "  var m: #[impl(bram)] [i32; 256]\n",
+        "process expr (a: buffer in u8, o: buffer out u32)\n",
+        "  var m: #[impl(bram)] [u32; 256]\n",
         "  loop\n",
         "    let i = @rcv(a)\n",
         "    let s = m[i] + m[8'd7]\n",
@@ -354,8 +354,8 @@ fn reads_in_an_expression_each_get_a_state() {
 #[test]
 fn a_read_in_a_sent_value_is_lifted() {
     let v = compile(concat!(
-        "process sendread (a: buffer in i8, o: buffer out i32)\n",
-        "  var m: #[impl(bram)] [i32; 256]\n",
+        "process sendread (a: buffer in u8, o: buffer out u32)\n",
+        "  var m: #[impl(bram)] [u32; 256]\n",
         "  loop\n",
         "    let i = @rcv(a)\n",
         "    @send(o, m[i])\n",
@@ -370,8 +370,8 @@ fn a_read_inside_a_branch_stays_in_that_branch() {
     // The cycle a read costs is spent only on the path that reads, so lifting
     // one out of an arm would make the other arm pay for it.
     let v = compile(concat!(
-        "process armed (a: buffer in i8, o: buffer out i32)\n",
-        "  var m: #[impl(bram)] [i32; 256]\n",
+        "process armed (a: buffer in u8, o: buffer out u32)\n",
+        "  var m: #[impl(bram)] [u32; 256]\n",
         "  loop\n",
         "    let i = @rcv(a)\n",
         "    if i[7] then\n",
@@ -388,8 +388,8 @@ fn a_write_target_is_not_lifted_as_a_read() {
     // `m[a] = d` is the write port. Lifting the subscript would turn every
     // store into a load and then assign to what it loaded.
     let v = compile(concat!(
-        "process store (a: buffer in i8, d: buffer in i32, o: buffer out i32)\n",
-        "  var m: #[impl(bram)] [i32; 256]\n",
+        "process store (a: buffer in u8, d: buffer in u32, o: buffer out u32)\n",
+        "  var m: #[impl(bram)] [u32; 256]\n",
         "  loop\n",
         "    let i = @rcv(a)\n",
         "    let x = @rcv(d)\n",
@@ -409,8 +409,8 @@ fn a_write_target_is_not_lifted_as_a_read() {
 #[test]
 fn an_annotation_that_is_not_impl_names_itself() {
     let text = compile_err(concat!(
-        "process p (rd: buffer out i32)\n",
-        "  var v: #[inline(lutram)] [i32; 4] = @zeroed()\n",
+        "process p (rd: buffer out u32)\n",
+        "  var v: #[inline(lutram)] [u32; 4] = @zeroed()\n",
         "  let _s = @try_send(rd, v[2'd0])\n",
     ));
     assert!(text.contains("`inline` is not an annotation"), "{}", text);
@@ -419,11 +419,11 @@ fn an_annotation_that_is_not_impl_names_itself() {
 
 #[test]
 fn an_annotation_on_a_single_value_says_it_wanted_an_array() {
-    // `#[impl(bram)] i32` asks for a memory holding one thing, which is a
+    // `#[impl(bram)] u32` asks for a memory holding one thing, which is a
     // register with extra words.
     let text = compile_err(concat!(
-        "process p (rd: buffer out i32)\n",
-        "  var v: #[impl(lutram)] i32 = @zeroed()\n",
+        "process p (rd: buffer out u32)\n",
+        "  var v: #[impl(lutram)] u32 = @zeroed()\n",
         "  let _s = @try_send(rd, v)\n",
     ));
     assert!(text.contains("needs an array"), "{}", text);
@@ -433,8 +433,8 @@ fn an_annotation_on_a_single_value_says_it_wanted_an_array() {
 #[test]
 fn an_unclosed_annotation_points_at_where_the_bracket_belongs() {
     let text = compile_err(concat!(
-        "process p (rd: buffer out i32)\n",
-        "  var v: #[impl(lutram] [i32; 4] = @zeroed()\n",
+        "process p (rd: buffer out u32)\n",
+        "  var v: #[impl(lutram] [u32; 4] = @zeroed()\n",
         "  let _s = @try_send(rd, v[2'd0])\n",
     ));
     assert!(text.contains("closes with `)]`"), "{}", text);

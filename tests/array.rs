@@ -6,7 +6,7 @@
 // be a struct field, a pipe payload or a parameter.
 //
 // Subscripting one used to fall through to the bit selects, so `line.words[1]`
-// read bit 1 of the flattened struct and typed as `i1` -- a wrong answer that
+// read bit 1 of the flattened struct and typed as `u1` -- a wrong answer that
 // synthesizes, rather than a diagnostic.
 
 use ddl::diag::SourceMap;
@@ -48,15 +48,15 @@ fn compile_err(src: &str) -> String {
 /// this.
 const LINE: &str = concat!(
     "struct line_t\n",
-    "  tag: i17\n",
-    "  words: [i32; 4]\n",
+    "  tag: u17\n",
+    "  words: [u32; 4]\n",
     "\n",
 );
 
 #[test]
 fn a_constant_index_selects_an_element() {
-    let v = compile(&format!("{}fun pick (l: line_t, o: out i32)\n  o = l.words[1]\n", LINE));
-    // Element 1 of a 4 x i32 field, which sits in the low 128 bits of the
+    let v = compile(&format!("{}fun pick (l: line_t, o: out u32)\n  o = l.words[1]\n", LINE));
+    // Element 1 of a 4 x u32 field, which sits in the low 128 bits of the
     // struct: bits 63:32, not bit 1.
     assert!(v.contains("[63:32]"), "{}", v);
     assert!(v.contains("output [31:0] o"), "{}", v);
@@ -65,18 +65,18 @@ fn a_constant_index_selects_an_element() {
 #[test]
 fn an_element_is_not_a_bit() {
     // The regression itself, stated as the thing that must not come back: a
-    // 32-bit element cannot be assigned to an `i1`, and before this it could.
+    // 32-bit element cannot be assigned to an `u1`, and before this it could.
     let text = compile_err(&format!(
-        "{}fun pick (l: line_t, o: out i1)\n  o = l.words[1]\n",
+        "{}fun pick (l: line_t, o: out u1)\n  o = l.words[1]\n",
         LINE
     ));
-    assert!(text.contains("cannot assign `i32`"), "{}", text);
+    assert!(text.contains("cannot assign `u32`"), "{}", text);
 }
 
 #[test]
 fn a_computed_index_is_a_part_select_scaled_by_the_element() {
     let v = compile(&format!(
-        "{}fun pick (l: line_t, i: i2, o: out i32)\n  o = l.words[i]\n",
+        "{}fun pick (l: line_t, i: u2, o: out u32)\n  o = l.words[i]\n",
         LINE
     ));
     // Widened before scaling: `i` is 2 bits and the base it has to produce is
@@ -90,7 +90,7 @@ fn a_computed_index_shifts_rather_than_multiplies_where_it_can() {
     // A multiply is a DSP as far as GowinSynthesis is concerned, and an
     // address is the last place to spend one on a constant.
     let v = compile(&format!(
-        "{}fun pick (l: line_t, i: i2, o: out i32)\n  o = l.words[i]\n",
+        "{}fun pick (l: line_t, i: u2, o: out u32)\n  o = l.words[i]\n",
         LINE
     ));
     assert!(!v.contains(" * "), "{}", v);
@@ -100,7 +100,7 @@ fn a_computed_index_shifts_rather_than_multiplies_where_it_can() {
 fn an_element_width_that_is_not_a_power_of_two_multiplies() {
     // The anti-vacuous half of the test above: the shift is a special case,
     // and the general path has to be there and be right.
-    let v = compile("fun pick (l: [i3; 5], i: i3, o: out i3)\n  o = l[i]\n");
+    let v = compile("fun pick (l: [u3; 5], i: u3, o: out u3)\n  o = l[i]\n");
     assert!(v.contains("* 4'd3"), "{}", v);
     assert!(v.contains("+: 3]"), "{}", v);
 }
@@ -108,7 +108,7 @@ fn an_element_width_that_is_not_a_power_of_two_multiplies() {
 #[test]
 fn a_range_of_elements_is_a_shorter_array() {
     let v = compile(&format!(
-        "{}fun pick (l: line_t, o: out [i32; 2])\n  o = l.words[2..1]\n",
+        "{}fun pick (l: line_t, o: out [u32; 2])\n  o = l.words[2..1]\n",
         LINE
     ));
     // Elements 2 and 1: bits 95:32, and 64 bits wide.
@@ -118,14 +118,14 @@ fn a_range_of_elements_is_a_shorter_array() {
 
 #[test]
 fn an_index_past_the_end_is_refused() {
-    let text = compile_err("fun oob (l: [i8; 4], o: out i8)\n  o = l[7]\n");
-    assert!(text.contains("element 7 is out of bounds for `[i8; 4]`"), "{}", text);
+    let text = compile_err("fun oob (l: [u8; 4], o: out u8)\n  o = l[7]\n");
+    assert!(text.contains("element 7 is out of bounds for `[u8; 4]`"), "{}", text);
     assert!(text.contains("4 element(s)"), "{}", text);
 }
 
 #[test]
 fn a_range_past_the_end_is_refused() {
-    let text = compile_err("fun oob (l: [i8; 4], o: out [i8; 2])\n  o = l[4..3]\n");
+    let text = compile_err("fun oob (l: [u8; 4], o: out [u8; 2])\n  o = l[4..3]\n");
     assert!(text.contains("out of bounds"), "{}", text);
 }
 
@@ -133,12 +133,12 @@ fn a_range_past_the_end_is_refused() {
 fn an_array_travels_through_a_pipe() {
     // What the struct field was standing in for: a cache line as a payload.
     let v = compile(concat!(
-        "process p (a: buffer in [i32; 4], b: buffer out i32)\n",
+        "process p (a: buffer in [u32; 4], b: buffer out u32)\n",
         "  loop\n",
         "    let c = @rcv(a)\n",
         "    @send(b, c[0])\n",
     ));
-    // Two entries on the wire, so the port is twice the payload: 4 x i32 is
+    // Two entries on the wire, so the port is twice the payload: 4 x u32 is
     // 128 bits, and a pipe of them is 256.
     assert!(v.contains("input [255:0] a_data"), "{}", v);
     assert!(v.contains("output [63:0] b_data"), "{}", v);
@@ -150,8 +150,8 @@ fn an_unrolled_loop_indexes_by_element() {
     // that folded to a constant and must still select an element rather than
     // becoming a part-select with a constant base.
     let v = compile(concat!(
-        "fun total (l: [i8; 4], o: out i8)\n",
-        "  var acc: i8 = 8'd0\n",
+        "fun total (l: [u8; 4], o: out u8)\n",
+        "  var acc: u8 = 8'd0\n",
         "  for i in 0..4\n",
         "    acc += l[i]\n",
         "  o = acc\n",
@@ -176,7 +176,7 @@ fn a_constant_element_is_spliced_in_place() {
         "{}{}",
         LINE,
         concat!(
-            "fun fill (l: line_t, w: i32, o: out line_t)\n",
+            "fun fill (l: line_t, w: u32, o: out line_t)\n",
             "  var t: line_t = l\n",
             "  t.words[1] = w\n",
             "  o = t\n",
@@ -193,8 +193,8 @@ fn a_constant_element_is_spliced_in_place() {
 #[test]
 fn a_computed_element_muxes_every_slot() {
     let v = compile(concat!(
-        "fun put (a: [i8; 4], k: i2, x: i8, o: out [i8; 4])\n",
-        "  var t: [i8; 4] = a\n",
+        "fun put (a: [u8; 4], k: u2, x: u8, o: out [u8; 4])\n",
+        "  var t: [u8; 4] = a\n",
         "  t[k] = x\n",
         "  o = t\n",
     ));
@@ -213,7 +213,7 @@ fn an_element_of_a_field_is_reached_through_both_steps() {
         "{}{}",
         LINE,
         concat!(
-            "fun fill (l: line_t, k: i2, w: i32, o: out line_t)\n",
+            "fun fill (l: line_t, k: u2, w: u32, o: out line_t)\n",
             "  var t: line_t = l\n",
             "  t.words[k] = w\n",
             "  o = t\n",
@@ -227,8 +227,8 @@ fn an_element_of_a_field_is_reached_through_both_steps() {
 #[test]
 fn an_element_index_past_the_end_is_refused() {
     let text = compile_err(concat!(
-        "fun put (a: [i8; 4], x: i8, o: out [i8; 4])\n",
-        "  var t: [i8; 4] = a\n",
+        "fun put (a: [u8; 4], x: u8, o: out [u8; 4])\n",
+        "  var t: [u8; 4] = a\n",
         "  t[4] = x\n",
         "  o = t\n",
     ));
@@ -241,10 +241,10 @@ fn a_computed_index_must_be_the_last_step() {
     // knows, which is a `+:` on the left of an assignment.
     let text = compile_err(concat!(
         "struct pair_t\n",
-        "  lo: i8\n",
-        "  hi: i8\n",
+        "  lo: u8\n",
+        "  hi: u8\n",
         "\n",
-        "fun put (a: [pair_t; 4], k: i2, x: i8, o: out [pair_t; 4])\n",
+        "fun put (a: [pair_t; 4], k: u2, x: u8, o: out [pair_t; 4])\n",
         "  var t: [pair_t; 4] = a\n",
         "  t[k].lo = x\n",
         "  o = t\n",
@@ -256,8 +256,8 @@ fn a_computed_index_must_be_the_last_step() {
 #[test]
 fn a_bit_of_an_integer_is_not_an_lvalue() {
     let text = compile_err(concat!(
-        "fun put (v: i8, k: i3, o: out i8)\n",
-        "  var t: i8 = v\n",
+        "fun put (v: u8, k: u3, o: out u8)\n",
+        "  var t: u8 = v\n",
         "  t[k] = 1'b1\n",
         "  o = t\n",
     ));
@@ -268,13 +268,13 @@ fn a_bit_of_an_integer_is_not_an_lvalue() {
 //
 // A multi-bit part-select at a computed base. The MECHANISM was always here --
 // an array element at a computed index lowers to a `+:` of the element width
-// -- but there was no way to write one on a plain `iN`, so the workaround was
-// to declare the thing `[i8; 4]`. That is usually what it was, and sometimes
+// -- but there was no way to write one on a plain `uN`, so the workaround was
+// to declare the thing `[u8; 4]`. That is usually what it was, and sometimes
 // it is a 32-bit word that a field offset points into.
 
 #[test]
 fn a_computed_base_is_a_part_select() {
-    let v = compile("fun ex (x: i32, b: i5, o: out i8)\n  o = @slice(x, b, 8)\n");
+    let v = compile("fun ex (x: u32, b: u5, o: out u8)\n  o = @slice(x, b, 8)\n");
     assert!(v.contains("x[b +: 8]"), "{}", v);
 }
 
@@ -282,32 +282,32 @@ fn a_computed_base_is_a_part_select() {
 fn a_constant_base_is_an_ordinary_range() {
     // `+:` with a literal base is correct and is also the construct this
     // backend exists to keep away from GowinSynthesis.
-    let v = compile("fun ex (x: i32, o: out i8)\n  o = @slice(x, 8, 8)\n");
+    let v = compile("fun ex (x: u32, o: out u8)\n  o = @slice(x, 8, 8)\n");
     assert!(v.contains("x[15:8]"), "{}", v);
     assert!(!v.contains("+:"), "{}", v);
 }
 
 #[test]
 fn a_slice_wider_than_its_operand_is_refused() {
-    let text = compile_err("fun ex (x: i8, b: i3, o: out i16)\n  o = @slice(x, b, 16)\n");
+    let text = compile_err("fun ex (x: u8, b: u3, o: out u16)\n  o = @slice(x, b, 16)\n");
     assert!(text.contains("does not fit"), "{}", text);
 }
 
 #[test]
 fn a_constant_slice_past_the_end_is_refused() {
-    let text = compile_err("fun ex (x: i32, o: out i8)\n  o = @slice(x, 28, 8)\n");
+    let text = compile_err("fun ex (x: u32, o: out u8)\n  o = @slice(x, 28, 8)\n");
     assert!(text.contains("runs past the end"), "{}", text);
 }
 
 #[test]
 fn a_slice_width_must_be_constant() {
-    let text = compile_err("fun ex (x: i32, b: i5, o: out i8)\n  o = @slice(x, 0, b)\n");
+    let text = compile_err("fun ex (x: u32, b: u5, o: out u8)\n  o = @slice(x, 0, b)\n");
     assert!(text.contains("must be a constant"), "{}", text);
 }
 
 #[test]
 fn a_signed_base_is_refused() {
-    let text = compile_err("fun ex (x: i32, b: s5, o: out i8)\n  o = @slice(x, b, 8)\n");
+    let text = compile_err("fun ex (x: u32, b: i5, o: out u8)\n  o = @slice(x, b, 8)\n");
     assert!(text.contains("must be unsigned"), "{}", text);
 }
 
@@ -322,15 +322,15 @@ fn a_signed_base_is_refused() {
 #[test]
 fn a_length_that_divides_by_zero_says_so() {
     let text = compile_err(concat!(
-        "process p (rd: buffer out i32)\n",
-        "  var vals: [i32; 8 / 0] = @zeroed()\n",
+        "process p (rd: buffer out u32)\n",
+        "  var vals: [u32; 8 / 0] = @zeroed()\n",
         "  let _s = @try_send(rd, vals[3'd0])\n",
     ));
     assert!(text.contains("array length divides by zero"), "{}", text);
     // The `%` beside it folds through the same guard.
     let text = compile_err(concat!(
-        "process p (rd: buffer out i32)\n",
-        "  var vals: [i32; 8 % 0] = @zeroed()\n",
+        "process p (rd: buffer out u32)\n",
+        "  var vals: [u32; 8 % 0] = @zeroed()\n",
         "  let _s = @try_send(rd, vals[3'd0])\n",
     ));
     assert!(text.contains("array length divides by zero"), "{}", text);
@@ -339,8 +339,8 @@ fn a_length_that_divides_by_zero_says_so() {
 #[test]
 fn a_length_that_overflows_says_so() {
     let text = compile_err(concat!(
-        "process p (rd: buffer out i32)\n",
-        "  var vals: [i32; 2 ** 200] = @zeroed()\n",
+        "process p (rd: buffer out u32)\n",
+        "  var vals: [u32; 2 ** 200] = @zeroed()\n",
         "  let _s = @try_send(rd, vals[3'd0])\n",
     ));
     assert!(text.contains("overflows"), "{}", text);
@@ -351,15 +351,15 @@ fn the_two_ends_of_an_unusable_length_read_differently() {
     // Nothing to hold, and more than an index could reach. One message for
     // both would be wrong at whichever end the reader was standing at.
     let empty = compile_err(concat!(
-        "process p (rd: buffer out i32)\n",
-        "  var vals: [i32; 0] = @zeroed()\n",
+        "process p (rd: buffer out u32)\n",
+        "  var vals: [u32; 0] = @zeroed()\n",
         "  let _s = @try_send(rd, vals[3'd0])\n",
     ));
     assert!(empty.contains("holds nothing"), "{}", empty);
 
     let huge = compile_err(concat!(
-        "process p (rd: buffer out i32)\n",
-        "  var vals: [i32; 8000000000] = @zeroed()\n",
+        "process p (rd: buffer out u32)\n",
+        "  var vals: [u32; 8000000000] = @zeroed()\n",
         "  let _s = @try_send(rd, vals[3'd0])\n",
     ));
     assert!(huge.contains("past what an index can address"), "{}", huge);

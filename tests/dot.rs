@@ -19,14 +19,14 @@ fn dot(src: &str) -> String {
 }
 
 const BLOCKS: &str = concat!(
-    "sequence dbl (src: buffer in i16, dst: buffer out i16)\n",
+    "sequence dbl (src: buffer in u16, dst: buffer out u16)\n",
     "  let a = @rcv(src)\n",
     "  |||\n",
     "  @send(dst, a)\n",
-    "sequence widen (src: buffer in i16, dst: buffer out i32)\n",
+    "sequence widen (src: buffer in u16, dst: buffer out u32)\n",
     "  let a = @rcv(src)\n",
     "  |||\n",
-    "  let w: i32 = @zext(a, 32)\n",
+    "  let w: u32 = @zext(a, 32)\n",
     "  @send(dst, w)\n",
 );
 
@@ -36,8 +36,8 @@ fn an_edge_runs_from_the_producer_to_the_consumer() {
         "{}{}",
         BLOCKS,
         concat!(
-            "graph chain (src: buffer in i16, dst: buffer out i32)\n",
-            "  let mid: buffer i16\n",
+            "graph chain (src: buffer in u16, dst: buffer out u32)\n",
+            "  let mid: buffer u16\n",
             "  dbl(src, mid)\n",
             "  widen(mid, dst)\n",
         )
@@ -54,8 +54,8 @@ fn the_graphs_own_pipes_are_drawn_as_the_boundary() {
         "{}{}",
         BLOCKS,
         concat!(
-            "graph chain (src: buffer in i16, dst: buffer out i32)\n",
-            "  let mid: buffer i16\n",
+            "graph chain (src: buffer in u16, dst: buffer out u32)\n",
+            "  let mid: buffer u16\n",
             "  dbl(src, mid)\n",
             "  widen(mid, dst)\n",
         )
@@ -76,8 +76,8 @@ fn one_edge_per_pipe_not_one_per_wire() {
         "{}{}",
         BLOCKS,
         concat!(
-            "graph chain (src: buffer in i16, dst: buffer out i32)\n",
-            "  let mid: buffer i16\n",
+            "graph chain (src: buffer in u16, dst: buffer out u32)\n",
+            "  let mid: buffer u16\n",
             "  dbl(src, mid)\n",
             "  widen(mid, dst)\n",
         )
@@ -95,13 +95,13 @@ fn a_feedback_path_is_visible_as_one() {
         "{}{}",
         BLOCKS,
         concat!(
-            "sequence merge (a: buffer in i16, out_: buffer out i16)\n",
+            "sequence merge (a: buffer in u16, out_: buffer out u16)\n",
             "  let x = @rcv(a)\n",
             "  |||\n",
             "  @send(out_, x)\n",
-            "graph loopy (src: buffer in i16, dst: buffer out i16)\n",
-            "  let back: buffer i16\n",
-            "  let fwd: buffer i16\n",
+            "graph loopy (src: buffer in u16, dst: buffer out u16)\n",
+            "  let back: buffer u16\n",
+            "  let fwd: buffer u16\n",
             "  merge(src, back)\n",
             "  dbl(back, fwd)\n",
             "  merge(fwd, dst)\n",
@@ -122,10 +122,10 @@ fn a_module_with_no_structure_is_not_drawn() {
         "{}{}",
         BLOCKS,
         concat!(
-            "fun helper (a: i8, o: out i8)\n",
+            "fun helper (a: u8, o: out u8)\n",
             "  o = a\n",
-            "graph chain (src: buffer in i16, dst: buffer out i32)\n",
-            "  let mid: buffer i16\n",
+            "graph chain (src: buffer in u16, dst: buffer out u32)\n",
+            "  let mid: buffer u16\n",
             "  dbl(src, mid)\n",
             "  widen(mid, dst)\n",
         )
@@ -138,7 +138,7 @@ fn a_module_with_no_structure_is_not_drawn() {
 fn a_file_with_no_graph_says_so_rather_than_drawing_nothing() {
     // An empty picture looks exactly like a broken tool.
     let g = dot(concat!(
-        "fun f (a: i8, o: out i8)\n",
+        "fun f (a: u8, o: out u8)\n",
         "  o = a\n",
     ));
     assert!(g.contains("no `graph` declarations"), "{}", g);
@@ -150,9 +150,9 @@ fn several_graphs_each_get_their_own_cluster() {
         "{}{}",
         BLOCKS,
         concat!(
-            "graph one (src: buffer in i16, dst: buffer out i16)\n",
+            "graph one (src: buffer in u16, dst: buffer out u16)\n",
             "  dbl(src, dst)\n",
-            "graph two (src: buffer in i16, dst: buffer out i32)\n",
+            "graph two (src: buffer in u16, dst: buffer out u32)\n",
             "  widen(src, dst)\n",
         )
     ));
@@ -170,8 +170,8 @@ fn the_output_is_syntactically_a_digraph() {
         "{}{}",
         BLOCKS,
         concat!(
-            "graph chain (src: buffer in i16, dst: buffer out i32)\n",
-            "  let mid: buffer i16\n",
+            "graph chain (src: buffer in u16, dst: buffer out u32)\n",
+            "  let mid: buffer u16\n",
             "  dbl(src, mid)\n",
             "  widen(mid, dst)\n",
         )

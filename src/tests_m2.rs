@@ -80,7 +80,7 @@ fn compile_err(src: &str) -> String {
 }
 
 const OPS: &str = concat!(
-    "enum op_e: i2\n",
+    "enum op_e: u2\n",
     "  OP_ADD\n",
     "  OP_SUB\n",
     "  OP_AND\n",
@@ -92,7 +92,7 @@ const OPS: &str = concat!(
 #[test]
 fn implicit_discriminants_count_up() {
     let v = compile(&format!(
-        "{}fun f (op: op_e, o: out i1)\n  o = op == OP_AND\n",
+        "{}fun f (op: op_e, o: out u1)\n  o = op == OP_AND\n",
         OPS
     ));
     // OP_AND is the third variant, so 2.
@@ -104,10 +104,10 @@ fn implicit_discriminants_count_up() {
 #[test]
 fn explicit_discriminants_are_honoured() {
     let v = compile(concat!(
-        "enum lb_e: i6\n",
+        "enum lb_e: u6\n",
         "  LB_ADD = 6'b110101\n",
         "  LB_EP1 = 6'b111111\n",
-        "fun f (op: lb_e, o: out i1)\n",
+        "fun f (op: lb_e, o: out u1)\n",
         "  o = op == LB_ADD\n",
     ));
     assert!(v.contains("6'h35"), "{}", v);
@@ -121,7 +121,7 @@ fn the_tag_width_is_inferred_when_not_written() {
         "  A\n",
         "  B\n",
         "  C\n",
-        "fun f (x: small_e, o: out i1)\n",
+        "fun f (x: small_e, o: out u1)\n",
         "  o = x == C\n",
     ));
     // Largest discriminant 2, so two bits.
@@ -131,11 +131,11 @@ fn the_tag_width_is_inferred_when_not_written() {
 #[test]
 fn a_tag_too_narrow_for_its_variants_is_rejected() {
     let text = compile_err(concat!(
-        "enum bad_e: i1\n",
+        "enum bad_e: u1\n",
         "  A\n",
         "  B\n",
         "  C\n",
-        "fun f (x: bad_e, o: out i1)\n",
+        "fun f (x: bad_e, o: out u1)\n",
         "  o = x == A\n",
     ));
     assert!(text.contains("1 bits wide"), "{}", text);
@@ -147,10 +147,10 @@ fn duplicate_discriminant_values_are_rejected() {
     // SystemVerilog rejects duplicate labels but accepts duplicate values,
     // which is the dangerous direction.
     let text = compile_err(concat!(
-        "enum dup_e: i2\n",
+        "enum dup_e: u2\n",
         "  A = 1\n",
         "  B = 1\n",
-        "fun f (x: dup_e, o: out i1)\n",
+        "fun f (x: dup_e, o: out u1)\n",
         "  o = x == A\n",
     ));
     assert!(text.contains("already used"), "{}", text);
@@ -159,7 +159,7 @@ fn duplicate_discriminant_values_are_rejected() {
 #[test]
 fn enums_do_arithmetic_nowhere() {
     let text = compile_err(&format!(
-        "{}fun f (op: op_e, o: out i2)\n  o = op + op\n",
+        "{}fun f (op: op_e, o: out u2)\n  o = op + op\n",
         OPS
     ));
     assert!(text.contains("expected an integer"), "{}", text);
@@ -171,7 +171,7 @@ fn enums_do_arithmetic_nowhere() {
 fn match_becomes_a_case_statement() {
     let v = compile(&format!(
         concat!(
-            "{}fun f (op: op_e, a: i8, b: i8, o: out i8)\n",
+            "{}fun f (op: op_e, a: u8, b: u8, o: out u8)\n",
             "  match op\n",
             "    .OP_ADD =>\n",
             "      o = a + b\n",
@@ -200,7 +200,7 @@ fn a_match_emits_no_mux_for_bindings_no_arm_touched() {
     // Every arm used to emit `cond ? x : x` for every name in scope.
     let v = compile(&format!(
         concat!(
-            "{}fun f (op: op_e, a: i8, b: i8, c: i8, d: i8, o: out i8)\n",
+            "{}fun f (op: op_e, a: u8, b: u8, c: u8, d: u8, o: out u8)\n",
             "  let untouched = c & d\n",
             "  match op\n",
             "    .OP_ADD =>\n",
@@ -219,7 +219,7 @@ fn a_match_emits_no_mux_for_bindings_no_arm_touched() {
 fn a_non_exhaustive_match_is_rejected_as_a_latch() {
     let text = compile_err(&format!(
         concat!(
-            "{}fun f (op: op_e, a: i8, o: out i8)\n",
+            "{}fun f (op: op_e, a: u8, o: out u8)\n",
             "  match op\n",
             "    .OP_ADD =>\n",
             "      o = a\n",
@@ -237,10 +237,10 @@ fn a_non_exhaustive_match_is_rejected_as_a_latch() {
 #[test]
 fn covering_every_variant_needs_no_catch_all() {
     let v = compile(concat!(
-        "enum two_e: i1\n",
+        "enum two_e: u1\n",
         "  LO\n",
         "  HI\n",
-        "fun f (x: two_e, a: i8, b: i8, o: out i8)\n",
+        "fun f (x: two_e, a: u8, b: u8, o: out u8)\n",
         "  match x\n",
         "    .LO =>\n",
         "      o = a\n",
@@ -254,7 +254,7 @@ fn covering_every_variant_needs_no_catch_all() {
 fn an_unknown_variant_lists_the_real_ones() {
     let text = compile_err(&format!(
         concat!(
-            "{}fun f (op: op_e, a: i8, o: out i8)\n",
+            "{}fun f (op: op_e, a: u8, o: out u8)\n",
             "  match op\n",
             "    .OP_NOPE =>\n",
             "      o = a\n",
@@ -271,7 +271,7 @@ fn an_unknown_variant_lists_the_real_ones() {
 fn a_variant_matched_twice_is_rejected() {
     let text = compile_err(&format!(
         concat!(
-            "{}fun f (op: op_e, a: i8, o: out i8)\n",
+            "{}fun f (op: op_e, a: u8, o: out u8)\n",
             "  match op\n",
             "    .OP_ADD =>\n",
             "      o = a\n",
@@ -289,7 +289,7 @@ fn a_variant_matched_twice_is_rejected() {
 fn an_arm_after_a_catch_all_is_unreachable() {
     let text = compile_err(&format!(
         concat!(
-            "{}fun f (op: op_e, a: i8, o: out i8)\n",
+            "{}fun f (op: op_e, a: u8, o: out u8)\n",
             "  match op\n",
             "    _ =>\n",
             "      o = a\n",
@@ -304,7 +304,7 @@ fn an_arm_after_a_catch_all_is_unreachable() {
 #[test]
 fn matching_on_a_plain_integer_is_rejected() {
     let text = compile_err(concat!(
-        "fun f (x: i2, a: i8, o: out i8)\n",
+        "fun f (x: u2, a: u8, o: out u8)\n",
         "  match x\n",
         "    _ =>\n",
         "      o = a\n",
@@ -317,9 +317,9 @@ fn matching_on_a_plain_integer_is_rejected() {
 #[test]
 fn a_call_is_inlined() {
     let v = compile(concat!(
-        "fun helper (t: i3, o: out i1)\n",
+        "fun helper (t: u3, o: out u1)\n",
         "  o = t[2]\n",
-        "fun caller (t: i3, o: out i1)\n",
+        "fun caller (t: u3, o: out u1)\n",
         "  o = helper(t)\n",
     ));
     let caller = v.split("module caller").nth(1).expect("caller emitted");
@@ -329,9 +329,9 @@ fn a_call_is_inlined() {
 #[test]
 fn a_function_declared_later_is_still_callable() {
     let v = compile(concat!(
-        "fun caller (t: i3, o: out i1)\n",
+        "fun caller (t: u3, o: out u1)\n",
         "  o = helper(t)\n",
-        "fun helper (t: i3, o: out i1)\n",
+        "fun helper (t: u3, o: out u1)\n",
         "  o = t[0]\n",
     ));
     assert!(v.contains("module caller"), "{}", v);
@@ -340,9 +340,9 @@ fn a_function_declared_later_is_still_callable() {
 #[test]
 fn call_arity_is_checked() {
     let text = compile_err(concat!(
-        "fun helper (a: i3, b: i3, o: out i1)\n",
+        "fun helper (a: u3, b: u3, o: out u1)\n",
         "  o = a[0] & b[0]\n",
-        "fun caller (t: i3, o: out i1)\n",
+        "fun caller (t: u3, o: out u1)\n",
         "  o = helper(t)\n",
     ));
     assert!(text.contains("takes 2 argument(s), found 1"), "{}", text);
@@ -351,18 +351,18 @@ fn call_arity_is_checked() {
 #[test]
 fn call_argument_types_are_checked() {
     let text = compile_err(concat!(
-        "fun helper (a: i3, o: out i1)\n",
+        "fun helper (a: u3, o: out u1)\n",
         "  o = a[0]\n",
-        "fun caller (t: i8, o: out i1)\n",
+        "fun caller (t: u8, o: out u1)\n",
         "  o = helper(t)\n",
     ));
-    assert!(text.contains("is `i3` but `i8` was given"), "{}", text);
+    assert!(text.contains("is `u3` but `u8` was given"), "{}", text);
 }
 
 #[test]
 fn a_recursive_call_is_rejected_as_a_circuit_that_never_settles() {
     let text = compile_err(concat!(
-        "fun loopy (a: i3, o: out i1)\n",
+        "fun loopy (a: u3, o: out u1)\n",
         "  o = loopy(a)\n",
     ));
     assert!(text.contains("calls itself"), "{}", text);
@@ -372,10 +372,10 @@ fn a_recursive_call_is_rejected_as_a_circuit_that_never_settles() {
 #[test]
 fn a_multi_output_function_cannot_be_an_expression() {
     let text = compile_err(concat!(
-        "fun two (a: i3, x: out i1, y: out i1)\n",
+        "fun two (a: u3, x: out u1, y: out u1)\n",
         "  x = a[0]\n",
         "  y = a[1]\n",
-        "fun caller (t: i3, o: out i1)\n",
+        "fun caller (t: u3, o: out u1)\n",
         "  o = two(t)\n",
     ));
     assert!(text.contains("cannot be used as an expression"), "{}", text);
@@ -384,7 +384,7 @@ fn a_multi_output_function_cannot_be_an_expression() {
 #[test]
 fn calling_something_that_is_not_a_function_is_rejected() {
     let text = compile_err(concat!(
-        "fun caller (t: i3, o: out i1)\n",
+        "fun caller (t: u3, o: out u1)\n",
         "  o = nope(t)\n",
     ));
     assert!(text.contains("is not a function"), "{}", text);
@@ -395,9 +395,9 @@ fn calling_something_that_is_not_a_function_is_rejected() {
 #[test]
 fn a_duplicate_declaration_is_rejected() {
     let text = compile_err(concat!(
-        "fun f (a: i1, o: out i1)\n",
+        "fun f (a: u1, o: out u1)\n",
         "  o = a\n",
-        "fun f (a: i1, o: out i1)\n",
+        "fun f (a: u1, o: out u1)\n",
         "  o = a\n",
     ));
     assert!(text.contains("declared more than once"), "{}", text);
@@ -406,9 +406,9 @@ fn a_duplicate_declaration_is_rejected() {
 #[test]
 fn the_banner_appears_once_for_a_multi_module_file() {
     let v = compile(concat!(
-        "fun a1 (x: i1, o: out i1)\n",
+        "fun a1 (x: u1, o: out u1)\n",
         "  o = x\n",
-        "fun a2 (x: i1, o: out i1)\n",
+        "fun a2 (x: u1, o: out u1)\n",
         "  o = x\n",
     ));
     assert_eq!(v.matches("GENERATED FILE").count(), 1, "{}", v);
@@ -532,9 +532,9 @@ fn banner_cmd(verilog: &str) -> String {
 #[test]
 fn a_compound_assignment_reads_then_writes() {
     let v = compile(concat!(
-        "fun bump (a: i8, o: out i8)
+        "fun bump (a: u8, o: out u8)
 ",
-        "  var acc: i8 = a
+        "  var acc: u8 = a
 ",
         "  acc += 8'd3
 ",
@@ -583,8 +583,8 @@ fn every_arithmetic_and_bitwise_operator_has_a_compound_form() {
         (">>=", " >> "),
     ] {
         let v = compile(&format!(
-            "fun f (a: i8, o: out i8)
-  var x: i8 = a
+            "fun f (a: u8, o: out u8)
+  var x: u8 = a
   x {} 8'd1
   o = x
 ",
@@ -598,9 +598,9 @@ fn every_arithmetic_and_bitwise_operator_has_a_compound_form() {
 #[test]
 fn a_compound_assignment_is_width_checked_like_a_plain_one() {
     let text = compile_err(concat!(
-        "fun bad (a: i8, b: i32, o: out i8)
+        "fun bad (a: u8, b: u32, o: out u8)
 ",
-        "  var x: i8 = a
+        "  var x: u8 = a
 ",
         "  x += b
 ",
@@ -615,9 +615,9 @@ fn tilde_assign_is_refused_by_name() {
     // `~` is unary inversion, so `x ~= y` is a guess between "invert" and
     // "not equal". The diagnostic says so rather than picking one.
     let text = compile_err(concat!(
-        "fun bad (a: i8, o: out i8)
+        "fun bad (a: u8, o: out u8)
 ",
-        "  var x: i8 = a
+        "  var x: u8 = a
 ",
         "  x ~= 8'd1
 ",
@@ -630,9 +630,9 @@ fn tilde_assign_is_refused_by_name() {
 #[test]
 fn a_let_binding_still_cannot_be_compound_assigned() {
     let text = compile_err(concat!(
-        "fun bad (a: i8, o: out i8)
+        "fun bad (a: u8, o: out u8)
 ",
-        "  let x: i8 = a
+        "  let x: u8 = a
 ",
         "  x += 8'd1
 ",
@@ -645,14 +645,14 @@ fn a_let_binding_still_cannot_be_compound_assigned() {
 // ---- structs -------------------------------------------------------------
 
 const REQ: &str = concat!(
-    "enum kind_e: i2\n",
+    "enum kind_e: u2\n",
     "  K_LOAD\n",
     "  K_STORE\n",
     "  K_ALU\n",
     "struct req_t\n",
     "  kind: kind_e\n",
-    "  addr: i16\n",
-    "  data: i8\n",
+    "  addr: u16\n",
+    "  data: u8\n",
 );
 
 #[test]
@@ -660,7 +660,7 @@ fn a_struct_packs_first_field_into_the_high_bits() {
     // Matching SystemVerilog packed structs, so a DDL struct and its SV
     // counterpart have the same layout across a module boundary.
     let v = compile(&format!(
-        "{}fun unpack (r: req_t, k: out kind_e, a: out i16, d: out i8)\n  k = r.kind\n  a = r.addr\n  d = r.data\n",
+        "{}fun unpack (r: req_t, k: out kind_e, a: out u16, d: out u8)\n  k = r.kind\n  a = r.addr\n  d = r.data\n",
         REQ
     ));
     assert!(v.contains("input  [25:0] r"), "26 bits total:\n{}", v);
@@ -672,7 +672,7 @@ fn a_struct_packs_first_field_into_the_high_bits() {
 #[test]
 fn a_struct_is_built_with_call_syntax() {
     let v = compile(&format!(
-        "{}fun pack (k: kind_e, a: i16, d: i8, r: out req_t)\n  r = req_t(k, a, d)\n",
+        "{}fun pack (k: kind_e, a: u16, d: u8, r: out req_t)\n  r = req_t(k, a, d)\n",
         REQ
     ));
     assert!(v.contains("{k, a, d}"), "{}", v);
@@ -685,7 +685,7 @@ fn a_field_keeps_its_own_type() {
     // it could not be matched on.
     let v = compile(&format!(
         concat!(
-            "{}fun f (r: req_t, yes: out i1)\n",
+            "{}fun f (r: req_t, yes: out u1)\n",
             "  match r.kind\n",
             "    .K_STORE =>\n",
             "      yes = 1'b1\n",
@@ -701,7 +701,7 @@ fn a_field_keeps_its_own_type() {
 #[test]
 fn an_unknown_field_lists_the_real_ones() {
     let text = compile_err(&format!(
-        "{}fun f (r: req_t, o: out i8)\n  o = r.nope\n",
+        "{}fun f (r: req_t, o: out u8)\n  o = r.nope\n",
         REQ
     ));
     assert!(text.contains("has no field `nope`"), "{}", text);
@@ -711,22 +711,22 @@ fn an_unknown_field_lists_the_real_ones() {
 #[test]
 fn struct_construction_checks_arity_and_types() {
     let text = compile_err(&format!(
-        "{}fun f (k: kind_e, a: i16, r: out req_t)\n  r = req_t(k, a)\n",
+        "{}fun f (k: kind_e, a: u16, r: out req_t)\n  r = req_t(k, a)\n",
         REQ
     ));
     assert!(text.contains("has 3 field(s), found 2"), "{}", text);
 
     let text = compile_err(&format!(
-        "{}fun f (k: kind_e, a: i16, d: i32, r: out req_t)\n  r = req_t(k, a, d)\n",
+        "{}fun f (k: kind_e, a: u16, d: u32, r: out req_t)\n  r = req_t(k, a, d)\n",
         REQ
     ));
     assert!(text.contains("field `data`"), "{}", text);
-    assert!(text.contains("`i8` but `i32` was given"), "{}", text);
+    assert!(text.contains("`u8` but `u32` was given"), "{}", text);
 }
 
 #[test]
 fn taking_a_field_of_a_non_struct_is_rejected() {
-    let text = compile_err("fun f (x: i8, o: out i8)\n  o = x.nope\n");
+    let text = compile_err("fun f (x: u8, o: out u8)\n  o = x.nope\n");
     assert!(text.contains("has no fields"), "{}", text);
 }
 
@@ -734,9 +734,9 @@ fn taking_a_field_of_a_non_struct_is_rejected() {
 fn a_struct_round_trips_through_pack_and_unpack() {
     let v = compile(&format!(
         concat!(
-            "{}fun pack (k: kind_e, a: i16, d: i8, r: out req_t)\n",
+            "{}fun pack (k: kind_e, a: u16, d: u8, r: out req_t)\n",
             "  r = req_t(k, a, d)\n",
-            "fun roundtrip (k: kind_e, a: i16, d: i8, o: out i16)\n",
+            "fun roundtrip (k: kind_e, a: u16, d: u8, o: out u16)\n",
             "  let packed = req_t(k, a, d)\n",
             "  o = packed.addr\n",
         ),
@@ -751,12 +751,12 @@ fn a_struct_round_trips_through_pack_and_unpack() {
 fn a_struct_field_may_be_another_struct() {
     let v = compile(concat!(
         "struct inner_t\n",
-        "  lo: i4\n",
-        "  hi: i4\n",
+        "  lo: u4\n",
+        "  hi: u4\n",
         "struct outer_t\n",
-        "  tag: i2\n",
+        "  tag: u2\n",
         "  body: inner_t\n",
-        "fun f (o: outer_t, r: out i4)\n",
+        "fun f (o: outer_t, r: out u4)\n",
         "  r = o.body.hi\n",
     ));
     assert!(v.contains("input  [9:0] o"), "2 + 8 bits:\n{}", v);
@@ -771,11 +771,11 @@ fn a_sparse_enum_needs_a_wildcard_even_when_every_variant_is_covered() {
     // fallback -- so reordering otherwise-equivalent arms changed what 2'b11
     // produced.
     let text = compile_err(concat!(
-        "enum logic_e: i2\n",
+        "enum logic_e: u2\n",
         "  LOGIC_AND\n",
         "  LOGIC_OR\n",
         "  LOGIC_XOR\n",
-        "fun f (op: logic_e, a: i8, b: i8, o: out i8)\n",
+        "fun f (op: logic_e, a: u8, b: u8, o: out u8)\n",
         "  match op\n",
         "    .LOGIC_AND =>\n",
         "      o = a & b\n",
@@ -795,7 +795,7 @@ fn a_dense_enum_still_needs_no_wildcard() {
     // them all really is exhaustive and the check stays out of the way.
     let v = compile(&format!(
         concat!(
-            "{}fun f (op: op_e, a: i8, b: i8, o: out i8)\n",
+            "{}fun f (op: op_e, a: u8, b: u8, o: out u8)\n",
             "  match op\n",
             "    .OP_ADD =>\n",
             "      o = a + b\n",
@@ -815,7 +815,7 @@ fn a_dense_enum_still_needs_no_wildcard() {
 // ---- @unreachable, and CRLF ----------------------------------------------
 
 const SPARSE: &str = concat!(
-    "enum logic_e: i2\n",
+    "enum logic_e: u2\n",
     "  LOGIC_AND\n",
     "  LOGIC_OR\n",
     "  LOGIC_XOR\n",
@@ -827,7 +827,7 @@ fn unreachable_lets_a_sparse_enum_be_covered_by_name() {
     // author asserts it cannot occur, which is what `unique case` means.
     let v = compile(&format!(
         concat!(
-            "{}fun f (op: logic_e, a: i8, b: i8, o: out i8)\n",
+            "{}fun f (op: logic_e, a: u8, b: u8, o: out u8)\n",
             "  match op\n",
             "    .LOGIC_AND =>\n",
             "      o = a & b\n",
@@ -852,7 +852,7 @@ fn unreachable_does_not_excuse_a_missing_variant() {
     // be usable to skip one.
     let text = compile_err(&format!(
         concat!(
-            "{}fun f (op: logic_e, a: i8, b: i8, o: out i8)\n",
+            "{}fun f (op: logic_e, a: u8, b: u8, o: out u8)\n",
             "  match op\n",
             "    .LOGIC_AND =>\n",
             "      o = a & b\n",
@@ -869,7 +869,7 @@ fn unreachable_does_not_excuse_a_missing_variant() {
 fn unreachable_must_sit_on_a_catch_all() {
     let text = compile_err(&format!(
         concat!(
-            "{}fun f (op: logic_e, a: i8, b: i8, o: out i8)\n",
+            "{}fun f (op: logic_e, a: u8, b: u8, o: out u8)\n",
             "  match op\n",
             "    .LOGIC_AND =>\n",
             "      o = a & b\n",
@@ -888,7 +888,7 @@ fn unreachable_must_sit_on_a_catch_all() {
 fn the_sparse_enum_error_names_unreachable_as_an_option() {
     let text = compile_err(&format!(
         concat!(
-            "{}fun f (op: logic_e, a: i8, b: i8, o: out i8)\n",
+            "{}fun f (op: logic_e, a: u8, b: u8, o: out u8)\n",
             "  match op\n",
             "    .LOGIC_AND =>\n",
             "      o = a & b\n",
@@ -907,7 +907,7 @@ fn a_match_diagnostic_points_at_the_match_not_the_file() {
     // It used to anchor at 1:1, which is useless in a module with several.
     let text = compile_err(&format!(
         concat!(
-            "{}fun f (op: logic_e, a: i8, b: i8, o: out i8)\n",
+            "{}fun f (op: logic_e, a: u8, b: u8, o: out u8)\n",
             "  match op\n",
             "    .LOGIC_AND =>\n",
             "      o = a & b\n",
@@ -925,7 +925,7 @@ fn a_match_diagnostic_points_at_the_match_not_the_file() {
 fn every_unhandled_match_is_reported_not_just_the_first() {
     let text = compile_err(&format!(
         concat!(
-            "{}fun f (op: logic_e, a: i8, b: i8, x: out i8, y: out i8)\n",
+            "{}fun f (op: logic_e, a: u8, b: u8, x: out u8, y: out u8)\n",
             "  match op\n",
             "    .LOGIC_AND =>\n",
             "      x = a\n",
@@ -959,7 +959,7 @@ fn crlf_parses_the_same_as_lf() {
     let lf = format!(
         concat!(
             "{}-- a comment, which must not disturb the block probe\n",
-            "fun f (op: logic_e, a: i8, b: i8, o: out i8)\n",
+            "fun f (op: logic_e, a: u8, b: u8, o: out u8)\n",
             "  match op\n",
             "    .LOGIC_AND =>\n",
             "      o = a & b\n",
@@ -981,7 +981,7 @@ fn crlf_parses_the_same_as_lf() {
 #[test]
 fn crlf_survives_nested_blocks() {
     let lf = concat!(
-        "fun f (c: i1, a: i8, b: i8, o: out i8)\n",
+        "fun f (c: u1, a: u8, b: u8, o: out u8)\n",
         "  if c then\n",
         "    o = a\n",
         "  else\n",
@@ -996,7 +996,7 @@ fn crlf_survives_nested_blocks() {
 
 /// Dense: four variants filling a two-bit tag exactly.
 const LB4: &str = concat!(
-    "enum lb_e: i2\n",
+    "enum lb_e: u2\n",
     "  LB_ADD\n",
     "  LB_SUB\n",
     "  LB_AND\n",
@@ -1010,7 +1010,7 @@ fn an_or_pattern_makes_a_grouped_match_exhaustive() {
     // the check off, on the one enum whose drift history motivated it.
     let v = compile(&format!(
         concat!(
-            "{}fun f (lb: lb_e, a: i8, b: i8, o: out i8)\n",
+            "{}fun f (lb: lb_e, a: u8, b: u8, o: out u8)\n",
             "  match lb\n",
             "    .LB_ADD | .LB_SUB =>\n",
             "      o = a + b\n",
@@ -1029,7 +1029,7 @@ fn an_or_pattern_becomes_several_labels_on_one_arm() {
     // groups opcodes, and is why or-patterns were worth building.
     let v = compile(&format!(
         concat!(
-            "{}fun f (lb: lb_e, a: i8, b: i8, o: out i8)\n",
+            "{}fun f (lb: lb_e, a: u8, b: u8, o: out u8)\n",
             "  match lb\n",
             "    .LB_ADD | .LB_SUB | .LB_AND =>\n",
             "      o = a + b\n",
@@ -1048,7 +1048,7 @@ fn a_final_or_pattern_costs_no_logic() {
     // liveness drops it -- grouping must not cost gates.
     let v = compile(&format!(
         concat!(
-            "{}fun f (lb: lb_e, a: i8, b: i8, o: out i8)\n",
+            "{}fun f (lb: lb_e, a: u8, b: u8, o: out u8)\n",
             "  match lb\n",
             "    .LB_ADD =>\n",
             "      o = a + b\n",
@@ -1066,7 +1066,7 @@ fn a_final_or_pattern_costs_no_logic() {
 fn an_or_pattern_still_reports_a_missing_variant() {
     let text = compile_err(&format!(
         concat!(
-            "{}fun f (lb: lb_e, a: i8, o: out i8)\n",
+            "{}fun f (lb: lb_e, a: u8, o: out u8)\n",
             "  match lb\n",
             "    .LB_ADD | .LB_SUB =>\n",
             "      o = a\n",
@@ -1082,7 +1082,7 @@ fn an_or_pattern_still_reports_a_missing_variant() {
 fn a_variant_repeated_across_alternatives_is_rejected() {
     let text = compile_err(&format!(
         concat!(
-            "{}fun f (lb: lb_e, a: i8, o: out i8)\n",
+            "{}fun f (lb: lb_e, a: u8, o: out u8)\n",
             "  match lb\n",
             "    .LB_ADD | .LB_ADD =>\n",
             "      o = a\n",
@@ -1098,7 +1098,7 @@ fn a_variant_repeated_across_alternatives_is_rejected() {
 fn a_variant_repeated_in_a_later_arm_is_rejected() {
     let text = compile_err(&format!(
         concat!(
-            "{}fun f (lb: lb_e, a: i8, o: out i8)\n",
+            "{}fun f (lb: lb_e, a: u8, o: out u8)\n",
             "  match lb\n",
             "    .LB_ADD | .LB_SUB =>\n",
             "      o = a\n",
@@ -1117,7 +1117,7 @@ fn an_alternative_cannot_mix_a_binding_with_variants() {
     // `.LB_ADD | x` would match everything and leave the named one dead.
     let text = compile_err(&format!(
         concat!(
-            "{}fun f (lb: lb_e, a: i8, o: out i8)\n",
+            "{}fun f (lb: lb_e, a: u8, o: out u8)\n",
             "  match lb\n",
             "    .LB_ADD | x =>\n",
             "      o = a\n",
@@ -1133,7 +1133,7 @@ fn an_alternative_cannot_mix_a_binding_with_variants() {
 fn an_unknown_variant_inside_an_alternative_is_caught() {
     let text = compile_err(&format!(
         concat!(
-            "{}fun f (lb: lb_e, a: i8, o: out i8)\n",
+            "{}fun f (lb: lb_e, a: u8, o: out u8)\n",
             "  match lb\n",
             "    .LB_ADD | .LB_NOPE =>\n",
             "      o = a\n",
@@ -1149,7 +1149,7 @@ fn an_unknown_variant_inside_an_alternative_is_caught() {
 fn or_patterns_compose_with_unreachable_on_a_sparse_enum() {
     let v = compile(&format!(
         concat!(
-            "{}fun f (op: logic_e, a: i8, b: i8, o: out i8)\n",
+            "{}fun f (op: logic_e, a: u8, b: u8, o: out u8)\n",
             "  match op\n",
             "    .LOGIC_AND | .LOGIC_OR =>\n",
             "      o = a & b\n",
@@ -1166,15 +1166,15 @@ fn or_patterns_compose_with_unreachable_on_a_sparse_enum() {
 // ---- field assignment and @zeroed() --------------------------------------
 
 const UOP: &str = concat!(
-    "enum kind_e: i2\n",
+    "enum kind_e: u2\n",
     "  K_NOP\n",
     "  K_ADD\n",
     "  K_SUB\n",
     "  K_LD\n",
     "struct uop_t\n",
     "  kind: kind_e\n",
-    "  dst: i5\n",
-    "  imm: i8\n",
+    "  dst: u5\n",
+    "  imm: u8\n",
 );
 
 #[test]
@@ -1183,7 +1183,7 @@ fn a_struct_is_built_field_by_field() {
     // that this opcode uses.
     let v = compile(&format!(
         concat!(
-            "{}fun build (k: kind_e, d: i5, i: i8, o: out uop_t)\n",
+            "{}fun build (k: kind_e, d: u5, i: u8, o: out uop_t)\n",
             "  var u: uop_t = @zeroed()\n",
             "  u.kind = k\n",
             "  u.dst = d\n",
@@ -1208,7 +1208,7 @@ fn a_struct_is_built_field_by_field() {
 fn a_part_select_always_reads_from_a_name() {
     let v = compile(&format!(
         concat!(
-            "{}fun build (k: kind_e, d: i5, i: i8, o: out uop_t)\n",
+            "{}fun build (k: kind_e, d: u5, i: u8, o: out uop_t)\n",
             "  var u: uop_t = @zeroed()\n",
             "  u.kind = k\n",
             "  u.dst = d\n",
@@ -1246,12 +1246,12 @@ fn a_part_select_always_reads_from_a_name() {
 fn a_nested_field_can_be_assigned() {
     let v = compile(concat!(
         "struct inner_t\n",
-        "  lo: i4\n",
-        "  hi: i4\n",
+        "  lo: u4\n",
+        "  hi: u4\n",
         "struct outer_t\n",
-        "  tag: i2\n",
+        "  tag: u2\n",
         "  body: inner_t\n",
-        "fun f (t: i2, x: i4, o: out outer_t)\n",
+        "fun f (t: u2, x: u4, o: out outer_t)\n",
         "  var v: outer_t = @zeroed()\n",
         "  v.tag = t\n",
         "  v.body.hi = x\n",
@@ -1274,7 +1274,7 @@ fn assigning_an_unknown_field_is_rejected() {
 #[test]
 fn a_field_assignment_is_type_checked() {
     let text = compile_err(&format!(
-        "{}fun f (x: i8, o: out uop_t)\n  var u: uop_t = @zeroed()\n  u.dst = x\n  o = u\n",
+        "{}fun f (x: u8, o: out uop_t)\n  var u: uop_t = @zeroed()\n  u.dst = x\n  o = u\n",
         UOP
     ));
     assert!(text.contains("cannot assign"), "{}", text);
@@ -1283,8 +1283,8 @@ fn a_field_assignment_is_type_checked() {
 #[test]
 fn taking_a_field_of_a_non_struct_target_is_rejected() {
     let text = compile_err(concat!(
-        "fun f (x: i8, o: out i8)\n",
-        "  var v: i8 = @zeroed()\n",
+        "fun f (x: u8, o: out u8)\n",
+        "  var v: u8 = @zeroed()\n",
         "  v.nope = x\n",
         "  o = v\n",
     ));
@@ -1293,7 +1293,7 @@ fn taking_a_field_of_a_non_struct_target_is_rejected() {
 
 #[test]
 fn zeroed_needs_a_type_it_can_take_from_context() {
-    let text = compile_err("fun f (o: out i8)\n  let x = @zeroed()\n  o = x\n");
+    let text = compile_err("fun f (o: out u8)\n  let x = @zeroed()\n  o = x\n");
     assert!(text.contains("needs a type from its context"), "{}", text);
 }
 
@@ -1310,14 +1310,14 @@ fn zeroed_takes_the_type_of_an_assignment_target() {
 //
 // A process takes data through pipes and nothing else, so these all share one
 // boundary: `src` carries the stimulus and `got` is "an item arrived this
-// cycle" -- which is exactly what a bare `go: i1` input used to mean, spelled
+// cycle" -- which is exactly what a bare `go: u1` input used to mean, spelled
 // so the compiler owns the protocol. `o` is a `buffer out` because these are
 // observations of state.
 
 /// The header every register test uses, plus the receive that drives it.
 const PROC_IN: &str = concat!(
-    "process p (src: buffer in i8, o: buffer out i8)\n",
-    "  var c: i8 = @zeroed()\n",
+    "process p (src: buffer in u8, o: buffer out u8)\n",
+    "  var c: u8 = @zeroed()\n",
     "  let (x, go) = @try_rcv(src)\n",
 );
 
@@ -1338,8 +1338,8 @@ fn a_process_gets_implicit_clock_and_reset() {
 #[test]
 fn a_var_in_a_process_becomes_a_register() {
     let v = compile(concat!(
-        "process p (src: buffer in i8, o: buffer out i8)\n",
-        "  var c: i8 = 8'd7\n",
+        "process p (src: buffer in u8, o: buffer out u8)\n",
+        "  var c: u8 = 8'd7\n",
         "  let (x, go) = @try_rcv(src)\n",
         "  if go then\n",
         "    c = c + 8'd1\n",
@@ -1405,11 +1405,11 @@ fn a_register_can_hold_a_struct_and_be_updated_field_by_field() {
 #[test]
 fn an_enum_register_resets_to_its_named_variant() {
     let v = compile(concat!(
-        "enum st_e: i2\n",
+        "enum st_e: u2\n",
         "  S_IDLE\n",
         "  S_RUN\n",
         "  S_DONE\n",
-        "process p (src: buffer in i8, o: buffer out st_e)\n",
+        "process p (src: buffer in u8, o: buffer out st_e)\n",
         "  var st: st_e = S_RUN\n",
         "  let (x, go) = @try_rcv(src)\n",
         "  if go then\n",
@@ -1422,8 +1422,8 @@ fn an_enum_register_resets_to_its_named_variant() {
 #[test]
 fn a_register_reset_value_must_be_constant() {
     let text = compile_err(concat!(
-        "process p (src: buffer in i8, o: buffer out i1)\n",
-        "  var c: i1 = clk\n",
+        "process p (src: buffer in u8, o: buffer out u1)\n",
+        "  var c: u1 = clk\n",
         "  let _s = @try_send(o, c)\n",
     ));
     assert!(text.contains("must be a constant"), "{}", text);
@@ -1434,15 +1434,15 @@ fn a_constant_parameter_can_be_a_reset_value() {
     // The counterpart: a plain parameter is a compile-time constant, so it is
     // exactly what a reset value is allowed to be.
     let v = compile(concat!(
-        "process p (seed: i8 = 8'd9, src: buffer in i8, o: buffer out i8)\n",
-        "  var c: i8 = seed\n",
+        "process p (seed: u8 = 8'd9, src: buffer in u8, o: buffer out u8)\n",
+        "  var c: u8 = seed\n",
         "  let (x, got) = @try_rcv(src)\n",
         "  let _s = @try_send(o, c)\n",
     ));
     assert!(v.contains("c <= 8'd9;"), "{}", v);
     // Named in the header comment so the file is readable, and folded away
     // everywhere else: it is not a port.
-    assert!(v.contains("//   seed : i8 = 8'd9"), "{}", v);
+    assert!(v.contains("//   seed : u8 = 8'd9"), "{}", v);
     let body = v.split("module p (").nth(1).expect("a module");
     assert!(!body.contains("seed"), "{}", body);
 }
@@ -1450,7 +1450,7 @@ fn a_constant_parameter_can_be_a_reset_value() {
 #[test]
 fn a_register_needs_a_declared_type() {
     let text = compile_err(concat!(
-        "process p (src: buffer in i8, o: buffer out i8)\n",
+        "process p (src: buffer in u8, o: buffer out u8)\n",
         "  var c = 8'd0\n",
         "  let _s = @try_send(o, c)\n",
     ));
@@ -1461,8 +1461,8 @@ fn a_register_needs_a_declared_type() {
 fn a_process_needs_at_least_one_pipe() {
     // Constants alone are not a boundary: nothing can observe this.
     let text = compile_err(concat!(
-        "process p (a: i8 = 8'd1)\n",
-        "  var c: i8 = @zeroed()\n",
+        "process p (a: u8 = 8'd1)\n",
+        "  var c: u8 = @zeroed()\n",
         "  c = a\n",
     ));
     assert!(text.contains("at least one pipe"), "{}", text);
@@ -1473,8 +1473,8 @@ fn a_process_has_no_plain_data_ports() {
     // The rule the language is built on: a process cannot present a raw wire
     // and hand-roll a protocol over it.
     let ins = compile_err(concat!(
-        "process p (cp: i16, dst: buffer out i16)\n",
-        "  var c: i16 = @zeroed()\n",
+        "process p (cp: u16, dst: buffer out u16)\n",
+        "  var c: u16 = @zeroed()\n",
         "  c = cp\n",
         "  let _s = @try_send(dst, c)\n",
     ));
@@ -1482,7 +1482,7 @@ fn a_process_has_no_plain_data_ports() {
     assert!(ins.contains("buffer in"), "{}", ins);
 
     let outs = compile_err(concat!(
-        "process p (src: buffer in i16, o: out i16)\n",
+        "process p (src: buffer in u16, o: out u16)\n",
         "  let (x, got) = @try_rcv(src)\n",
         "  o = x\n",
     ));
@@ -1492,8 +1492,8 @@ fn a_process_has_no_plain_data_ports() {
 #[test]
 fn clk_and_rst_n_cannot_be_declared_by_hand() {
     let text = compile_err(concat!(
-        "process p (clk: i1, o: buffer out i8)\n",
-        "  var c: i8 = @zeroed()\n",
+        "process p (clk: u1, o: buffer out u8)\n",
+        "  var c: u8 = @zeroed()\n",
         "  let _s = @try_send(o, c)\n",
     ));
     assert!(text.contains("implicit on a process"), "{}", text);
@@ -1506,11 +1506,11 @@ fn clk_and_rst_n_cannot_be_declared_by_hand() {
 #[test]
 fn a_two_level_dedent_after_a_nested_if_parses() {
     let v = compile(concat!(
-        "process p (src: buffer in i8, o: buffer out i8)\n",
-        "  var c: i8 = @zeroed()\n",
+        "process p (src: buffer in u8, o: buffer out u8)\n",
+        "  var c: u8 = @zeroed()\n",
         "  let (x, got) = @try_rcv(src)\n",
-        "  let clear: i1 = x[0]\n",
-        "  let go: i1 = x[1]\n",
+        "  let clear: u1 = x[0]\n",
+        "  let go: u1 = x[1]\n",
         "  if clear then\n",
         "    c = @zeroed()\n",
         "  else\n",
@@ -1526,8 +1526,8 @@ fn a_two_level_dedent_after_a_nested_if_parses() {
 
 const PIPE: &str = concat!(
     "struct item_t\n",
-    "  tag: i4\n",
-    "  payload: i16\n",
+    "  tag: u4\n",
+    "  payload: u16\n",
 );
 
 #[test]
@@ -1611,7 +1611,7 @@ fn every_output_pipe_is_two_deep() {
     // one could not hold the item its producer had already committed to when
     // the sink stalled, which is the whole reason the second entry is there.
     let v = compile(concat!(
-        "process p (src: buffer in i32, o: buffer out i32)\n",
+        "process p (src: buffer in u32, o: buffer out u32)\n",
         "  let (x, got) = @try_rcv(src)\n",
         "  let _s = @try_send(o, x)\n",
     ));
@@ -1699,14 +1699,14 @@ fn a_pipe_payload_is_type_checked() {
 
 #[test]
 fn only_the_pipe_forms_produce_a_pair() {
-    let text = compile_err("fun f (a: i8, o: out i8)\n  let (x, y) = a\n  o = x\n");
+    let text = compile_err("fun f (a: u8, o: out u8)\n  let (x, y) = a\n  o = x\n");
     assert!(text.contains("`@try_rcv(p)` and `@peek(p)` produce a pair"), "{}", text);
 }
 
 // ---- blocking channel operations -----------------------------------------
 
 const ADDER: &str = concat!(
-    "process p (src: buffer in i32, dst: buffer out i32)\n",
+    "process p (src: buffer in u32, dst: buffer out u32)\n",
     "  loop\n",
     "    let a = @rcv(src)\n",
     "    let b = @rcv(src)\n",
@@ -1746,7 +1746,7 @@ fn a_value_crossing_a_state_becomes_a_register() {
 #[test]
 fn a_barrier_inside_a_conditional_gets_its_own_state() {
     let v = compile(concat!(
-        "process p (go: i1 = 1'b1, src: buffer in i32, dst: buffer out i32)\n",
+        "process p (go: u1 = 1'b1, src: buffer in u32, dst: buffer out u32)\n",
         "  loop\n",
         "    if go then\n",
         "      let a = @rcv(src)\n",
@@ -1763,7 +1763,7 @@ fn a_loop_with_no_blocking_operation_repeats_every_cycle() {
     // Not an error and not a state machine: `loop` with no barrier is the
     // per-cycle form, which is what most of this compiler's output is.
     let v = compile(concat!(
-        "process p (src: buffer in i32, dst: buffer out i32)\n",
+        "process p (src: buffer in u32, dst: buffer out u32)\n",
         "  loop\n",
         "    let (x, got) = @try_rcv(src)\n",
         "    @try_send(dst, x)\n",
@@ -1779,8 +1779,8 @@ fn a_linear_body_runs_once_and_stops() {
     // desc.md:37 -- a process "may stop (reach terminal state)". `loop` is
     // what makes a body repeat; without one it is a program that runs once.
     let v = compile(concat!(
-        "process p (src: buffer in i32, dst: buffer out i32)\n",
-        "  var seen: i32 = @zeroed()\n",
+        "process p (src: buffer in u32, dst: buffer out u32)\n",
+        "  var seen: u32 = @zeroed()\n",
         "  let (x, got) = @try_rcv(src)\n",
         "  seen = x\n",
         "  @try_send(dst, seen)\n",
@@ -1795,7 +1795,7 @@ fn a_linear_body_runs_once_and_stops() {
 #[test]
 fn a_linear_body_with_barriers_ends_in_a_terminal_state() {
     let v = compile(concat!(
-        "process p (src: buffer in i32, dst: buffer out i32)\n",
+        "process p (src: buffer in u32, dst: buffer out u32)\n",
         "  let a = @rcv(src)\n",
         "  @send(dst, a)\n",
     ));
@@ -1813,7 +1813,7 @@ fn break_in_a_per_cycle_loop_has_nothing_to_leave() {
     // A `loop` with no blocking operation is the per-cycle form: it has no
     // states, so there is no state machine to leave.
     let text = compile_err(concat!(
-        "process p (src: buffer in i32, dst: buffer out i32)\n",
+        "process p (src: buffer in u32, dst: buffer out u32)\n",
         "  loop\n",
         "    let (x, got) = @try_rcv(src)\n",
         "    @try_send(dst, x)\n",
@@ -1825,7 +1825,7 @@ fn break_in_a_per_cycle_loop_has_nothing_to_leave() {
 #[test]
 fn break_leaves_a_blocking_loop_for_its_terminal_state() {
     let v = compile(concat!(
-        "process until_zero (src: buffer in i32, dst: buffer out i32)\n",
+        "process until_zero (src: buffer in u32, dst: buffer out u32)\n",
         "  loop\n",
         "    let a = @rcv(src)\n",
         "    if a == 32'd0 then\n",
@@ -1844,8 +1844,8 @@ fn statements_after_the_last_barrier_run_when_it_fires() {
     // `@send`"). They are the send state's post scope now: the same place a
     // statement between a receive and a branch goes, and the same cycle.
     let v = compile(concat!(
-        "process p (src: buffer in i32, dst: buffer out i32)\n",
-        "  var n: i32 = @zeroed()\n",
+        "process p (src: buffer in u32, dst: buffer out u32)\n",
+        "  var n: u32 = @zeroed()\n",
         "  loop\n",
         "    let a = @rcv(src)\n",
         "    @send(dst, a)\n",
@@ -1858,7 +1858,7 @@ fn statements_after_the_last_barrier_run_when_it_fires() {
 #[test]
 fn receiving_from_an_output_pipe_is_rejected_in_a_loop() {
     let text = compile_err(concat!(
-        "process p (src: buffer in i32, dst: buffer out i32)\n",
+        "process p (src: buffer in u32, dst: buffer out u32)\n",
         "  loop\n",
         "    let a = @rcv(dst)\n",
         "    @send(dst, a)\n",
@@ -1869,13 +1869,13 @@ fn receiving_from_an_output_pipe_is_rejected_in_a_loop() {
 // ---- sequences -----------------------------------------------------------
 
 const PIPE3: &str = concat!(
-    "sequence s (src: buffer in i16, dst: buffer out i32)\n",
+    "sequence s (src: buffer in u16, dst: buffer out u32)\n",
     "  let a = @rcv(src)\n",
-    "  let doubled: i16 = a + a\n",
+    "  let doubled: u16 = a + a\n",
     "  |||\n",
-    "  let wide: i32 = @zext(doubled, 32)\n",
+    "  let wide: u32 = @zext(doubled, 32)\n",
     "  |||\n",
-    "  let scaled: i32 = wide + wide\n",
+    "  let scaled: u32 = wide + wide\n",
     "  @send(dst, scaled)\n",
 );
 
@@ -1947,7 +1947,7 @@ fn the_item_leaving_is_registered_alongside_its_validity_bit() {
 #[test]
 fn a_blocking_read_outside_the_head_stage_is_rejected() {
     let text = compile_err(concat!(
-        "sequence s (src: buffer in i16, dst: buffer out i32)\n",
+        "sequence s (src: buffer in u16, dst: buffer out u32)\n",
         "  let a = @rcv(src)\n",
         "  |||\n",
         "  let b = @rcv(src)\n",
@@ -1959,10 +1959,10 @@ fn a_blocking_read_outside_the_head_stage_is_rejected() {
 #[test]
 fn a_sequence_must_end_by_sending() {
     let text = compile_err(concat!(
-        "sequence s (src: buffer in i16, dst: buffer out i32)\n",
+        "sequence s (src: buffer in u16, dst: buffer out u32)\n",
         "  let a = @rcv(src)\n",
         "  |||\n",
-        "  let b: i32 = @zext(a, 32)\n",
+        "  let b: u32 = @zext(a, 32)\n",
     ));
     assert!(text.contains("ends by sending"), "{}", text);
 }
@@ -1972,18 +1972,18 @@ fn a_sequence_must_end_by_sending() {
 
 const CMD: &str = concat!(
     "struct cmd_t\n",
-    "  we: i1\n",
-    "  addr: i5\n",
-    "  data: i32\n",
+    "  we: u1\n",
+    "  addr: u5\n",
+    "  data: u32\n",
 );
 
 const REGFILE: &str = concat!(
     "struct cmd_t\n",
-    "  we: i1\n",
-    "  addr: i5\n",
-    "  data: i32\n",
-    "process rf (cmd: buffer in cmd_t, rd: buffer out i32)\n",
-    "  var vals: #[impl(lutram)] [i32; 32] = @zeroed()\n",
+    "  we: u1\n",
+    "  addr: u5\n",
+    "  data: u32\n",
+    "process rf (cmd: buffer in cmd_t, rd: buffer out u32)\n",
+    "  var vals: #[impl(lutram)] [u32; 32] = @zeroed()\n",
     "  loop\n",
     "    let (c, got) = @try_rcv(cmd)\n",
     "    let _s = @try_send(rd, vals[c.addr])\n",
@@ -2041,8 +2041,8 @@ fn a_memory_with_no_initialiser_has_no_reset_loop() {
         "{}{}",
         CMD,
         concat!(
-            "process rf (cmd: buffer in cmd_t, rd: buffer out i32)\n",
-            "  var vals: #[impl(lutram)] [i32; 32]\n",
+            "process rf (cmd: buffer in cmd_t, rd: buffer out u32)\n",
+            "  var vals: #[impl(lutram)] [u32; 32]\n",
             "  loop\n",
             "    let (c, got) = @try_rcv(cmd)\n",
             "    let _s = @try_send(rd, vals[c.addr])\n",
@@ -2058,7 +2058,7 @@ fn a_memory_with_no_initialiser_has_no_reset_loop() {
 #[test]
 fn the_element_type_can_be_an_enum() {
     let v = compile(&format!("{}{}", OPS, concat!(
-        "process rf (addr: buffer in i5, rd: buffer out op_e)\n",
+        "process rf (addr: buffer in u5, rd: buffer out op_e)\n",
         "  var tags: #[impl(lutram)] [op_e; 32] = OP_SUB\n",
         "  let (a, got) = @try_rcv(addr)\n",
         "  let _s = @try_send(rd, tags[a])\n",
@@ -2070,16 +2070,16 @@ fn the_element_type_can_be_an_enum() {
 #[test]
 fn a_narrow_index_is_widened_and_a_wide_one_is_refused() {
     let v = compile(concat!(
-        "process rf (addr: buffer in i3, rd: buffer out i32)\n",
-        "  var vals: #[impl(lutram)] [i32; 32] = @zeroed()\n",
+        "process rf (addr: buffer in u3, rd: buffer out u32)\n",
+        "  var vals: #[impl(lutram)] [u32; 32] = @zeroed()\n",
         "  let (a, got) = @try_rcv(addr)\n",
         "  let _s = @try_send(rd, vals[a])\n",
     ));
     assert!(v.contains("vals["), "{}", v);
 
     let text = compile_err(concat!(
-        "process rf (addr: buffer in i8, rd: buffer out i32)\n",
-        "  var vals: #[impl(lutram)] [i32; 32] = @zeroed()\n",
+        "process rf (addr: buffer in u8, rd: buffer out u32)\n",
+        "  var vals: #[impl(lutram)] [u32; 32] = @zeroed()\n",
         "  let (a, got) = @try_rcv(addr)\n",
         "  let _s = @try_send(rd, vals[a])\n",
     ));
@@ -2094,8 +2094,8 @@ fn an_unknown_impl_is_rejected() {
     // is no other construct it could be, so the parser names what is wrong
     // rather than leaving the driver to guess from the first word on the line.
     let text = compile_err(concat!(
-        "process rf (addr: buffer in i5, rd: buffer out i32)\n",
-        "  var vals: #[impl(sram)] [i32; 32] = @zeroed()\n",
+        "process rf (addr: buffer in u5, rd: buffer out u32)\n",
+        "  var vals: #[impl(sram)] [u32; 32] = @zeroed()\n",
         "  let (a, got) = @try_rcv(addr)\n",
         "  let _s = @try_send(rd, vals[a])\n",
     ));
@@ -2108,8 +2108,8 @@ fn an_unknown_impl_is_rejected() {
 #[test]
 fn a_memory_cannot_be_a_parameter() {
     let text = compile_err(concat!(
-        "process rf (vals: #[impl(lutram)] [i32; 32], rd: buffer out i32)\n",
-        "  var acc: i32 = 0\n",
+        "process rf (vals: #[impl(lutram)] [u32; 32], rd: buffer out u32)\n",
+        "  var acc: u32 = 0\n",
         "  let _s = @try_send(rd, acc)\n",
     ));
     assert!(text.contains("cannot be a parameter"), "{}", text);
@@ -2118,8 +2118,8 @@ fn a_memory_cannot_be_a_parameter() {
 #[test]
 fn a_memory_needs_a_constant_reset() {
     let text = compile_err(concat!(
-        "process rf (addr: buffer in i5, rd: buffer out i1)\n",
-        "  var vals: #[impl(lutram)] [i1; 32] = clk\n",
+        "process rf (addr: buffer in u5, rd: buffer out u1)\n",
+        "  var vals: #[impl(lutram)] [u1; 32] = clk\n",
         "  let (a, got) = @try_rcv(addr)\n",
         "  let _s = @try_send(rd, vals[a])\n",
     ));
@@ -2133,8 +2133,8 @@ fn a_memory_in_a_blocking_process_writes_only_in_the_state_that_writes_it() {
     // in a blocking process mean what it reads as: written once per item, not
     // once per clock.
     let v = compile(concat!(
-        "process p (src: buffer in i32, dst: buffer out i32)\n",
-        "  var vals: #[impl(lutram)] [i32; 32] = @zeroed()\n",
+        "process p (src: buffer in u32, dst: buffer out u32)\n",
+        "  var vals: #[impl(lutram)] [u32; 32] = @zeroed()\n",
         "  loop\n",
         "    let a = @rcv(src)\n",
         "    vals[5'd0] = a\n",
@@ -2148,8 +2148,8 @@ fn a_memory_in_a_blocking_process_writes_only_in_the_state_that_writes_it() {
 #[test]
 fn a_memory_is_not_a_value() {
     let text = compile_err(concat!(
-        "fun f (x: i32, y: out i32)\n",
-        "  let vals: #[impl(lutram)] [i32; 32] = @zeroed()\n",
+        "fun f (x: u32, y: out u32)\n",
+        "  let vals: #[impl(lutram)] [u32; 32] = @zeroed()\n",
         "  y = x\n",
     ));
     assert!(text.contains("state rather than a value"), "{}", text);
@@ -2158,7 +2158,7 @@ fn a_memory_is_not_a_value() {
 #[test]
 fn an_assertion_is_guarded_on_simulation() {
     let v = compile(concat!(
-        "fun f (x: i8, y: out i8)\n",
+        "fun f (x: u8, y: out u8)\n",
         "  @assert(x != 8'd0, \"x must not be zero\")\n",
         "  y = x\n",
     ));
@@ -2172,8 +2172,8 @@ fn an_assertion_is_guarded_on_simulation() {
 #[test]
 fn a_clocked_assertion_runs_on_the_edge_and_not_during_reset() {
     let v = compile(concat!(
-        "process p (src: buffer in i8, o: buffer out i8)\n",
-        "  var n: i8 = 0\n",
+        "process p (src: buffer in u8, o: buffer out u8)\n",
+        "  var n: u8 = 0\n",
         "  let (x, got) = @try_rcv(src)\n",
         "  @assert(x != 8'd0, \"x must not be zero\")\n",
         "  n = x\n",
@@ -2188,7 +2188,7 @@ fn a_clocked_assertion_runs_on_the_edge_and_not_during_reset() {
 #[test]
 fn an_assertion_inside_an_if_is_an_implication() {
     let v = compile(concat!(
-        "fun f (c: i1, x: i8, y: out i8)\n",
+        "fun f (c: u1, x: u8, y: out u8)\n",
         "  if c then\n",
         "    @assert(x != 8'd0, \"x must not be zero when c\")\n",
         "    y = x\n",
@@ -2203,7 +2203,7 @@ fn an_assertion_inside_an_if_is_an_implication() {
 #[test]
 fn an_assertion_in_a_match_arm_is_guarded_by_that_arm() {
     let v = compile(&format!("{}{}", OPS, concat!(
-        "fun f (op: op_e, x: i8, y: out i8)\n",
+        "fun f (op: op_e, x: u8, y: out u8)\n",
         "  match op\n",
         "    .OP_ADD =>\n",
         "      @assert(x != 8'd0, \"no zero on add\")\n",
@@ -2220,7 +2220,7 @@ fn an_assertion_in_a_match_arm_is_guarded_by_that_arm() {
 #[test]
 fn fatal_uses_the_fatal_task() {
     let v = compile(concat!(
-        "fun f (x: i8, y: out i8)\n",
+        "fun f (x: u8, y: out u8)\n",
         "  @fatal(x != 8'd0, \"x must not be zero\")\n",
         "  y = x\n",
     ));
@@ -2232,7 +2232,7 @@ fn an_assertion_message_is_escaped() {
     // A bare `%` would be read by `$error` as a format specifier and would
     // consume an argument that is not there.
     let v = compile(concat!(
-        "fun f (x: i8, y: out i8)\n",
+        "fun f (x: u8, y: out u8)\n",
         "  @assert(x != 8'd0, \"100% of the time\")\n",
         "  y = x\n",
     ));
@@ -2242,17 +2242,17 @@ fn an_assertion_message_is_escaped() {
 #[test]
 fn an_assertion_condition_must_be_i1() {
     let text = compile_err(concat!(
-        "fun f (x: i8, y: out i8)\n",
+        "fun f (x: u8, y: out u8)\n",
         "  @assert(x, \"nope\")\n",
         "  y = x\n",
     ));
-    assert!(text.contains("`i1` condition"), "{}", text);
+    assert!(text.contains("`u1` condition"), "{}", text);
 }
 
 #[test]
 fn an_assertion_message_must_be_a_literal() {
     let text = compile_err(concat!(
-        "fun f (x: i8, y: out i8)\n",
+        "fun f (x: u8, y: out u8)\n",
         "  @assert(x != 8'd0, x)\n",
         "  y = x\n",
     ));
@@ -2264,8 +2264,8 @@ fn an_assertion_keeps_its_cone_alive() {
     // Nothing downstream reads an assertion, so without it being a root the
     // whole cone feeding it would look dead and be stripped.
     let v = compile(concat!(
-        "fun f (a: i8, b: i8, y: out i8)\n",
-        "  let sum: i8 = a + b\n",
+        "fun f (a: u8, b: u8, y: out u8)\n",
+        "  let sum: u8 = a + b\n",
         "  @assert(sum != 8'd0, \"sum must not be zero\")\n",
         "  y = a\n",
     ));
@@ -2278,7 +2278,7 @@ fn emit_ir_shows_what_the_compiler_decided() {
     let map = SourceMap::new("t.ddl", REGFILE);
     let ir = compile_with(&map, &EmitOptions::default(), Emit::Ir)
         .expect("compiles");
-    assert!(ir.contains("mem   vals : [i32; 32] lutram"), "{}", ir);
+    assert!(ir.contains("mem   vals : [u32; 32] lutram"), "{}", ir);
     assert!(ir.contains("memread vals["), "{}", ir);
     // No banner: this is for reading, not for checking in.
     assert!(!ir.contains("GENERATED FILE"), "{}", ir);
@@ -2301,8 +2301,8 @@ fn a_bram_in_a_process_with_no_states_has_nowhere_to_put_its_cycle() {
     // back distributed RAM under a `bram` label. A per-cycle process has no
     // state to spend, so the answer is `lutram` or a process that blocks.
     let text = compile_err(concat!(
-        "process rf (addr: buffer in i5, rd: buffer out i32)\n",
-        "  var vals: #[impl(bram)] [i32; 32]\n",
+        "process rf (addr: buffer in u5, rd: buffer out u32)\n",
+        "  var vals: #[impl(bram)] [u32; 32]\n",
         "  let (a, got) = @try_rcv(addr)\n",
         "  let _s = @try_send(rd, vals[a])\n",
     ));
@@ -2316,8 +2316,8 @@ fn a_bram_cannot_be_reset() {
     // written on reset cannot be inferred as one: 256x32 would come out as
     // 8192 flip-flops, which is a silent disaster rather than a loud one.
     let text = compile_err(concat!(
-        "process p (req: buffer in i8, resp: buffer out i32)\n",
-        "  var table: #[impl(bram)] [i32; 256] = @zeroed()\n",
+        "process p (req: buffer in u8, resp: buffer out u32)\n",
+        "  var table: #[impl(bram)] [u32; 256] = @zeroed()\n",
         "  loop\n",
         "    let a = @rcv(req)\n",
         "    let v = table[a]\n",
@@ -2354,8 +2354,8 @@ fn the_same_source_compiles_to_the_same_bytes() {
 #[test]
 fn a_let_cannot_be_assigned() {
     let text = compile_err(concat!(
-        "fun f (x: i8, y: out i8)\n",
-        "  let acc: i8 = 8'd0\n",
+        "fun f (x: u8, y: out u8)\n",
+        "  let acc: u8 = 8'd0\n",
         "  acc = x\n",
         "  y = acc\n",
     ));
@@ -2366,8 +2366,8 @@ fn a_let_cannot_be_assigned() {
 #[test]
 fn a_var_can_be_assigned() {
     let v = compile(concat!(
-        "fun f (x: i8, y: out i8)\n",
-        "  var acc: i8 = 8'd0\n",
+        "fun f (x: u8, y: out u8)\n",
+        "  var acc: u8 = 8'd0\n",
         "  acc = x\n",
         "  y = acc\n",
     ));
@@ -2378,14 +2378,14 @@ fn a_var_can_be_assigned() {
 fn an_out_parameter_is_assignable_without_being_a_var() {
     // `out` is written once and read back by the caller, which is a different
     // thing from state that changes.
-    let v = compile("fun f (x: i8, y: out i8)\n  y = x\n");
+    let v = compile("fun f (x: u8, y: out u8)\n  y = x\n");
     assert!(v.contains("assign y = x;"), "{}", v);
 }
 
 #[test]
 fn a_constant_parameter_cannot_be_assigned() {
     let text = compile_err(concat!(
-        "process p (n: i8 = 8'd3, src: buffer in i8, o: buffer out i8)\n",
+        "process p (n: u8 = 8'd3, src: buffer in u8, o: buffer out u8)\n",
         "  loop\n",
         "    let (x, got) = @try_rcv(src)\n",
         "    n = x\n",
@@ -2398,7 +2398,7 @@ fn a_constant_parameter_cannot_be_assigned() {
 #[test]
 fn a_received_item_cannot_be_assigned() {
     let text = compile_err(concat!(
-        "process p (src: buffer in i8, o: buffer out i8)\n",
+        "process p (src: buffer in u8, o: buffer out u8)\n",
         "  loop\n",
         "    let (x, got) = @try_rcv(src)\n",
         "    x = 8'd0\n",
@@ -2411,8 +2411,8 @@ fn a_received_item_cannot_be_assigned() {
 fn a_register_is_still_mutable() {
     // The leading `var` scan and the assignability check have to agree.
     let v = compile(concat!(
-        "process p (src: buffer in i8, o: buffer out i8)\n",
-        "  var c: i8 = 8'd0\n",
+        "process p (src: buffer in u8, o: buffer out u8)\n",
+        "  var c: u8 = 8'd0\n",
         "  loop\n",
         "    let (x, got) = @try_rcv(src)\n",
         "    c = c + x\n",
@@ -2428,8 +2428,8 @@ fn a_let_keeps_its_name_where_a_mux_join_would_not() {
     // `let` is a NAMED wire, where the same thing written as an `if` over a
     // pre-initialised binding became an anonymous temporary.
     let v = compile(concat!(
-        "fun f (c: i1, y: out i32)\n",
-        "  let picked: i32 = if c then 32'd1 else 32'd2\n",
+        "fun f (c: u1, y: out u32)\n",
+        "  let picked: u32 = if c then 32'd1 else 32'd2\n",
         "  y = picked\n",
     ));
     assert!(v.contains("wire [31:0] picked ="), "{}", v);
@@ -2439,7 +2439,7 @@ fn a_let_keeps_its_name_where_a_mux_join_would_not() {
 // ---- M7b: a call can produce more than one value --------------------------
 
 const DIVMOD: &str = concat!(
-    "fun divmod (a: i8, b: i8, q: out i8, r: out i8)\n",
+    "fun divmod (a: u8, b: u8, q: out u8, r: out u8)\n",
     "  q = a / b\n",
     "  r = a % b\n",
 );
@@ -2447,7 +2447,7 @@ const DIVMOD: &str = concat!(
 #[test]
 fn a_tuple_binding_takes_one_name_per_output() {
     let v = compile(&format!("{}{}", DIVMOD, concat!(
-        "fun f (x: i8, y: i8, s: out i8)\n",
+        "fun f (x: u8, y: u8, s: out u8)\n",
         "  let (quot, rem) = divmod(x, y)\n",
         "  s = quot + rem\n",
     )));
@@ -2460,7 +2460,7 @@ fn a_tuple_binding_takes_one_name_per_output() {
 #[test]
 fn declaration_order_decides_which_name_gets_which() {
     let v = compile(&format!("{}{}", DIVMOD, concat!(
-        "fun f (x: i8, y: i8, s: out i8)\n",
+        "fun f (x: u8, y: u8, s: out u8)\n",
         "  let (first, second) = divmod(x, y)\n",
         "  s = first\n",
     )));
@@ -2471,7 +2471,7 @@ fn declaration_order_decides_which_name_gets_which() {
 #[test]
 fn binding_the_wrong_number_of_names_says_what_the_outputs_are() {
     let text = compile_err(&format!("{}{}", DIVMOD, concat!(
-        "fun f (x: i8, y: i8, s: out i8)\n",
+        "fun f (x: u8, y: u8, s: out u8)\n",
         "  let (a, b, c) = divmod(x, y)\n",
         "  s = a\n",
     )));
@@ -2482,7 +2482,7 @@ fn binding_the_wrong_number_of_names_says_what_the_outputs_are() {
 #[test]
 fn a_multi_output_function_is_still_refused_in_expression_position() {
     let text = compile_err(&format!("{}{}", DIVMOD, concat!(
-        "fun f (x: i8, y: i8, s: out i8)\n",
+        "fun f (x: u8, y: u8, s: out u8)\n",
         "  s = divmod(x, y)\n",
     )));
     assert!(text.contains("cannot be used as an expression"), "{}", text);
@@ -2492,9 +2492,9 @@ fn a_multi_output_function_is_still_refused_in_expression_position() {
 #[test]
 fn a_function_with_no_outputs_produces_nothing_to_bind() {
     let text = compile_err(concat!(
-        "fun nothing (a: i8)\n",
-        "  let unused: i8 = a\n",
-        "fun f (x: i8, s: out i8)\n",
+        "fun nothing (a: u8)\n",
+        "  let unused: u8 = a\n",
+        "fun f (x: u8, s: out u8)\n",
         "  let (a, b) = nothing(x)\n",
         "  s = x\n",
     ));
@@ -2506,7 +2506,7 @@ fn a_multi_output_call_inside_a_branch_is_muxed() {
     // The results are ordinary bindings, so the SSA join treats them like any
     // other -- but only if both arms bind them.
     let v = compile(&format!("{}{}", DIVMOD, concat!(
-        "fun f (c: i1, x: i8, y: i8, s: out i8)\n",
+        "fun f (c: u1, x: u8, y: u8, s: out u8)\n",
         "  if c then\n",
         "    let (q, r) = divmod(x, y)\n",
         "    s = q + r\n",
@@ -2519,7 +2519,7 @@ fn a_multi_output_call_inside_a_branch_is_muxed() {
 #[test]
 fn a_multi_output_call_cannot_recurse() {
     let text = compile_err(concat!(
-        "fun loopy (a: i8, p: out i8, q: out i8)\n",
+        "fun loopy (a: u8, p: out u8, q: out u8)\n",
         "  let (x, y) = loopy(a)\n",
         "  p = x\n",
         "  q = y\n",
@@ -2549,7 +2549,7 @@ fn the_verified_alu_and_shifter_can_be_called() {
 
     let src = imported.text().to_string()
         + concat!(
-            "\nfun both (a: i32, b: i32, t: rdt_e, n: i5, ra: out i32, rs: out i32)\n",
+            "\nfun both (a: u32, b: u32, t: rdt_e, n: u5, ra: out u32, rs: out u32)\n",
             "  let (arith, ovf, log_r, cmp_r, un) = k2g_alu(a, b, t, t, ARITH_ADD, LOGIC_AND, CMP_EQ, UNARY_NEG)\n",
             "  let (sh, bx, bi) = k2g_shift(a, b, n, SHIFT_LL, 5'd0, 5'd8)\n",
             "  ra = arith\n",
@@ -2574,7 +2574,7 @@ fn a_wrapped_if_expression_means_what_the_one_line_form_means() {
     // changed with a line break. `rdt_normalize` in k2g_xstage.ddl is where
     // this was found: the two extends are long enough to want wrapping.
     let v = compile(concat!(
-        "fun pick (c: i1, a: i32, b: i32, o: out i32, p: out i32)\n",
+        "fun pick (c: u1, a: u32, b: u32, o: out u32, p: out u32)\n",
         "  o = if c then a else b\n",
         "  p =\n",
         "      if c then a else b\n",
@@ -2586,7 +2586,7 @@ fn a_wrapped_if_expression_means_what_the_one_line_form_means() {
 #[test]
 fn a_wrapped_chain_of_else_ifs_lowers_to_nested_selects() {
     let v = compile(concat!(
-        "fun pick (d: i2, o: out i8)\n",
+        "fun pick (d: u2, o: out u8)\n",
         "  o =\n",
         "      if d == 2'd0 then 8'd1\n",
         "      else if d == 2'd1 then 8'd2\n",
@@ -2606,17 +2606,17 @@ fn every_other_block_shape_is_refused_by_the_parser() {
     // is the one-line form of the same thing -- the message is the parser's
     // and is poor for both, which is a separate problem from this one.
     for src in [
-        "fun f (c: i1, a: i32, o: out i32)
+        "fun f (c: u1, a: u32, o: out u32)
   o =
       if c then a
 ",
-        "fun f (c: i1, a: i32, o: out i32)
+        "fun f (c: u1, a: u32, o: out u32)
   o = if c then a
 ",
-        "fun f (c: i1, a: i32, o: out i32)
+        "fun f (c: u1, a: u32, o: out u32)
   o =
-      let x: i32 = a
-      let y: i32 = a
+      let x: u32 = a
+      let y: u32 = a
 ",
     ] {
         let text = compile_err(src);

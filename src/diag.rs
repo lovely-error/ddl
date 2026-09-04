@@ -414,7 +414,7 @@ mod tests {
     fn map() -> SourceMap {
         SourceMap::new(
             "shift.ddl",
-            "fun f (a: i32)\n  let y = foo + 1\n  return y\n",
+            "fun f (a: u32)\n  let y = foo + 1\n  return y\n",
         )
     }
 
@@ -422,7 +422,7 @@ mod tests {
     fn line_col_is_one_based() {
         let m = map();
         assert_eq!(m.line_col(0), (1, 1));
-        // "fun f (a: i32)\n" is 15 bytes, so offset 15 is the start of line 2.
+        // "fun f (a: u32)\n" is 15 bytes, so offset 15 is the start of line 2.
         assert_eq!(m.line_col(15), (2, 1));
         assert_eq!(m.line_col(17), (2, 3));
     }
@@ -466,10 +466,10 @@ mod tests {
         // The whole point of concatenating: `cat a.ddl b.ddl` also compiles,
         // but reports every error in b as though it were at the bottom of a.
         let m = SourceMap::from_files(vec![
-            ("types.ddl".into(), "enum e: i1
+            ("types.ddl".into(), "enum e: u1
   A
 ".into()),
-            ("shift.ddl".into(), "fun f (a: i32)
+            ("shift.ddl".into(), "fun f (a: u32)
   let y = foo + 1
 ".into()),
         ]);
@@ -487,11 +487,11 @@ mod tests {
     #[test]
     fn a_file_without_a_trailing_newline_does_not_run_into_the_next() {
         let m = SourceMap::from_files(vec![
-            ("a.ddl".into(), "fun f (o: out i1)".into()),
-            ("b.ddl".into(), "fun g (o: out i1)
+            ("a.ddl".into(), "fun f (o: out u1)".into()),
+            ("b.ddl".into(), "fun g (o: out u1)
 ".into()),
         ]);
-        assert!(m.text().contains("i1)
+        assert!(m.text().contains("u1)
 fun g"), "{:?}", m.text());
         let lo = m.text().find("fun g").expect("in the buffer") as u32;
         assert_eq!(m.line_col(lo), (1, 1));

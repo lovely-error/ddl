@@ -59,16 +59,16 @@
 -- examples/verify.sh counts the RAM primitives in the netlist, because that is
 -- the only place the answer exists.
 
-process bram_lookup (cmd: buffer in i16, din: buffer in i32, resp: buffer out i32)
-  var t: #[impl(bram)] [i32; 256]
+process bram_lookup (cmd: buffer in u16, din: buffer in u32, resp: buffer out u32)
+  var t: #[impl(bram)] [u32; 256]
 
   loop
     let c = @rcv(cmd)
 
     -- Decoded once, in the cycle the command's handshake completes, so the
     -- branch below costs no cycle of its own.
-    let addr: i8 = c[7..0]
-    let is_write: i1 = c[15]
+    let addr: u8 = c[7..0]
+    let is_write: u1 = c[15]
 
     if is_write then
       let d = @rcv(din)

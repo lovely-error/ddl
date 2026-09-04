@@ -19,7 +19,7 @@
 // changed was the continuation lines of wrapped parameter lists,
 //
 //     fun k2g_shift (
-//         value: i32,          -- shift operand, and the BINS destination
+//         value: u32,          -- shift operand, and the BINS destination
 //
 // pulling them from four spaces to two, because a deeper line is
 // indistinguishable from a nested block without knowing what construct it is
@@ -160,11 +160,11 @@ mod tests {
         let src = concat!(
             "fun k2g_shift (
 ",
-            "    value: i32,
+            "    value: u32,
 ",
-            "    amount: i5,
+            "    amount: u5,
 ",
-            "    result: out i32)
+            "    result: out u32)
 ",
             "  result = value
 ",
@@ -175,7 +175,7 @@ mod tests {
     #[test]
     fn nesting_is_not_rewritten_either() {
         let src = concat!(
-            "fun f (c: i1, a: i8, o: out i8)
+            "fun f (c: u1, a: u8, o: out u8)
 ",
             "    if c then
 ",
@@ -193,7 +193,7 @@ mod tests {
     fn comments_survive() {
         // The whole reason this is not an AST round trip: the parser drops
         // every one of them, so re-emitting from the tree would delete them.
-        let src = "-- a note   \nfun f (a: i8, o: out i8)\n    -- another  \n    o = a\n";
+        let src = "-- a note   \nfun f (a: u8, o: out u8)\n    -- another  \n    o = a\n";
         match format_source(src) {
             Outcome::Changed(got) => {
                 assert!(got.contains("-- a note"), "{}", got);
@@ -205,37 +205,37 @@ mod tests {
 
     #[test]
     fn trailing_whitespace_goes() {
-        let got = format_source("fun f (a: i8, o: out i8)   \n  o = a\t\n");
+        let got = format_source("fun f (a: u8, o: out u8)   \n  o = a\t\n");
         // The tab makes it decline; that is the point of the next test.
         assert!(matches!(got, Outcome::Refused(_)));
 
-        let got = format_source("fun f (a: i8, o: out i8)   \n  o = a  \n");
-        assert_eq!(got, Outcome::Changed("fun f (a: i8, o: out i8)\n  o = a\n".to_string()));
+        let got = format_source("fun f (a: u8, o: out u8)   \n  o = a  \n");
+        assert_eq!(got, Outcome::Changed("fun f (a: u8, o: out u8)\n  o = a\n".to_string()));
     }
 
     #[test]
     fn a_tab_makes_it_decline_rather_than_guess() {
         // Converting one means choosing a width, and choosing wrong moves the
         // line into a different block.
-        let got = format_source("fun f (a: i8, o: out i8)\n\to = a\n");
+        let got = format_source("fun f (a: u8, o: out u8)\n\to = a\n");
         assert!(matches!(got, Outcome::Refused(_)), "{:?}", got);
     }
 
     #[test]
     fn a_run_of_blank_lines_collapses() {
-        let got = format_source("fun f (a: i8, o: out i8)\n  o = a\n\n\n\n");
-        assert_eq!(got, Outcome::Changed("fun f (a: i8, o: out i8)\n  o = a\n".to_string()));
+        let got = format_source("fun f (a: u8, o: out u8)\n  o = a\n\n\n\n");
+        assert_eq!(got, Outcome::Changed("fun f (a: u8, o: out u8)\n  o = a\n".to_string()));
     }
 
     #[test]
     fn a_missing_trailing_newline_is_added() {
-        let got = format_source("fun f (a: i8, o: out i8)\n  o = a");
-        assert_eq!(got, Outcome::Changed("fun f (a: i8, o: out i8)\n  o = a\n".to_string()));
+        let got = format_source("fun f (a: u8, o: out u8)\n  o = a");
+        assert_eq!(got, Outcome::Changed("fun f (a: u8, o: out u8)\n  o = a\n".to_string()));
     }
 
     #[test]
     fn an_already_formatted_file_is_left_alone() {
-        let src = "fun f (a: i8, o: out i8)\n  o = a\n";
+        let src = "fun f (a: u8, o: out u8)\n  o = a\n";
         assert_eq!(format_source(src), Outcome::Unchanged);
     }
 
@@ -244,7 +244,7 @@ mod tests {
         // It cannot be shown to be unharmed, so it is not harmed. The trailing
         // whitespace is what gives it something to change, so the refusal is
         // the verification declining rather than there being nothing to do.
-        let got = format_source("fun f (a: i8, o: out i8)   \n  ??? broken\n");
+        let got = format_source("fun f (a: u8, o: out u8)   \n  ??? broken\n");
         assert!(matches!(got, Outcome::Refused(_)), "{:?}", got);
     }
 }

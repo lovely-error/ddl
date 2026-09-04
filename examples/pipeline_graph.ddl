@@ -6,7 +6,7 @@
 -- it computes nothing, and what it emits is wires and instantiations.
 --
 -- What is worth noticing is what is NOT written here. There is no `valid`, no
--- `ready`, no FIFO, and no depth. `let stage1: buffer i16` says two blocks
+-- `ready`, no FIFO, and no depth. `let stage1: buffer u16` says two blocks
 -- are connected and what travels between them; the handshake on both ends was
 -- generated when those blocks were compiled, and connecting them is three
 -- wires because both ends already agree on what the three wires mean.
@@ -19,28 +19,28 @@
 
 import "mul3.ddl"
 
-sequence add_one (src: buffer in i16, dst: buffer out i16)
+sequence add_one (src: buffer in u16, dst: buffer out u16)
   let a = @rcv(src)
   |||
-  let b: i16 = a + 16'd1
+  let b: u16 = a + 16'd1
   @send(dst, b)
 
-sequence saturate (src: buffer in i32, dst: buffer out i32)
+sequence saturate (src: buffer in u32, dst: buffer out u32)
   let a = @rcv(src)
   |||
   -- Clamp to 16 bits' worth, so the stage does something a mux can show.
-  let too_big: i1 = a > 32'd65535
-  let b: i32 = if too_big then 32'd65535 else a
+  let too_big: u1 = a > 32'd65535
+  let b: u32 = if too_big then 32'd65535 else a
   @send(dst, b)
 
--- `mul3` comes from mul3.ddl: i16 in, i32 out, three pipeline stages.
+-- `mul3` comes from mul3.ddl: u16 in, u32 out, three pipeline stages.
 --
 -- Latency here is add_one's 1, plus mul3's 3, plus saturate's 1 -- and
 -- throughput is still one item per cycle, because every stage is its own
 -- pipeline and the pipes between them carry the back-pressure.
-graph scaler (src: buffer in i16, dst: buffer out i32)
-  let bumped: buffer i16
-  let scaled: buffer i32
+graph scaler (src: buffer in u16, dst: buffer out u32)
+  let bumped: buffer u16
+  let scaled: buffer u32
 
   add_one(src, bumped)
   mul3(bumped, scaled)

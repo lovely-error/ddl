@@ -212,7 +212,7 @@ left.
 3. ~~**Element assignment on an array value.**~~ Built. `s.words[1] = x` and
    `a[i] = x` both work, at a constant index or a computed one. A cache line
    arriving over a burst can be filled a beat at a time.
-4. **Pipe depth.** `let p: buffer i32 [4]`. Two entries is a credit of two.
+4. **Pipe depth.** `let p: buffer u32 [4]`. Two entries is a credit of two.
    Enough behind a cache that hits; not enough to cover a miss. Still the
    largest thing on this list, and cheaper now than it will be later: the salt
    is already a gray-coded pointer, so depth 2^k is k+1 bits of salt and the

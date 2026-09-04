@@ -11,7 +11,7 @@
 
 import "k2g_pkg.ddl"   -- generated from the emulator; -I $K2G/rtl to find it
 
-enum fault_e: i5
+enum fault_e: u5
   FAULT_NONE                  = 5'h00
   FAULT_ILLEGAL_OPCODE        = 5'h01
   FAULT_ILLEGAL_PREFIX_COMBO  = 5'h02
@@ -29,7 +29,7 @@ enum fault_e: i5
 -- One per arm of the emulator's CanonInsn. Flat, so execute is a single match
 -- rather than a nest of prefix conditionals -- every reinterpretation
 -- (BMX+SHL becoming an extract, CSP+LD a port read) is resolved during decode.
-enum uop_kind_e: i5
+enum uop_kind_e: u5
   UOP_NOP
   UOP_PUT_IMM
   UOP_SET_TAG
@@ -50,7 +50,7 @@ enum uop_kind_e: i5
   UOP_HALT
   UOP_FAULT
 
-enum cond_kind_e: i3
+enum cond_kind_e: u3
   CCK_NONE
   CCK_OVERFLOW
   CCK_FLAG
@@ -58,23 +58,23 @@ enum cond_kind_e: i3
   CCK_NEGATIVE
   CCK_POSITIVE
 
-enum arith_e: i2
+enum arith_e: u2
   ARITH_ADD
   ARITH_SUB
   ARITH_MUL
   ARITH_DIV
 
-enum logic_e: i2
+enum logic_e: u2
   LOGIC_AND
   LOGIC_OR
   LOGIC_XOR
 
-enum shift_e: i2
+enum shift_e: u2
   SHIFT_LL
   SHIFT_LR
   SHIFT_AR
 
-enum cmp_e: i3
+enum cmp_e: u3
   CMP_EQ
   CMP_NE
   CMP_LT
@@ -82,11 +82,11 @@ enum cmp_e: i3
   CMP_LE
   CMP_GE
 
-enum unary_e: i2
+enum unary_e: u2
   UNARY_NOT
   UNARY_NEG
 
-enum jump_e: i2
+enum jump_e: u2
   JT_REL_IMM
   JT_REL_REG
   JT_ABS_REG
@@ -97,15 +97,15 @@ enum jump_e: i2
 struct uop_t
   kind: uop_kind_e
 
-  dst: i5              -- arg1 for most forms
-  src: i5              -- arg2 for most forms
-  imm: i32             -- immediate / offset / displacement
-  use_imm: i1          -- src2 is `imm` rather than register `src`
+  dst: u5              -- arg1 for most forms
+  src: u5              -- arg2 for most forms
+  imm: u32             -- immediate / offset / displacement
+  use_imm: u1          -- src2 is `imm` rather than register `src`
 
   -- Predication (spec 7). Resolved during the prefix's own decode cycle.
   cond: cond_kind_e
-  cond_reg: i5
-  cond_invert: i1
+  cond_reg: u5
+  cond_invert: u1
 
   -- Operation selectors, valid per `kind`.
   arith_op: arith_e
@@ -121,24 +121,24 @@ struct uop_t
   -- -- address, width from the source tag, predication, faults -- is a
   -- store's and stays a store's. What it adds is where the bytes have to
   -- become visible.
-  is_insn: i1
-  on_flags: i1         -- FLAG prefix: operate on flag_bit
-  uto_reg: i5          -- link register / widening-multiply high half
-  uto_valid: i1
+  is_insn: u1
+  on_flags: u1         -- FLAG prefix: operate on flag_bit
+  uto_reg: u5          -- link register / widening-multiply high half
+  uto_valid: u1
   datakind: rdt_e      -- for loads / put-constant / retag
-  bm_start: i5         -- BMX
-  bm_span: i5
+  bm_start: u5         -- BMX
+  bm_span: u5
 
   -- Set when decode itself failed; `fault` says why.
   fault: fault_e
-  size_bytes: i32
+  size_bytes: u32
 
 fun uop_nop (u: out uop_t)
   u = @zeroed()
 
 -- `cp` is the code point being decoded when the fault was detected, and it
 -- rides in `imm` because a fault uop has no immediate of its own.
-fun uop_fault (cause: fault_e, cp: i16, u: out uop_t)
+fun uop_fault (cause: fault_e, cp: u16, u: out uop_t)
   var f: uop_t = @zeroed()
   f.kind = UOP_FAULT
   f.fault = cause

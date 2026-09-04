@@ -46,7 +46,7 @@ fn a_width_mismatch_points_at_the_operator_that_has_it() {
     assert_at(
         4,
         concat!(
-            "fun f (a: i32, b: i5, o: out i32)\n",
+            "fun f (a: u32, b: u5, o: out u32)\n",
             "  let p = a\n",
             "  let q = a\n",
             "  o = a + b\n",
@@ -59,7 +59,7 @@ fn a_latch_points_at_the_branch_that_causes_it() {
     assert_at(
         4,
         concat!(
-            "fun f (c: i1, a: i8, o: out i8)\n",
+            "fun f (c: u1, a: u8, o: out u8)\n",
             "  let p = a\n",
             "  let q = a\n",
             "  if c then\n",
@@ -73,7 +73,7 @@ fn a_non_boolean_condition_points_at_the_condition() {
     assert_at(
         4,
         concat!(
-            "fun f (a: i8, o: out i8)\n",
+            "fun f (a: u8, o: out u8)\n",
             "  let p = a\n",
             "  let q = a\n",
             "  if a then\n",
@@ -89,8 +89,8 @@ fn a_match_on_the_wrong_type_points_at_the_scrutinee() {
     assert_at(
         4,
         concat!(
-            "fun f (a: i8, o: out i8)\n",
-            "  var v: i8 = @zeroed()\n",
+            "fun f (a: u8, o: out u8)\n",
+            "  var v: u8 = @zeroed()\n",
             "  let q = a\n",
             "  match a\n",
             "    _ =>\n",
@@ -105,8 +105,8 @@ fn assigning_a_let_points_at_the_assignment() {
     assert_at(
         4,
         concat!(
-            "fun f (a: i8, o: out i8)\n",
-            "  let z: i8 = a\n",
+            "fun f (a: u8, o: out u8)\n",
+            "  let z: u8 = a\n",
             "  let q = a\n",
             "  z = a\n",
             "  o = z\n",
@@ -119,8 +119,8 @@ fn a_for_bound_points_at_the_loop() {
     assert_at(
         4,
         concat!(
-            "fun f (v: i8, o: out i8)\n",
-            "  var acc: i8 = @zeroed()\n",
+            "fun f (v: u8, o: out u8)\n",
+            "  var acc: u8 = @zeroed()\n",
             "  let q = v\n",
             "  for i in 0..v\n",
             "    acc = acc + 8'd1\n",
@@ -140,7 +140,7 @@ fn a_scheduler_refusal_points_at_the_statement_it_refuses() {
     assert_at(
         4,
         concat!(
-            "process p (src: buffer in i32, dst: buffer out i32)\n",
+            "process p (src: buffer in u32, dst: buffer out u32)\n",
             "  loop\n",
             "    let a = @rcv(src)\n",
             "    let b = @rcv(src) + a\n",
@@ -154,7 +154,7 @@ fn a_pipe_that_is_not_a_pipe_points_at_the_operation() {
     assert_at(
         4,
         concat!(
-            "process p (src: buffer in i32, dst: buffer out i32)\n",
+            "process p (src: buffer in u32, dst: buffer out u32)\n",
             "  loop\n",
             "    let a = @rcv(src)\n",
             "    let b = @rcv(nosuch)\n",
@@ -168,7 +168,7 @@ fn a_send_of_the_wrong_type_points_at_the_send() {
     assert_at(
         5,
         concat!(
-            "process p (src: buffer in i8, dst: buffer out i32)\n",
+            "process p (src: buffer in u8, dst: buffer out u32)\n",
             "  loop\n",
             "    let a = @rcv(src)\n",
             "    let b = @rcv(src)\n",
@@ -182,10 +182,10 @@ fn a_sequence_stage_error_points_into_the_stage() {
     assert_at(
         5,
         concat!(
-            "sequence s (src: buffer in i16, dst: buffer out i16)\n",
+            "sequence s (src: buffer in u16, dst: buffer out u16)\n",
             "  let a = @rcv(src)\n",
             "  |||\n",
-            "  let b: i16 = a + a\n",
+            "  let b: u16 = a + a\n",
             "  let c = @rcv(src)\n",
             "  @send(dst, b)\n",
         ),
@@ -199,12 +199,12 @@ fn nothing_reports_at_line_one_by_accident() {
     // preamble precisely so that shows up as a failure rather than a pass.
     for src in [
         concat!(
-            "fun f (a: i32, b: i5, o: out i32)\n",
+            "fun f (a: u32, b: u5, o: out u32)\n",
             "  let p = a\n",
             "  o = a + b\n",
         ),
         concat!(
-            "fun f (a: i8, o: out i8)\n",
+            "fun f (a: u8, o: out u8)\n",
             "  let p = a\n",
             "  o = nope\n",
         ),
@@ -223,7 +223,7 @@ fn nothing_reports_at_line_one_by_accident() {
 #[test]
 fn a_bad_statement_blames_its_own_line_not_the_declaration() {
     let (line, text) = first_error(concat!(
-        "fun f (a: i8, o: out i8)
+        "fun f (a: u8, o: out u8)
 ",
         "  let x = a
 ",
@@ -241,14 +241,14 @@ fn each_kind_of_body_says_what_it_holds() {
     let cases = [
         (
             concat!("struct s_t
-", "  a: i8
+", "  a: u8
 ", "  ??? junk
 "),
             "a struct body names one field per line",
         ),
         (
             concat!(
-                "graph g (src: buffer in i16, dst: buffer out i16)
+                "graph g (src: buffer in u16, dst: buffer out u16)
 ",
                 "  ??? junk
 ",
@@ -256,7 +256,7 @@ fn each_kind_of_body_says_what_it_holds() {
             "a graph body declares a pipe",
         ),
         (
-            concat!("enum e_t: i2
+            concat!("enum e_t: u2
 ", "  A
 ", "  ??? junk
 "),
@@ -278,7 +278,7 @@ fn leftovers_on_a_body_line_are_caught_there() {
     // declaration and be reported as top-level garbage, with a note about
     // top-level declarations, three lines away from the problem.
     let (line, text) = first_error(concat!(
-        "enum e_t: i2
+        "enum e_t: u2
 ",
         "  A
 ",
@@ -303,13 +303,13 @@ fn genuine_top_level_garbage_still_reads_as_that() {
 #[test]
 fn a_trailing_comment_on_a_body_line_is_not_leftovers() {
     let map = SourceMap::new("t.ddl", concat!(
-        "enum e_t: i2
+        "enum e_t: u2
 ",
         "  A       -- the quiet one
 ",
         "  B
 ",
-        "fun f (x: e_t, o: out i1)
+        "fun f (x: e_t, o: out u1)
 ",
         "  o = x == B
 ",

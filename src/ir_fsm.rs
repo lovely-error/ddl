@@ -1687,7 +1687,7 @@ pub fn lower_blocking(
                 sink.err_span(
                     low.here(),
                     format!(
-                        "an `if` condition must be `i1`, found `{}`",
+                        "an `if` condition must be `u1`, found `{}`",
                         low.ty_of(v).display()
                     ),
                 );

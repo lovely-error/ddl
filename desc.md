@@ -88,10 +88,10 @@ Two aspects:
    4. a file reached twice is included once, so diamonds and cycles are fine
 
 ### types
-1. `iN`
-   1. arbitrary width unsigned integer
+1. `uN` / `iN`
+   1. arbitrary width unsigned (`uN`) and signed (`iN`) integers
    2. signed ints are in two complement format
-   3. implicit cast to `[i1;N]`
+   3. implicit cast to `[u1;N]`
 2. `[T;n]`
    1. arrays of length n of T items
    2. `@map(item, fun_ref)` enables simd operations
@@ -107,7 +107,7 @@ Two aspects:
    4. blocking reads and nonblocking reads
    5. every pipe is a `buffer`
       1. producer stalls when no slots available; two slots, head and skid
-      2. `@try_rcv` -> (T, i1) , if data item present, consume it (ok in seq & proc)
+      2. `@try_rcv` -> (T, u1) , if data item present, consume it (ok in seq & proc)
       3. `@rcv` -> T , blocking read (ok in proc, banned in seq)
       4. `@send` blocking send (ok in proc, banned in seq)
    6. there is no lossy kind and no way to ask for one. A producer that never
@@ -164,10 +164,10 @@ the parts that are not built.
 ### examples
 nesting by indentation instead of brackets
 ```
-process STM (arg1: i1) -- only direct parameters (inout is forbidden)
+process STM (arg1: u1) -- only direct parameters (inout is forbidden)
    var state: MyEnum = MyEnum::Uninit
-   var mem: [i1;32] = @zeroed()
-   let some_const: i1 = 0
+   var mem: [u1;32] = @zeroed()
+   let some_const: u1 = 0
 
     loop
         match state
@@ -178,7 +178,7 @@ process STM (arg1: i1) -- only direct parameters (inout is forbidden)
         
 
 -- only direct parameters, must contain parameters
-sequence Exmpl (arg1: buffer in i1, arg1: buffer in i4, arg2: buffer out i4, arg3: buffer out i8)
+sequence Exmpl (arg1: buffer in u1, arg1: buffer in u4, arg2: buffer out u4, arg3: buffer out u8)
 
    -- stage 1
    let val1 = @rcv(arg1) -- only first stage can contain blocking reads
@@ -191,19 +191,19 @@ sequence Exmpl (arg1: buffer in i1, arg1: buffer in i4, arg2: buffer out i4, arg
    |||
 
    -- stage 3
-   let res: i4 = val1 * val2 -- multiplication may extend the pipeline
+   let res: u4 = val1 * val2 -- multiplication may extend the pipeline
    @send(arg3, res) -- blocking send. the pipeline head should have checked if sink has a free slot, so this cannot be blocking
 
 
-function name (arg1: i1, arg2: inout [i8;8])
+function name (arg1: u1, arg2: inout [u8;8])
    arg2[0] += arg1 -- this will be lowered differently based on whether it is used in process or sequence
 
 
-pin out led_enable: i1 = 0
-pin in data_pin: i1
+pin out led_enable: u1 = 0
+pin in data_pin: u1
 clock ex1 = 12*10**6
 
-io process LedBlinker (arg1: buffer out i1)
+io process LedBlinker (arg1: buffer out u1)
 
     @bind_clock(ex1)
 

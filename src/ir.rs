@@ -80,7 +80,7 @@ pub enum UnOp {
     BitNot,
     /// `-x`, wrapping at the operand's width.
     Neg,
-    /// `!x`, i1 in and out.
+    /// `!x`, u1 in and out.
     LogNot,
 }
 
@@ -1577,7 +1577,7 @@ pub fn lower_function(
         );
         sink.push(
             Diag::error(span, "no outputs")
-                .with_note("write `result: out i32` in the parameter list"),
+                .with_note("write `result: out u32` in the parameter list"),
         );
         return None;
     }
@@ -1688,7 +1688,7 @@ fn for_bounds(
 /// An expression that has to be known at compile time.
 ///
 /// Lowered rather than folded syntactically, so a constant parameter counts:
-/// by the time a body is lowered, `n: i8 = 4` is already an `Op::Const` in the
+/// by the time a body is lowered, `n: u8 = 4` is already an `Op::Const` in the
 /// environment, and refusing it would make every parameterised design write
 /// its sizes twice.
 fn const_operand(
@@ -2830,7 +2830,7 @@ fn lower_stmt_at(
                                         format!("`{}` is not an array", other.display()),
                                     )
                                     .with_note(
-                                        "only an `[T; n]` can have an element assigned; a bit of an `iN` is not an lvalue",
+                                        "only an `[T; n]` can have an element assigned; a bit of an `uN` is not an lvalue",
                                     ),
                                 );
                                 return None;
@@ -3059,7 +3059,7 @@ fn lower_stmt_at(
                 sink.err_span(
                     low.here(),
                     format!(
-                        "an `if` condition must be `i1`, found `{}`",
+                        "an `if` condition must be `u1`, found `{}`",
                         cond_ty.display()
                     ),
                 );
@@ -3662,7 +3662,7 @@ pub fn lower_expr(
 /// `a[i]` and `a[hi..lo]` on a packed `[T; n]`, in elements.
 ///
 /// Element `k` occupies bits `[(k+1)*w-1 : k*w]`, which is how a packed array
-/// lays out in SystemVerilog too, so a DDL `[i32; 4]` and its `.svh`
+/// lays out in SystemVerilog too, so a DDL `[u32; 4]` and its `.svh`
 /// counterpart still meet at a module boundary.
 fn lower_array_index(
     low: &mut Lowerer,
@@ -3783,8 +3783,8 @@ fn lower_subscript(
     // vector so that it can be a struct field, a pipe payload or an operand
     // (ty.rs:49), and packing is a representation rather than a change of
     // meaning. Subscripting one used to fall through to the bit selects
-    // below, so `line.words[1]` -- a struct field of type `[i32; 4]` -- read
-    // bit 1 of the flattened struct and typed as `i1`. That is a wrong answer
+    // below, so `line.words[1]` -- a struct field of type `[u32; 4]` -- read
+    // bit 1 of the flattened struct and typed as `u1`. That is a wrong answer
     // rather than a diagnostic, and it is the shape of wrong answer that
     // synthesizes and runs.
     if let Ty::Array(elem, n) = &base_ty {
@@ -3872,7 +3872,7 @@ fn lower_assert(
     if cond_ty != Ty::BOOL {
         sink.err_span(
             low.here(),
-            format!("{} needs an `i1` condition, found `{}`", name, cond_ty.display()),
+            format!("{} needs an `u1` condition, found `{}`", name, cond_ty.display()),
         );
         return None;
     }
@@ -4162,7 +4162,7 @@ fn lower_builtin(
                 Diag::error(
                     low.here(),
                     format!(
-                        "an `if` condition is `i1`, found `{}`",
+                        "an `if` condition is `u1`, found `{}`",
                         low.ty_of(cond).display()
                     ),
                 )
@@ -4363,7 +4363,7 @@ fn lower_builtin(
                 if ty != Ty::BOOL {
                     sink.err_span(
                         low.here(),
-                        format!("`!` needs `i1`, found `{}`", ty.display()),
+                        format!("`!` needs `u1`, found `{}`", ty.display()),
                     );
                     return None;
                 }

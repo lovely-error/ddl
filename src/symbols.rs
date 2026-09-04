@@ -24,7 +24,7 @@ pub struct EnumDef {
     /// the HIGH bits, matching the way a struct puts its first field there, so
     /// the layout is the one a reader already knows.
     pub width: u32,
-    /// Declared by `enum Name: iN` when no variant carries a payload, and
+    /// Declared by `enum Name: uN` when no variant carries a payload, and
     /// derived from the largest discriminant when one does -- a tagged union
     /// may not be annotated, because the number would name the tag while
     /// reading as the width of the whole value.
@@ -188,8 +188,8 @@ impl Symbols {
 ///
 /// ```text
 /// struct addr_t
-///   page: i8
-///   off:  i8
+///   page: u8
+///   off:  u8
 /// enum req_e
 ///   Read(addr_t)
 /// ```
@@ -270,7 +270,7 @@ pub fn build(
     }
 
     // A width annotation on a tagged union would say one thing and mean
-    // another: `enum req_e: i2` reads as "two bits wide" and the value is 18,
+    // another: `enum req_e: u2` reads as "two bits wide" and the value is 18,
     // because the payload sits under the tag. Reinterpreting the number as the
     // TAG width is worse still -- the same syntax would mean the whole value
     // for one enum and part of it for the next, and a struct field budgeted

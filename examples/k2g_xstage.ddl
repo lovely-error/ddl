@@ -72,34 +72,34 @@ import "k2g_alu.ddl"
 import "k2g_shift.ddl"
 
 struct wb_t
-  we_value: i1
-  we_tag: i1
-  we_overflow: i1
-  we_flag: i1
-  addr: i5
-  value: i32
+  we_value: u1
+  we_tag: u1
+  we_overflow: u1
+  we_flag: u1
+  addr: u5
+  value: u32
   tag: rdt_e
-  overflow: i1
-  flag: i1
+  overflow: u1
+  flag: u1
 
   -- What X detected, travelling with the packet rather than on ports of its
   -- own. `fault_valid` suppresses every write above it; `fault_info` is the
   -- number the FAULT_INFO port reports (spec 8).
-  fault_valid: i1
+  fault_valid: u1
   fault: fault_e
-  fault_info: i32
+  fault_info: u32
 
 -- A register's bits always match what its tag claims (spec 5.1, 1.1.1), so a
 -- value written back is re-extended to its tag's width. `RDT_U32` and
 -- `RDT_S32` are the identity, which is why one normalize after the writeback
 -- mux costs nothing on the branches that do not need it (k2g_core.sv:880).
-fun rdt_normalize (v: i32, t: rdt_e, o: out i32)
-  let sgn: i1 = rdt_is_signed(t)
-  let as_byte: i32 =
+fun rdt_normalize (v: u32, t: rdt_e, o: out u32)
+  let sgn: u1 = rdt_is_signed(t)
+  let as_byte: u32 =
       if sgn then @concat(@rep(v[7], 24), v[7..0]) else @concat(24'd0, v[7..0])
-  let as_half: i32 =
+  let as_half: u32 =
       if sgn then @concat(@rep(v[15], 16), v[15..0]) else @concat(16'd0, v[15..0])
-  let width: i2 = t[1..0]
+  let width: u2 = t[1..0]
   o =
       if width == 2'd0 then as_byte
       else if width == 2'd1 then as_half
@@ -107,8 +107,8 @@ fun rdt_normalize (v: i32, t: rdt_e, o: out i32)
 
 -- Store width comes from the source register's tag, not the opcode (spec 5.3),
 -- so the width is a function of a tag everywhere it is needed.
-fun rdt_width_bytes (t: rdt_e, w: out i3)
-  let low: i2 = t[1..0]
+fun rdt_width_bytes (t: rdt_e, w: out u3)
+  let low: u2 = t[1..0]
   w = if low == 2'd0 then 3'd1 else if low == 2'd1 then 3'd2 else 3'd4
 
 -- `mem_bytes` is where ADDR_OUT_OF_RANGE begins (spec 8), so it is
@@ -116,13 +116,13 @@ fun rdt_width_bytes (t: rdt_e, w: out i3)
 -- number and the cosimulation is what checks that they agree. A plain
 -- parameter is folded at compile time and is not a port.
 process k2g_xstage (uops: buffer in uop_t, wb: buffer out wb_t,
-                    mem_bytes: i32 = 32'h00800000)
-  var values: #[impl(lutram)] [i32; 32] = @zeroed()
+                    mem_bytes: u32 = 32'h00800000)
+  var values: #[impl(lutram)] [u32; 32] = @zeroed()
   -- The reset tag matches the emulator's, so a register that has never been
   -- written still compares equal.
   var tags: #[impl(lutram)] [rdt_e; 32] = RDT_U32
-  var overflow: #[impl(lutram)] [i1; 32] = @zeroed()
-  var flagbit: #[impl(lutram)] [i1; 32] = @zeroed()
+  var overflow: #[impl(lutram)] [u1; 32] = @zeroed()
+  var flagbit: #[impl(lutram)] [u1; 32] = @zeroed()
 
   -- The W stage: what the previous cycle computed. It drives the array write
   -- port AND the forwarding mux, which is why it has to be read before it is
@@ -136,26 +136,26 @@ process k2g_xstage (uops: buffer in uop_t, wb: buffer out wb_t,
     -- Asynchronous, straight out of the arrays. Nothing is registered between
     -- here and the address adder below; that is the property this whole file
     -- exists to keep.
-    let ra: i5 = uop.dst
-    let rb: i5 = uop.src
+    let ra: u5 = uop.dst
+    let rb: u5 = uop.src
     -- The third port reads the register an XCP/XCN prefix names. Predication
     -- is out of this slice, so the forwarded `xc_*` below feed nothing and are
     -- stripped -- but the port is read here because K2G reads it, and leaving
     -- it out would quietly compare a two-port file against a three-port one.
-    let rc: i5 = uop.cond_reg
+    let rc: u5 = uop.cond_reg
 
-    let ra_value: i32 = values[ra]
-    let rb_value: i32 = values[rb]
-    let rc_value: i32 = values[rc]
+    let ra_value: u32 = values[ra]
+    let rb_value: u32 = values[rb]
+    let rc_value: u32 = values[rc]
     let ra_tag: rdt_e = tags[ra]
     let rb_tag: rdt_e = tags[rb]
     let rc_tag: rdt_e = tags[rc]
-    let ra_ovf: i1 = overflow[ra]
-    let rb_ovf: i1 = overflow[rb]
-    let rc_ovf: i1 = overflow[rc]
-    let ra_flg: i1 = flagbit[ra]
-    let rb_flg: i1 = flagbit[rb]
-    let rc_flg: i1 = flagbit[rc]
+    let ra_ovf: u1 = overflow[ra]
+    let rb_ovf: u1 = overflow[rb]
+    let rc_ovf: u1 = overflow[rc]
+    let ra_flg: u1 = flagbit[ra]
+    let rb_flg: u1 = flagbit[rb]
+    let rc_flg: u1 = flagbit[rc]
 
     -- ---- forwarding W -> X ---------------------------------------------
     -- The file reads before it writes, so this instruction cannot see the
@@ -170,29 +170,29 @@ process k2g_xstage (uops: buffer in uop_t, wb: buffer out wb_t,
     -- obvious: a store takes its width from the source register's tag, so an
     -- unforwarded tag does not corrupt a value, it writes the wrong number of
     -- bytes.
-    let writing: i1 = w.we_value | w.we_tag | w.we_overflow | w.we_flag
-    let ma: i1 = writing & (w.addr == ra)
-    let mb: i1 = writing & (w.addr == rb)
-    let mc: i1 = writing & (w.addr == rc)
+    let writing: u1 = w.we_value | w.we_tag | w.we_overflow | w.we_flag
+    let ma: u1 = writing & (w.addr == ra)
+    let mb: u1 = writing & (w.addr == rb)
+    let mc: u1 = writing & (w.addr == rc)
 
-    let xa_value: i32 = if ma & w.we_value then w.value else ra_value
-    let xb_value: i32 = if mb & w.we_value then w.value else rb_value
-    let xc_value: i32 = if mc & w.we_value then w.value else rc_value
+    let xa_value: u32 = if ma & w.we_value then w.value else ra_value
+    let xb_value: u32 = if mb & w.we_value then w.value else rb_value
+    let xc_value: u32 = if mc & w.we_value then w.value else rc_value
     let xa_tag: rdt_e = if ma & w.we_tag then w.tag else ra_tag
     let xb_tag: rdt_e = if mb & w.we_tag then w.tag else rb_tag
     let xc_tag: rdt_e = if mc & w.we_tag then w.tag else rc_tag
-    let xa_ovf: i1 = if ma & w.we_overflow then w.overflow else ra_ovf
-    let xb_ovf: i1 = if mb & w.we_overflow then w.overflow else rb_ovf
-    let xc_ovf: i1 = if mc & w.we_overflow then w.overflow else rc_ovf
-    let xa_flg: i1 = if ma & w.we_flag then w.flag else ra_flg
-    let xb_flg: i1 = if mb & w.we_flag then w.flag else rb_flg
-    let xc_flg: i1 = if mc & w.we_flag then w.flag else rc_flg
+    let xa_ovf: u1 = if ma & w.we_overflow then w.overflow else ra_ovf
+    let xb_ovf: u1 = if mb & w.we_overflow then w.overflow else rb_ovf
+    let xc_ovf: u1 = if mc & w.we_overflow then w.overflow else rc_ovf
+    let xa_flg: u1 = if ma & w.we_flag then w.flag else ra_flg
+    let xb_flg: u1 = if mb & w.we_flag then w.flag else rb_flg
+    let xc_flg: u1 = if mc & w.we_flag then w.flag else rc_flg
 
     -- ---- predication ----------------------------------------------------
     -- Zero and negative are computed from the register value on demand; there
     -- is no global condition register (spec 7). This is what the third read
     -- port exists for, and reading it is no longer free of consequence.
-    var cond_raw: i1 = 1'b1
+    var cond_raw: u1 = 1'b1
     match uop.cond
       .CCK_OVERFLOW =>
         cond_raw = xc_ovf
@@ -206,8 +206,8 @@ process k2g_xstage (uops: buffer in uop_t, wb: buffer out wb_t,
         cond_raw = (xc_value != 32'd0) & (!xc_value[31])
       _ =>
         cond_raw = 1'b1
-    let unpredicated: i1 = uop.cond == CCK_NONE
-    let cond_met: i1 = if unpredicated then 1'b1 else cond_raw ^ uop.cond_invert
+    let unpredicated: u1 = uop.cond == CCK_NONE
+    let cond_met: u1 = if unpredicated then 1'b1 else cond_raw ^ uop.cond_invert
 
     -- ---- reserved F32 operands -------------------------------------------
     -- `F32` is reserved (spec 11), so reading a register carrying the tag
@@ -218,8 +218,8 @@ process k2g_xstage (uops: buffer in uop_t, wb: buffer out wb_t,
     --
     -- The emulator's `check_no_f32_operands` enumerates the same set in the
     -- same A-before-B order, so `FAULT_INFO` agrees when both carry the tag.
-    var reads_a: i1 = @zeroed()
-    var reads_b: i1 = @zeroed()
+    var reads_a: u1 = @zeroed()
+    var reads_b: u1 = @zeroed()
     match uop.kind
       .UOP_COPY | .UOP_LOAD | .UOP_CSP_LOAD | .UOP_BEXT =>
         reads_b = 1'b1
@@ -240,40 +240,40 @@ process k2g_xstage (uops: buffer in uop_t, wb: buffer out wb_t,
       _ =>
         reads_a = 1'b0
 
-    let f32_a: i1 = reads_a & (xa_tag == RDT_F32)
-    let f32_b: i1 = reads_b & (xb_tag == RDT_F32)
+    let f32_a: u1 = reads_a & (xa_tag == RDT_F32)
+    let f32_b: u1 = reads_b & (xb_tag == RDT_F32)
     -- The predicate register is read whatever the predicate decides, so its
     -- tag is checked outside the `cond_met` gate.
-    let f32_cond: i1 = (!unpredicated) & (xc_tag == RDT_F32)
+    let f32_cond: u1 = (!unpredicated) & (xc_tag == RDT_F32)
 
     -- ---- functional units ----------------------------------------------
     -- The two verified helpers, called rather than reimplemented. An
     -- immediate carries no tag of its own, so it takes the left operand's
     -- interpretation.
-    let alu_b: i32 = if uop.use_imm then uop.imm else xb_value
+    let alu_b: u32 = if uop.use_imm then uop.imm else xb_value
     let alu_b_tag: rdt_e = if uop.use_imm then xa_tag else xb_tag
     let (arith_result, arith_ovf, logic_result, cmp_result, unary_result) = k2g_alu(
         xa_value, alu_b, xa_tag, alu_b_tag,
         uop.arith_op, uop.logic_op, uop.cmp_op, uop.unary_op)
 
-    let amount: i5 = if uop.use_imm then uop.imm[4..0] else xb_value[4..0]
+    let amount: u5 = if uop.use_imm then uop.imm[4..0] else xb_value[4..0]
     let (shift_result, bext_result, bins_result) = k2g_shift(
         xa_value, xb_value, amount, uop.shift_op, uop.bm_start, uop.bm_span)
 
     -- ---- the address adder ----------------------------------------------
     -- read -> forward -> add, in one cycle. A synchronous register read would
     -- put a pipeline stage in the middle of this.
-    let load_addr: i32 = xb_value + uop.imm
-    let store_addr: i32 = xa_value + uop.imm
-    let is_load: i1 = uop.kind == UOP_LOAD
-    let access_addr: i32 = if is_load then load_addr else store_addr
+    let load_addr: u32 = xb_value + uop.imm
+    let store_addr: u32 = xa_value + uop.imm
+    let is_load: u1 = uop.kind == UOP_LOAD
+    let access_addr: u32 = if is_load then load_addr else store_addr
     -- A store takes its width from the SOURCE register's tag, not the opcode.
     let access_tag: rdt_e = if is_load then uop.datakind else xb_tag
 
     -- The FLAG prefix makes a logic op work on flag bits instead of values
     -- (k2g_core.sv:981). Computed here so the writeback arm is a choice
     -- between two ready answers.
-    var flag_logic: i1 = @zeroed()
+    var flag_logic: u1 = @zeroed()
     match uop.logic_op
       .LOGIC_AND =>
         flag_logic = xa_flg & xb_flg
@@ -285,11 +285,11 @@ process k2g_xstage (uops: buffer in uop_t, wb: buffer out wb_t,
     -- ---- alignment and range ---------------------------------------------
     -- Checked before anything commits, which is what makes faults precise
     -- (spec 8).
-    let access_width: i3 = rdt_width_bytes(access_tag)
-    let is_store: i1 = uop.kind == UOP_STORE
-    let is_access: i1 = is_load | is_store
+    let access_width: u3 = rdt_width_bytes(access_tag)
+    let is_store: u1 = uop.kind == UOP_STORE
+    let is_access: u1 = is_load | is_store
 
-    var misaligned: i1 = @zeroed()
+    var misaligned: u1 = @zeroed()
     if access_width == 3'd1 then
       misaligned = 1'b0
     else
@@ -300,8 +300,8 @@ process k2g_xstage (uops: buffer in uop_t, wb: buffer out wb_t,
 
     -- The last byte the access touches has to be inside memory too, so the
     -- width is added before the comparison rather than after it.
-    let last_byte: i32 = access_addr + @zext(access_width, 32)
-    let out_of_range: i1 = last_byte > mem_bytes
+    let last_byte: u32 = access_addr + @zext(access_width, 32)
+    let out_of_range: u1 = last_byte > mem_bytes
 
     -- ---- fault detection --------------------------------------------------
     -- A PRIORITY CHAIN, and the order is architecture rather than taste. The
@@ -312,9 +312,9 @@ process k2g_xstage (uops: buffer in uop_t, wb: buffer out wb_t,
     --
     -- `f32_cond` sits outside the `cond_met` gate: the predicate register is
     -- read whatever the predicate decides.
-    var fault_valid: i1 = @zeroed()
+    var fault_valid: u1 = @zeroed()
     var fault: fault_e = FAULT_NONE
-    var fault_info: i32 = @zeroed()
+    var fault_info: u32 = @zeroed()
 
     if got & f32_cond then
       fault_valid = 1'b1
@@ -348,7 +348,7 @@ process k2g_xstage (uops: buffer in uop_t, wb: buffer out wb_t,
     -- Nothing commits behind a fault, and nothing commits on a predicate that
     -- did not hold. One term, used by every arm of the writeback below, which
     -- is what keeps a new opcode from forgetting it.
-    let commits: i1 = got & cond_met & (!fault_valid)
+    let commits: u1 = got & cond_met & (!fault_valid)
 
     -- ---- the writeback packet -------------------------------------------
     -- `n_raw` is the value before normalization and `n_norm` the tag to
@@ -356,7 +356,7 @@ process k2g_xstage (uops: buffer in uop_t, wb: buffer out wb_t,
     -- the operand's tag while writing back the destination's, so the two
     -- differ on three branches (k2g_core.sv:880).
     var n: wb_t = @zeroed()
-    var n_raw: i32 = @zeroed()
+    var n_raw: u32 = @zeroed()
     var n_norm: rdt_e = RDT_U32
     n.addr = uop.dst
     n.tag = uop.datakind

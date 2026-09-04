@@ -168,7 +168,7 @@ module rdt_width_bytes (
 endmodule
 
 // Built with:
-//   mem_bytes : i32 = 32'h800000
+//   mem_bytes : u32 = 32'h800000
 //
 module k2g_xstage (
     input          clk,

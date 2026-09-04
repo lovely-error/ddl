@@ -25,8 +25,8 @@
 -- `count_en` is reading a value that was true at some point, which is the
 -- distinction the enable exists to keep.
 
-process pulse_counter (tick: port in i1, clear: port in i1, count: port out i16)
-  var n: i16 = @zeroed()
+process pulse_counter (tick: port in u1, clear: port in u1, count: port out u16)
+  var n: u16 = @zeroed()
 
   loop
     let (t, got_tick) = @try_rcv(tick)

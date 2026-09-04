@@ -99,7 +99,7 @@ pub struct StructField {
 #[derive(Debug)]
 pub struct EnumDecl {
     pub name: AlphanumSpan,
-    /// Explicit tag width from `enum Name: iN`, if written.
+    /// Explicit tag width from `enum Name: uN`, if written.
     pub tag_type: Option<PrecTypeExpr>,
     pub variants: Vec<EnumVariant>,
 }
@@ -303,14 +303,14 @@ pub enum BuiltinOp {
     Or,
     Xor,
     BitInvert,
-    // Comparison. All yield i1.
+    // Comparison. All yield u1.
     Eq,
     Ne,
     Lt,
     Gt,
     Le,
     Ge,
-    // Logical. Operands and result are i1.
+    // Logical. Operands and result are u1.
     LogAnd,
     LogOr,
     LogNot,
@@ -347,8 +347,8 @@ pub enum BuiltinOp {
     ///
     /// The mechanism was already here: an array element at a computed index
     /// lowers to a `+:` of the element width. What was missing was a way to
-    /// SAY one on a plain `iN`, so the workaround was to declare the thing
-    /// `[i8; 4]` -- which is usually what it was, and sometimes is not.
+    /// SAY one on a plain `uN`, so the workaround was to declare the thing
+    /// `[u8; 4]` -- which is usually what it was, and sometimes is not.
     Slice,
     // Bit plumbing: @concat(a, b, ..) high-to-low, @rep(x, n), @zeroed().
     Concat,
@@ -1091,7 +1091,7 @@ fn t1() {
         // "      break\n",
         // "    return\n",
         // "  expr\n",
-        "  let _ : [[i1;2];2] = expr\n"
+        "  let _ : [[u1;2];2] = expr\n"
     );
     let inp_str = str.as_bytes().as_ptr_range();
     let start_ptr = inp_str.start;
@@ -1215,7 +1215,7 @@ fn resolve_expr_in(src_body: &str) -> PrecResExpr {
     // the pointers a genuinely 'static target. This is the clearest argument
     // for interning identifiers; see the note in src/diag.rs.
     let src: &'static str = Box::leak(
-        format!("fun f (a: i32, b: i32, c: i32)\n  let out = {}\n", src_body)
+        format!("fun f (a: u32, b: u32, c: u32)\n  let out = {}\n", src_body)
             .into_boxed_str(),
     );
     let range = src.as_bytes().as_ptr_range();
@@ -1359,8 +1359,8 @@ fn t3() {
     use crate::lex::parse_top_level;
     let str = concat!(
         "struct IntPair\n",
-        "  fst: i1\n",
-        "  snd: i1\n",
+        "  fst: u1\n",
+        "  snd: u1\n",
     );
     let inp_str = str.as_bytes().as_ptr_range();
     let start_ptr = inp_str.start;

@@ -11,7 +11,7 @@
 // The interface has to match the `extern` declaration, and examples/fanout.ddl
 // is where that is written.
 
-// `extern sink_ext (a: buffer in i32)` -- examples/fanout.ddl:27
+// `extern sink_ext (a: buffer in u32)` -- examples/fanout.ddl:27
 module sink_ext (
   input         clk,
   input         rst_n,

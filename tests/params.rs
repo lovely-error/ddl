@@ -35,7 +35,7 @@ fn an_inout_parameter_is_two_ports_at_a_module_boundary() {
     // Not a Verilog `inout`, which is a tri-state and not what this means. The
     // value that came in and the value going back are separate wires.
     let v = compile(concat!(
-        "fun bump (step: i8, acc: inout i8)\n",
+        "fun bump (step: u8, acc: inout u8)\n",
         "  acc = acc + step\n",
     ));
     assert!(v.contains("input  [7:0] acc,"), "{}", v);
@@ -48,10 +48,10 @@ fn an_inout_argument_is_updated_in_place_at_the_call_site() {
     // The call is inlined, so "by reference" means the caller's binding is
     // replaced with whatever the callee left in it.
     let v = compile(concat!(
-        "fun bump (step: i8, acc: inout i8)\n",
+        "fun bump (step: u8, acc: inout u8)\n",
         "  acc = acc + step\n",
-        "fun total (a: i8, b: i8, o: out i8)\n",
-        "  var acc: i8 = @zeroed()\n",
+        "fun total (a: u8, b: u8, o: out u8)\n",
+        "  var acc: u8 = @zeroed()\n",
         "  bump(a, acc)\n",
         "  bump(b, acc)\n",
         "  o = acc\n",
@@ -65,10 +65,10 @@ fn an_inout_argument_is_updated_in_place_at_the_call_site() {
 fn an_inout_can_be_read_before_it_is_written() {
     // That is the difference from `out`: the value arrived with the call.
     let v = compile(concat!(
-        "fun double_it (x: inout i8)\n",
+        "fun double_it (x: inout u8)\n",
         "  x = x + x\n",
-        "fun use_it (a: i8, o: out i8)\n",
-        "  var v: i8 = a\n",
+        "fun use_it (a: u8, o: out u8)\n",
+        "  var v: u8 = a\n",
         "  double_it(v)\n",
         "  o = v\n",
     ));
@@ -78,11 +78,11 @@ fn an_inout_can_be_read_before_it_is_written() {
 #[test]
 fn an_inout_mixes_with_a_bound_output() {
     let v = compile(concat!(
-        "fun step (acc: inout i8, carry: out i1)\n",
+        "fun step (acc: inout u8, carry: out u1)\n",
         "  acc = acc + 8'd1\n",
         "  carry = acc == 8'd0\n",
-        "fun run (a: i8, o: out i8, c: out i1)\n",
-        "  var acc: i8 = a\n",
+        "fun run (a: u8, o: out u8, c: out u1)\n",
+        "  var acc: u8 = a\n",
         "  let (got) = step(acc)\n",
         "  o = acc\n",
         "  c = got\n",
@@ -97,9 +97,9 @@ fn an_inout_mixes_with_a_bound_output() {
 fn an_inout_argument_has_to_be_a_variable() {
     // An expression has nowhere for the answer to go.
     let text = compile_err(concat!(
-        "fun bump (step: i8, acc: inout i8)\n",
+        "fun bump (step: u8, acc: inout u8)\n",
         "  acc = acc + step\n",
-        "fun total (a: i8, o: out i8)\n",
+        "fun total (a: u8, o: out u8)\n",
         "  bump(a, a + 8'd1)\n",
         "  o = a\n",
     ));
@@ -109,10 +109,10 @@ fn an_inout_argument_has_to_be_a_variable() {
 #[test]
 fn an_inout_argument_cannot_be_a_let() {
     let text = compile_err(concat!(
-        "fun bump (step: i8, acc: inout i8)\n",
+        "fun bump (step: u8, acc: inout u8)\n",
         "  acc = acc + step\n",
-        "fun total (a: i8, o: out i8)\n",
-        "  let acc: i8 = a\n",
+        "fun total (a: u8, o: out u8)\n",
+        "  let acc: u8 = a\n",
         "  bump(a, acc)\n",
         "  o = acc\n",
     ));
@@ -123,9 +123,9 @@ fn an_inout_argument_cannot_be_a_let() {
 #[test]
 fn a_call_with_outputs_still_has_to_bind_them() {
     let text = compile_err(concat!(
-        "fun f (a: i8, o: out i8)\n",
+        "fun f (a: u8, o: out u8)\n",
         "  o = a\n",
-        "fun g (a: i8, o: out i8)\n",
+        "fun g (a: u8, o: out u8)\n",
         "  f(a)\n",
         "  o = a\n",
     ));
@@ -135,9 +135,9 @@ fn a_call_with_outputs_still_has_to_bind_them() {
 #[test]
 fn a_call_that_produces_nothing_says_so() {
     let text = compile_err(concat!(
-        "fun nothing (a: i8)\n",
-        "  let x: i8 = a\n",
-        "fun g (a: i8, o: out i8)\n",
+        "fun nothing (a: u8)\n",
+        "  let x: u8 = a\n",
+        "fun g (a: u8, o: out u8)\n",
         "  nothing(a)\n",
         "  o = a\n",
     ));
@@ -153,13 +153,13 @@ fn an_unrecognised_pipe_qualifier_is_refused() {
     // plain parameter: the qualifier parser falls through to `in`, the word
     // itself is then read as the type, and what follows it has nowhere to go.
     let text = compile_err(concat!(
-        "sequence widen (src: buffer in i16, dst: fifo out i32)
+        "sequence widen (src: buffer in u16, dst: fifo out u32)
 ",
         "  let a = @rcv(src)
 ",
         "  |||
 ",
-        "  let w: i32 = @zext(a, 32)
+        "  let w: u32 = @zext(a, 32)
 ",
         "  @send(dst, w)
 ",
@@ -173,17 +173,17 @@ fn every_pipe_has_all_three_legs() {
     // says the thing that is accepted really does carry all three legs. There
     // is no shape of pipe that emits two.
     let v = compile(concat!(
-        "sequence widen (src: buffer in i16, dst: buffer out i32)
+        "sequence widen (src: buffer in u16, dst: buffer out u32)
 ",
         "  let a = @rcv(src)
 ",
         "  |||
 ",
-        "  let w: i32 = @zext(a, 32)
+        "  let w: u32 = @zext(a, 32)
 ",
         "  @send(dst, w)
 ",
-        "sequence sink_ (src: buffer in i32, dst: buffer out i32)
+        "sequence sink_ (src: buffer in u32, dst: buffer out u32)
 ",
         "  let a = @rcv(src)
 ",
@@ -191,9 +191,9 @@ fn every_pipe_has_all_three_legs() {
 ",
         "  @send(dst, a)
 ",
-        "graph g (src: buffer in i16, dst: buffer out i32)
+        "graph g (src: buffer in u16, dst: buffer out u32)
 ",
-        "  let mid: buffer i32
+        "  let mid: buffer u32
 ",
         "  widen(src, mid)
 ",
@@ -228,7 +228,7 @@ fn every_pipe_has_all_three_legs() {
 #[test]
 fn a_port_is_a_data_port_and_an_enable() {
     let v = compile(concat!(
-        "process tap (lvl: port in i8, out_: port out i32)\n",
+        "process tap (lvl: port in u8, out_: port out u32)\n",
         "  let (x, got) = @try_rcv(lvl)\n",
         "  if got then\n",
         "    let _s = @try_send(out_, @zext(x, 32))\n",
@@ -245,7 +245,7 @@ fn a_port_is_a_data_port_and_an_enable() {
 #[test]
 fn try_rcv_on_a_port_answers_with_its_enable() {
     let v = compile(concat!(
-        "process tap (a: port in i16, b: port in i16, sum: port out i32)\n",
+        "process tap (a: port in u16, b: port in u16, sum: port out u32)\n",
         "  let (x, gx) = @try_rcv(a)\n",
         "  let (y, gy) = @try_rcv(b)\n",
         "  if gx & gy then\n",
@@ -264,7 +264,7 @@ fn try_send_on_a_port_always_succeeds() {
     // declares, so the answer never varies -- and the enable carries the path
     // instead, exactly as a pipe's offer does.
     let v = compile(concat!(
-        "process tap (src: buffer in i32, sum: port out i32)\n",
+        "process tap (src: buffer in u32, sum: port out u32)\n",
         "  let (v, got) = @try_rcv(src)\n",
         "  if got then\n",
         "    let _s = @try_send(sum, v)\n",
@@ -276,7 +276,7 @@ fn try_send_on_a_port_always_succeeds() {
 #[test]
 fn rcv_on_a_port_waits_for_the_enable() {
     let v = compile(concat!(
-        "process relay (src: port in i32, dst: port out i32)\n",
+        "process relay (src: port in u32, dst: port out u32)\n",
         "  loop\n",
         "    let v = @rcv(src)\n",
         "    @send(dst, v + 32'd1)\n",
@@ -292,7 +292,7 @@ fn rcv_on_a_port_waits_for_the_enable() {
 #[test]
 fn a_port_is_not_a_value() {
     let text = compile_err(concat!(
-        "process tap (lvl: port in i8, dst: buffer out i32)\n",
+        "process tap (lvl: port in u8, dst: buffer out u32)\n",
         "  let _s = @try_send(dst, @zext(lvl, 32))\n",
     ));
     assert!(text.contains("is a `port in`, which is a pipe rather than a value"), "{}", text);
@@ -302,7 +302,7 @@ fn a_port_is_not_a_value() {
 #[test]
 fn a_port_out_is_not_assigned() {
     let text = compile_err(concat!(
-        "process tap (src: buffer in i32, sum: port out i32)\n",
+        "process tap (src: buffer in u32, sum: port out u32)\n",
         "  let (v, got) = @try_rcv(src)\n",
         "  sum = v\n",
     ));
@@ -313,7 +313,7 @@ fn a_port_out_is_not_assigned() {
 #[test]
 fn a_port_has_nothing_to_drop() {
     let text = compile_err(concat!(
-        "process tap (lvl: port in i8, dst: buffer out i32)\n",
+        "process tap (lvl: port in u8, dst: buffer out u32)\n",
         "  let _d = @drop(lvl)\n",
         "  let _s = @try_send(dst, 32'd0)\n",
     ));
@@ -323,7 +323,7 @@ fn a_port_has_nothing_to_drop() {
 #[test]
 fn a_send_on_one_branch_puts_that_branch_in_the_enable() {
     let v = compile(concat!(
-        "process tap (src: buffer in i32, sum: port out i32)\n",
+        "process tap (src: buffer in u32, sum: port out u32)\n",
         "  let (v, got) = @try_rcv(src)\n",
         "  if got then\n",
         "    let _s = @try_send(sum, v)\n",
@@ -339,7 +339,7 @@ fn a_port_out_nothing_sends_to_still_drives() {
     // An output left undriven would be a floating wire, which is the thing the
     // `if` rule exists to keep out of the language.
     let v = compile(concat!(
-        "process tap (src: buffer in i32, dst: buffer out i32, spare: port out i32)\n",
+        "process tap (src: buffer in u32, dst: buffer out u32, spare: port out u32)\n",
         "  let (v, got) = @try_rcv(src)\n",
         "  let _s = @try_send(dst, v)\n",
     ));
@@ -350,8 +350,8 @@ fn a_port_out_nothing_sends_to_still_drives() {
 #[test]
 fn a_port_out_in_a_state_machine_is_driven_by_the_state_that_sent() {
     let v = compile(concat!(
-        "process pump (cmd: buffer in i8, din: buffer in i32, stat: port out i32)\n",
-        "  var n: i32 = @zeroed()\n",
+        "process pump (cmd: buffer in u8, din: buffer in u32, stat: port out u32)\n",
+        "  var n: u32 = @zeroed()\n",
         "  loop\n",
         "    let c = @rcv(cmd)\n",
         "    if c[0] then\n",
@@ -372,7 +372,7 @@ fn a_port_out_in_a_state_machine_is_driven_by_the_state_that_sent() {
 fn a_plain_parameter_is_still_a_folded_constant() {
     // The whole reason `port` is spelled with a word.
     let v = compile(concat!(
-        "process p (k: i8 = 8'd3, src: buffer in i32, dst: buffer out i32)\n",
+        "process p (k: u8 = 8'd3, src: buffer in u32, dst: buffer out u32)\n",
         "  let (a, got) = @try_rcv(src)\n",
         "  let _s = @try_send(dst, a + @zext(k, 32))\n",
     ));
@@ -383,7 +383,7 @@ fn a_plain_parameter_is_still_a_folded_constant() {
 #[test]
 fn a_memory_cannot_be_a_port() {
     let text = compile_err(concat!(
-        "process p (m: port in #[impl(lutram)] [i32; 4], dst: buffer out i32)\n",
+        "process p (m: port in #[impl(lutram)] [u32; 4], dst: buffer out u32)\n",
         "  let _s = @try_send(dst, 32'd0)\n",
     ));
     assert!(text.contains("cannot be a parameter"), "{}", text);
@@ -394,8 +394,8 @@ fn a_process_of_ports_alone_is_a_plain_verilog_module() {
     // What `port` is for: a module with no pipes at all, so DDL can write the
     // ordinary sequential blocks a design needs beside the dataflow ones.
     let v = compile(concat!(
-        "process counter (step: port in i8, n: port out i32)\n",
-        "  var c: i32 = @zeroed()\n",
+        "process counter (step: port in u8, n: port out u32)\n",
+        "  var c: u32 = @zeroed()\n",
         "  loop\n",
         "    let (s, got) = @try_rcv(step)\n",
         "    c += @zext(s, 32)\n",
@@ -415,7 +415,7 @@ fn a_process_of_ports_alone_is_a_plain_verilog_module() {
 #[test]
 fn a_port_in_works_in_a_sequence_stage() {
     let v = compile(concat!(
-        "sequence tagit (src: buffer in i32, lvl: port in i8, dst: buffer out i32)\n",
+        "sequence tagit (src: buffer in u32, lvl: port in u8, dst: buffer out u32)\n",
         "  let x = @rcv(src)\n",
         "  |||\n",
         "  let (l, got) = @try_rcv(lvl)\n",
@@ -432,7 +432,7 @@ fn a_port_out_in_a_sequence_belongs_to_the_stage_that_sent() {
     // holding a different item -- so what stands in for "the state fired" is
     // "this stage has a valid item and the pipeline is moving".
     let v = compile(concat!(
-        "sequence tagit (src: buffer in i32, sum: port out i32, dst: buffer out i32)\n",
+        "sequence tagit (src: buffer in u32, sum: port out u32, dst: buffer out u32)\n",
         "  let x = @rcv(src)\n",
         "  |||\n",
         "  let _s = @try_send(sum, x + x)\n",
@@ -448,7 +448,7 @@ fn a_port_out_in_a_sequence_belongs_to_the_stage_that_sent() {
 #[test]
 fn a_port_out_in_the_head_stage_tracks_the_input() {
     let v = compile(concat!(
-        "sequence early (src: buffer in i32, seen: port out i32, dst: buffer out i32)\n",
+        "sequence early (src: buffer in u32, seen: port out u32, dst: buffer out u32)\n",
         "  let x = @rcv(src)\n",
         "  let _s = @try_send(seen, x)\n",
         "  |||\n",
@@ -463,7 +463,7 @@ fn a_port_out_in_the_head_stage_tracks_the_input() {
 #[test]
 fn a_port_out_under_an_if_keeps_the_branch_in_its_enable() {
     let v = compile(concat!(
-        "sequence flagged (src: buffer in i32, big: port out i32, dst: buffer out i32)\n",
+        "sequence flagged (src: buffer in u32, big: port out u32, dst: buffer out u32)\n",
         "  let x = @rcv(src)\n",
         "  |||\n",
         "  if x[31] then\n",
@@ -482,7 +482,7 @@ fn a_port_out_sent_to_in_two_stages_is_refused() {
     // process, where only one state is current, there is nothing to choose
     // between them.
     let text = compile_err(concat!(
-        "sequence both (src: buffer in i32, tap: port out i32, dst: buffer out i32)\n",
+        "sequence both (src: buffer in u32, tap: port out u32, dst: buffer out u32)\n",
         "  let x = @rcv(src)\n",
         "  let _a = @try_send(tap, x)\n",
         "  |||\n",

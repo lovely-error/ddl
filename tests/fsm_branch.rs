@@ -32,11 +32,11 @@ fn compile_err(src: &str) -> String {
 /// The shape this whole change exists for: one command pipe, and what the
 /// command says decides which pipe is waited on next.
 const RW: &str = concat!(
-    "process rw (cmd: buffer in i8, din: buffer in i32, dout: buffer out i32)\n",
-    "  var cell: i32 = @zeroed()\n",
+    "process rw (cmd: buffer in u8, din: buffer in u32, dout: buffer out u32)\n",
+    "  var cell: u32 = @zeroed()\n",
     "  loop\n",
     "    let c = @rcv(cmd)\n",
-    "    let is_write: i1 = c[0]\n",
+    "    let is_write: u1 = c[0]\n",
     "    if is_write then\n",
     "      let d = @rcv(din)\n",
     "      cell = d\n",
@@ -95,8 +95,8 @@ fn a_var_changes_only_when_its_state_fires() {
     // with no gate at all. A counter that counted clock ticks instead of
     // items.
     let v = compile(concat!(
-        "process counter (src: buffer in i32, dst: buffer out i32)\n",
-        "  var seen: i32 = @zeroed()\n",
+        "process counter (src: buffer in u32, dst: buffer out u32)\n",
+        "  var seen: u32 = @zeroed()\n",
         "  loop\n",
         "    let a = @rcv(src)\n",
         "    seen = seen + 32'd1\n",
@@ -111,8 +111,8 @@ fn an_arm_with_work_and_no_wait_gets_a_state_of_its_own() {
     // paths, so they would run on the other arm too. A state of its own is a
     // cycle, and the only way to guard them.
     let v = compile(concat!(
-        "process p (src: buffer in i32, dst: buffer out i32)\n",
-        "  var n: i32 = @zeroed()\n",
+        "process p (src: buffer in u32, dst: buffer out u32)\n",
+        "  var n: u32 = @zeroed()\n",
         "  loop\n",
         "    let a = @rcv(src)\n",
         "    if a[0] then\n",
@@ -129,7 +129,7 @@ fn an_arm_with_work_and_no_wait_gets_a_state_of_its_own() {
 #[test]
 fn an_empty_else_falls_straight_through() {
     let v = compile(concat!(
-        "process p (go: i1 = 1'b1, src: buffer in i32, dst: buffer out i32)\n",
+        "process p (go: u1 = 1'b1, src: buffer in u32, dst: buffer out u32)\n",
         "  loop\n",
         "    if go then\n",
         "      let a = @rcv(src)\n",
@@ -142,7 +142,7 @@ fn an_empty_else_falls_straight_through() {
 #[test]
 fn conditionals_nest() {
     let v = compile(concat!(
-        "process p (src: buffer in i32, dst: buffer out i32)\n",
+        "process p (src: buffer in u32, dst: buffer out u32)\n",
         "  loop\n",
         "    let a = @rcv(src)\n",
         "    if a[0] then\n",
@@ -163,7 +163,7 @@ fn conditionals_nest() {
 #[test]
 fn a_value_received_on_one_arm_can_be_read_after_the_join() {
     let v = compile(concat!(
-        "process p (sel: buffer in i1, a: buffer in i32, b: buffer in i32, dst: buffer out i32)\n",
+        "process p (sel: buffer in u1, a: buffer in u32, b: buffer in u32, dst: buffer out u32)\n",
         "  loop\n",
         "    let s = @rcv(sel)\n",
         "    if s then\n",
@@ -183,7 +183,7 @@ fn a_value_received_on_one_arm_can_be_read_after_the_join() {
 #[test]
 fn a_body_that_runs_once_still_reaches_its_terminal_state_from_either_arm() {
     let v = compile(concat!(
-        "process once (src: buffer in i32, dst: buffer out i32)\n",
+        "process once (src: buffer in u32, dst: buffer out u32)\n",
         "  let a = @rcv(src)\n",
         "  if a[0] then\n",
         "    @send(dst, a)\n",
@@ -200,7 +200,7 @@ fn a_body_that_runs_once_still_reaches_its_terminal_state_from_either_arm() {
 fn a_linear_loop_is_scheduled_exactly_as_before() {
     // The graph must not cost anything where there is no fork.
     let v = compile(concat!(
-        "process p (src: buffer in i32, dst: buffer out i32)\n",
+        "process p (src: buffer in u32, dst: buffer out u32)\n",
         "  loop\n",
         "    let a = @rcv(src)\n",
         "    let b = @rcv(src)\n",
@@ -218,10 +218,10 @@ fn a_match_can_hold_a_wait() {
     // to reach a payload, and `==` on an enum that carries one is refused
     // because it would compare the padding.
     let v = compile(concat!(
-        "enum e: i1\n",
+        "enum e: u1\n",
         "  A\n",
         "  B\n",
-        "process p (src: buffer in i32, dst: buffer out i32, k: e = A)\n",
+        "process p (src: buffer in u32, dst: buffer out u32, k: e = A)\n",
         "  loop\n",
         "    let a = @rcv(src)\n",
         "    match k\n",
@@ -237,10 +237,10 @@ fn a_match_can_hold_a_wait() {
 const DISPATCH: &str = concat!(
     "enum req_e\n",
     "  Nop\n",
-    "  Read(i8)\n",
-    "  Write(i8)\n",
+    "  Read(u8)\n",
+    "  Write(u8)\n",
     "  Halt\n",
-    "process dispatch (cmd: buffer in req_e, din: buffer in i32, dout: buffer out i32)\n",
+    "process dispatch (cmd: buffer in req_e, din: buffer in u32, dout: buffer out u32)\n",
     "  loop\n",
     "    let r = @rcv(cmd)\n",
     "    match r\n",
@@ -299,14 +299,14 @@ fn one_name_cannot_be_two_payload_types_across_arms() {
     // name is one wire across it, which has one type.
     let text = compile_err(concat!(
         "struct addr_t\n",
-        "  page: i8\n",
-        "  off: i8\n",
+        "  page: u8\n",
+        "  off: u8\n",
         "enum req_e\n",
         "  Nop\n",
         "  Read(addr_t)\n",
-        "  Write(i8)\n",
+        "  Write(u8)\n",
         "  Halt\n",
-        "process d (cmd: buffer in req_e, din: buffer in i32, dout: buffer out i32)\n",
+        "process d (cmd: buffer in req_e, din: buffer in u32, dout: buffer out u32)\n",
         "  loop\n",
         "    let r = @rcv(cmd)\n",
         "    match r\n",
@@ -320,7 +320,7 @@ fn one_name_cannot_be_two_payload_types_across_arms() {
         "      .Halt =>\n",
         "        break\n",
     ));
-    assert!(text.contains("binds `addr_t` on one arm and `i8` on another"), "{}", text);
+    assert!(text.contains("binds `addr_t` on one arm and `u8` on another"), "{}", text);
 }
 
 #[test]
@@ -328,12 +328,12 @@ fn a_scheduled_match_still_has_to_cover_its_scrutinee() {
     // The coverage rules are the same analysis for both readings of a `match`,
     // which is the point of sharing it rather than writing it twice.
     let text = compile_err(concat!(
-        "enum e: i2\n",
+        "enum e: u2\n",
         "  A\n",
         "  B\n",
         "  C\n",
         "  D\n",
-        "process p (src: buffer in i32, dst: buffer out i32, k: e = A)\n",
+        "process p (src: buffer in u32, dst: buffer out u32, k: e = A)\n",
         "  loop\n",
         "    let a = @rcv(src)\n",
         "    match k\n",
@@ -348,10 +348,10 @@ fn a_scheduled_match_still_has_to_cover_its_scrutinee() {
 #[test]
 fn a_wait_in_the_scrutinee_is_refused() {
     let text = compile_err(concat!(
-        "enum e: i1\n",
+        "enum e: u1\n",
         "  A\n",
         "  B\n",
-        "process p (src: buffer in e, dst: buffer out i32)\n",
+        "process p (src: buffer in e, dst: buffer out u32)\n",
         "  loop\n",
         "    match @rcv(src)\n",
         "      .A =>\n",
@@ -365,7 +365,7 @@ fn a_wait_in_the_scrutinee_is_refused() {
 #[test]
 fn a_wait_in_the_condition_itself_is_refused() {
     let text = compile_err(concat!(
-        "process p (src: buffer in i1, dst: buffer out i32)\n",
+        "process p (src: buffer in u1, dst: buffer out u32)\n",
         "  loop\n",
         "    if @rcv(src) then\n",
         "      @send(dst, 32'd1)\n",
@@ -380,15 +380,15 @@ fn a_wait_in_the_condition_itself_is_refused() {
 /// The widening-multiply shape: one item in, one cycle, except when a second
 /// writeback is owed -- and then nothing new is accepted until it has gone.
 const MULW: &str = concat!(
-    "process mulw (uops: buffer in i32, wb: buffer out i32)
+    "process mulw (uops: buffer in u32, wb: buffer out u32)
 ",
-    "  var hi: i32 = @zeroed()
+    "  var hi: u32 = @zeroed()
 ",
     "  loop
 ",
     "    let u = @rcv(uops)
 ",
-    "    let wide: i1 = u[0]
+    "    let wide: u1 = u[0]
 ",
     "    hi = u + u
 ",
@@ -467,9 +467,9 @@ fn a_try_rcv_samples_without_waiting() {
     // The other direction: a state whose barrier is a send may still look at
     // an input, and `got` says whether anything was there.
     let v = compile(concat!(
-        "process tap (src: buffer in i32, dst: buffer out i32)
+        "process tap (src: buffer in u32, dst: buffer out u32)
 ",
-        "  var last: i32 = @zeroed()
+        "  var last: u32 = @zeroed()
 ",
         "  loop
 ",
@@ -491,7 +491,7 @@ fn a_try_rcv_samples_without_waiting() {
 fn a_body_with_no_blocking_operation_still_takes_them() {
     // The stateless form, unchanged: no state register at all.
     let v = compile(concat!(
-        "process a (i: buffer in i32, o: buffer out i32)
+        "process a (i: buffer in u32, o: buffer out u32)
 ",
         "  loop
 ",
@@ -518,7 +518,7 @@ fn a_body_with_no_blocking_operation_still_takes_them() {
 #[test]
 fn a_nested_loop_comes_back_to_its_own_entry() {
     let v = compile(concat!(
-        "process drain (cmd: buffer in i8, src: buffer in i32, dst: buffer out i32)\n",
+        "process drain (cmd: buffer in u8, src: buffer in u32, dst: buffer out u32)\n",
         "  loop\n",
         "    let c = @rcv(cmd)\n",
         "    loop\n",
@@ -539,7 +539,7 @@ fn a_nested_loop_comes_back_to_its_own_entry() {
 #[test]
 fn break_leaves_the_innermost_loop_only() {
     let v = compile(concat!(
-        "process triple (a: buffer in i8, b: buffer in i8, o: buffer out i8)\n",
+        "process triple (a: buffer in u8, b: buffer in u8, o: buffer out u8)\n",
         "  loop\n",
         "    let x = @rcv(a)\n",
         "    if x[7] then\n",
@@ -572,8 +572,8 @@ fn a_loop_with_no_wait_still_counts() {
     // and the state it spins in fires every cycle -- which is what makes the
     // count advance.
     let v = compile(concat!(
-        "process delay (a: buffer in i8, o: buffer out i8)\n",
-        "  var n: i8 = 8'd0\n",
+        "process delay (a: buffer in u8, o: buffer out u8)\n",
+        "  var n: u8 = 8'd0\n",
         "  loop\n",
         "    let x = @rcv(a)\n",
         "    n = 8'd0\n",
@@ -597,8 +597,8 @@ fn a_loop_entry_is_not_absorbed_by_the_state_above_it() {
     // the body jumps back to it, and absorbing it leaves that edge pointing at
     // a state that has been emptied.
     let v = compile(concat!(
-        "process guard (a: buffer in i8, o: buffer out i8)\n",
-        "  var n: i8 = 8'd0\n",
+        "process guard (a: buffer in u8, o: buffer out u8)\n",
+        "  var n: u8 = 8'd0\n",
         "  loop\n",
         "    let x = @rcv(a)\n",
         "    loop\n",
@@ -616,7 +616,7 @@ fn a_loop_entry_is_not_absorbed_by_the_state_above_it() {
 #[test]
 fn a_loop_outside_a_blocking_process_says_what_it_needs() {
     let text = compile_err(concat!(
-        "fun spin (a: i8, o: out i8)\n",
+        "fun spin (a: u8, o: out u8)\n",
         "  loop\n",
         "    o = a\n",
     ));

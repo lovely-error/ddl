@@ -26,21 +26,21 @@ fn compile_err(src: &str) -> String {
     }
 }
 
-/// A one-stage sequence, i16 in and i16 out.
+/// A one-stage sequence, u16 in and u16 out.
 const DBL: &str = concat!(
-    "sequence dbl (src: buffer in i16, dst: buffer out i16)\n",
+    "sequence dbl (src: buffer in u16, dst: buffer out u16)\n",
     "  let a = @rcv(src)\n",
     "  |||\n",
-    "  let d: i16 = a + a\n",
+    "  let d: u16 = a + a\n",
     "  @send(dst, d)\n",
 );
 
-/// i16 in, i32 out, so a graph has to keep the two apart.
+/// u16 in, u32 out, so a graph has to keep the two apart.
 const WIDEN: &str = concat!(
-    "sequence widen (src: buffer in i16, dst: buffer out i32)\n",
+    "sequence widen (src: buffer in u16, dst: buffer out u32)\n",
     "  let a = @rcv(src)\n",
     "  |||\n",
-    "  let w: i32 = @zext(a, 32)\n",
+    "  let w: u32 = @zext(a, 32)\n",
     "  @send(dst, w)\n",
 );
 
@@ -51,9 +51,9 @@ fn a_graph_instantiates_and_wires() {
         DBL,
         WIDEN,
         concat!(
-            "graph quad (src: buffer in i16, dst: buffer out i32)\n",
-            "  let once: buffer i16\n",
-            "  let twice: buffer i16\n",
+            "graph quad (src: buffer in u16, dst: buffer out u32)\n",
+            "  let once: buffer u16\n",
+            "  let twice: buffer u16\n",
             "  dbl(src, once)\n",
             "  dbl(once, twice)\n",
             "  widen(twice, dst)\n",
@@ -83,7 +83,7 @@ fn a_graph_carries_clock_and_reset_to_every_instance() {
         "{}{}",
         DBL,
         concat!(
-            "graph g (src: buffer in i16, dst: buffer out i16)\n",
+            "graph g (src: buffer in u16, dst: buffer out u16)\n",
             "  dbl(src, dst)\n",
         )
     ));
@@ -102,7 +102,7 @@ fn a_graph_port_connects_straight_through() {
         "{}{}",
         DBL,
         concat!(
-            "graph g (src: buffer in i16, dst: buffer out i16)\n",
+            "graph g (src: buffer in u16, dst: buffer out u16)\n",
             "  dbl(src, dst)\n",
         )
     ));
@@ -127,13 +127,13 @@ fn a_cycle_is_allowed() {
         "{}{}",
         DBL,
         concat!(
-            "sequence merge (a: buffer in i16, out_: buffer out i16)\n",
+            "sequence merge (a: buffer in u16, out_: buffer out u16)\n",
             "  let x = @rcv(a)\n",
             "  |||\n",
             "  @send(out_, x)\n",
-            "graph loopy (src: buffer in i16, dst: buffer out i16)\n",
-            "  let back: buffer i16\n",
-            "  let fwd: buffer i16\n",
+            "graph loopy (src: buffer in u16, dst: buffer out u16)\n",
+            "  let back: buffer u16\n",
+            "  let fwd: buffer u16\n",
             "  merge(src, back)\n",
             "  dbl(back, fwd)\n",
             "  merge(fwd, dst)\n",
@@ -149,10 +149,10 @@ fn a_graph_can_instantiate_a_graph() {
         "{}{}",
         DBL,
         concat!(
-            "graph inner (a: buffer in i16, b: buffer out i16)\n",
+            "graph inner (a: buffer in u16, b: buffer out u16)\n",
             "  dbl(a, b)\n",
-            "graph outer (src: buffer in i16, dst: buffer out i16)\n",
-            "  let mid: buffer i16\n",
+            "graph outer (src: buffer in u16, dst: buffer out u16)\n",
+            "  let mid: buffer u16\n",
             "  inner(src, mid)\n",
             "  inner(mid, dst)\n",
         )
@@ -164,12 +164,12 @@ fn a_graph_can_instantiate_a_graph() {
 #[test]
 fn a_process_is_instantiable_too() {
     let v = compile(concat!(
-        "process adder (src: buffer in i32, dst: buffer out i32)\n",
+        "process adder (src: buffer in u32, dst: buffer out u32)\n",
         "  loop\n",
         "    let a = @rcv(src)\n",
         "    let b = @rcv(src)\n",
         "    @send(dst, a + b)\n",
-        "graph g (src: buffer in i32, dst: buffer out i32)\n",
+        "graph g (src: buffer in u32, dst: buffer out u32)\n",
         "  adder(src, dst)\n",
     ));
     assert!(v.contains("adder u_adder ("), "{}", v);
@@ -184,8 +184,8 @@ fn two_producers_on_one_pipe_is_an_error() {
         "{}{}",
         DBL,
         concat!(
-            "graph g (src: buffer in i16, dst: buffer out i16)\n",
-            "  let mid: buffer i16\n",
+            "graph g (src: buffer in u16, dst: buffer out u16)\n",
+            "  let mid: buffer u16\n",
             "  dbl(src, mid)\n",
             "  dbl(src, mid)\n",
             "  dbl(mid, dst)\n",
@@ -205,8 +205,8 @@ fn two_consumers_says_what_it_would_take() {
         "{}{}",
         DBL,
         concat!(
-            "graph g (src: buffer in i16, dst: buffer out i16)\n",
-            "  let mid: buffer i16\n",
+            "graph g (src: buffer in u16, dst: buffer out u16)\n",
+            "  let mid: buffer u16\n",
             "  dbl(src, mid)\n",
             "  dbl(mid, dst)\n",
             "  dbl(mid, dst)\n",
@@ -223,8 +223,8 @@ fn a_pipe_nothing_sends_to_is_an_error() {
         "{}{}",
         DBL,
         concat!(
-            "graph g (src: buffer in i16, dst: buffer out i16)\n",
-            "  let mid: buffer i16\n",
+            "graph g (src: buffer in u16, dst: buffer out u16)\n",
+            "  let mid: buffer u16\n",
             "  dbl(src, dst)\n",
             "  dbl(mid, dst)\n",
         )
@@ -238,8 +238,8 @@ fn a_pipe_nothing_receives_from_is_an_error() {
         "{}{}",
         DBL,
         concat!(
-            "graph g (src: buffer in i16, dst: buffer out i16)\n",
-            "  let mid: buffer i16\n",
+            "graph g (src: buffer in u16, dst: buffer out u16)\n",
+            "  let mid: buffer u16\n",
             "  dbl(src, mid)\n",
             "  dbl(src, dst)\n",
         )
@@ -254,12 +254,12 @@ fn a_width_mismatch_at_an_instance_port_is_caught_here() {
         "{}{}",
         DBL,
         concat!(
-            "graph g (src: buffer in i32, dst: buffer out i16)\n",
+            "graph g (src: buffer in u32, dst: buffer out u16)\n",
             "  dbl(src, dst)\n",
         )
     ));
-    assert!(text.contains("carries `i32`"), "{}", text);
-    assert!(text.contains("`dbl.src` carries `i16`"), "{}", text);
+    assert!(text.contains("carries `u32`"), "{}", text);
+    assert!(text.contains("`dbl.src` carries `u16`"), "{}", text);
 }
 
 #[test]
@@ -271,8 +271,8 @@ fn a_pipe_naming_a_kind_that_does_not_exist_is_refused() {
         "{}{}",
         DBL,
         concat!(
-            "graph g (src: buffer in i16, dst: buffer out i16)\n",
-            "  let mid: fifo i16\n",
+            "graph g (src: buffer in u16, dst: buffer out u16)\n",
+            "  let mid: fifo u16\n",
             "  dbl(src, mid)\n",
             "  dbl(mid, dst)\n",
         )
@@ -280,7 +280,7 @@ fn a_pipe_naming_a_kind_that_does_not_exist_is_refused() {
     assert!(text.contains("does not belong in a `graph` body"), "{}", text);
     assert!(text.contains("`let <name>: buffer <T>`"), "{}", text);
     // It blames the line, not the whole `graph` declaration.
-    assert!(text.contains("let mid: fifo i16"), "{}", text);
+    assert!(text.contains("let mid: fifo u16"), "{}", text);
 }
 
 #[test]
@@ -289,12 +289,12 @@ fn the_arity_error_lists_the_pipes_it_wanted() {
         "{}{}",
         DBL,
         concat!(
-            "graph g (src: buffer in i16, dst: buffer out i16)\n",
+            "graph g (src: buffer in u16, dst: buffer out u16)\n",
             "  dbl(src)\n",
         )
     ));
     assert!(text.contains("has 2 pipe parameters, but 1 was given"), "{}", text);
-    assert!(text.contains("src: buffer in i16, dst: buffer out i16"), "{}", text);
+    assert!(text.contains("src: buffer in u16, dst: buffer out u16"), "{}", text);
 }
 
 #[test]
@@ -303,7 +303,7 @@ fn an_unknown_module_lists_the_real_ones() {
         "{}{}",
         DBL,
         concat!(
-            "graph g (src: buffer in i16, dst: buffer out i16)\n",
+            "graph g (src: buffer in u16, dst: buffer out u16)\n",
             "  nosuch(src, dst)\n",
         )
     ));
@@ -317,7 +317,7 @@ fn an_undeclared_pipe_name_says_how_to_declare_it() {
         "{}{}",
         DBL,
         concat!(
-            "graph g (src: buffer in i16, dst: buffer out i16)\n",
+            "graph g (src: buffer in u16, dst: buffer out u16)\n",
             "  dbl(src, nowhere)\n",
         )
     ));
@@ -327,15 +327,15 @@ fn an_undeclared_pipe_name_says_how_to_declare_it() {
 
 #[test]
 fn a_pipe_with_no_kind_says_which_word_is_missing() {
-    // `let mid: i16` is the shape of the mistake the `let` spelling invites:
+    // `let mid: u16` is the shape of the mistake the `let` spelling invites:
     // a pipe declaration that names no kind reads as a wire.
     let text = compile_err(&format!(
         "{}{}",
         DBL,
         concat!(
-            "graph g (src: buffer in i16, dst: buffer out i16)
+            "graph g (src: buffer in u16, dst: buffer out u16)
 ",
-            "  let mid: i16
+            "  let mid: u16
 ",
             "  dbl(src, mid)
 ",
@@ -346,13 +346,13 @@ fn a_pipe_with_no_kind_says_which_word_is_missing() {
     assert!(text.contains("does not say what kind of pipe it is"), "{}", text);
     assert!(text.contains("let <name>: buffer <T>"), "{}", text);
     // And it blames the line, not the whole `graph` declaration.
-    assert!(text.contains("let mid: i16"), "{}", text);
+    assert!(text.contains("let mid: u16"), "{}", text);
 }
 
 #[test]
 fn a_graph_cannot_instantiate_itself() {
     let text = compile_err(concat!(
-        "graph g (src: buffer in i16, dst: buffer out i16)\n",
+        "graph g (src: buffer in u16, dst: buffer out u16)\n",
         "  g(src, dst)\n",
     ));
     assert!(text.contains("cannot instantiate itself"), "{}", text);
@@ -366,7 +366,7 @@ fn a_plain_parameter_on_a_graph_is_refused() {
         "{}{}",
         DBL,
         concat!(
-            "graph g (n: i8, src: buffer in i16, dst: buffer out i16)\n",
+            "graph g (n: u8, src: buffer in u16, dst: buffer out u16)\n",
             "  dbl(src, dst)\n",
         )
     ));
@@ -376,8 +376,8 @@ fn a_plain_parameter_on_a_graph_is_refused() {
 #[test]
 fn an_empty_graph_is_refused() {
     let text = compile_err(concat!(
-        "graph g (src: buffer in i16, dst: buffer out i16)\n",
-        "  let mid: buffer i16\n",
+        "graph g (src: buffer in u16, dst: buffer out u16)\n",
+        "  let mid: buffer u16\n",
     ));
     assert!(text.contains("instantiates nothing"), "{}", text);
 }
@@ -398,13 +398,13 @@ fn an_empty_graph_is_refused() {
 #[test]
 fn a_graph_can_instantiate_a_module_ddl_did_not_compile() {
     let v = compile(concat!(
-        "extern psram (req: buffer in i32, rsp: buffer out i32)\n",
-        "sequence dbl (a: buffer in i32, b: buffer out i32)\n",
+        "extern psram (req: buffer in u32, rsp: buffer out u32)\n",
+        "sequence dbl (a: buffer in u32, b: buffer out u32)\n",
         "  let x = @rcv(a)\n",
         "  |||\n",
         "  @send(b, x + x)\n",
-        "graph top (src: buffer in i32, dst: buffer out i32)\n",
-        "  let mid: buffer i32\n",
+        "graph top (src: buffer in u32, dst: buffer out u32)\n",
+        "  let mid: buffer u32\n",
         "  dbl(src, mid)\n",
         "  psram(mid, dst)\n",
     ));
@@ -418,13 +418,13 @@ fn a_graph_can_instantiate_a_module_ddl_did_not_compile() {
 #[test]
 fn an_extern_emits_no_module_of_its_own() {
     let v = compile(concat!(
-        "extern sink (a: buffer in i32)\n",
-        "sequence src_ (a: buffer in i32, b: buffer out i32)\n",
+        "extern sink (a: buffer in u32)\n",
+        "sequence src_ (a: buffer in u32, b: buffer out u32)\n",
         "  let x = @rcv(a)\n",
         "  |||\n",
         "  @send(b, x)\n",
-        "graph top (i: buffer in i32)\n",
-        "  let mid: buffer i32\n",
+        "graph top (i: buffer in u32)\n",
+        "  let mid: buffer u32\n",
         "  src_(i, mid)\n",
         "  sink(mid)\n",
     ));
@@ -437,8 +437,8 @@ fn an_extern_emits_no_module_of_its_own() {
 #[test]
 fn the_connections_to_an_extern_are_still_checked() {
     let text = compile_err(concat!(
-        "extern psram (req: buffer in i32, rsp: buffer out i32)\n",
-        "graph top (src: buffer in i32, dst: buffer out i32)\n",
+        "extern psram (req: buffer in u32, rsp: buffer out u32)\n",
+        "graph top (src: buffer in u32, dst: buffer out u32)\n",
         "  psram(src)\n",
     ));
     assert!(text.contains("pipe parameter"), "{}", text);
@@ -447,10 +447,10 @@ fn the_connections_to_an_extern_are_still_checked() {
 #[test]
 fn two_producers_on_a_pipe_are_refused_even_when_one_is_extern() {
     let text = compile_err(concat!(
-        "extern psram (req: buffer in i32, rsp: buffer out i32)\n",
-        "extern other (rsp: buffer out i32)\n",
-        "graph top (src: buffer in i32, dst: buffer out i32)\n",
-        "  let mid: buffer i32\n",
+        "extern psram (req: buffer in u32, rsp: buffer out u32)\n",
+        "extern other (rsp: buffer out u32)\n",
+        "graph top (src: buffer in u32, dst: buffer out u32)\n",
+        "  let mid: buffer u32\n",
         "  psram(src, mid)\n",
         "  other(mid)\n",
     ));
@@ -463,8 +463,8 @@ fn an_extern_declares_pipes_and_nothing_else() {
     // the graph has no way to reach, left unconnected in the instantiation --
     // a floating wire, which is the shape of bug that shows up as a hang.
     let text = compile_err(concat!(
-        "extern pll (lock: port out i1, rsp: buffer out i32)\n",
-        "graph top (dst: buffer out i32)\n",
+        "extern pll (lock: port out u1, rsp: buffer out u32)\n",
+        "graph top (dst: buffer out u32)\n",
         "  pll(dst)\n",
     ));
     assert!(text.contains("is not a pipe"), "{}", text);
@@ -479,7 +479,7 @@ fn an_extern_declares_pipes_and_nothing_else() {
 // so these are modules the compiler writes: a datapath, no states.
 
 const DOUBLER: &str = concat!(
-    "sequence dbl (a: buffer in i32, b: buffer out i32)\n",
+    "sequence dbl (a: buffer in u32, b: buffer out u32)\n",
     "  let x = @rcv(a)\n",
     "  |||\n",
     "  @send(b, x + x)\n",
@@ -491,8 +491,8 @@ fn a_merge_arbitrates_in_rotation() {
         "{}{}",
         DOUBLER,
         concat!(
-            "graph top (p: buffer in i32, q: buffer in i32, o: buffer out i32)\n",
-            "  let m: buffer i32\n",
+            "graph top (p: buffer in u32, q: buffer in u32, o: buffer out u32)\n",
+            "  let m: buffer u32\n",
             "  @merge(p, q, m)\n",
             "  dbl(m, o)\n",
         )
@@ -517,8 +517,8 @@ fn only_one_input_of_a_merge_is_granted() {
         "{}{}",
         DOUBLER,
         concat!(
-            "graph top (p: buffer in i32, q: buffer in i32, o: buffer out i32)\n",
-            "  let m: buffer i32\n",
+            "graph top (p: buffer in u32, q: buffer in u32, o: buffer out u32)\n",
+            "  let m: buffer u32\n",
             "  @merge(p, q, m)\n",
             "  dbl(m, o)\n",
         )
@@ -538,8 +538,8 @@ fn a_split_takes_only_when_every_sink_has_room() {
         "{}{}",
         DOUBLER,
         concat!(
-            "graph top (p: buffer in i32, o1: buffer out i32, o2: buffer out i32)\n",
-            "  let d: buffer i32\n",
+            "graph top (p: buffer in u32, o1: buffer out u32, o2: buffer out u32)\n",
+            "  let d: buffer u32\n",
             "  dbl(p, d)\n",
             "  @split(d, o1, o2)\n",
         )
@@ -560,8 +560,8 @@ fn a_combinator_never_depends_on_the_ready_coming_back() {
         "{}{}",
         DOUBLER,
         concat!(
-            "graph top (p: buffer in i32, o1: buffer out i32, o2: buffer out i32)\n",
-            "  let d: buffer i32\n",
+            "graph top (p: buffer in u32, o1: buffer out u32, o2: buffer out u32)\n",
+            "  let d: buffer u32\n",
             "  dbl(p, d)\n",
             "  @split(d, o1, o2)\n",
         )
@@ -579,8 +579,8 @@ fn a_three_way_merge_rotates_over_three_starts() {
         "{}{}",
         DOUBLER,
         concat!(
-            "graph top (p: buffer in i32, q: buffer in i32, r: buffer in i32, o: buffer out i32)\n",
-            "  let m: buffer i32\n",
+            "graph top (p: buffer in u32, q: buffer in u32, r: buffer in u32, o: buffer out u32)\n",
+            "  let m: buffer u32\n",
             "  @merge(p, q, r, m)\n",
             "  dbl(m, o)\n",
         )
@@ -597,10 +597,10 @@ fn one_module_serves_every_use_of_the_same_shape() {
         "{}{}",
         DOUBLER,
         concat!(
-            "graph top (a: buffer in i32, b: buffer in i32, c: buffer in i32, d: buffer in i32, o: buffer out i32)\n",
-            "  let m1: buffer i32\n",
-            "  let m2: buffer i32\n",
-            "  let m3: buffer i32\n",
+            "graph top (a: buffer in u32, b: buffer in u32, c: buffer in u32, d: buffer in u32, o: buffer out u32)\n",
+            "  let m1: buffer u32\n",
+            "  let m2: buffer u32\n",
+            "  let m3: buffer u32\n",
             "  @merge(a, b, m1)\n",
             "  @merge(c, d, m2)\n",
             "  @merge(m1, m2, m3)\n",
@@ -614,7 +614,7 @@ fn one_module_serves_every_use_of_the_same_shape() {
 #[test]
 fn a_combinator_needs_two_sides() {
     let text = compile_err(concat!(
-        "graph top (p: buffer in i32, o: buffer out i32)\n",
+        "graph top (p: buffer in u32, o: buffer out u32)\n",
         "  @merge(p)\n",
     ));
     assert!(text.contains("needs at least two pipes"), "{}", text);

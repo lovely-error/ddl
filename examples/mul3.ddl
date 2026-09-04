@@ -12,11 +12,11 @@
 -- up. Channel rule 3 holds as everywhere else: `dst_valid` is the last
 -- validity bit, which is a register.
 
-sequence mul3 (src: buffer in i16, dst: buffer out i32)
+sequence mul3 (src: buffer in u16, dst: buffer out u32)
   let a = @rcv(src)
-  let doubled: i16 = a + a
+  let doubled: u16 = a + a
   |||
-  let wide: i32 = @zext(doubled, 32)
+  let wide: u32 = @zext(doubled, 32)
   |||
-  let scaled: i32 = wide + wide
+  let scaled: u32 = wide + wide
   @send(dst, scaled)

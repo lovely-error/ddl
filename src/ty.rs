@@ -21,10 +21,10 @@
 //
 //   * Unsized literals adopt the width of the other operand, checked to fit.
 //     So `x - 1` works for any width of `x`, and `x - 300` is an error when
-//     `x` is `i8`.
+//     `x` is `u8`.
 //   * Comparisons never complain. They widen internally to hold both operands
 //     exactly, including the extra bit a mixed-signedness pair needs. That is
-//     the rule k2g_alu.sv:15 spells out by hand: "s32 spans [-2^31, 2^31-1]
+//     the rule k2g_alu.sv:15 spells out by hand: "i32 spans [-2^31, 2^31-1]
 //     and u32 spans [0, 2^32-1]; their union does not fit in 32 bits, so a
 //     32-bit comparator must misorder some mixed-tag pairs."
 
@@ -33,9 +33,9 @@ use crate::symbols::Symbols;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Ty {
-    /// `iN` -- unsigned, N bits.
+    /// `uN` -- unsigned, N bits.
     UInt(u32),
-    /// `sN` -- signed, two's complement, N bits.
+    /// `iN` -- signed, two's complement, N bits.
     SInt(u32),
     /// `[T; n]`
     Array(Box<Ty>, u32),
@@ -121,8 +121,8 @@ impl Ty {
 
     pub fn display(&self) -> String {
         match self {
-            Ty::UInt(w) => format!("i{}", w),
-            Ty::SInt(w) => format!("s{}", w),
+            Ty::UInt(w) => format!("u{}", w),
+            Ty::SInt(w) => format!("i{}", w),
             Ty::Array(elem, n) => format!("[{}; {}]", elem.display(), n),
             Ty::Enum { name, .. } | Ty::Struct { name, .. } => name.clone(),
             Ty::Mem { elem, len, kind } => {
@@ -140,7 +140,7 @@ impl Ty {
 pub enum TyError {
     /// Not a type name at all.
     UnknownType(String),
-    /// `i0` / `s0`, or a width that does not fit in u32.
+    /// `u0` / `i0`, or a width that does not fit in u32.
     BadWidth(String),
     /// Array length that would not fold, and what stopped it.
     BadArrayLen(ConstError),
@@ -154,7 +154,7 @@ impl TyError {
     pub fn message(&self) -> String {
         match self {
             TyError::UnknownType(n) => format!(
-                "`{}` is not a type; expected `iN` (unsigned), `sN` (signed) or `[T; n]`",
+                "`{}` is not a type; expected `uN` (unsigned), `iN` (signed) or `[T; n]`",
                 n
             ),
             TyError::BadWidth(n) => format!("`{}` has an invalid width", n),
@@ -187,7 +187,7 @@ impl TyError {
     }
 }
 
-/// Parses `iN` / `sN`.
+/// Parses `uN` / `iN`.
 ///
 /// Replaces the old check, which accepted any identifier beginning with `i`
 /// and never looked at the width.
@@ -197,8 +197,8 @@ pub fn parse_scalar_type_name(name: &str) -> Result<Ty, TyError> {
         return Err(TyError::UnknownType(name.to_string()));
     }
     let signed = match bytes[0] {
-        b'i' => false,
-        b's' => true,
+        b'u' => false,
+        b'i' => true,
         _ => return Err(TyError::UnknownType(name.to_string())),
     };
     let digits = &name[1..];
@@ -220,7 +220,7 @@ pub fn resolve_type_expr(expr: &PrecTypeExpr, syms: &Symbols) -> Result<Ty, TyEr
         PrecTypeExpr::Ident(span) => {
             let name = anumspan_to_str(span);
             // A user-declared name wins over the built-in spelling, so an
-            // enum called `i8` would shadow the scalar type rather than being
+            // enum called `u8` would shadow the scalar type rather than being
             // silently ignored.
             if let Some(ty) = syms.lookup_type(name) {
                 return Ok(ty);
@@ -267,8 +267,8 @@ impl ConstError {
     /// "discriminant ...". The caller knows what it asked for and this knows
     /// what became of it, and neither knows the other half.
     ///
-    /// Worth keeping apart because they are different mistakes. `[i32; n]` is
-    /// waiting for a value the compiler does not have; `[i32; 8 / 0]` has every
+    /// Worth keeping apart because they are different mistakes. `[u32; n]` is
+    /// waiting for a value the compiler does not have; `[u32; 8 / 0]` has every
     /// value it needs and no answer. Reporting the second as the first sends a
     /// reader looking for a runtime variable that is not there.
     pub fn reason(&self) -> &'static str {
@@ -408,7 +408,7 @@ impl OpTyError {
                 format!("expected an integer, found `{}`", t.display())
             }
             OpTyError::NeedsBool(t) => format!(
-                "logical operators need `i1`, found `{}`",
+                "logical operators need `u1`, found `{}`",
                 t.display()
             ),
             OpTyError::LiteralTooWide { value, ty } => {
@@ -565,16 +565,16 @@ mod tests {
 
     #[test]
     fn scalar_type_names() {
-        assert_eq!(parse_scalar_type_name("i1").unwrap(), Ty::UInt(1));
-        assert_eq!(parse_scalar_type_name("i32").unwrap(), Ty::UInt(32));
-        assert_eq!(parse_scalar_type_name("s32").unwrap(), Ty::SInt(32));
+        assert_eq!(parse_scalar_type_name("u1").unwrap(), Ty::UInt(1));
+        assert_eq!(parse_scalar_type_name("u32").unwrap(), Ty::UInt(32));
+        assert_eq!(parse_scalar_type_name("i32").unwrap(), Ty::SInt(32));
     }
 
     #[test]
     fn identifiers_starting_with_i_are_not_types() {
         // The old check was `if let [b'i', tail @ ..]` with an is_alphanumeric
         // fold, so all of these typechecked as integers.
-        for bad in ["item", "input", "i", "iFoo", "i0", "s0", "x32", ""] {
+        for bad in ["item", "input", "i", "iFoo", "uFoo", "u0", "i0", "s32", "x32", ""] {
             assert!(
                 parse_scalar_type_name(bad).is_err(),
                 "`{}` must not parse as a type",
@@ -591,9 +591,9 @@ mod tests {
 
     #[test]
     fn same_width_arithmetic_is_accepted() {
-        let i32 = Ty::UInt(32);
-        assert_eq!(binop_result(BuiltinOp::Add, &i32, &i32).unwrap(), i32);
-        assert_eq!(binop_result(BuiltinOp::Xor, &i32, &i32).unwrap(), i32);
+        let u32 = Ty::UInt(32);
+        assert_eq!(binop_result(BuiltinOp::Add, &u32, &u32).unwrap(), u32);
+        assert_eq!(binop_result(BuiltinOp::Xor, &u32, &u32).unwrap(), u32);
     }
 
     #[test]
@@ -635,7 +635,7 @@ mod tests {
 
     #[test]
     fn mixed_sign_comparison_gets_the_extra_bit() {
-        // k2g_alu.sv:15: s32 and u32 together do not fit in 32 bits.
+        // k2g_alu.sv:15: i32 and u32 together do not fit in 32 bits.
         let t = comparison_operand_ty(&Ty::SInt(32), &Ty::UInt(32));
         assert_eq!(t, Ty::SInt(33));
         // Same signedness needs no extra bit.
@@ -647,7 +647,7 @@ mod tests {
     fn logical_operators_demand_i1() {
         assert!(binop_result(BuiltinOp::LogAnd, &Ty::BOOL, &Ty::BOOL).is_ok());
         let err = binop_result(BuiltinOp::LogAnd, &Ty::UInt(32), &Ty::BOOL).unwrap_err();
-        assert!(err.message().contains("i1"), "{}", err.message());
+        assert!(err.message().contains("u1"), "{}", err.message());
     }
 
     #[test]

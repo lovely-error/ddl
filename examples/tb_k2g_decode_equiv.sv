@@ -2,7 +2,7 @@
 //
 // These no longer have the same ports, and that is the point of the test. The
 // SystemVerilog carries `cp_valid` / `accept` / `uop_valid` / `hold`, four
-// signals hand-wired into a protocol. The DDL declares `cps: buffer in i16`
+// signals hand-wired into a protocol. The DDL declares `cps: buffer in u16`
 // and `uop: buffer out uop_t` and the compiler writes the same protocol --
 // with `hold` GONE, because `hold` only ever existed to stand in for the
 // back-pressure `uop_valid` had no `ready` to carry.

@@ -13,7 +13,7 @@
 -- Channel rule 3 still holds: in the send state `valid` is `state == 2`, and
 -- state is a register, so `valid` never depends combinationally on `ready`.
 
-process fsm_adder (src: buffer in i32, dst: buffer out i32)
+process fsm_adder (src: buffer in u32, dst: buffer out u32)
   loop
     let a = @rcv(src)
     let b = @rcv(src)

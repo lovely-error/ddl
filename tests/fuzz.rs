@@ -69,7 +69,7 @@ const WORDS: &[&str] = &[
     "fun", "process", "sequence", "graph", "struct", "enum", "let", "var", "loop", "break",
     "for", "in", "if", "then", "else", "match", "import", "return", "buffer", "out",
     "inout", "@rcv", "@send", "@try_rcv", "@try_send", "@zext", "@sext", "@trunc", "@cast",
-    "@concat", "@zeroed", "@assert", "@unreachable", "i1", "i8", "i32", "s32", "|||", "=>", "..",
+    "@concat", "@zeroed", "@assert", "@unreachable", "u1", "u8", "u32", "i32", "|||", "=>", "..",
     "==", "+=", "<<=", "#[impl(lutram)]", "#[impl(bram)]", "(", ")", "[", "]", ",", ":", "=",
     "+", "-", "*", "/", "%", "&", "|", "^", "~", "<", ">", "!", ".", "_", "\n", "  ", "    ",
     "8'd1", "32'hFF", "1'b0", "0", "999999999999999999999", "a", "x", "src", "dst", "-- c",
@@ -81,12 +81,12 @@ const WORDS: &[&str] = &[
 fn corpus() -> Vec<String> {
     #[cfg_attr(miri, allow(unused_mut))]
     let mut seeds: Vec<String> = vec![
-        "fun f (a: i8, o: out i8)\n  o = a\n".into(),
-        "sequence s (src: buffer in i16, dst: buffer out i16)\n  let a = @rcv(src)\n  |||\n  @send(dst, a)\n".into(),
-        "process p (src: buffer in i32, dst: buffer out i32)\n  loop\n    let a = @rcv(src)\n    @send(dst, a)\n".into(),
-        "enum e\n  A\n  B(i8)\nfun f (x: e, o: out i8)\n  var v: i8 = @zeroed()\n  match x\n    .A =>\n      v = 8'd0\n    .B d =>\n      v = d\n  o = v\n".into(),
-        "struct s\n  a: i8\n  b: i8\nfun f (x: s, o: out i8)\n  o = x.a\n".into(),
-        "fun f (o: out i8)\n  var acc: i8 = @zeroed()\n  for i in 0..4\n    acc = acc + 8'd1\n  o = acc\n".into(),
+        "fun f (a: u8, o: out u8)\n  o = a\n".into(),
+        "sequence s (src: buffer in u16, dst: buffer out u16)\n  let a = @rcv(src)\n  |||\n  @send(dst, a)\n".into(),
+        "process p (src: buffer in u32, dst: buffer out u32)\n  loop\n    let a = @rcv(src)\n    @send(dst, a)\n".into(),
+        "enum e\n  A\n  B(u8)\nfun f (x: e, o: out u8)\n  var v: u8 = @zeroed()\n  match x\n    .A =>\n      v = 8'd0\n    .B d =>\n      v = d\n  o = v\n".into(),
+        "struct s\n  a: u8\n  b: u8\nfun f (x: s, o: out u8)\n  o = x.a\n".into(),
+        "fun f (o: out u8)\n  var acc: u8 = @zeroed()\n  for i in 0..4\n    acc = acc + 8'd1\n  o = acc\n".into(),
     ];
     // The examples too, when they are beside us -- they are the largest real
     // programs there are, and the k2g_* ones need a package we may not have.
@@ -423,33 +423,33 @@ fn inputs_that_broke_it_before_still_do_not() {
         ("one newline", "\n"),
         ("only spaces", "     "),
         ("a lone keyword", "fun"),
-        ("a header and nothing else", "fun f (a: i8, o: out i8)"),
-        ("unterminated parameter list", "fun f (a: i8"),
-        ("multi-byte in a comment", "-- \u{1F600}\nfun f (a: i8, o: out i8)\n  o = a\n"),
-        ("multi-byte identifier", "fun \u{00e9} (a: i8, o: out i8)\n  o = a\n"),
-        ("a NUL byte", "fun f (a: i8, o: out i8)\n  o = a\n\u{0}"),
-        ("CR alone", "fun f (a: i8, o: out i8)\r  o = a\r"),
-        ("no trailing newline", "fun f (a: i8, o: out i8)\n  o = a"),
+        ("a header and nothing else", "fun f (a: u8, o: out u8)"),
+        ("unterminated parameter list", "fun f (a: u8"),
+        ("multi-byte in a comment", "-- \u{1F600}\nfun f (a: u8, o: out u8)\n  o = a\n"),
+        ("multi-byte identifier", "fun \u{00e9} (a: u8, o: out u8)\n  o = a\n"),
+        ("a NUL byte", "fun f (a: u8, o: out u8)\n  o = a\n\u{0}"),
+        ("CR alone", "fun f (a: u8, o: out u8)\r  o = a\r"),
+        ("no trailing newline", "fun f (a: u8, o: out u8)\n  o = a"),
         ("deep nesting", &"(".repeat(200)),
         // The one the fuzzer found. Nesting past what the parser follows used
         // to overflow the stack, which is the process dying with no
         // diagnostic -- `catch_unwind` cannot see it, so the harness above
         // would have reported nothing at all.
         ("balanced parens past the limit", &format!(
-            "fun f (a: i8, o: out i8)
+            "fun f (a: u8, o: out u8)
   o = {}a{}
 ",
             "(".repeat(5000),
             ")".repeat(5000),
         )),
         ("unbalanced open parens", &format!(
-            "fun f (a: i8, o: out i8)
+            "fun f (a: u8, o: out u8)
   o = {}a
 ",
             "(".repeat(5000),
         )),
         ("indented blocks past the limit", &{
-            let mut s = String::from("fun f (c: i1, a: i8, o: out i8)
+            let mut s = String::from("fun f (c: u1, a: u8, o: out u8)
 ");
             for i in 0..300 {
                 s.push_str(&" ".repeat(i + 1));
@@ -461,9 +461,9 @@ fn inputs_that_broke_it_before_still_do_not() {
 ");
             s
         }),
-        ("a huge width", "fun f (a: i99999999, o: out i8)\n  o = a\n"),
-        ("a huge literal", "fun f (o: out i8)\n  o = 999999999999999999999999999999\n"),
-        ("indentation only", "fun f (a: i8, o: out i8)\n                    \n"),
+        ("a huge width", "fun f (a: u99999999, o: out u8)\n  o = a\n"),
+        ("a huge literal", "fun f (o: out u8)\n  o = 999999999999999999999999999999\n"),
+        ("indentation only", "fun f (a: u8, o: out u8)\n                    \n"),
     ];
     for (name, src) in cases {
         if let Err(what) = survives(src) {

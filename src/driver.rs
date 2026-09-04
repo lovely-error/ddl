@@ -434,7 +434,7 @@ mod tests {
     #[test]
     fn a_parse_error_reports_a_real_location() {
         let src = concat!(
-            "process Good (a: buffer in i1)\n",
+            "process Good (a: buffer in u1)\n",
             "  return\n",
             "\n",
             "gibberish Bad\n",
@@ -450,7 +450,7 @@ mod tests {
 
     #[test]
     fn tabs_are_rejected_with_an_explanation() {
-        let src = "process Name (a: buffer in i1)\n\treturn\n";
+        let src = "process Name (a: buffer in u1)\n\treturn\n";
         let map = SourceMap::new("t.ddl", src);
         let diags = parse_source(&map).err().expect("tabs should be rejected");
         let text = map.render_all(&diags);
@@ -464,7 +464,7 @@ mod tests {
     fn a_clean_source_parses() {
         let src = concat!(
             "-- a comment, which desc.md uses everywhere\n",
-            "process Name (a: buffer in i1)\n",
+            "process Name (a: buffer in u1)\n",
             "  let x = a\n",
             "  return\n",
         );
@@ -497,7 +497,7 @@ mod emit_tests {
     #[test]
     fn a_trivial_function_becomes_a_module() {
         let v = compile(concat!(
-            "fun adder (a: i8, b: i8, sum: out i8)\n",
+            "fun adder (a: u8, b: u8, sum: out u8)\n",
             "  sum = a + b\n",
         ));
         assert!(v.contains("module adder ("), "{}", v);
@@ -510,7 +510,7 @@ mod emit_tests {
 
     #[test]
     fn the_banner_says_how_to_regenerate() {
-        let v = compile("fun f (a: i1, o: out i1)\n  o = a\n");
+        let v = compile("fun f (a: u1, o: out u1)\n  o = a\n");
         assert!(v.contains("GENERATED FILE -- DO NOT EDIT BY HAND"), "{}", v);
         assert!(v.contains("Regenerate with:"), "{}", v);
     }
@@ -521,7 +521,7 @@ mod emit_tests {
     #[test]
     fn never_emits_clog2_or_width_casts_or_calls() {
         let v = compile(concat!(
-            "fun widths (a: i8, b: i32, o: out i32, p: out s40)\n",
+            "fun widths (a: u8, b: u32, o: out u32, p: out i40)\n",
             "  o = @zext(a, 32) + b\n",
             "  p = @sext(@signed(b), 40)\n",
         ));
@@ -544,7 +544,7 @@ mod emit_tests {
     #[test]
     fn signedness_lives_on_the_declaration() {
         let v = compile(concat!(
-            "fun sh (v: i32, amt: i5, o: out s32)\n",
+            "fun sh (v: u32, amt: u5, o: out i32)\n",
             "  o = @signed(v) >> amt\n",
         ));
         assert!(v.contains("wire signed [31:0]"), "{}", v);
@@ -555,7 +555,7 @@ mod emit_tests {
     #[test]
     fn unsigned_shift_stays_logical() {
         let v = compile(concat!(
-            "fun sh (v: i32, amt: i5, o: out i32)\n",
+            "fun sh (v: u32, amt: u5, o: out u32)\n",
             "  o = v >> amt\n",
         ));
         assert!(v.contains(">>"), "{}", v);
@@ -565,7 +565,7 @@ mod emit_tests {
     #[test]
     fn if_else_becomes_a_mux() {
         let v = compile(concat!(
-            "fun pick (c: i1, a: i8, b: i8, o: out i8)\n",
+            "fun pick (c: u1, a: u8, b: u8, o: out u8)\n",
             "  if c then\n",
             "    o = a\n",
             "  else\n",
@@ -577,7 +577,7 @@ mod emit_tests {
     #[test]
     fn mixed_widths_are_rejected_with_the_cast_to_write() {
         let text = compile_err(concat!(
-            "fun bad (a: i32, b: i5, o: out i32)\n",
+            "fun bad (a: u32, b: u5, o: out u32)\n",
             "  o = a + b\n",
         ));
         assert!(text.contains("width mismatch"), "{}", text);
@@ -586,7 +586,7 @@ mod emit_tests {
 
     #[test]
     fn an_unassigned_output_is_an_error() {
-        let text = compile_err("fun bad (a: i8, o: out i8)\n  let x = a\n");
+        let text = compile_err("fun bad (a: u8, o: out u8)\n  let x = a\n");
         assert!(text.contains("`o` is never assigned"), "{}", text);
     }
 
@@ -594,7 +594,7 @@ mod emit_tests {
     fn assigning_on_only_one_branch_is_an_error() {
         // Combinational logic has no memory, so this would be a latch.
         let text = compile_err(concat!(
-            "fun bad (c: i1, a: i8, o: out i8)\n",
+            "fun bad (c: u1, a: u8, o: out u8)\n",
             "  if c then\n",
             "    o = a\n",
         ));
@@ -604,7 +604,7 @@ mod emit_tests {
     #[test]
     fn unsized_literals_adopt_the_other_operand_width() {
         let v = compile(concat!(
-            "fun inc (a: i32, o: out i32)\n",
+            "fun inc (a: u32, o: out u32)\n",
             "  o = a - 1\n",
         ));
         assert!(v.contains("32'd1"), "{}", v);
@@ -612,14 +612,14 @@ mod emit_tests {
 
     #[test]
     fn a_literal_that_does_not_fit_is_rejected() {
-        let text = compile_err("fun bad (a: i8, o: out i8)\n  o = a + 300\n");
+        let text = compile_err("fun bad (a: u8, o: out u8)\n  o = a + 300\n");
         assert!(text.contains("width mismatch") || text.contains("does not fit"), "{}", text);
     }
 
     #[test]
     fn multiplication_widens_to_the_full_product() {
         let v = compile(concat!(
-            "fun mul (a: i16, b: i16, o: out i32)\n",
+            "fun mul (a: u16, b: u16, o: out u32)\n",
             "  o = a * b\n",
         ));
         assert!(v.contains("output [31:0] o"), "{}", v);
@@ -632,7 +632,7 @@ mod emit_tests {
     #[test]
     fn bit_slices_and_concat() {
         let v = compile(concat!(
-            "fun bits (a: i32, o: out i8, p: out i32)\n",
+            "fun bits (a: u32, o: out u8, p: out u32)\n",
             "  o = a[15..8]\n",
             "  p = @concat(a[15..0], a[31..16])\n",
         ));
@@ -643,7 +643,7 @@ mod emit_tests {
     #[test]
     fn a_computed_index_becomes_a_part_select() {
         let v = compile(concat!(
-            "fun pick (a: i32, i: i5, o: out i1)\n",
+            "fun pick (a: u32, i: u5, o: out u1)\n",
             "  o = a[i]\n",
         ));
         assert!(v.contains("+: 1"), "{}", v);

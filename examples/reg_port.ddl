@@ -22,18 +22,18 @@
 -- construction: `dout_valid` is `state == 2`, and state is a register, so
 -- `valid` cannot depend combinationally on `ready` however the branches run.
 
-process reg_port (cmd: buffer in i8, din: buffer in i32, dout: buffer out i32)
+process reg_port (cmd: buffer in u8, din: buffer in u32, dout: buffer out u32)
   -- The register being read and written. A process reaches its own state and
   -- nothing else (desc.md:26), so this cell is genuinely private -- the only
   -- way to its contents is through the pipes.
-  var cell: i32 = @zeroed()
+  var cell: u32 = @zeroed()
 
   loop
     let c = @rcv(cmd)
 
     -- Decoded here rather than in the arms, so both paths share it and it
     -- costs one bit of logic instead of two.
-    let is_write: i1 = c[0]
+    let is_write: u1 = c[0]
 
     if is_write then
       let d = @rcv(din)

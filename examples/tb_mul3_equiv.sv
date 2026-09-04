@@ -114,7 +114,7 @@ module tb_mul3_equiv;
     #1 compare();
 
     // Items enter in order and must leave in order. The first doubling is
-    // 16-bit and wraps -- the DDL says `let doubled: i16 = a + a`, and the
+    // 16-bit and wraps -- the DDL says `let doubled: u16 = a + a`, and the
     // widening happens only in the next stage -- so the model has to wrap too.
     if (push) begin
       automatic logic [15:0] doubled = d + d;

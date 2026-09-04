@@ -11,7 +11,7 @@
 -- payload is padded below itself -- so the tag is always in the same place and
 -- a `match` reads it without knowing yet what it is looking at.
 --
--- The width is derived and cannot be written down. `enum req_e: i2` would read
+-- The width is derived and cannot be written down. `enum req_e: u2` would read
 -- as "two bits wide" and the value is 18; reading the annotation as the TAG
 -- width instead would mean the same syntax names the whole value on an enum
 -- with no payloads and part of it here, and a struct field budgeted from the
@@ -31,31 +31,31 @@
 -- read of an address nobody supplied.
 
 struct addr_t
-  page: i8
-  off: i8
+  page: u8
+  off: u8
 
 enum req_e
   Nop
   Read(addr_t)
-  Write(i8)
+  Write(u8)
   Halt
 
 -- The payload is 16 bits wide because `addr_t` is the widest of them; `Write`
 -- uses eight of those and the rest is padded with zeros rather than left
 -- undefined. `x` propagates through a comparison in simulation and shows up as
 -- a bug somewhere else entirely.
-fun build_read (page: i8, off: i8, r: out req_e)
+fun build_read (page: u8, off: u8, r: out req_e)
   r = Read(addr_t(page, off))
 
-fun build_write (d: i8, r: out req_e)
+fun build_write (d: u8, r: out req_e)
   r = Write(d)
 
 -- One `case` on the tag, and each arm reaching only for what its own variant
 -- carries. `a` is 16 bits and `d` is 8, and neither exists on the other's arm.
-fun serve (r: req_e, is_store: out i1, page: out i8, data: out i8)
-  var store: i1 = 1'b0
-  var p: i8 = @zeroed()
-  var v: i8 = @zeroed()
+fun serve (r: req_e, is_store: out u1, page: out u8, data: out u8)
+  var store: u1 = 1'b0
+  var p: u8 = @zeroed()
+  var v: u8 = @zeroed()
 
   match r
     .Nop =>

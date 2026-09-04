@@ -34,10 +34,10 @@ fn compile_err(src: &str) -> String {
 
 /// Look at the head, take it only if it is wanted.
 const GATE: &str = concat!(
-    "process gate (src: buffer in i32, dst: buffer out i32)\n",
+    "process gate (src: buffer in u32, dst: buffer out u32)\n",
     "  loop\n",
     "    let (v, present) = @peek(src)\n",
-    "    let wanted: i1 = present & (!v[0])\n",
+    "    let wanted: u1 = present & (!v[0])\n",
     "    let (x, got) = @try_rcv(src)\n",
     "    if got & wanted then\n",
     "      let _s = @try_send(dst, x)\n",
@@ -67,7 +67,7 @@ fn a_peek_does_not_spend_the_cycles_one_operation() {
 #[test]
 fn two_peeks_are_fine() {
     let v = compile(concat!(
-        "process twice (src: buffer in i32, dst: buffer out i1)\n",
+        "process twice (src: buffer in u32, dst: buffer out u1)\n",
         "  loop\n",
         "    let (a, p1) = @peek(src)\n",
         "    let (b, p2) = @peek(src)\n",
@@ -79,7 +79,7 @@ fn two_peeks_are_fine() {
 #[test]
 fn a_drop_takes_the_item() {
     let v = compile(concat!(
-        "process drain (src: buffer in i32, dst: buffer out i1)\n",
+        "process drain (src: buffer in u32, dst: buffer out u1)\n",
         "  loop\n",
         "    let took = @drop(src)\n",
         "    let _s = @try_send(dst, took)\n",
@@ -92,8 +92,8 @@ fn a_drop_takes_the_item() {
 #[test]
 fn a_bare_drop_discards_the_answer_too() {
     let v = compile(concat!(
-        "process drain (src: buffer in i32, dst: buffer out i32)\n",
-        "  var n: i32 = @zeroed()\n",
+        "process drain (src: buffer in u32, dst: buffer out u32)\n",
+        "  var n: u32 = @zeroed()\n",
         "  loop\n",
         "    @drop(src)\n",
         "    n = n + 32'd1\n",
@@ -107,7 +107,7 @@ fn a_drop_spends_the_cycles_one_operation() {
     // Unlike a peek. Two consuming operations on one pipe in one cycle is one
     // transfer being counted twice, whichever pair they are.
     let text = compile_err(concat!(
-        "process bad (src: buffer in i32, dst: buffer out i32)\n",
+        "process bad (src: buffer in u32, dst: buffer out u32)\n",
         "  loop\n",
         "    let took = @drop(src)\n",
         "    let (x, got) = @try_rcv(src)\n",
@@ -119,7 +119,7 @@ fn a_drop_spends_the_cycles_one_operation() {
 #[test]
 fn neither_works_on_an_output() {
     let text = compile_err(concat!(
-        "process bad (src: buffer in i32, dst: buffer out i32)\n",
+        "process bad (src: buffer in u32, dst: buffer out u32)\n",
         "  loop\n",
         "    let (v, p) = @peek(dst)\n",
         "    let _s = @try_send(dst, v)\n",
@@ -127,7 +127,7 @@ fn neither_works_on_an_output() {
     assert!(text.contains("cannot be peeked at"), "{}", text);
 
     let text = compile_err(concat!(
-        "process bad (src: buffer in i32, dst: buffer out i32)\n",
+        "process bad (src: buffer in u32, dst: buffer out u32)\n",
         "  loop\n",
         "    @drop(dst)\n",
         "    let (x, got) = @try_rcv(src)\n",
@@ -142,7 +142,7 @@ fn a_drop_in_a_state_machine_consumes_in_that_state() {
     // "take one here" rather than a rename of an unused binding: the state
     // that drops `src` claims it, and the state that does not, does not.
     let v = compile(concat!(
-        "process skipper (ctl: buffer in i1, src: buffer in i32, dst: buffer out i32)
+        "process skipper (ctl: buffer in u1, src: buffer in u32, dst: buffer out u32)
 ",
         "  loop
 ",
@@ -171,7 +171,7 @@ fn a_drop_beside_a_blocking_receive_on_the_same_pipe_is_refused() {
     // used to lower silently and perform ONE consume while the program asked
     // for two.
     let text = compile_err(concat!(
-        "process bad (src: buffer in i32, dst: buffer out i32)
+        "process bad (src: buffer in u32, dst: buffer out u32)
 ",
         "  loop
 ",
@@ -190,7 +190,7 @@ fn a_drop_beside_a_blocking_receive_on_the_same_pipe_is_refused() {
 #[test]
 fn only_the_two_pair_forms_produce_a_pair() {
     let text = compile_err(concat!(
-        "process bad (src: buffer in i32, dst: buffer out i32)\n",
+        "process bad (src: buffer in u32, dst: buffer out u32)\n",
         "  loop\n",
         "    let (a, b) = src\n",
         "    let _s = @try_send(dst, a)\n",
@@ -203,17 +203,17 @@ fn only_the_two_pair_forms_produce_a_pair() {
 /// The widening-multiply shape with no stall construct in it: the receive is
 /// written on the branch that can take one, and that is the whole of it.
 const WIDEN: &str = concat!(
-    "process widen (src: buffer in i32, dst: buffer out i32)\n",
-    "  var pending: i1 = @zeroed()\n",
-    "  var lo: i32 = @zeroed()\n",
+    "process widen (src: buffer in u32, dst: buffer out u32)\n",
+    "  var pending: u1 = @zeroed()\n",
+    "  var lo: u32 = @zeroed()\n",
     "  loop\n",
     "    let (x, present) = @peek(src)\n",
-    "    var took: i1 = 1'b0\n",
+    "    var took: u1 = 1'b0\n",
     "    if pending then\n",
     "      took = 1'b0\n",
     "    else\n",
     "      took = @drop(src)\n",
-    "    let out_val: i32 = if pending then lo else x + x\n",
+    "    let out_val: u32 = if pending then lo else x + x\n",
     "    if pending | took then\n",
     "      let _s = @try_send(dst, out_val)\n",
     "    if pending then\n",
@@ -245,7 +245,7 @@ fn an_offer_is_made_on_its_own_branch_and_no_other() {
     // Anti-vacuous: an UNguarded send offers whenever it is reached, so the
     // guard above is doing something rather than being the default.
     let plain = compile(concat!(
-        "process pass (src: buffer in i32, dst: buffer out i32)\n",
+        "process pass (src: buffer in u32, dst: buffer out u32)\n",
         "  loop\n",
         "    let (x, got) = @try_rcv(src)\n",
         "    let _s = @try_send(dst, x)\n",
@@ -259,11 +259,11 @@ fn got_agrees_with_the_narrowed_ready() {
     // the pipe only there, so on any other branch nothing transferred and the
     // answer must say so, or the program acts on an item it never got.
     let v = compile(concat!(
-        "process g (src: buffer in i32, dst: buffer out i1)\n",
-        "  var arm: i1 = @zeroed()\n",
+        "process g (src: buffer in u32, dst: buffer out u1)\n",
+        "  var arm: u1 = @zeroed()\n",
         "  loop\n",
         "    arm = !arm\n",
-        "    var took: i1 = 1'b0\n",
+        "    var took: u1 = 1'b0\n",
         "    if arm then\n",
         "      took = @drop(src)\n",
         "    let _s = @try_send(dst, took)\n",

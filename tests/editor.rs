@@ -114,7 +114,7 @@ fn the_grammar_highlights_the_pieces_of_a_real_example() {
         ("the stage cut", "stage-cut"),
         ("`--` comments", "comment.line.double-dash.ddl"),
         ("sized literals like 8'd1", "constant.numeric.sized.ddl"),
-        ("`iN`/`sN` types", "[is][0-9]+"),
+        ("`uN`/`iN` types", "[iu][0-9]+"),
         ("dotted match patterns", "variable.other.enummember.ddl"),
         ("the import path", "keyword.control.import.ddl"),
     ] {

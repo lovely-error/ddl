@@ -11,7 +11,7 @@
 --     flag a not-borrow flag and left it wrong for `b == 0` (spec 5.4).
 --
 --   * Comparisons widen both operands to 33 bits by their OWN tag before
---     comparing. s32 spans [-2^31, 2^31-1] and u32 spans [0, 2^32-1]; their
+--     comparing. i32 spans [-2^31, 2^31-1] and u32 spans [0, 2^32-1]; their
 --     union does not fit in 32 bits, so a 32-bit comparator must misorder some
 --     mixed-tag pairs -- the same trap as C's usual arithmetic conversions
 --     making `-1 < 1u` false. The extra bit costs about one LUT since the
@@ -26,12 +26,12 @@
 
 import "k2g_types.ddl"
 
-fun rdt_is_signed (t: rdt_e, signed_: out i1)
+fun rdt_is_signed (t: rdt_e, signed_: out u1)
   signed_ = t[2]
 
 fun k2g_alu (
-    a: i32,
-    b: i32,
+    a: u32,
+    b: u32,
     a_tag: rdt_e,        -- interpretation of the left operand
     b_tag: rdt_e,        -- interpretation of the right operand
     arith_op: arith_e,
@@ -39,20 +39,20 @@ fun k2g_alu (
     cmp_op: cmp_e,
     unary_op: unary_e,
 
-    arith_result: out i32,
-    arith_overflow: out i1,
-    logic_result: out i32,
-    cmp_result: out i1,
-    unary_result: out i32)
+    arith_result: out u32,
+    arith_overflow: out u1,
+    logic_result: out u32,
+    cmp_result: out u1,
+    unary_result: out u32)
 
   -- ---- add / subtract ----------------------------------------------------
   -- One adder shared between both directions. Widening to 33 bits is explicit
   -- here, exactly as the SystemVerilog writes `{1'b0, a}`; the extra bit is
   -- the carry out for ADD and the borrow for SUB.
-  let a33: i33 = @concat(1'b0, a)
-  let b33: i33 = @concat(1'b0, b)
-  let sum: i33 = a33 + b33
-  let diff: i33 = a33 - b33
+  let a33: u33 = @concat(1'b0, a)
+  let b33: u33 = @concat(1'b0, b)
+  let sum: u33 = a33 + b33
+  let diff: u33 = a33 - b33
 
   -- arith_e fills its two-bit tag exactly, so naming all four variants makes
   -- this exhaustive with no wildcard: add a fifth and the compiler says so,
@@ -90,10 +90,10 @@ fun k2g_alu (
   -- Each operand widens by its own tag: replicate bit 31 if signed, prepend 0
   -- if unsigned. Then one signed 33-bit comparison covers all four tag
   -- combinations exactly.
-  let a_signed: i1 = rdt_is_signed(a_tag)
-  let b_signed: i1 = rdt_is_signed(b_tag)
-  let a_top: i1 = a_signed & a[31]
-  let b_top: i1 = b_signed & b[31]
+  let a_signed: u1 = rdt_is_signed(a_tag)
+  let b_signed: u1 = rdt_is_signed(b_tag)
+  let a_top: u1 = a_signed & a[31]
+  let b_top: u1 = b_signed & b[31]
   let a_wide = @signed(@concat(a_top, a))
   let b_wide = @signed(@concat(b_top, b))
 
