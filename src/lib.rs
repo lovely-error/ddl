@@ -6,7 +6,6 @@
 // returns a value or returns diagnostics, and the caller decides.
 #![feature(decl_macro)]
 #![feature(str_from_raw_parts)]
-#![feature(coroutines)]
 
 pub mod diag;
 pub mod dot;

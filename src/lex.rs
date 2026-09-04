@@ -140,9 +140,6 @@ pub enum RawExpr {
     },
     StmtBlock(StmtBlock),
     /// `if c then a else b` in expression position.
-    ///
-    /// The `else` is mandatory here: an expression must have a value on every
-    /// path, and a missing one would be a latch rather than a default.
     Ternary {
         cond: Box<RawExpr>,
         then_e: Box<RawExpr>,
@@ -232,9 +229,6 @@ pub enum BindingPattern {
         subbinding: Option<AlphanumSpan>,
     },
     /// `.A | .B | .C` -- alternatives for ONE scrutinee position.
-    ///
-    /// The enclosing `Vec<BindingPattern>` is still one entry per scrutinee;
-    /// this nests inside a single entry so that shape does not change.
     AnyOf(Vec<BindingPattern>),
 }
 
@@ -320,12 +314,6 @@ pub enum ArgTypeQualifier {
     BufferOut,
     /// `port in T` / `port out T` -- a plain data port with an enable beside
     /// it, and no back-pressure at all.
-    ///
-    /// Spelled with a word rather than reusing the bare `T` because the bare
-    /// form already means something else and quietly: a plain parameter is
-    /// CONFIGURATION, folded at compile time and gone. Two spellings one space
-    /// apart, one a constant and one a per-cycle wire, is the kind of thing
-    /// this language exists to not have.
     PortIn,
     PortOut,
     /// `stream in` / `stream out`, which the language no longer has.
@@ -354,9 +342,7 @@ pub struct RawEnumField {
     /// `= <const>`. Absent means one more than the previous variant, so the
     /// common case of a dense enum needs no numbers at all.
     pub discriminant: Option<RawExpr>,
-    /// `: T` payload, the tagged-union form of desc.md:78. Parsed so the
-    /// syntax has a home, but rejected downstream -- a data-carrying variant
-    /// needs a layout algorithm that does not exist yet.
+    /// `: T` payload, the tagged-union form
     pub payload: Option<RawTypeExpr>,
 }
 #[derive(Debug, Clone)]
@@ -385,6 +371,7 @@ pub enum TopLevelDecl {
 /// declares internal pipes and instantiates processes and sequences on them,
 /// which is why it has its own tiny statement parser rather than reusing the
 /// one that knows about arithmetic.
+/// 
 /// `extern name (pipes)` -- a module DDL did not compile.
 ///
 /// No body: the Verilog is written by hand and lives outside this program.
@@ -1232,10 +1219,7 @@ unsafe fn try_parse_ite_stmt(
     let is_linebreak = else_depth != 0;
 
     // A token at a different indentation belongs to an enclosing block, so
-    // this `if` simply has no `else`. This used to `return Err(true)` -- a
-    // committed failure -- which made dedenting two levels at once after a
-    // nested bare `if` a hard parse error for the whole declaration, with the
-    // blame landing on the `fun` or `process` keyword.
+    // this `if` simply has no `else`.
     let could_be_else = !is_linebreak || else_depth == depth;
     if !could_be_else {
         let rs = ITEStmt {
@@ -1373,9 +1357,7 @@ fn try_parse_match_arm_lhs(
     let mut bindings = Vec::new();
     loop {
         // One scrutinee position, which may offer several alternatives joined
-        // by `|`. `k2g_decode.sv` groups opcodes this way eight times over, and
-        // without it a 64-way decode has to choose between duplicated bodies
-        // and a `_` that switches exhaustiveness checking off.
+        // by `|`.
         let (first, tail) = try_parse_case_pattern(char_ptr, char_end_ptr)?;
         char_ptr = tail;
         let mut alternatives = vec![first];
@@ -1476,8 +1458,7 @@ unsafe fn try_parse_var_decl_stmt(
     char_ptr = tail;
 
     // `let (val, ok) = @try_rcv(p)`. A non-blocking receive answers with the
-    // item and whether there was one, and there is no way to use it without
-    // taking both -- desc.md:189, "let (val2, is_valid) = @try_rcv(arg2)".
+    // item and whether there was one
     let mut rest: Vec<AlphanumSpan> = Vec::new();
     let (is_tuple, tail) = strip_prefix_on_match(char_ptr, char_end_ptr, "(");
     let var_name;
@@ -1838,8 +1819,7 @@ unsafe fn try_parse_expr_1(
     // `if c then a else b` as a value.
     //
     // This is also what makes `else if` work: the else branch is an
-    // expression, so it can be another `if`. The decoder is full of the
-    // SystemVerilog form this replaces -- `(lb == LB_PUC8) ? RDT_U8 : ...`.
+    // expression, so it can be another `if`.
     if let Ok((expr, tail)) = try_parse_ternary(char_ptr, char_end_ptr, parent_depth) {
         return Ok((expr, tail));
     }
@@ -1905,7 +1885,7 @@ unsafe fn try_parse_expr_1(
         return Ok((RawExpr::NumLiteral(num), tail));
     }
 
-    // lets try to parse just letters first, most common case
+    // must be identifier, which is the only thing left that can be an expression atom.
     let (ident, tail) = try_parse_alphanum(char_ptr, char_end_ptr)?;
     char_ptr = tail;
 
@@ -2002,11 +1982,7 @@ unsafe fn try_parse_expr(
     };
     // An expression starting at a line break is a statement block.
     //
-    // This probed for a bare LF, so on a CRLF file it saw the CR, decided the
-    // expression was inline, and every construct whose body is an indented
-    // block -- match arms above all -- failed to parse. Both paths below go
-    // through skip_trivia, which handles either ending, so the probe just had
-    // to agree with them.
+    // Recognises both LF and CRLF
     let (is_block_start, _) = strip_line_break(char_ptr, char_end_ptr);
     if is_block_start {
         // multiline string?
@@ -2118,17 +2094,21 @@ pub unsafe fn try_parse_enum_decl(
     if !matched {
         return Err(())
     }
+    let has_separation = any_delimiter_present(tail, char_end_ptr);
+    if !has_separation {
+        // todo: report error, because `enum` is a keyword and must be followed by whitespace
+        return Err(());
+    }
     char_ptr = tail;
-    // todo: err if we got no spaces between kw and name
     let (_, tail) = skip_whitespaces(char_ptr, char_end_ptr);
     char_ptr = tail;
     let (enum_name, tail) = try_parse_alphanum(char_ptr, char_end_ptr)?;
     char_ptr = tail;
-    let (_, tail) = skip_whitespaces(char_ptr, char_end_ptr);
-    char_ptr = tail;
-
+    
     // Optional explicit tag width: `enum arith_e: i2`. A newline stops the
     // whitespace skip, so a plain `enum Name` cannot match this by accident.
+    let (_, tail) = skip_whitespaces(char_ptr, char_end_ptr);
+    char_ptr = tail;
     let (has_tag_type, tail) = strip_prefix_on_match(char_ptr, char_end_ptr, ":");
     let tag_type = if has_tag_type {
         char_ptr = tail;
@@ -2144,8 +2124,9 @@ pub unsafe fn try_parse_enum_decl(
     let (body_ancore_depth, _) = skip_trivia(char_ptr, char_end_ptr);
     let inbound = anchor_depth < body_ancore_depth;
     if !inbound {
+        // an enum with no variants is invalid
         return Err(());
-    } // an enum with no variants is invalid
+    }
 
     let mut fields = Vec::new();
     loop {
@@ -2180,9 +2161,9 @@ pub unsafe fn try_parse_enum_decl(
 /// One enum variant. Three forms:
 ///
 /// ```text
-/// ARITH_ADD              -- discriminant follows the previous variant
-/// LB_EP1 = 6'b111111     -- explicit, which the generated k2g_pkg needs
-/// Some: i32              -- payload; parsed, rejected later
+/// ARITH_ADD              -- variant with no payload or associated value
+/// LB_EP1 = 6'b111111     -- variant with explicit associated value
+/// Some(i32)              -- variant with payload
 /// ```
 unsafe fn try_parse_enum_field(
     mut char_ptr: *const u8,
@@ -2263,8 +2244,9 @@ pub unsafe fn try_parse_struct_decl(
     let (body_ancore_depth, _) = skip_trivia(char_ptr, char_end_ptr);
     let inbound = anchor_depth < body_ancore_depth;
     if !inbound {
+        // no field struct is invalid
         return Err(());
-    } // no field struct is invalid
+    } 
 
     let mut fields = Vec::new();
     loop {
@@ -2348,8 +2330,9 @@ pub unsafe fn try_parse_sequence_decl(
     let (body_ancore_depth, _) = skip_trivia(char_ptr, char_end_ptr);
     let inbound = anchor_depth < body_ancore_depth;
     if !inbound {
+        // no stmt process is invalid
         return Err(());
-    } // no stmt process is invalid
+    } 
 
     let mut stmts = Vec::new();
     loop {
@@ -2573,8 +2556,13 @@ pub unsafe fn try_parse_extern_decl(
     mut char_ptr: *const u8,
     char_end_ptr: *const u8,
 ) -> Result<(RawExternDecl, *const u8), ()> {
-    let (matched, tail) = strip_prefix_on_match(char_ptr, char_end_ptr, "extern ");
-    if !matched {
+    let (matched, tail) = strip_prefix_on_match(char_ptr, char_end_ptr, "extern");
+    if !matched  {
+        return Err(());
+    }
+    let has_separation = any_delimiter_present(tail, char_end_ptr);
+    if !has_separation {
+        // todo: report a parse error here, because the user wrote `externName` and meant `extern Name`.
         return Err(());
     }
     char_ptr = tail;
@@ -2616,8 +2604,13 @@ unsafe fn try_parse_graph_pipe(
     mut char_ptr: *const u8,
     char_end_ptr: *const u8,
 ) -> Result<(RawGraphPipe, *const u8), ()> {
-    let (matched, tail) = strip_prefix_on_match(char_ptr, char_end_ptr, "let ");
+    let (matched, tail) = strip_prefix_on_match(char_ptr, char_end_ptr, "let");
     if !matched {
+        return Err(());
+    }
+    let has_separation = any_delimiter_present(tail, char_end_ptr);
+    if !has_separation {
+        // todo: report a parse error here, because the user wrote `letName` and meant `let Name`.
         return Err(());
     }
     char_ptr = tail;
@@ -2714,8 +2707,13 @@ pub unsafe fn try_parse_process_decl(
     anchor_depth: u32,
     fail: &mut Option<BodyFail>,
 ) -> Result<(RawProcessDecl, *const u8), ()> {
-    let (matched, tail) = strip_prefix_on_match(char_ptr, char_end_ptr, "process ");
+    let (matched, tail) = strip_prefix_on_match(char_ptr, char_end_ptr, "process");
     if !matched {
+        return Err(());
+    }
+    let has_separation = any_delimiter_present(tail, char_end_ptr);
+    if !has_separation {
+        // todo: report a parse error here, because the user wrote `processName` and meant `process Name`.
         return Err(());
     }
     char_ptr = tail;
