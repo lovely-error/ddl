@@ -120,7 +120,7 @@ fn a_graph_port_connects_straight_through() {
 
 #[test]
 fn a_cycle_is_allowed() {
-    // desc.md:82 asks for this explicitly. A net is a net whichever order the
+    // desc.md:111 asks for this explicitly. A net is a net whichever order the
     // instances appear in, so a feedback path needs no special handling -- and
     // a retry queue or a credit return is not expressible without one.
     let v = compile(&format!(

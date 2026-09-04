@@ -49,8 +49,8 @@ fun k2g_alu (
   -- One adder shared between both directions. Widening to 33 bits is explicit
   -- here, exactly as the SystemVerilog writes `{1'b0, a}`; the extra bit is
   -- the carry out for ADD and the borrow for SUB.
-  let a33: u33 = @concat(1'b0, a)
-  let b33: u33 = @concat(1'b0, b)
+  let a33: u33 = {1'b0, a}
+  let b33: u33 = {1'b0, b}
   let sum: u33 = a33 + b33
   let diff: u33 = a33 - b33
 
@@ -94,8 +94,8 @@ fun k2g_alu (
   let b_signed: u1 = rdt_is_signed(b_tag)
   let a_top: u1 = a_signed & a[31]
   let b_top: u1 = b_signed & b[31]
-  let a_wide = @signed(@concat(a_top, a))
-  let b_wide = @signed(@concat(b_top, b))
+  let a_wide = @signed({a_top, a})
+  let b_wide = @signed({b_top, b})
 
   match cmp_op
     .CMP_EQ =>

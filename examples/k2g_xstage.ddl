@@ -96,9 +96,9 @@ struct wb_t
 fun rdt_normalize (v: u32, t: rdt_e, o: out u32)
   let sgn: u1 = rdt_is_signed(t)
   let as_byte: u32 =
-      if sgn then @concat(@rep(v[7], 24), v[7..0]) else @concat(24'd0, v[7..0])
+      if sgn then {@rep(v[7], 24), v[7..0]} else {24'd0, v[7..0]}
   let as_half: u32 =
-      if sgn then @concat(@rep(v[15], 16), v[15..0]) else @concat(16'd0, v[15..0])
+      if sgn then {@rep(v[15], 16), v[15..0]} else {16'd0, v[15..0]}
   let width: u2 = t[1..0]
   o =
       if width == 2'd0 then as_byte

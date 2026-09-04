@@ -248,7 +248,7 @@ pub fn contains_barrier(stmt: &PrecResInnerStmt) -> bool {
 /// Only in statement position, and only as the whole initialiser: a read whose
 /// value arrives a cycle later cannot be a subexpression of anything, because
 /// there is no way to say that the rest of the expression waits.
-fn as_sync_read<'a>(
+pub(crate) fn as_sync_read<'a>(
     stmt: &'a PrecResInnerStmt,
     sync_mem_of: &dyn Fn(&str) -> Option<usize>,
 ) -> Option<MemRead<'a>> {
@@ -1088,6 +1088,47 @@ pub fn reads_of(stmt: &PrecResInnerStmt, out: &mut HashSet<String>) {
     }
 }
 
+/// Memory names a statement WRITES: the base of every `m[i] = v` in it.
+///
+/// Separate from `reads_of`, which reports the base of a subscript assignment
+/// too -- it has to, because the address is read either way. Telling the two
+/// apart is what decides whether a memory is a table (readable from anywhere,
+/// nothing to order) or storage (one stage owns it).
+pub(crate) fn writes_of(stmt: &PrecResInnerStmt, out: &mut HashSet<String>) {
+    fn in_expr(e: &PrecResExpr, out: &mut HashSet<String>) {
+        // Only a block can hold statements; every other expression form is a
+        // value, and a value writes nothing.
+        if let PrecResExpr::StmtBlock(b) = e {
+            for c in &b.components {
+                writes_of(c, out);
+            }
+        }
+    }
+    match stmt {
+        PrecResInnerStmt::AssignStmt(a) => {
+            if let PrecResExpr::SubscriptAccess(sub) = &a.lvalue
+                && let PrecResExpr::Ref(n) = &sub.base
+            {
+                out.insert(anumspan_to_str(n).to_string());
+            }
+        }
+        PrecResInnerStmt::IfThenElse(i) => {
+            in_expr(&i.then_case, out);
+            if let Some(e) = &i.else_case {
+                in_expr(e, out);
+            }
+        }
+        PrecResInnerStmt::MatchStmt(m) => {
+            for c in &m.cases {
+                in_expr(&c.rhs, out);
+            }
+        }
+        PrecResInnerStmt::Loop(l) => in_expr(&l.repeat_expr, out),
+        PrecResInnerStmt::ForLoop(f) => in_expr(&f.body, out),
+        _ => {}
+    }
+}
+
 /// Names a state defines: its plain `let`s, whatever its barrier binds, and
 /// whatever its synchronous read fetches.
 ///
@@ -1238,25 +1279,6 @@ pub fn state_width(n: usize) -> u32 {
 ///
 /// A struct rather than the six-tuple this was, which needed a comment to say
 /// which field was which and had `entry.3` at every use.
-struct MemPortStart {
-    we_key: String,
-    addr_key: String,
-    data_key: String,
-    we: Option<ValueId>,
-    addr: Option<ValueId>,
-    data: Option<ValueId>,
-}
-
-impl MemPortStart {
-    fn keys(&self) -> [(&String, &Option<ValueId>); 3] {
-        [
-            (&self.we_key, &self.we),
-            (&self.addr_key, &self.addr),
-            (&self.data_key, &self.data),
-        ]
-    }
-}
-
 /// Finishes a process whose body is a blocking `loop`.
 pub fn lower_blocking(
     map: &crate::diag::SourceMap,
@@ -1585,19 +1607,8 @@ pub fn lower_blocking(
     // Without the reset between states, a write in one state would be the
     // write port's value in every state, and a scratchpad updated once per
     // item would be rewritten every cycle.
-    let mem_port_start: Vec<MemPortStart> = low
-        .mems
-        .iter()
-        .map(|m| {
-            let (we_key, addr_key, data_key) = Lowerer::mem_port_keys(&m.name);
-            let we = env.get(&we_key).and_then(|b| b.value);
-            let addr = env.get(&addr_key).and_then(|b| b.value);
-            let data = env.get(&data_key).and_then(|b| b.value);
-            MemPortStart { we_key, addr_key, data_key, we, addr, data }
-        })
-        .collect();
-    // Per memory: which states wrote, and with what.
-    let mut mem_writes: Vec<Vec<(usize, ValueId, ValueId, ValueId)>> =
+    // Per memory: which states wrote which of its ports, and with what.
+    let mut mem_writes: Vec<Vec<(usize, usize, crate::ir::WritePort)>> =
         vec![Vec::new(); low.mems.len()];
 
     for (k, st) in states_sched.iter().enumerate() {
@@ -1632,13 +1643,10 @@ pub fn lower_blocking(
             port.sent = None;
             port.send_guard = None;
         }
-        for port in &mem_port_start {
-            for (key, start) in port.keys() {
-                if let (Some(v), Some(b)) = (start, env.get_mut(key)) {
-                    b.value = Some(*v);
-                }
-            }
-        }
+        // Every state starts its write ports over. A port a state took would
+        // otherwise still be in the environment for the next one, and a
+        // scratchpad written once per item would be rewritten every cycle.
+        low.clear_write_slots(&mut env);
 
         for stmt in &st.stmts {
             crate::ir::lower_stmt_pub(&mut low, stmt, &mut env, sink)?;
@@ -1656,7 +1664,7 @@ pub fn lower_blocking(
             // The name means the memory's output register from here on. Not a
             // value computed from the array -- the array is read inside the
             // memory's own clocked block, and this is the only way to see it.
-            let q = low.emit(elem.clone(), Op::MemReadReg { mem: read.mem_ix as u32 });
+            let q = low.emit(elem.clone(), Op::MemReadReg { mem: read.mem_ix as u32, port: 0 });
             env.insert(read.bind.clone(), Binding::constant(q, elem));
         }
         if let Some(bind) = st.barrier.as_ref().and_then(|b| b.bind.as_ref()) {
@@ -1830,19 +1838,11 @@ pub fn lower_blocking(
                 sends.push((k, v, port.send_guard));
             }
         }
-        for (ix, port) in mem_port_start.iter().enumerate() {
-            let we = env.get(&port.we_key).and_then(|b| b.value);
-            let wrote = we.is_some() && we != port.we;
-            if !wrote {
-                continue;
-            }
-            let (we, addr, data) = (
-                we.expect("checked"),
-                env.get(&port.addr_key).and_then(|b| b.value),
-                env.get(&port.data_key).and_then(|b| b.value),
-            );
-            if let (Some(addr), Some(data)) = (addr, data) {
-                mem_writes[ix].push((k, we, addr, data));
+        for (ix, writes) in mem_writes.iter_mut().enumerate() {
+            for slot in 0..low.mem_slots(ix) {
+                if let Some(p) = low.write_slot(ix, slot, &env) {
+                    writes.push((k, slot, p));
+                }
             }
         }
 
@@ -2042,45 +2042,49 @@ pub fn lower_blocking(
     // never completed does not perform one; the address and data are muxed by
     // the same firing signal.
     //
-    // A memory still has exactly one write port here, as it does everywhere
-    // else (k2g_regfile.sv:18-24 records what a second one cost when it was
-    // tried). Several states writing it is not several ports: only one state
-    // is active in any cycle.
-    for ix in 0..low.mems.len() {
-        let writes = mem_writes[ix].clone();
-        if writes.is_empty() {
-            continue;
-        }
-        let port = &mem_port_start[ix];
-        let mut we: Option<ValueId> = None;
-        let mut addr = port.addr.expect("a declared memory has an address port");
-        let mut data = port.data.expect("a declared memory has a data port");
-        for (k, we_k, addr_k, data_k) in &writes {
-            let gated = low.emit(
-                Ty::BOOL,
-                Op::Bin { op: BinOp::And, lhs: fires[*k], rhs: *we_k },
-            );
-            we = Some(match we {
-                None => gated,
-                Some(prev) => low.emit(Ty::BOOL, Op::Bin { op: BinOp::Or, lhs: prev, rhs: gated }),
+    // SEVERAL STATES WRITING ONE PORT IS STILL ONE PORT: only one state is
+    // active in any cycle, so they mux onto it. What decides how many ports a
+    // memory has is how many writes one state performs -- two writes in a row
+    // both happen in that cycle and there is nothing to mux them onto.
+    for (ix, writes) in mem_writes.iter().enumerate() {
+        let writes = writes.clone();
+        let ports = writes.iter().map(|(_, slot, _)| slot + 1).max().unwrap_or(0);
+        let mut settled: Vec<crate::ir::WritePort> = Vec::with_capacity(ports);
+        for slot in 0..ports {
+            let idle = low.idle_write(ix);
+            let mut we: Option<ValueId> = None;
+            let mut addr = idle.addr;
+            let mut data = idle.data;
+            for (k, _, p) in writes.iter().filter(|(_, s, _)| *s == slot) {
+                let gated =
+                    low.emit(Ty::BOOL, Op::Bin { op: BinOp::And, lhs: fires[*k], rhs: p.we });
+                we = Some(match we {
+                    None => gated,
+                    Some(prev) => {
+                        low.emit(Ty::BOOL, Op::Bin { op: BinOp::Or, lhs: prev, rhs: gated })
+                    }
+                });
+                let addr_ty = low.ty_of(addr);
+                addr = low.emit(
+                    addr_ty,
+                    Op::Mux { cond: gated, then_val: p.addr, else_val: addr },
+                );
+                let data_ty = low.ty_of(data);
+                data = low.emit(
+                    data_ty,
+                    Op::Mux { cond: gated, then_val: p.data, else_val: data },
+                );
+            }
+            let we = we.expect("a slot in range has at least one writer");
+            // With one writer the mux selector IS the write enable, so the mux
+            // is redundant: address and data are don't-cares where it is low.
+            settled.push(crate::ir::WritePort {
+                we,
+                addr: low.drop_gated_mux(addr, we),
+                data: low.drop_gated_mux(data, we),
             });
-            let addr_ty = low.ty_of(addr);
-            addr = low.emit(
-                addr_ty,
-                Op::Mux { cond: gated, then_val: *addr_k, else_val: addr },
-            );
-            let data_ty = low.ty_of(data);
-            data = low.emit(
-                data_ty,
-                Op::Mux { cond: gated, then_val: *data_k, else_val: data },
-            );
         }
-        let we = we.expect("a non-empty write list");
-        // With one writer the mux selector IS the write enable, so the mux is
-        // redundant: the address is a don't-care wherever the enable is low.
-        low.mems[ix].addr = low.drop_gated_mux(addr, we);
-        low.mems[ix].data = low.drop_gated_mux(data, we);
-        low.mems[ix].we = we;
+        low.mems[ix].write = settled;
     }
 
     let mut generated: Vec<Reg> = Vec::new();
@@ -2221,7 +2225,7 @@ pub fn lower_blocking(
             let addr_ty = low.ty_of(addr);
             addr = low.emit(addr_ty, Op::Mux { cond: in_st[*k], then_val: *a, else_val: addr });
         }
-        low.mems[ix].read = Some(crate::ir::ReadPort { addr, en });
+        low.mems[ix].read = vec![crate::ir::ReadPort { addr, en }];
     }
 
     for (port, sends) in low.port_outs.clone().into_iter().zip(port_sends.clone()) {

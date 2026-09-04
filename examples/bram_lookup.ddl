@@ -13,11 +13,13 @@
 --            a cycle after the address. Dense, and the only thing that holds
 --            a table of any size.
 --
--- WHERE THE CYCLE GOES has to be somewhere the source can point at, and the
--- only place in this language that holds one is a state of a blocking
--- `process`. So a `bram` read is a statement of its own -- `let v = t[a]` --
--- and it costs a state. A read written inside an expression is refused,
--- because there is no way to say the rest of the expression waits.
+-- WHERE THE CYCLE GOES has to be somewhere the source can point at, and this
+-- language has two places that hold one: a state of a blocking `process`,
+-- which is this file, and a `|||` stage cut in a `sequence`, which is the same
+-- edge arranged differently. Either way a `bram` read is a statement of its
+-- own -- `let v = t[a]` -- and the value is there on the far side. A read
+-- written inside an expression is refused in both, because there is no way to
+-- say the rest of the expression waits.
 --
 -- IT HAS A FILL PORT, and that is not decoration. A `bram` cannot have a
 -- reset -- the reset loop is a write to every element, and 256x32 comes out as
@@ -25,6 +27,25 @@
 -- reset AND no write port has no drivers at all: every synthesizer deletes it,
 -- and the version of this file without a fill port synthesized to six cells
 -- and inferred nothing. Storage you cannot write is not storage.
+--
+-- ONE fill port, though, and that is a measurement too: a second write port on
+-- the K2G 32x32 value array inferred no RAM at all, and the array came out as
+-- 1120 flip-flops and ~3700 LUTs of read muxing against 32 SSRAM primitives
+-- for the single-port version (k2g_regfile.sv:18-24). The language does not
+-- cap the count -- an ASIC memory compiler emits a real multi-write cell, and
+-- an FPGA's limit has no business deciding what a design may say -- so what
+-- that costs is chosen at build time: `--lvt-bram` builds a multi-write `bram`
+-- out of one-write blocks, one bank per write port replicated per read port,
+-- with a live value table saying which bank holds the newest value. That is
+-- how a block RAM comes back here.
+--
+-- A `sequence` fills one the same way, under one rule: every read and write of
+-- a memory it writes happens in ONE stage. Stage j and stage k hold different
+-- items in the same cycle, so splitting them would pair an item's read with a
+-- write belonging to an item several places away in the stream. Kept together,
+-- every item sees every write of every item before it, plus its own -- the
+-- last of those by forwarding, because the array is written on the same edge
+-- that fills the read register.
 --
 -- WHAT THE ANNOTATION ACTUALLY DECIDES, measured on GowinSynthesis for the
 -- GW1NR-9C rather than assumed:

@@ -350,8 +350,8 @@ pub enum BuiltinOp {
     /// SAY one on a plain `uN`, so the workaround was to declare the thing
     /// `[u8; 4]` -- which is usually what it was, and sometimes is not.
     Slice,
-    // Bit plumbing: @concat(a, b, ..) high-to-low, @rep(x, n), @zeroed().
-    Concat,
+    // Bit plumbing: @rep(x, n), @zeroed(). Concatenation is not here -- it is
+    // `{a, b}`, spelled as punctuation and carried as `Splice`.
     Rep,
     Zeroed,
     /// `@assert(cond)` / `@assert(cond, "message")` -- checked in simulation,
@@ -394,7 +394,6 @@ unsafe fn resolve_anum_span(anum_span: &AlphanumSpan) -> Result<AnumResolution, 
             "unsigned" => return Ok(AnumResolution::Builtin(BuiltinOp::Unsigned)),
             // Bit plumbing.
             "slice" => return Ok(AnumResolution::Builtin(BuiltinOp::Slice)),
-            "concat" => return Ok(AnumResolution::Builtin(BuiltinOp::Concat)),
             "rep" => return Ok(AnumResolution::Builtin(BuiltinOp::Rep)),
             "zeroed" => return Ok(AnumResolution::Builtin(BuiltinOp::Zeroed)),
             "unreachable" => return Ok(AnumResolution::Builtin(BuiltinOp::Unreachable)),
@@ -1345,7 +1344,7 @@ fn sized_and_radix_literals() {
     assert_eq!(shape(&resolve_expr_in("0b1010")), "10");
     assert_eq!(shape(&resolve_expr_in("0o17")), "15");
     assert_eq!(shape(&resolve_expr_in("1_000_000")), "1000000");
-    // desc.md:204, "clock ex1 = 12*10**6", spells a frequency this way.
+    // desc.md:234, "clock ex1 = 12*10**6", spells a frequency this way.
     assert_eq!(shape(&resolve_expr_in("12*10**6")), "(Mul 12 (Pow 10 6))");
 }
 

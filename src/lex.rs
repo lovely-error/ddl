@@ -131,8 +131,8 @@ pub enum RawExpr {
         args: Vec<RawExpr>,
     },
     // [expr]
-    SubscriptAccess(Box<SubscriptAccess>), 
-    // '{ [a..b], c[d..e], f }
+    SubscriptAccess(Box<SubscriptAccess>),
+    // { a, b[hi..lo], c } -- concatenation, high-to-low
     Splice(Vec<RawExpr>),
     // expr <op> expr
     InfixExpr {
@@ -330,7 +330,7 @@ pub enum RawTypeExpr {
     Ident(AlphanumSpan), 
     Array(Box<RawTypeExpr>, RawExpr),
     /// `#[impl(lutram)] [T; n]` -- an array that asks for a particular backing
-    /// store rather than being a packed vector. desc.md:98.
+    /// store rather than being a packed vector. desc.md:127.
     ///
     /// The kind is resolved here rather than carried as a span: there are
     /// three of them and they are spelled out in the annotation, so a name
@@ -1632,13 +1632,19 @@ unsafe fn try_parse_var_decl_stmt(
     Ok((result, char_ptr))
 }
 
-unsafe fn try_parse_invocation_tuple(
+/// A comma-separated list of expressions between `open` and `close`.
+///
+/// Two constructs are this shape and neither wants its own copy of the
+/// line-continuation rules below: `f(a, b)` and the concatenation `{a, b}`.
+unsafe fn try_parse_delimited_tuple(
     mut char_ptr: *const u8,
     char_end_ptr: *const u8,
     parent_depth: u32,
+    open: &str,
+    close: &str,
 ) -> Result<(Vec<RawExpr>, *const u8), ()> {
-    let (is_paren_begin, tail) = strip_prefix_on_match(char_ptr, char_end_ptr, "(");
-    if !is_paren_begin {
+    let (is_open, tail) = strip_prefix_on_match(char_ptr, char_end_ptr, open);
+    if !is_open {
         return Err(());
     }
     char_ptr = tail;
@@ -1646,23 +1652,23 @@ unsafe fn try_parse_invocation_tuple(
     loop {
         let (_, tail) = skip_whitespaces(char_ptr, char_end_ptr);
         char_ptr = tail;
-        // An argument list may continue on the next line, whether the break
-        // comes after the open paren or after a comma. A call with eight
+        // The list may continue on the next line, whether the break comes
+        // after the opening delimiter or after a comma. A call with eight
         // operands is unreadable on one line, and every port list in the
         // SystemVerilog this replaces is wrapped.
         //
         // The continuation must be indented PAST the statement that opened the
-        // call. That is what keeps it distinguishable from the other thing a
+        // list. That is what keeps it distinguishable from the other thing a
         // line break can start here -- an indented block -- and it is the same
-        // test the closing paren below makes, one level in the other
+        // test the closing delimiter below makes, one level in the other
         // direction.
         let (depth, tail_) = skip_trivia(char_ptr, char_end_ptr);
         let continues_on_next_line = depth > parent_depth;
         if continues_on_next_line {
             char_ptr = tail_;
         }
-        let (is_paren_end, tail) = strip_prefix_on_match(char_ptr, char_end_ptr, ")");
-        if is_paren_end {
+        let (is_close, tail) = strip_prefix_on_match(char_ptr, char_end_ptr, close);
+        if is_close {
             char_ptr = tail;
             break;
         }
@@ -1674,13 +1680,14 @@ unsafe fn try_parse_invocation_tuple(
             char_ptr = tail;
         }
         {
-            // special case to make it valid for closing paren to appear on newline e.g. call(...\n)
-            let (rparen_depth, tail_) = skip_trivia(char_ptr, char_end_ptr);
-            let (is_rparen, tail_) = strip_prefix_on_match(tail_, char_end_ptr, ")");
-            let is_linebreak = rparen_depth != 0;
-            let special_case = is_linebreak && is_rparen;
+            // special case to make it valid for the closing delimiter to
+            // appear on newline e.g. call(...\n)
+            let (close_depth, tail_) = skip_trivia(char_ptr, char_end_ptr);
+            let (is_close, tail_) = strip_prefix_on_match(tail_, char_end_ptr, close);
+            let is_linebreak = close_depth != 0;
+            let special_case = is_linebreak && is_close;
             if special_case {
-                let is_correct_indent = rparen_depth == parent_depth;
+                let is_correct_indent = close_depth == parent_depth;
                 if !is_correct_indent {
                     return Err(());
                 }
@@ -1921,6 +1928,30 @@ unsafe fn try_parse_expr_1(
         return Ok((expr, char_ptr));
     }
 
+    // concatenation?
+    //
+    // `{a, b, c}` joins its operands high-to-low, the way Verilog spells the
+    // same thing. It is punctuation rather than a builtin because it is not a
+    // call: there is nothing to name, and a reader coming from the language
+    // this compiles to already knows what the braces mean.
+    let (is_concat_begin, _) = strip_prefix_on_match(char_ptr, char_end_ptr, "{");
+    if is_concat_begin {
+        let (parts, tail) =
+            try_parse_delimited_tuple(char_ptr, char_end_ptr, parent_depth, "{", "}")?;
+        // `{}` is the one shape that parses and cannot mean anything: a value
+        // of no bits. Named here rather than left to lowering, because the
+        // parser is what knows the braces were empty.
+        if parts.is_empty() {
+            diagnose(
+                char_ptr,
+                "`{}` is a concatenation of nothing".to_string(),
+                Some("a concatenation joins at least one value, as `{a, b}`".to_string()),
+            );
+            return Err(());
+        }
+        return Ok((RawExpr::Splice(parts), tail));
+    }
+
     // unary prefix operator?
     //
     // `-` here is unambiguous: a `--` would already have been eaten as a
@@ -1993,7 +2024,8 @@ unsafe fn try_parse_expr_2(
         // function call?
         let (is_arg_tuple_begin, _) = strip_prefix_on_match(char_ptr, char_end_ptr, "(");
         if is_arg_tuple_begin {
-            let (args, tail) = try_parse_invocation_tuple(char_ptr, char_end_ptr, parent_depth)?;
+            let (args, tail) =
+                try_parse_delimited_tuple(char_ptr, char_end_ptr, parent_depth, "(", ")")?;
             expr = RawExpr::Call {
                 base: Box::new(expr),
                 args,

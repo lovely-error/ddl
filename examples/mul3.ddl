@@ -1,9 +1,9 @@
 -- A three-stage pipeline. `|||` is the stage cut.
 --
 -- Everything inside a stage is combinational; every cut becomes a register
--- bank with a validity bit riding alongside the data -- desc.md:51's "implicit
+-- bank with a validity bit riding alongside the data -- desc.md:80's "implicit
 -- is_valid condition at each stage". The whole pipeline shifts together when
--- the sink has a slot (desc.md:48).
+-- the sink has a slot (desc.md:77).
 --
 -- `|||` has been parsed and thrown away since before this work started; this
 -- is the first time it means anything.

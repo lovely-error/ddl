@@ -484,7 +484,7 @@ fn the_checked_in_verilog_is_up_to_date() {
     let mut checked = 0;
     for name in [
         "mul3", "fsm_adder", "k3g_stage", "pipeline_graph", "reg_port", "tagged",
-        "bram_lookup", "fanout", "pulse_counter", "k2g_shift",
+        "bram_lookup", "fanout", "pulse_counter", "k2g_shift", "rf_lvt",
         "k2g_alu",
         "k2g_decode",
         "k2g_xstage",
@@ -502,7 +502,7 @@ fn the_checked_in_verilog_is_up_to_date() {
         let current = std::fs::read_to_string(&out)
             .unwrap_or_else(|e| panic!("cannot read {}: {}", out, e))
             .replace("\r\n", "\n");
-        let opts = EmitOptions { regenerate_cmd: banner_cmd(&current) };
+        let opts = EmitOptions { regenerate_cmd: banner_cmd(&current), ..EmitOptions::default() };
         let fresh = match compile_to_verilog(&map, &opts) {
             Ok(v) => v,
             Err(diags) => panic!("{} stopped compiling:
@@ -1580,7 +1580,7 @@ fn an_output_valid_is_a_register_output() {
 
 #[test]
 fn a_buffer_is_two_deep() {
-    // desc.md:105 calls a pipe a fifo and desc.md:109 says the producer stalls
+    // desc.md:134 calls a pipe a fifo and desc.md:138 says the producer stalls
     // "when no slots available" -- plural. One entry is not that, and it is
     // also what forced `ready` to be combinational.
     let v = compile(&format!(
@@ -2152,7 +2152,7 @@ fn a_memory_is_not_a_value() {
         "  let vals: #[impl(lutram)] [u32; 32] = @zeroed()\n",
         "  y = x\n",
     ));
-    assert!(text.contains("state rather than a value"), "{}", text);
+    assert!(text.contains("storage rather than a value"), "{}", text);
 }
 
 #[test]
@@ -2622,4 +2622,85 @@ fn every_other_block_shape_is_refused_by_the_parser() {
         let text = compile_err(src);
         assert!(text.contains("error"), "{}", text);
     }
+}
+
+// ---- `{a, b}` concatenation ----------------------------------------------
+
+#[test]
+fn braces_join_their_operands_high_to_low() {
+    let v = compile(concat!(
+        "fun f (a: u16, b: u16, c: u32, o: out u64)\n",
+        "  o = {a, b, c}\n",
+    ));
+    // Leftmost operand in the high bits, which is the order it is written in
+    // and the order Verilog reads a concatenation.
+    assert!(v.contains("{a, b, c}"), "{}", v);
+    assert!(v.contains("output [63:0] o"), "{}", v);
+}
+
+#[test]
+fn a_concatenation_is_as_wide_as_its_parts_add_up_to() {
+    // The width is derived, never declared, so getting it wrong is a width
+    // error at the use rather than a silent truncation.
+    let text = compile_err(concat!(
+        "fun f (a: u16, b: u16, o: out u64)\n",
+        "  o = {a, b}\n",
+    ));
+    assert!(text.contains("32"), "{}", text);
+    assert!(text.contains("64"), "{}", text);
+}
+
+#[test]
+fn a_concatenation_of_signed_parts_is_unsigned() {
+    // A bit with something below it has no sign left to keep. An `iN` that
+    // wanted to stay signed wanted `@sext`.
+    let v = compile(concat!(
+        "fun f (a: i8, b: i8, o: out u16)\n",
+        "  o = {a, b}\n",
+    ));
+    assert!(v.contains("{a, b}"), "{}", v);
+}
+
+#[test]
+fn braces_nest_and_hold_slices() {
+    let v = compile(concat!(
+        "fun f (a: u32, o: out u32)\n",
+        "  o = {{a[15..8], a[7..0]}, a[23..16], a[31..24]}\n",
+    ));
+    assert!(v.contains("[15:8]"), "{}", v);
+    assert!(v.contains("[31:24]"), "{}", v);
+}
+
+#[test]
+fn a_concatenation_wraps_onto_continuation_lines() {
+    // Same rule the argument list of a call follows, because it is the same
+    // parser: indented past the statement that opened the brace.
+    let v = compile(concat!(
+        "fun f (a: u8, b: u8, o: out u16)\n",
+        "  o = {\n",
+        "      a,\n",
+        "      b,\n",
+        "  }\n",
+    ));
+    assert!(v.contains("{a, b}"), "{}", v);
+}
+
+#[test]
+fn an_empty_concatenation_is_refused() {
+    let text = compile_err(concat!(
+        "fun f (o: out u8)\n",
+        "  o = {}\n",
+    ));
+    assert!(text.contains("concatenation"), "{}", text);
+}
+
+#[test]
+fn concat_is_no_longer_a_builtin() {
+    // It is punctuation now. `@concat` resolves to nothing, the way any other
+    // unknown `@` name does.
+    let text = compile_err(concat!(
+        "fun f (a: u8, b: u8, o: out u16)\n",
+        "  o = @concat(a, b)\n",
+    ));
+    assert!(text.contains("error"), "{}", text);
 }

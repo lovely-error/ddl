@@ -79,6 +79,35 @@ fn generated_verilog() -> Vec<PathBuf> {
     out
 }
 
+/// The `--lvt-bram` build of examples/rf_lvt.ddl, written where it can be
+/// linted with the rest.
+///
+/// It is not a checked-in `.v` because it is a second way to build a file that
+/// already has one, and two generated outputs from one source is one of them
+/// going stale. But it is the newest emission in the backend -- bank arrays,
+/// per-read replicas, a table and the wires that select from it -- so leaving
+/// it out would mean the least-exercised path is the one nothing reads.
+fn lvt_variant() -> Option<PathBuf> {
+    use ddl::driver::compile_to_verilog;
+    use ddl::verilog::EmitOptions;
+
+    let src = "examples/rf_lvt.ddl".to_string();
+    let (map, load_diags) = ddl::source::load_program(std::slice::from_ref(&src), Vec::new()).ok()?;
+    if !load_diags.is_empty() {
+        return None;
+    }
+    let opts = EmitOptions {
+        regenerate_cmd: "ddl build --lvt-bram examples/rf_lvt.ddl".to_string(),
+        lvt_bram: true,
+    };
+    let text = compile_to_verilog(&map, &opts).ok()?;
+    let dir = PathBuf::from("target/lint");
+    std::fs::create_dir_all(&dir).ok()?;
+    let out = dir.join("rf_lvt_lvt.v");
+    std::fs::write(&out, text).ok()?;
+    Some(out)
+}
+
 #[cfg_attr(miri, ignore = "runs a subprocess")]
 #[test]
 fn the_generated_verilog_passes_a_linter() {
@@ -98,7 +127,9 @@ fn the_generated_verilog_passes_a_linter() {
         }
     };
 
-    let files = generated_verilog();
+    let mut files = generated_verilog();
+    // Generated rather than found: see `lvt_variant`.
+    files.extend(lvt_variant());
     let mut linted = 0;
     let mut failures: Vec<String> = Vec::new();
 

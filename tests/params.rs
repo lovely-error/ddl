@@ -1,6 +1,6 @@
 // `inout` parameters, and what a parameter is allowed to be.
 //
-// `inout` is desc.md:57 -- by reference and readable, which is what lets a
+// `inout` is desc.md:86 -- by reference and readable, which is what lets a
 // helper update its argument instead of returning a new copy of it.
 //
 // The rest of it is what a parameter may be qualified with. There is one pipe

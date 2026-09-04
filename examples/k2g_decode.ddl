@@ -182,26 +182,26 @@ process k2g_decode (
 
     -- ---- immediate assembly ------------------------------------------------
     -- XI sign-extends from bit 9, XIZEXT zero-extends (spec 4.1).
-    let imm10_sext: u32 = @concat(@rep(imm10[9], 22), imm10)
-    let imm10_zext: u32 = @concat(22'd0, imm10)
+    let imm10_sext: u32 = {@rep(imm10[9], 22), imm10}
+    let imm10_zext: u32 = {22'd0, imm10}
     let xi_ext: u32 = if lb == LB_XI then imm10_sext else imm10_zext
 
     -- Three different combining rules depending on the main opcode (spec 4).
     let imm_alu: u32 = if pfx.xi_valid
-        then @concat(pfx.xi_value[26..0], arg2)
-        else @concat(@rep(arg2[4], 27), arg2)
+        then {pfx.xi_value[26..0], arg2}
+        else {@rep(arg2[4], 27), arg2}
     let imm_mem: u32 = if pfx.xi_valid then pfx.xi_value else 32'd0
 
     -- DISPI assembles a 20-bit displacement then shifts left by one. The
     -- extension follows the prefix that supplied it -- previously this
     -- sign-extended unconditionally, so XIZEXT could yield a negative
     -- displacement (spec 4.1).
-    let disp20: u20 = @concat(pfx.xi_value[9..0], imm10)
+    let disp20: u20 = {pfx.xi_value[9..0], imm10}
     let disp_from_xi: u32 = if pfx.xi_zext
-        then @concat(12'd0, disp20)
-        else @concat(@rep(disp20[19], 12), disp20)
+        then {12'd0, disp20}
+        else {@rep(disp20[19], 12), disp20}
     let disp_ext: u32 = if pfx.xi_valid then disp_from_xi else imm10_sext
-    let disp_bytes: u32 = @concat(disp_ext[30..0], 1'b0)
+    let disp_bytes: u32 = {disp_ext[30..0], 1'b0}
 
     -- ---- main decode -------------------------------------------------------
     var main_uop: uop_t = @zeroed()
@@ -324,7 +324,7 @@ process k2g_decode (
         main_uop.shift_op = if lb == LB_SHLI then SHIFT_LL
             else if lb == LB_SHRI then SHIFT_LR else SHIFT_AR
         main_uop.use_imm = 1'b1
-        main_uop.imm = @concat(27'd0, arg2)
+        main_uop.imm = {27'd0, arg2}
 
       -- ---- comparisons, and the prefetch that replaces them ----
       .LB_TST | .LB_TSTN | .LB_LT | .LB_GT | .LB_LTE | .LB_GTE =>
@@ -473,8 +473,8 @@ process k2g_decode (
           out_uop.dst = llc_dst
           out_uop.datakind = llc_kind
           out_uop.imm = if llc_kind == RDT_U32
-              then @concat(llc_hi, cp)
-              else @concat(16'd0, cp)
+              then {llc_hi, cp}
+              else {16'd0, cp}
           out_uop.cond = pfx.cond
           out_uop.cond_reg = pfx.cond_reg
           out_uop.cond_invert = pfx.cond_invert

@@ -20,6 +20,17 @@ fn compile(src: &str) -> String {
     }
 }
 
+/// Compiles with `--lvt-bram`, which changes only how a multi-write `bram` is
+/// built out of primitives.
+fn compile_lvt(src: &str) -> String {
+    let map = SourceMap::new("t.ddl", src);
+    let opts = EmitOptions { lvt_bram: true, ..EmitOptions::default() };
+    match compile_to_verilog(&map, &opts) {
+        Ok(v) => v,
+        Err(diags) => panic!("compile failed:\n{}", map.render_all(&diags)),
+    }
+}
+
 fn compile_err(src: &str) -> String {
     let map = SourceMap::new("t.ddl", src);
     match compile_to_verilog(&map, &EmitOptions::default()) {
@@ -438,4 +449,603 @@ fn an_unclosed_annotation_points_at_where_the_bracket_belongs() {
         "  let _s = @try_send(rd, v[2'd0])\n",
     ));
     assert!(text.contains("closes with `)]`"), "{}", text);
+}
+
+// ---- memories in a sequence -----------------------------------------------
+//
+// A pipeline stage cut IS a clock edge, which is the one thing a `bram` read
+// needs and could not find here before: the address goes out in the stage that
+// names it and the value is there in the stage below, in the memory's own
+// output register. That register is the pipeline register for that boundary,
+// so the read costs no flop of ours and no cycle beyond the cut that was
+// already written.
+//
+// A stage MAY write one, under a rule: every read and write of a memory that
+// is written happens in ONE stage. Every stage is live at once holding a
+// different item, so a write in stage j and a read in stage k pair an item's
+// read with a write belonging to an item (k - j) places away in the stream --
+// and an item's own two writes would not even be adjacent, the next item's
+// landing between them. With one stage there is no distance to depend on, and
+// the guarantee is the one the source reads as: each item sees every write of
+// every item before it, plus its own, in source order.
+//
+// A memory NOTHING writes is a table, has no order to keep, and may be read
+// from any stage, any number of times.
+
+/// The shape the whole feature exists for: a lookup, one item per cycle.
+const SEQ_LOOKUP: &str = concat!(
+    "sequence lookup (addr: buffer in u5, val: buffer out u32)\n",
+    "  var tbl: #[impl(bram)] [u32; 32]\n",
+    "  let a = @rcv(addr)\n",
+    "  let v = tbl[a]\n",
+    "  |||\n",
+    "  @send(val, v)\n",
+);
+
+#[test]
+fn a_bram_read_spans_a_stage_cut() {
+    let v = compile(SEQ_LOOKUP);
+    // The array and its output register, in the memory's own clocked block --
+    // the shape a synthesizer infers block RAM from.
+    assert!(v.contains("reg [31:0] tbl [0:31];"), "{}", v);
+    assert!(v.contains("reg [31:0] tbl_q;"), "{}", v);
+    assert!(v.contains("if (tbl_re) tbl_q <= tbl["), "{}", v);
+}
+
+#[test]
+fn the_memorys_register_is_the_pipeline_register() {
+    // No `v_s1`. The name the read bound crosses the cut in `tbl_q`, and a
+    // register of our own beside it would pair the value with the item behind.
+    let v = compile(SEQ_LOOKUP);
+    assert!(!v.contains("v_s1"), "a second register for the read:\n{}", v);
+}
+
+#[test]
+fn the_read_enable_follows_the_shift() {
+    // A memory that kept reading through a stall would have moved on to the
+    // item behind by the time the stall lifted.
+    let v = compile(SEQ_LOOKUP);
+    assert!(v.contains("wire tbl_re = "), "{}", v);
+    assert!(v.contains("& shift;"), "{}", v);
+}
+
+#[test]
+fn a_sequence_memory_is_a_rom_in_the_comment_too() {
+    let v = compile(SEQ_LOOKUP);
+    assert!(v.contains("block ROM: sync reads"), "{}", v);
+    assert!(!v.contains("one sync write port"), "{}", v);
+}
+
+#[test]
+fn the_value_is_not_there_in_the_stage_that_asked() {
+    let text = compile_err(concat!(
+        "sequence s (addr: buffer in u5, val: buffer out u32)\n",
+        "  var tbl: #[impl(bram)] [u32; 32]\n",
+        "  let a = @rcv(addr)\n",
+        "  let v = tbl[a]\n",
+        "  let w: u32 = v + 32'd1\n",
+        "  |||\n",
+        "  @send(val, w)\n",
+    ));
+    assert!(text.contains("used in the stage that asked for it"), "{}", text);
+}
+
+#[test]
+fn a_read_in_the_last_stage_has_nowhere_to_land() {
+    let text = compile_err(concat!(
+        "sequence s (addr: buffer in u5, val: buffer out u32)\n",
+        "  var tbl: #[impl(bram)] [u32; 32]\n",
+        "  let a = @rcv(addr)\n",
+        "  |||\n",
+        "  let v = tbl[a]\n",
+        "  @send(val, v)\n",
+    ));
+    assert!(text.contains("read in the last stage"), "{}", text);
+    assert!(text.contains("put a `|||` after this line"), "{}", text);
+}
+
+#[test]
+fn a_table_may_be_read_from_several_stages() {
+    // Nothing writes it, so there is no order to keep and no reason to confine
+    // it to one stage. Each read takes its own port and its own enable, from
+    // the liveness of the stage that asked.
+    let v = compile(concat!(
+        "sequence s (req: buffer in u8, val: buffer out u32)\n",
+        "  var tbl: #[impl(bram)] [u32; 16]\n",
+        "  let c = @rcv(req)\n",
+        "  let x = tbl[c[3..0]]\n",
+        "  |||\n",
+        "  let y = tbl[c[7..4]]\n",
+        "  |||\n",
+        "  @send(val, x + y)\n",
+    ));
+    assert!(v.contains("wire tbl_re1 = v0 & shift;"), "{}", v);
+    assert!(v.contains("x_s2 <= (shift ? tbl_q0 : x_s2);"), "{}", v);
+}
+
+#[test]
+fn a_table_takes_a_read_port_per_read_in_one_stage() {
+    // Two reads in one stage are two addresses in the same cycle and there is
+    // nothing to mux them onto, so they are two ports -- which an ASIC memory
+    // compiler answers with a two-read cell and an FPGA by replicating the
+    // array under the same write stream. Unlike a process, where one state is
+    // current and several reads DO mux onto one port.
+    let v = compile(concat!(
+        "sequence s (req: buffer in u8, val: buffer out u32)\n",
+        "  var tbl: #[impl(bram)] [u32; 16]\n",
+        "  let c = @rcv(req)\n",
+        "  let x = tbl[c[3..0]]\n",
+        "  let y = tbl[c[7..4]]\n",
+        "  |||\n",
+        "  @send(val, x + y)\n",
+    ));
+    assert!(v.contains("reg [31:0] tbl_q0;"), "{}", v);
+    assert!(v.contains("reg [31:0] tbl_q1;"), "{}", v);
+    assert!(v.contains("if (tbl_re0) tbl_q0 <= tbl["), "{}", v);
+    assert!(v.contains("if (tbl_re1) tbl_q1 <= tbl["), "{}", v);
+}
+
+
+#[test]
+fn a_written_memory_is_owned_by_one_stage() {
+    let text = compile_err(concat!(
+        "sequence s (addr: buffer in u5, val: buffer out u32)\n",
+        "  var tbl: #[impl(bram)] [u32; 32]\n",
+        "  let a = @rcv(addr)\n",
+        "  tbl[a] = 32'd7\n",
+        "  let v = tbl[a]\n",
+        "  |||\n",
+        "  let w = tbl[a]\n",
+        "  |||\n",
+        "  @send(val, v + w)\n",
+    ));
+    assert!(text.contains("touched in stage 0 and stage 1"), "{}", text);
+    assert!(text.contains("live at once"), "{}", text);
+}
+
+#[test]
+fn a_write_is_gated_by_the_stage_that_owns_it_and_no_other() {
+    // Ungated, a stall would rewrite every cycle it waited. Gated by every
+    // stage rather than by the owning one, the write would need the whole
+    // pipeline occupied before it happened -- which is what this pins.
+    let v = compile(concat!(
+        "sequence s (addr: buffer in u5, val: buffer out u32)\n",
+        "  var tbl: #[impl(bram)] [u32; 32]\n",
+        "  let a = @rcv(addr)\n",
+        "  tbl[a] = 32'd7\n",
+        "  let x: u32 = @zext(a, 32)\n",
+        "  |||\n",
+        "  let y: u32 = x + 32'd1\n",
+        "  |||\n",
+        "  @send(val, y)\n",
+    ));
+    let block = v.split("// tbl [0:31]").nth(1).expect("the memory block");
+    let block = block.split("endmodule").next().expect("the end");
+    assert!(block.contains("& shift)"), "{}", block);
+    assert!(!block.contains("v0 & shift"), "gated by a stage that does not own it:\n{}", block);
+    assert!(!block.contains("v1 & shift"), "gated by a stage that does not own it:\n{}", block);
+}
+
+#[test]
+fn a_read_sees_a_write_above_it_in_the_same_stage() {
+    // Different addresses, so the collision is a real comparison. It is decided
+    // in the stage that asked -- where both addresses exist -- and one bit plus
+    // the data crosses the cut to answer the read on the far side.
+    let v = compile(concat!(
+        "sequence s (req: buffer in u8, val: buffer out u32)\n",
+        "  var tbl: #[impl(bram)] [u32; 16]\n",
+        "  let c = @rcv(req)\n",
+        "  let wa: u4 = c[3..0]\n",
+        "  let ra: u4 = c[7..4]\n",
+        "  tbl[wa] = 32'd7\n",
+        "  let v = tbl[ra]\n",
+        "  |||\n",
+        "  @send(val, v)\n",
+    ));
+    assert!(v.contains("reg tbl_fwd0_s1;"), "{}", v);
+    assert!(v.contains("tbl_fwd0_s1 <= (shift ? (ra == wa) : tbl_fwd0_s1);"), "{}", v);
+    assert!(v.contains("tbl_fwd0_s1 ? tbl_wdata0_s1 : tbl_q"), "{}", v);
+}
+
+#[test]
+fn an_unconditional_write_to_the_address_read_needs_no_port_at_all() {
+    // `t[a] = v` then `t[a]` is `v`. Asking the array as well would be a read
+    // port, an output register and a mux that can only choose one way.
+    let v = compile(concat!(
+        "sequence s (req: buffer in u4, val: buffer out u32)\n",
+        "  var tbl: #[impl(bram)] [u32; 16]\n",
+        "  let a = @rcv(req)\n",
+        "  tbl[a] = 32'd7\n",
+        "  let v = tbl[a]\n",
+        "  |||\n",
+        "  @send(val, v)\n",
+    ));
+    assert!(!v.contains("tbl_q"), "a read port for a value already in hand:\n{}", v);
+    assert!(!v.contains("tbl_re"), "{}", v);
+    // The written value crosses the cut like any other stage-0 value.
+    assert!(v.contains("v_s1 <= (shift ? 32'd7 : v_s1);"), "{}", v);
+    // And the memory is still written, for the items behind this one.
+    assert!(v.contains("tbl[req_item] <= 32'd7;"), "{}", v);
+}
+
+#[test]
+fn a_sequence_bram_cannot_be_reset_either() {
+    // The process's rule, unchanged and for the same measured reason: a reset
+    // is a write to every element and infers flip-flops, not a block RAM.
+    let text = compile_err(concat!(
+        "sequence s (addr: buffer in u5, val: buffer out u32)\n",
+        "  var tbl: #[impl(bram)] [u32; 32] = @zeroed()\n",
+        "  let a = @rcv(addr)\n",
+        "  let v = tbl[a]\n",
+        "  |||\n",
+        "  @send(val, v)\n",
+    ));
+    assert!(text.contains("cannot be reset"), "{}", text);
+}
+
+#[test]
+fn a_lutram_read_in_a_sequence_costs_no_cut() {
+    // Asynchronous, so it is ordinary combinational work inside one stage --
+    // and several of them are several read ports, which is what distributed
+    // RAM is for.
+    let v = compile(concat!(
+        "sequence s (addr: buffer in u5, val: buffer out u32)\n",
+        "  var tbl: #[impl(lutram)] [u32; 32]\n",
+        "  let a = @rcv(addr)\n",
+        "  let v: u32 = tbl[a] + tbl[a]\n",
+        "  |||\n",
+        "  @send(val, v)\n",
+    ));
+    assert!(!v.contains("tbl_q"), "a lutram has no read register:\n{}", v);
+    // Two reads, two array reads, in the one stage that wrote them. A
+    // synchronous read could not have done that at any price.
+    assert_eq!(v.matches("tbl[addr_item]").count(), 2, "{}", v);
+    // And nothing clocked at all: no write port, and reads that are wires.
+    assert!(!v.contains("// tbl "), "{}", v);
+}
+
+#[test]
+fn a_read_two_stages_on_crosses_like_anything_else() {
+    // `tbl_q` holds this item's answer for exactly one shift, so a use two
+    // stages down needs the ordinary crossing register -- captured from
+    // `tbl_q` at the SECOND cut, not the first.
+    let v = compile(concat!(
+        "sequence s (addr: buffer in u5, val: buffer out u32)\n",
+        "  var tbl: #[impl(bram)] [u32; 32]\n",
+        "  let a = @rcv(addr)\n",
+        "  let v = tbl[a]\n",
+        "  |||\n",
+        "  let w: u32 = @zext(a, 32)\n",
+        "  |||\n",
+        "  @send(val, v + w)\n",
+    ));
+    assert!(v.contains("v_s2 <= (shift ? tbl_q : v_s2);"), "{}", v);
+    assert!(!v.contains("v_s1"), "registered at the first cut too:\n{}", v);
+}
+
+#[test]
+fn a_bram_read_in_a_sequence_expression_says_where_the_cycle_goes() {
+    let text = compile_err(concat!(
+        "sequence s (addr: buffer in u5, val: buffer out u32)\n",
+        "  var tbl: #[impl(bram)] [u32; 32]\n",
+        "  let a = @rcv(addr)\n",
+        "  let v: u32 = tbl[a] + 32'd1\n",
+        "  |||\n",
+        "  @send(val, v)\n",
+    ));
+    assert!(text.contains("cannot sit inside an expression"), "{}", text);
+    // The note names a stage cut here, not a state.
+    assert!(text.contains("put a `|||` after it"), "{}", text);
+}
+
+#[test]
+fn bkram_is_refused_in_a_sequence_too() {
+    let text = compile_err(concat!(
+        "sequence s (addr: buffer in u5, val: buffer out u32)\n",
+        "  var tbl: #[impl(bkram)] [u32; 32]\n",
+        "  let a = @rcv(addr)\n",
+        "  let v = tbl[a]\n",
+        "  |||\n",
+        "  @send(val, v)\n",
+    ));
+    assert!(text.contains("`#[impl(bkram)]` is not supported yet"), "{}", text);
+}
+
+// ---- write-then-read in one state, which was silently wrong ---------------
+
+#[test]
+fn a_lutram_read_sees_a_write_above_it_in_the_same_state() {
+    // The array updates on the clock edge, so `cells[a] = d` followed by
+    // `cells[a]` read the contents from BEFORE the write -- with no diagnostic,
+    // for as long as memories have existed. `bram` escaped it by accident: its
+    // read is scheduled into a state after any write's, so the array had
+    // already been updated by the time it looked.
+    let v = compile(concat!(
+        "process p (req: buffer in u4, dout: buffer out u32)
+",
+        "  var cells: #[impl(lutram)] [u32;16] = @zeroed()
+",
+        "  loop
+",
+        "    let a = @rcv(req)
+",
+        "    cells[a] = 32'd7
+",
+        "    let v = cells[a]
+",
+        "    @send(dout, v)
+",
+    ));
+    // Unconditional and the same address, so the read IS the written value and
+    // the array read folds away entirely.
+    assert!(!v.contains("= cells[req_item];"), "still reads the stale array:
+{}", v);
+    assert!(v.contains("cells[req_item] <= 32'd7;"), "{}", v);
+}
+
+#[test]
+fn a_guarded_write_forwards_under_its_own_guard() {
+    let v = compile(concat!(
+        "process p (cmd: buffer in u16, dout: buffer out u32)
+",
+        "  var cells: #[impl(lutram)] [u32;16] = @zeroed()
+",
+        "  loop
+",
+        "    let c = @rcv(cmd)
+",
+        "    let a: u4 = c[3..0]
+",
+        "    let b: u4 = c[7..4]
+",
+        "    if c[15] then
+",
+        "      cells[a] = 32'd7
+",
+        "    let v = cells[b]
+",
+        "    @send(dout, v)
+",
+    ));
+    // The read takes the pending write only where the guard held AND the
+    // addresses matched; otherwise the array, as before.
+    assert!(v.contains("(b == "), "no address comparison:
+{}", v);
+    assert!(v.contains("cells[b]"), "{}", v);
+}
+
+#[test]
+fn a_read_with_no_write_above_it_is_untouched() {
+    // The common case must emit what it emitted before forwarding existed: no
+    // comparator, no mux, just the array read.
+    let v = compile(concat!(
+        "process p (req: buffer in u4, dout: buffer out u32)
+",
+        "  var cells: #[impl(lutram)] [u32;16] = @zeroed()
+",
+        "  loop
+",
+        "    let a = @rcv(req)
+",
+        "    let v = cells[a]
+",
+        "    @send(dout, v)
+",
+    ));
+    assert!(v.contains("wire [31:0] v = cells[req_item];"), "{}", v);
+}
+
+// ---- write ports are plural -----------------------------------------------
+//
+// How many a memory has is how many writes ONE PATH performs, not how many the
+// source contains. Two writes in a row both happen this cycle and there is
+// nothing to mux them onto; the two arms of an `if` cannot both happen, and the
+// SSA join is what proves it -- both arms write slot 0, and the join brings
+// them back together as one port with a muxed address.
+
+#[test]
+fn two_writes_in_a_row_are_two_ports() {
+    // Before this the second replaced the first in the environment and the
+    // first was silently dropped: the source said write twice and the hardware
+    // wrote once, with nothing said about it.
+    let v = compile(concat!(
+        "process p (req: buffer in u4, dout: buffer out u32)\n",
+        "  var cells: #[impl(lutram)] [u32;16] = @zeroed()\n",
+        "  loop\n",
+        "    let a = @rcv(req)\n",
+        "    cells[a] = 32'd7\n",
+        "    cells[a + 4'd1] = 32'd9\n",
+        "    @send(dout, 32'd0)\n",
+    ));
+    assert!(v.contains("cells[req_item] <= 32'd7;"), "{}", v);
+    assert!(v.contains("cells[(req_item + 4'd1)] <= 32'd9;"), "{}", v);
+    assert!(v.contains("2 sync write ports"), "{}", v);
+}
+
+#[test]
+fn the_two_arms_of_an_if_share_one_port() {
+    // They cannot both happen, so one port with a muxed address and data is
+    // the whole of what the hardware needs -- and on an FPGA a second port is
+    // the difference between a RAM primitive and a pile of flip-flops.
+    let v = compile(concat!(
+        "process p (cmd: buffer in u16, dout: buffer out u32)\n",
+        "  var cells: #[impl(lutram)] [u32;16] = @zeroed()\n",
+        "  loop\n",
+        "    let c = @rcv(cmd)\n",
+        "    let a: u4 = c[3..0]\n",
+        "    let b: u4 = c[7..4]\n",
+        "    if c[15] then\n",
+        "      cells[a] = 32'd2\n",
+        "    else\n",
+        "      cells[b] = 32'd3\n",
+        "    @send(dout, 32'd0)\n",
+    ));
+    assert!(v.contains("one sync write port"), "{}", v);
+    // And the enable is not `c ? 1'b1 : 1'b1`: both arms write unconditionally,
+    // so the shared port's enable is whatever reaching the `if` costs.
+    assert!(!v.contains("1'b1 : 1'b1"), "{}", v);
+}
+
+#[test]
+fn an_if_with_no_else_is_still_one_port_with_the_guard_as_its_enable() {
+    let v = compile(concat!(
+        "process p (cmd: buffer in u16, dout: buffer out u32)\n",
+        "  var cells: #[impl(lutram)] [u32;16] = @zeroed()\n",
+        "  loop\n",
+        "    let c = @rcv(cmd)\n",
+        "    if c[15] then\n",
+        "      cells[c[3..0]] = 32'd2\n",
+        "    @send(dout, 32'd0)\n",
+    ));
+    assert!(v.contains("one sync write port"), "{}", v);
+    assert!(v.contains("cmd_item[15]"), "{}", v);
+}
+
+#[test]
+fn match_arms_share_one_port_too() {
+    let v = compile(concat!(
+        "enum op_e: u2\n",
+        "  A\n",
+        "  B\n",
+        "  C\n",
+        "process p (cmd: buffer in op_e, dout: buffer out u32)\n",
+        "  var cells: #[impl(lutram)] [u32;16] = @zeroed()\n",
+        "  loop\n",
+        "    let c = @rcv(cmd)\n",
+        "    match c\n",
+        "      .A =>\n",
+        "        cells[4'd0] = 32'd1\n",
+        "      .B =>\n",
+        "        cells[4'd1] = 32'd2\n",
+        "      _ =>\n",
+        "        cells[4'd2] = 32'd3\n",
+        "    @send(dout, 32'd0)\n",
+    ));
+    assert!(v.contains("one sync write port"), "{}", v);
+}
+
+#[test]
+fn several_states_writing_one_port_is_still_one_port() {
+    // Only one state is current in any cycle, so they mux onto it. This is the
+    // rule that did not change, and the one a pipeline cannot use.
+    let v = compile(SCRATCH);
+    assert!(v.contains("one sync write port"), "{}", v);
+}
+
+#[test]
+fn two_writes_in_a_stage_are_two_ports_and_a_read_sees_both() {
+    let v = compile(concat!(
+        "sequence s (req: buffer in u8, dout: buffer out u32)\n",
+        "  var tbl: #[impl(lutram)] [u32;16]\n",
+        "  let c = @rcv(req)\n",
+        "  tbl[c[3..0]] = 32'd1\n",
+        "  tbl[c[7..4]] = 32'd2\n",
+        "  let v = tbl[c[3..0]]\n",
+        "  |||\n",
+        "  @send(dout, v)\n",
+    ));
+    assert!(v.contains("2 sync write ports"), "{}", v);
+    // Source order: the later write wins the forwarding mux, as it wins the
+    // array, so what the read saw and what the array holds cannot disagree.
+    assert!(v.contains("32'd2 : 32'd1"), "{}", v);
+}
+
+// ---- --lvt-bram ------------------------------------------------------------
+
+const TWO_WRITE_BRAM: &str = concat!(
+    "process rf (cmd: buffer in u32, rd: buffer out u32)\n",
+    "  var vals: #[impl(bram)] [u32;32]\n",
+    "  loop\n",
+    "    let c = @rcv(cmd)\n",
+    "    let a: u5 = c[4..0]\n",
+    "    let b: u5 = c[9..5]\n",
+    "    vals[a] = c\n",
+    "    vals[b] = 32'd9\n",
+    "    let x = vals[a]\n",
+    "    @send(rd, x)\n",
+);
+
+#[test]
+fn without_the_flag_the_ports_are_emitted_as_written() {
+    // Which is what an ASIC memory compiler wants: a real two-write cell is
+    // smaller and faster than anything built out of one-write blocks.
+    let v = compile(TWO_WRITE_BRAM);
+    assert!(v.contains("reg [31:0] vals [0:31];"), "{}", v);
+    assert!(v.contains("vals[a] <= cmd_item;"), "{}", v);
+    assert!(v.contains("vals[b] <= 32'd9;"), "{}", v);
+    assert!(!v.contains("vals_lvt"), "{}", v);
+}
+
+#[test]
+fn the_flag_builds_banks_and_a_live_value_table() {
+    let v = compile_lvt(TWO_WRITE_BRAM);
+    // One bank per write port, replicated per read port.
+    assert!(v.contains("reg [31:0] vals_b0r0 [0:31];"), "{}", v);
+    assert!(v.contains("reg [31:0] vals_b1r0 [0:31];"), "{}", v);
+    // Each write goes to its own bank and stamps the table.
+    assert!(v.contains("vals_b0r0[a] <= cmd_item;"), "{}", v);
+    assert!(v.contains("vals_lvt[a] <= 1'd0;"), "{}", v);
+    assert!(v.contains("vals_b1r0[b] <= 32'd9;"), "{}", v);
+    assert!(v.contains("vals_lvt[b] <= 1'd1;"), "{}", v);
+    // The read fetches every bank and the table on one enable, and the table
+    // picks which answer is current.
+    assert!(v.contains("vals_lvt_q0 <= vals_lvt["), "{}", v);
+    assert!(
+        v.contains("assign vals_q = (vals_lvt_q0 == 1'd0) ? vals_b0r0_q : vals_b1r0_q;"),
+        "{}",
+        v
+    );
+    // The table is the only array reset: resetting a bank is what stops a
+    // block RAM being inferred, which is the whole point of doing this.
+    assert!(v.contains("vals_lvt[vals_ix] <= 1'd0;"), "{}", v);
+    assert!(!v.contains("vals_b0r0[vals_ix]"), "{}", v);
+}
+
+#[test]
+fn the_flag_replicates_a_bank_per_read_port() {
+    let v = compile_lvt(concat!(
+        "sequence s (req: buffer in u32, dout: buffer out u32)\n",
+        "  var vals: #[impl(bram)] [u32;32]\n",
+        "  let c = @rcv(req)\n",
+        "  vals[c[4..0]] = c\n",
+        "  vals[c[9..5]] = 32'd9\n",
+        "  let x = vals[c[14..10]]\n",
+        "  let y = vals[c[19..15]]\n",
+        "  |||\n",
+        "  @send(dout, x + y)\n",
+    ));
+    for bank in 0..2 {
+        for read in 0..2 {
+            let arr = format!("vals_b{}r{}", bank, read);
+            assert!(v.contains(&format!("reg [31:0] {} [0:31];", arr)), "{}: {}", arr, v);
+        }
+    }
+    assert!(v.contains("assign vals_q0 = "), "{}", v);
+    assert!(v.contains("assign vals_q1 = "), "{}", v);
+}
+
+#[test]
+fn the_flag_leaves_a_single_write_bram_alone() {
+    // One write port needs no banking: several reads of one write stream is a
+    // replication every FPGA synthesizer already does by itself.
+    let v = compile_lvt(LOOKUP);
+    assert!(!v.contains("table__lvt"), "{}", v);
+    assert!(v.contains("if (in_s1) table__q <= table_[a_r];"), "{}", v);
+}
+
+#[test]
+fn the_flag_leaves_a_lutram_alone() {
+    // It names `bram`, and distributed RAM is a different primitive with a
+    // different answer to the same question.
+    let v = compile_lvt(concat!(
+        "process p (req: buffer in u4, dout: buffer out u32)\n",
+        "  var cells: #[impl(lutram)] [u32;16] = @zeroed()\n",
+        "  loop\n",
+        "    let a = @rcv(req)\n",
+        "    cells[a] = 32'd7\n",
+        "    cells[a + 4'd1] = 32'd9\n",
+        "    @send(dout, 32'd0)\n",
+    ));
+    assert!(!v.contains("cells_lvt"), "{}", v);
+    assert!(v.contains("2 sync write ports"), "{}", v);
 }

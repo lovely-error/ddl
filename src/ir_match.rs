@@ -412,7 +412,12 @@ pub fn lower_match(
     struct Arm {
         labels: Vec<u128>,
         env: Env,
+        /// How many write ports this arm took, per memory. Every arm starts
+        /// from `base`, which is what makes two arms writing once share one
+        /// port rather than asking for one each.
+        mem_slots: Vec<usize>,
     }
+    let base = low.mem_slot_counts();
     let mut arms: Vec<Arm> = Vec::new();
 
     for (ix, plan) in shape.cases.iter().enumerate() {
@@ -421,6 +426,7 @@ pub fn lower_match(
         }
         let case = &stmt.cases[ix];
         let mut arm_env = env.clone();
+        low.set_mem_slot_counts(&base);
 
         // A plain name is an irrefutable binding: it matches anything and
         // binds the scrutinee, which is how the wildcard works too.
@@ -459,13 +465,20 @@ pub fn lower_match(
         };
         lower_branch(low, &case.rhs, &mut arm_env, sink)?;
         low.pop_path(depth);
-        arms.push(Arm { labels: plan.labels.clone(), env: arm_env });
+        arms.push(Arm {
+            labels: plan.labels.clone(),
+            env: arm_env,
+            mem_slots: low.mem_slot_counts(),
+        });
     }
 
     // The last arm is the default: either it is the catch-all, or coverage is
     // complete and it is reached by elimination.
     let default_arm = arms.last().expect("plan_match rejects a match with no arms");
-    let names: Vec<String> = env.keys().cloned().collect();
+    // Write ports are joined separately, below: they are created as the arms
+    // run, so the keys an arm added are not in `env` here to be walked, and
+    // the arms can have added different numbers of them.
+    let names: Vec<String> = env.keys().filter(|k| !k.contains('#')).cloned().collect();
 
     for name in names {
         let fallback = match default_arm.env.get(&name).and_then(|b| b.value) {
@@ -521,6 +534,12 @@ pub fn lower_match(
             b.value = Some(joined);
         }
     }
+
+    let port_arms: Vec<(Vec<u128>, Env, Vec<usize>)> = arms
+        .into_iter()
+        .map(|a| (a.labels, a.env, a.mem_slots))
+        .collect();
+    low.join_write_slots_case(tag, &base, &port_arms, env);
     Some(())
 }
 

@@ -42,6 +42,35 @@ Two aspects:
    1. must not contain loops/state
       1. "inplace" mutatation can be expressed as comb logic and thus not considered state
    2. must not contain TDM memory
+      1. a `bram` read spans a `|||`, where the memory's own output register
+         is the pipeline register, and a `lutram` read is combinational and
+         sits inside a stage
+      2. every read and write of a memory a stage WRITES happens in one stage.
+         Stage j and stage k hold different items in the same cycle, so a
+         write in one and a read in the other pair an item's read with a write
+         (k - j) items away from it, and an item's own two writes are not even
+         adjacent -- the next item's lands between them. Confined to one stage
+         there is no distance to depend on: every item sees every write of
+         every item before it, plus its own, in source order
+      3. its own it sees by FORWARDING. The array is written on the same edge
+         that fills the read register, so the register holds what was there
+         before the write; which addresses collided is decided in the stage
+         that asked, and one bit plus the data crosses the cut
+      4. a memory nothing writes is a table, has no order to keep, and may be
+         read from any stage
+      5. ports are as many as the source asks for, reads and writes alike: one
+         write port per write that can happen in a cycle, so two writes in a
+         row are two and the arms of an `if` are one. A process muxes its
+         reads and its states' writes onto one port because only one state is
+         current; a pipeline cannot, because every stage is live at once
+      6. what that costs is the target's to decide. An ASIC memory compiler
+         emits a multi-port cell; an FPGA infers no RAM at all from a second
+         write port, so `--lvt-bram` builds one out of one-write blocks --
+         a bank per write port, replicated per read port, and a live value
+         table naming which bank holds the newest value at each address
+      7. so memory latency in a pipeline is a compile-time constant of 0 or 1
+         stage. `bkram`, whose point is that a bank conflict costs an extra
+         cycle, can never fit that; off-chip memory belongs behind a `port`
    3. must not contain div with runtime divisor
    4. can be lowered to pipeline with prologue (head-fsm-spine-pipeline or just pipeline)
       1. head gathers inputs (first stage, blocking reads), tail computes with it (nonblocking reads are allowed)
@@ -147,9 +176,10 @@ The compiler in this repository accepts: `fun`, `sequence`, `process`,
 (unrolled), `loop` nested to any depth with `break` leaving the innermost,
 compound assignment, element assignment (`a[k] = v`, at a constant or computed
 index), `inout` parameters, `buffer` pipes, `port in`/`port out` with an
-an enable and no back-pressure, `@slice`, the `@merge` and `@split`
-combinators, and `lutram` and `bram` memories — where several reads, including
-reads inside an expression, each get a state of their own. A blocking
+an enable and no back-pressure, `@slice`, `{a, b}` concatenation, the `@merge`
+and `@split` combinators, and `lutram` and `bram` memories — where several
+reads, including reads inside an expression, each get a state of their own, and
+where a `sequence` may read one across a `|||` but not write it. A blocking
 operation, a `break` or a `bram` read may sit in an `if`, a `match` or a
 `loop`. README.md is the current list; what follows is the design, including
 the parts that are not built.

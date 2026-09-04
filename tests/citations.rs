@@ -193,7 +193,7 @@ fn citations_in(flat: &str) -> Vec<Citation> {
             Some(v) => v,
             None => continue,
         };
-        // `desc.md:53-58` cites a run.
+        // `desc.md:82-87` cites a run.
         let mut through = line;
         if bytes.get(cursor) == Some(&b'-')
             && let Some((end_line, end_at)) = digits(cursor + 1)

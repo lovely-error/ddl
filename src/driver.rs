@@ -634,7 +634,7 @@ mod emit_tests {
         let v = compile(concat!(
             "fun bits (a: u32, o: out u8, p: out u32)\n",
             "  o = a[15..8]\n",
-            "  p = @concat(a[15..0], a[31..16])\n",
+            "  p = {a[15..0], a[31..16]}\n",
         ));
         assert!(v.contains("[15:8]"), "{}", v);
         assert!(v.contains("{"), "{}", v);

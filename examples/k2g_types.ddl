@@ -142,5 +142,5 @@ fun uop_fault (cause: fault_e, cp: u16, u: out uop_t)
   var f: uop_t = @zeroed()
   f.kind = UOP_FAULT
   f.fault = cause
-  f.imm = @concat(16'd0, cp)
+  f.imm = {16'd0, cp}
   u = f

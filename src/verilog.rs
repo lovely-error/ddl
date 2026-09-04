@@ -24,11 +24,27 @@ use crate::ty::{MemKind, Ty};
 pub struct EmitOptions {
     /// Printed in the banner so a reader knows how to regenerate the file.
     pub regenerate_cmd: String,
+    /// Build a `bram` with several write ports out of one-write blocks and a
+    /// live value table, instead of asking for a cell with several.
+    ///
+    /// Off by default, because the default target is whatever the reader's
+    /// flow can make of `if (we0) ... if (we1) ...` -- an ASIC memory compiler
+    /// answers that with a real multi-write cell, which is smaller and faster
+    /// than anything built out of blocks. An FPGA has no such cell, and what
+    /// it does instead is measured in examples/rf_lvt.ddl: GowinSynthesis
+    /// falls back to a flip-flop per bit and a 256x32 table then does not fit
+    /// the part at all, where the same source with this flag comes out as four
+    /// SDPBs. So it is not a size optimisation -- on that target it is the
+    /// difference between the design existing and not.
+    pub lvt_bram: bool,
 }
 
 impl Default for EmitOptions {
     fn default() -> Self {
-        EmitOptions { regenerate_cmd: "ddl build <source.ddl>".to_string() }
+        EmitOptions {
+            regenerate_cmd: "ddl build <source.ddl>".to_string(),
+            lvt_bram: false,
+        }
     }
 }
 
@@ -54,7 +70,7 @@ pub fn emit_banner(opts: &EmitOptions) -> String {
     out
 }
 
-pub fn emit_module(module: &Module, _opts: &EmitOptions) -> String {
+pub fn emit_module(module: &Module, opts: &EmitOptions) -> String {
     let mut out = String::new();
     let names = NameTable::build(module);
 
@@ -64,7 +80,7 @@ pub fn emit_module(module: &Module, _opts: &EmitOptions) -> String {
     // Built separately so an empty body -- a module that is pure wiring --
     // does not leave a double blank line behind.
     let mut body = String::new();
-    emit_body(&mut body, module, &names);
+    emit_body(&mut body, module, &names, opts);
     if !body.is_empty() {
         out.push('\n');
         out.push_str(&body);
@@ -137,15 +153,17 @@ fn live_values(module: &Module) -> Vec<bool> {
     let mut stack: Vec<ValueId> = module.drivers.iter().map(|(_, v)| *v).collect();
     stack.extend(module.regs.iter().map(|r| r.next));
     for mem in &module.mems {
-        stack.push(mem.we);
-        stack.push(mem.addr);
-        stack.push(mem.data);
+        for w in &mem.write {
+            stack.push(w.we);
+            stack.push(w.addr);
+            stack.push(w.data);
+        }
         // The READ port too. With one read state its address and enable are
         // already live through the state logic, which is why this was missing
         // and nothing said so; with two they are a mux and an OR that nothing
         // else reaches, and the memory's clocked block referred to wires the
         // file never declared.
-        if let Some(read) = &mem.read {
+        for read in &mem.read {
             stack.push(read.addr);
             stack.push(read.en);
         }
@@ -254,9 +272,11 @@ fn use_counts(module: &Module, live: &[bool]) -> Vec<u32> {
         bump(&reg.next, &mut counts);
     }
     for mem in &module.mems {
-        bump(&mem.we, &mut counts);
-        bump(&mem.addr, &mut counts);
-        bump(&mem.data, &mut counts);
+        for w in &mem.write {
+            bump(&w.we, &mut counts);
+            bump(&w.addr, &mut counts);
+            bump(&w.data, &mut counts);
+        }
     }
     for a in &module.asserts {
         bump(&a.cond, &mut counts);
@@ -432,7 +452,67 @@ fn emit_case_blocks(
     }
 }
 
-fn emit_body(out: &mut String, module: &Module, names: &NameTable) {
+/// Which of a memory's write ports can actually fire.
+///
+/// A port whose enable folded to a constant zero is a write no path reaches;
+/// emitting it would give synthesis a dead assignment to warn about and a
+/// reader a line to chase.
+fn live_write_ports(module: &Module, mem: &Memory) -> Vec<usize> {
+    (0..mem.write.len())
+        .filter(|w| !matches!(module.value(mem.write[*w].we).op, Op::Const(0)))
+        .collect()
+}
+
+/// Whether this memory is built as banks plus a live value table.
+///
+/// Only a `bram`, only with more than one write port, and only when asked.
+/// One write port needs no banking at all -- several READS of one write
+/// stream is a replication every FPGA synthesizer already does by itself --
+/// and `lutram` is left alone because the flag names `bram`.
+fn lvt_shape(mem: &Memory, live_writes: &[usize], opts: &EmitOptions) -> bool {
+    opts.lvt_bram && mem.kind == MemKind::BlockRam && live_writes.len() > 1
+}
+
+/// Bits needed to name one of `banks` banks.
+fn lvt_width(banks: usize) -> u32 {
+    let mut w = 0;
+    while (1usize << w) < banks {
+        w += 1;
+    }
+    w.max(1)
+}
+
+fn bank_array(name: &str, bank: usize, read: usize) -> String {
+    format!("{}_b{}r{}", name, bank, read)
+}
+
+/// Declares the banks, their per-read output registers, and the table.
+fn emit_lvt_decls(out: &mut String, mem: &Memory, name: &str, banks: usize) {
+    let reads = mem.read.len().max(1);
+    let w = signed_and_range(&mem.elem);
+    for b in 0..banks {
+        for r in 0..reads {
+            let arr = bank_array(name, b, r);
+            out.push_str(&format!("  reg {}{} [0:{}];\n", w, arr, mem.len - 1));
+            if !mem.read.is_empty() {
+                out.push_str(&format!("  reg {}{}_q;\n", w, arr));
+            }
+        }
+    }
+    let lw = lvt_width(banks);
+    out.push_str(&format!("  reg [{}:0] {}_lvt [0:{}];\n", lw - 1, name, mem.len - 1));
+    for r in 0..mem.read.len() {
+        out.push_str(&format!("  reg [{}:0] {}_lvt_q{};\n", lw - 1, name, r));
+        out.push_str(&format!(
+            "  wire {}{};\n",
+            w,
+            read_reg_ident(name, r, mem.read.len())
+        ));
+    }
+    out.push_str(&format!("  integer {}_ix;\n", name));
+}
+
+fn emit_body(out: &mut String, module: &Module, names: &NameTable, opts: &EmitOptions) {
     let live = live_values(module);
     let fold = foldable(module, &live);
 
@@ -462,26 +542,31 @@ fn emit_body(out: &mut String, module: &Module, names: &NameTable) {
     }
 
     for mem in &module.mems {
+        let name = sanitize(&mem.name);
+        let ports = live_write_ports(module, mem);
+        if lvt_shape(mem, &ports, opts) {
+            emit_lvt_decls(out, mem, &name, ports.len());
+            continue;
+        }
         out.push_str(&format!(
             "  reg {}{} [0:{}];\n",
             signed_and_range(&mem.elem),
-            sanitize(&mem.name),
+            name,
             mem.len - 1
         ));
-        // The read port's register belongs to the memory and is declared
+        // Each read port's register belongs to the memory and is declared
         // with it, so the two read as one thing.
-        if mem.read.is_some() {
+        for p in 0..mem.read.len() {
             out.push_str(&format!(
-                "  reg {}{}_q;
-",
+                "  reg {}{};\n",
                 signed_and_range(&mem.elem),
-                sanitize(&mem.name)
+                read_reg_ident(&name, p, mem.read.len())
             ));
         }
         // Verilog-2005 has no `for (integer i = ...)`, so the loop variable is
         // a module-level `integer`. It is touched only in the reset branch.
         if mem.reset.is_some() {
-            out.push_str(&format!("  integer {}_ix;\n", sanitize(&mem.name)));
+            out.push_str(&format!("  integer {}_ix;\n", name));
         }
     }
     if !module.mems.is_empty() {
@@ -542,7 +627,7 @@ fn emit_body(out: &mut String, module: &Module, names: &NameTable) {
         emit_clocked_block(out, module, names, &fold);
     }
     for mem in &module.mems {
-        emit_memory_block(out, module, names, &fold, mem);
+        emit_memory_block(out, module, names, &fold, mem, opts);
     }
     emit_instances(out, module);
     emit_assertions(out, module, names, &fold);
@@ -666,8 +751,21 @@ fn escape_message(msg: &str) -> String {
 /// register visibly belongs to the array: a memory called `table` escapes to
 /// `table_`, and its read register is `table__q` rather than `table_q`, which
 /// would read as a different memory's.
-pub fn read_reg_name(module: &Module, mem: u32) -> String {
-    format!("{}_q", sanitize(&module.mems[mem as usize].name))
+pub fn read_reg_name(module: &Module, mem: u32, port: u32) -> String {
+    let m = &module.mems[mem as usize];
+    read_reg_ident(&sanitize(&m.name), port as usize, m.read.len())
+}
+
+/// `<mem>_q` when the memory has one read port, `<mem>_q0`/`_q1` when several.
+///
+/// The unnumbered form is not nostalgia. A memory read once is the common case,
+/// and `t_q0` with no `t_q1` anywhere reads as though a port had gone missing.
+fn read_reg_ident(mem: &str, port: usize, ports: usize) -> String {
+    if ports <= 1 {
+        format!("{}_q", mem)
+    } else {
+        format!("{}_q{}", mem, port)
+    }
 }
 
 fn emit_memory_block(
@@ -676,52 +774,94 @@ fn emit_memory_block(
     names: &NameTable,
     fold: &[bool],
     mem: &Memory,
+    opts: &EmitOptions,
 ) {
     let name = sanitize(&mem.name);
     // A memory nothing writes is a lookup table. Emitting `if (1'b0)` around a
     // dead assignment would only give synthesis something to warn about -- but
     // a synchronous read still needs its block, because that is where its
     // register is driven from.
-    let never_written = matches!(module.value(mem.we).op, Op::Const(0));
-    if never_written && mem.reset.is_none() && mem.read.is_none() {
+    // A port whose enable folded to zero is not a port: the source has one
+    // write that no path reaches, and `if (1'b0)` around a dead assignment
+    // gives synthesis something to warn about and a reader something to chase.
+    let live_writes = live_write_ports(module, mem);
+    let never_written = live_writes.is_empty();
+    if never_written && mem.reset.is_none() && mem.read.is_empty() {
         return;
     }
-    let we = operand(module, names, fold, mem.we);
-    let addr = operand(module, names, fold, mem.addr);
-    let data = operand(module, names, fold, mem.data);
+    if lvt_shape(mem, &live_writes, opts) {
+        emit_lvt_block(out, module, names, fold, mem, &name, &live_writes);
+        return;
+    }
 
     out.push('\n');
-    out.push_str(&format!("  // {} [0:{}] -- {}\n", name, mem.len - 1, mem_note(mem.kind)));
+    out.push_str(&format!(
+        "  // {} [0:{}] -- {}\n",
+        name,
+        mem.len - 1,
+        mem_note(mem.kind, live_writes.len())
+    ));
     out.push_str("  always @(posedge clk) begin\n");
 
+    // ONE write port keeps the shape it always had -- `end else if (we) begin`
+    // -- because it is the shape every memory in examples/ has and the one a
+    // reader diffing against hand-written RTL is expecting. Only a memory that
+    // genuinely took several ports gets the general form below.
+    let one_port = live_writes.len() == 1;
     let mut write_open = false;
-    match mem.reset {
-        Some(k) => {
-            out.push_str("    if (!rst_n) begin\n");
-            out.push_str(&format!(
-                "      for ({ix} = 0; {ix} < {len}; {ix} = {ix} + 1) {nm}[{ix}] <= {val};\n",
-                ix = format!("{}_ix", name),
-                len = mem.len,
-                nm = name,
-                val = render_const(k, &mem.elem)
-            ));
-            if never_written {
-                out.push_str("    end\n");
-            } else {
-                out.push_str(&format!("    end else if ({}) begin\n", we));
-                write_open = true;
-            }
+    if let Some(k) = mem.reset {
+        out.push_str("    if (!rst_n) begin\n");
+        out.push_str(&format!(
+            "      for ({ix} = 0; {ix} < {len}; {ix} = {ix} + 1) {nm}[{ix}] <= {val};\n",
+            ix = format!("{}_ix", name),
+            len = mem.len,
+            nm = name,
+            val = render_const(k, &mem.elem)
+        ));
+        if never_written {
+            out.push_str("    end\n");
+        } else if one_port {
+            let we = operand(module, names, fold, mem.write[live_writes[0]].we);
+            out.push_str(&format!("    end else if ({}) begin\n", we));
+            write_open = true;
+        } else {
+            out.push_str("    end else begin\n");
+            write_open = true;
         }
-        None => {
-            if !never_written {
-                out.push_str(&format!("    if ({}) begin\n", we));
-                write_open = true;
-            }
-        }
+    } else if one_port {
+        let we = operand(module, names, fold, mem.write[live_writes[0]].we);
+        out.push_str(&format!("    if ({}) begin\n", we));
+        write_open = true;
     }
-    if write_open {
-        out.push_str(&format!("      {}[{}] <= {};\n", name, addr, data));
+
+    if one_port {
+        let port = &mem.write[live_writes[0]];
+        out.push_str(&format!(
+            "      {}[{}] <= {};\n",
+            name,
+            operand(module, names, fold, port.addr),
+            operand(module, names, fold, port.data)
+        ));
         out.push_str("    end\n");
+    } else {
+        // One `if` per port, in source order, so a later write to the same
+        // address wins -- the order `pending_write` forwarded them in, so what
+        // a read saw and what the array ends up holding cannot disagree.
+        let indent = if write_open { "      " } else { "    " };
+        for w in &live_writes {
+            let port = &mem.write[*w];
+            out.push_str(&format!(
+                "{}if ({}) {}[{}] <= {};\n",
+                indent,
+                operand(module, names, fold, port.we),
+                name,
+                operand(module, names, fold, port.addr),
+                operand(module, names, fold, port.data)
+            ));
+        }
+        if write_open {
+            out.push_str("    end\n");
+        }
     }
 
     // THE READ, INSIDE THE SAME BLOCK. The array is read on the clock edge, in
@@ -740,11 +880,16 @@ fn emit_memory_block(
     // The enable holds the value rather than letting the read free-run,
     // because the state that consumes it may wait any number of cycles on a
     // handshake. A read enable is part of the template synthesizers recognise.
-    if let Some(r) = &mem.read {
+    // One `if` per read port, all in this block. Several reads of one array
+    // are what an ASIC memory compiler answers with a multi-read cell and an
+    // FPGA answers by replicating the array under the same write stream --
+    // either way it is the tool's choice to make, and it can only make it
+    // from a template that asks for all of them together.
+    for (p, r) in mem.read.iter().enumerate() {
         out.push_str(&format!(
-            "    if ({}) {}_q <= {}[{}];\n",
+            "    if ({}) {} <= {}[{}];\n",
             operand(module, names, fold, r.en),
-            name,
+            read_reg_ident(&name, p, mem.read.len()),
             name,
             operand(module, names, fold, r.addr)
         ));
@@ -752,16 +897,157 @@ fn emit_memory_block(
     out.push_str("  end\n");
 }
 
+/// A `bram` with several write ports, built out of one-write blocks.
+///
+/// The construction is Laforest and Steffan's. One BANK per write port, so
+/// every block has the single write port it can actually infer; each bank
+/// REPLICATED once per read port, so every read has a port on every bank; and
+/// a live value table saying, per address, which bank last wrote it. A read
+/// fetches the same address from every bank and from the table, and the table
+/// picks which answer is the current one.
+///
+/// The table is registers rather than a block: it is `ceil(log2 banks)` bits
+/// wide, so a block would spend a whole primitive on one or two bits per
+/// address, and it needs a read port per reader like everything else here.
+/// That is where the cost of this lives -- LEN by that width in flip-flops --
+/// and it is why the default is to ask the target for a multi-write cell and
+/// only fall back to this when there is none.
+///
+/// The table is read on the same edge as the banks and with the same enable,
+/// so both see the memory as it was before this cycle's writes: a read and a
+/// write of one address in one cycle resolve the same way here as they do for
+/// a single-port `bram`, and forwarding sits on top of either.
+fn emit_lvt_block(
+    out: &mut String,
+    module: &Module,
+    names: &NameTable,
+    fold: &[bool],
+    mem: &Memory,
+    name: &str,
+    live_writes: &[usize],
+) {
+    let banks = live_writes.len();
+    let reads = mem.read.len();
+    let replicas = reads.max(1);
+    let lw = lvt_width(banks);
+
+    out.push('\n');
+    out.push_str(&format!(
+        "  // {} [0:{}] -- {}\n",
+        name,
+        mem.len - 1,
+        mem_note(mem.kind, banks)
+    ));
+    out.push_str(&format!(
+        "  // {} banks of one write port, {} replica(s) each, selected by a live value table\n",
+        banks, replicas
+    ));
+    out.push_str("  always @(posedge clk) begin\n");
+
+    // The table has to start somewhere, or the first read of an address
+    // nothing has written selects a bank at random rather than one bank's
+    // undefined contents. The banks themselves are not reset -- that is what
+    // stops a block RAM being inferred, and it is why this is the only array
+    // here that is registers.
+    out.push_str("    if (!rst_n) begin\n");
+    out.push_str(&format!(
+        "      for ({ix} = 0; {ix} < {len}; {ix} = {ix} + 1) {nm}_lvt[{ix}] <= {w}'d0;\n",
+        ix = format!("{}_ix", name),
+        len = mem.len,
+        nm = name,
+        w = lw
+    ));
+    out.push_str("    end else begin\n");
+
+    // Write port j owns bank j: every replica of it takes the data, and the
+    // table records that j is where the newest value now lives. In source
+    // order, so a later write to one address wins here exactly as it wins in
+    // what `pending_write` forwarded to a read in the same cycle.
+    for (bank, w) in live_writes.iter().enumerate() {
+        let port = &mem.write[*w];
+        let we = operand(module, names, fold, port.we);
+        let addr = operand(module, names, fold, port.addr);
+        let data = operand(module, names, fold, port.data);
+        out.push_str(&format!("      if ({}) begin\n", we));
+        for r in 0..replicas {
+            out.push_str(&format!(
+                "        {}[{}] <= {};\n",
+                bank_array(name, bank, r),
+                addr,
+                data
+            ));
+        }
+        out.push_str(&format!(
+            "        {}_lvt[{}] <= {}'d{};\n",
+            name, addr, lw, bank
+        ));
+        out.push_str("      end\n");
+    }
+    out.push_str("    end\n");
+
+    // Read port r goes to replica r of every bank, and to the table, all on
+    // the same enable so the answers line up in the same cycle.
+    for (r, read) in mem.read.iter().enumerate() {
+        let en = operand(module, names, fold, read.en);
+        let addr = operand(module, names, fold, read.addr);
+        out.push_str(&format!("    if ({}) begin\n", en));
+        for bank in 0..banks {
+            let arr = bank_array(name, bank, r);
+            out.push_str(&format!("      {}_q <= {}[{}];\n", arr, arr, addr));
+        }
+        out.push_str(&format!("      {}_lvt_q{} <= {}_lvt[{}];\n", name, r, name, addr));
+        out.push_str("    end\n");
+    }
+    out.push_str("  end\n");
+
+    // And the answer: the bank the table named, a cycle later.
+    for r in 0..reads {
+        let mut expr = format!("{}_q", bank_array(name, banks - 1, r));
+        for bank in (0..banks - 1).rev() {
+            expr = format!(
+                "({}_lvt_q{} == {}'d{}) ? {}_q : {}",
+                name,
+                r,
+                lw,
+                bank,
+                bank_array(name, bank, r),
+                expr
+            );
+        }
+        out.push_str(&format!(
+            "  assign {} = {};\n",
+            read_reg_ident(name, r, reads),
+            expr
+        ));
+    }
+}
+
 /// The resource each memory asked for, as a comment above its always block.
 ///
 /// Nothing in Verilog-2005 says "put this in block RAM", so the request
 /// survives as inference shape plus this note. A reader diffing the output
 /// against the DDL source needs to see that the request was heard.
-fn mem_note(kind: MemKind) -> &'static str {
-    match kind {
-        MemKind::LutRam => "distributed RAM: one sync write port, async reads",
-        MemKind::BlockRam => "block RAM: one sync write port, sync reads",
-        MemKind::BankedRam => "banked RAM",
+fn mem_note(kind: MemKind, writes: usize) -> String {
+    let reads = match kind {
+        MemKind::LutRam => "async reads",
+        MemKind::BlockRam => "sync reads",
+        MemKind::BankedRam => return "banked RAM".to_string(),
+    };
+    // A memory nothing writes is a table, and telling a reader it has a write
+    // port sends them looking for the line that writes it. How many it has is
+    // worth saying too: several is what the source asked for, and what the
+    // target has to answer with a multi-write cell or an LVT.
+    let store = match (kind, writes) {
+        (MemKind::LutRam, 0) => "distributed ROM",
+        (MemKind::BlockRam, 0) => "block ROM",
+        (MemKind::LutRam, _) => "distributed RAM",
+        (MemKind::BlockRam, _) => "block RAM",
+        (MemKind::BankedRam, _) => unreachable!("answered above"),
+    };
+    match writes {
+        0 => format!("{}: {}", store, reads),
+        1 => format!("{}: one sync write port, {}", store, reads),
+        n => format!("{}: {} sync write ports, {}", store, n, reads),
     }
 }
 
@@ -824,7 +1110,7 @@ fn signed_and_range(ty: &Ty) -> String {
 
 fn render_op(module: &Module, names: &NameTable, fold: &[bool], op: &Op, ty: &Ty) -> String {
     match op {
-        Op::MemReadReg { mem } => read_reg_name(module, *mem),
+        Op::MemReadReg { mem, port } => read_reg_name(module, *mem, *port),
         Op::MemRead { mem, addr } => {
             let m = &module.mems[*mem as usize];
             format!("{}[{}]", sanitize(&m.name), operand(module, names, fold, *addr))

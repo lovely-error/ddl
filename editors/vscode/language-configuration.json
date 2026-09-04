@@ -1,12 +1,13 @@
 {
   "comments": { "lineComment": "--" },
-  "brackets": [["(", ")"], ["[", "]"]],
+  "brackets": [["(", ")"], ["[", "]"], ["{", "}"]],
   "autoClosingPairs": [
     { "open": "(", "close": ")" },
     { "open": "[", "close": "]" },
+    { "open": "{", "close": "}" },
     { "open": "\"", "close": "\"", "notIn": ["string", "comment"] }
   ],
-  "surroundingPairs": [["(", ")"], ["[", "]"], ["\"", "\""]],
+  "surroundingPairs": [["(", ")"], ["[", "]"], ["{", "}"], ["\"", "\""]],
   "indentationRules": {
     "increaseIndentPattern": "^\\s*(fun|process|sequence|graph|struct|enum)\\b.*\\)?\\s*$|^\\s*(if\\b.*\\bthen|else|loop|for\\b.*\\bin\\b.*|match\\b.*|.*=>)\\s*$",
     "decreaseIndentPattern": "^(?!.*)$"

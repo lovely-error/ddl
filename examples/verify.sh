@@ -30,7 +30,14 @@ RTL="$K2G/rtl"
 # bram_lookup has no SystemVerilog counterpart and no equivalence testbench.
 # It is here for the RAM primitive count alone: `bram` picks a physical
 # primitive, and the netlist is the only thing that can say whether it got one.
-ALL_MODULES=(k2g_shift k2g_alu k2g_decode k2g_xstage k3g_stage fsm_adder mul3 bram_lookup)
+#
+# rf_lvt is checked against ITSELF built the other way. `--lvt-bram` is a second
+# way to build one description, so the two sides come from one source: what is
+# under test is whether banks and a live value table hold the same memory as the
+# multi-write cell they stand in for, and a hand-written reference would only be
+# a second opinion about what the description meant. Its testbench carries a
+# behavioural model too, because two builds of one wrong idea agree perfectly.
+ALL_MODULES=(k2g_shift k2g_alu k2g_decode k2g_xstage k3g_stage fsm_adder mul3 bram_lookup rf_lvt)
 MODULES=("$@")
 [ ${#MODULES[@]} -eq 0 ] && MODULES=("${ALL_MODULES[@]}")
 
@@ -78,8 +85,17 @@ for m in "${MODULES[@]}"; do
   ref_sv="$RTL/$m.sv"
   ref_srcs=("$RTL/k2g_pkg.sv" "$RTL/k2g_types.svh" "$RTL/$m.sv")
   standalone=0
+  variant=0
   parts=()
-  if [ -f "$DDL_ROOT/examples/${m}_ref.sv" ]; then
+  # Built from this same .ddl with a different flag rather than found on disk.
+  # `ref_sv` is pointed at the generated file only so the "no reference"
+  # branch below does not claim there is none.
+  if [ "$m" = "rf_lvt" ]; then
+    variant=1
+    standalone=1
+    ref_sv="$gen"
+    ref_srcs=()
+  elif [ -f "$DDL_ROOT/examples/${m}_ref.sv" ]; then
     ref_sv="$DDL_ROOT/examples/${m}_ref.sv"
     ref_srcs=("$ref_sv")
     standalone=1
@@ -103,6 +119,15 @@ for m in "${MODULES[@]}"; do
 
   eq="$WORK/$m/equiv"
   mkdir -p "$eq"
+  if [ "$variant" = "1" ]; then
+    ( cd "$DDL_ROOT" && "$DDL_BIN" build --lvt-bram "$src" -o "$eq/raw_lvt.v" ) \
+        || { fail "ddl build --lvt-bram"; continue; }
+    # Renamed so both builds can be instantiated in one testbench.
+    sed "s/^module $m (/module ${m}_lvt (/" "$eq/raw_lvt.v" > "$eq/${m}_lvt.v"
+    rm -f "$eq/raw_lvt.v"
+    ref_srcs=("$eq/${m}_lvt.v")
+    note "generated ${m}_lvt.v with --lvt-bram"
+  fi
   if [ "$standalone" = "1" ]; then
     cp "$gen" "$eq/${m}_ddl.v"
   else
@@ -165,6 +190,13 @@ TCL
 add_file -type verilog {k2g_regfile.sv}
 add_file -type verilog {k2g_alu.sv}
 add_file -type verilog {k2g_shift.sv}"
+  elif [ "$variant" = "1" ]; then
+    # The measurement the flag exists for: the same description, synthesized
+    # both ways, so the RAM primitive counts below say whether building the
+    # memory out of one-write blocks got a block RAM back.
+    cp "$eq/${m}_lvt.v" "$syn/ref/$m.sv"
+    ref_top="${m}_lvt"
+    pkg_line=""
   elif [ "$standalone" = "1" ]; then
     cp "$ref_sv" "$syn/ref/$m.sv"
     ref_top="${m}_ref"
@@ -210,6 +242,10 @@ TCL
   for d in "${sides[@]}"; do
     attempt=1
     until synth_once "$syn/$d"; do
+      # Only the silent crash is worth another go. A run that produced a log
+      # and objected in it will object again, and retrying buries the reason
+      # under two more minutes of the same.
+      if [ -s "$syn/$d/syn.log" ]; then break; fi
       attempt=$((attempt + 1))
       if [ "$attempt" -gt 3 ]; then break; fi
       note "retrying $d synthesis (gw_sh produced nothing)"
@@ -217,6 +253,37 @@ TCL
   done
   ddl_cells=$(count_cells "$syn/ddl")
   ref_cells=$(count_cells "$syn/ref")
+
+  count_rams() {
+    local vg="$1/impl/gwsynthesis/project.vg"
+    [ -f "$vg" ] || { echo 0; return; }
+    grep -cE '^\s*(RAM16[A-Z0-9]*|SDPB?|DPB?|SP|ROM)\b' "$vg"
+  }
+
+  # WHETHER THE DEFAULT BUILD SYNTHESIZES AT ALL IS THE MEASUREMENT, so it is
+  # reported rather than required. Two write ports is a shape this device has
+  # no cell for, and what GowinSynthesis does instead is fall back to
+  # flip-flops -- which for a table of any size does not fit. `--lvt-bram` is
+  # the way back to a RAM primitive, so that is the side this asserts on.
+  if [ "$variant" = "1" ]; then
+    if [ "$ddl_cells" -lt 0 ]; then
+      why=$(grep -oE 'ERROR \([A-Z0-9]+\) : .*' "$syn/ddl/syn.log" 2>/dev/null | head -1)
+      note "default build: no netlist -- ${why:-gw_sh produced nothing}"
+    else
+      note "default build: $ddl_cells cells, $(count_rams "$syn/ddl") RAM primitives"
+    fi
+    if [ "$ref_cells" -lt 0 ]; then
+      why=$(grep -oE 'ERROR \([A-Z0-9]+\) : .*' "$syn/ref/syn.log" 2>/dev/null | head -1)
+      fail "--lvt-bram build: no netlist -- ${why:-gw_sh produced nothing}"
+    else
+      lvt_rams=$(count_rams "$syn/ref")
+      note "--lvt-bram build: $ref_cells cells, $lvt_rams RAM primitives"
+      if [ "$lvt_rams" -eq 0 ]; then
+        fail "--lvt-bram inferred no RAM primitive, which is the only reason it exists"
+      fi
+    fi
+    continue
+  fi
 
   missing_netlist=0
   [ "$ddl_cells" -lt 0 ] && missing_netlist=1
@@ -240,11 +307,6 @@ TCL
     # Reported rather than failed on, because they are not this compiler's bug
     # to fix -- but reported every run, because this toolchain's real failures
     # are documented as easy to miss and must not hide among these.
-    count_rams() {
-      local vg="$1/impl/gwsynthesis/project.vg"
-      [ -f "$vg" ] || { echo 0; return; }
-      grep -cE '^\s*(RAM16[A-Z0-9]*|SDPB?|DPB?|SP|ROM)\b' "$vg"
-    }
     ddl_rams=$(count_rams "$syn/ddl")
     ref_rams=$(count_rams "$syn/ref")
     if [ "$ddl_rams" -gt 0 ] || [ "$ref_rams" -gt 0 ]; then

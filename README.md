@@ -76,15 +76,39 @@ cast.
 **Types.** `uN` and `iN` at any width, structs, enums — including tagged
 unions, where a variant carries a payload and `match` is the only way to reach
 it — and arrays backed by `lutram` (asynchronous reads) or `bram` (synchronous:
-the read costs a state, and is emitted inside the memory's own clocked block so
+the read costs a cycle, and is emitted inside the memory's own clocked block so
 it infers as a block RAM rather than as distributed RAM with a flop on it).
+That cycle is a state in a `process` and a `|||` cut in a `sequence`, where the
+memory's own output register is the pipeline register for that boundary — so
+`let v = t[a]` before a cut costs no flop of ours, and `v` means the value from
+the stage below on. A read sees the writes above it in source order, forwarded
+around the array, which updates only on the edge. A memory a stage **writes**
+is read and written in one stage — every item then sees every write of every
+item before it, plus its own — while a memory nothing writes has no order to
+keep and may be read anywhere.
+
+**Ports follow the source.** One write port per write that can happen in a
+cycle: two writes in a row are two ports, the arms of an `if` share one because
+they cannot both happen, and several states of a process share one because only
+one state is current. Reads are the same — as many as a pipeline stage asks
+for, muxed onto one in a process. An FPGA infers no RAM at all from a second
+write port while an ASIC memory compiler emits the cell, so the count is the
+source's to state and what it costs is the target's to answer: `ddl build
+--lvt-bram` builds a multi-write `bram` out of one-write blocks and a live value
+table instead of asking for a cell that an FPGA does not have. On a GW1NR-9C
+that is the difference between not fitting and four block RAMs —
+[examples/rf_lvt.ddl](examples/rf_lvt.ddl) carries the numbers, and
+`examples/verify.sh` re-measures them.
 A `[T; n]` without an `#[impl(...)]` is not storage but a packed value, so it
 can be a struct field, a pipe payload or a parameter; `a[k]` selects an
 element and `a[hi..lo]` a run of them, laid out the way SystemVerilog packs an
 array, and an index past the end is an error rather than a bit somewhere else.
 `a[k] = v` and `s.words[k] = v` assign one, at a constant index or a computed
 one; `@slice(x, base, w)` is the read side of the same idea on a plain `uN`,
-a `w`-bit window at a base this cycle decides.
+a `w`-bit window at a base this cycle decides. Going the other way, `{a, b, c}`
+joins values high-to-low and is spelled the way Verilog spells it — the result
+is `uN` of the summed widths, because a bit with something below it has no sign
+left to keep.
 Widths are checked and never silently adjusted: mixed widths are an
 error naming the `@zext`/`@trunc` that fixes them, and an unsized literal takes
 its width from the other operand.

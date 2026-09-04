@@ -69,7 +69,7 @@ const WORDS: &[&str] = &[
     "fun", "process", "sequence", "graph", "struct", "enum", "let", "var", "loop", "break",
     "for", "in", "if", "then", "else", "match", "import", "return", "buffer", "out",
     "inout", "@rcv", "@send", "@try_rcv", "@try_send", "@zext", "@sext", "@trunc", "@cast",
-    "@concat", "@zeroed", "@assert", "@unreachable", "u1", "u8", "u32", "i32", "|||", "=>", "..",
+    "@zeroed", "@assert", "@unreachable", "u1", "u8", "u32", "i32", "|||", "=>", "..", "{", "}",
     "==", "+=", "<<=", "#[impl(lutram)]", "#[impl(bram)]", "(", ")", "[", "]", ",", ":", "=",
     "+", "-", "*", "/", "%", "&", "|", "^", "~", "<", ">", "!", ".", "_", "\n", "  ", "    ",
     "8'd1", "32'hFF", "1'b0", "0", "999999999999999999999", "a", "x", "src", "dst", "-- c",

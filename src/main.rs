@@ -41,6 +41,13 @@ OPTIONS:
                     the declarations after precedence resolution, or `dot`
                     Graphviz of what each `graph` connects to what.
                     `--check` applies to `v` only.
+    --lvt-bram      build a `bram` that has more than one write port out of
+                    one-write blocks: one bank per write port, replicated per
+                    read port, and a live value table saying which bank holds
+                    the newest value. Without it the ports are emitted as
+                    written, which an ASIC memory compiler answers with a real
+                    multi-write cell -- an FPGA has none, and infers no RAM at
+                    all. Costs the table in flip-flops, so it is a choice.
 ";
 
 fn main() -> ExitCode {
@@ -72,6 +79,7 @@ struct BuildArgs {
     output: Option<String>,
     check_only: bool,
     emit: Emit,
+    lvt_bram: bool,
 }
 
 fn parse_build_args(args: &[String]) -> Result<BuildArgs, String> {
@@ -80,6 +88,7 @@ fn parse_build_args(args: &[String]) -> Result<BuildArgs, String> {
     let mut output = None;
     let mut check_only = false;
     let mut emit = Emit::Verilog;
+    let mut lvt_bram = false;
     let mut ix = 0;
     while ix < args.len() {
         match args[ix].as_str() {
@@ -98,6 +107,7 @@ fn parse_build_args(args: &[String]) -> Result<BuildArgs, String> {
                 }
             }
             "--check" => check_only = true,
+            "--lvt-bram" => lvt_bram = true,
             other if other.starts_with("--emit=") => {
                 emit = match &other["--emit=".len()..] {
                     "v" | "verilog" => Emit::Verilog,
@@ -122,7 +132,7 @@ fn parse_build_args(args: &[String]) -> Result<BuildArgs, String> {
     if inputs.is_empty() {
         return Err("no input file given".to_string());
     }
-    Ok(BuildArgs { inputs, include, output, check_only, emit })
+    Ok(BuildArgs { inputs, include, output, check_only, emit, lvt_bram })
 }
 
 /// Loads the inputs and everything they import.
@@ -154,7 +164,10 @@ fn run_build(args: &[String]) -> ExitCode {
         return ExitCode::FAILURE;
     }
 
-    let opts = EmitOptions { regenerate_cmd: regenerate_cmd(&args) };
+    let opts = EmitOptions {
+        regenerate_cmd: regenerate_cmd(&args),
+        lvt_bram: args.lvt_bram,
+    };
 
     // `--check` compares against a checked-in generated file, and only the
     // Verilog is ever checked in. Failing here beats silently comparing an IR

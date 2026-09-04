@@ -53,7 +53,7 @@ pub enum Ty {
     Mem { elem: Box<Ty>, len: u32, kind: MemKind },
 }
 
-/// Which FPGA resource the array asks to be built from. desc.md:99.
+/// Which FPGA resource the array asks to be built from. desc.md:128.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MemKind {
     /// Distributed RAM: one synchronous write port, asynchronous reads.

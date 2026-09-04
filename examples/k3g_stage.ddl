@@ -49,7 +49,7 @@ process k3g_stage (iops: buffer in in_item_t, uops: buffer out out_item_t)
     out.kind = item.kind
     out.dst = item.dst
     out.src = item.src
-    out.imm = @concat(16'd0, item.imm)
+    out.imm = {16'd0, item.imm}
 
     match item.kind
       .K_LOAD | .K_STORE =>

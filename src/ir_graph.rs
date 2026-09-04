@@ -16,7 +16,7 @@
 //     truncation at an instance port, and it is silent in every tool.
 //
 // Cycles are fine and need no handling: a net is a net whichever order the
-// instances appear in. desc.md:82 asks for that explicitly, and it is what
+// instances appear in. desc.md:111 asks for that explicitly, and it is what
 // makes a feedback path -- a retry queue, a credit return -- expressible.
 
 use std::collections::BTreeMap;
@@ -481,7 +481,7 @@ pub fn lower_graph(
 
 /// Exactly one producer and exactly one consumer for every pipe.
 ///
-/// desc.md:106 allows one producer and several consumers, by duplicating the
+/// desc.md:135 allows one producer and several consumers, by duplicating the
 /// sink -- which is what `@split` does, and it is still not what naming a pipe
 /// twice means. The duplication is real: each consumer gets its own pair of
 /// entries and its own salt, so the pipe has somewhere to put the copies. Two

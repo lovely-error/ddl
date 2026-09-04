@@ -139,7 +139,7 @@ pub enum Op {
     ///
     /// A leaf: it is driven by the memory's own clocked block, not by anything
     /// in the value graph, so nothing here computes it.
-    MemReadReg { mem: u32 },
+    MemReadReg { mem: u32, port: u32 },
 }
 
 #[derive(Debug, Clone)]
@@ -165,15 +165,27 @@ pub struct Reg {
     pub next: ValueId,
 }
 
-/// An array with a backing store: one write port, asynchronous reads.
+/// An array with a backing store, and as many ports as the source asked for.
 ///
-/// One write port is not a simplification, it is the constraint. K2G paid for
-/// learning it: a second write port on the 32x32 value array inferred no RAM
-/// at all and the array collapsed to 1120 flip-flops and ~3700 LUTs of read
-/// muxing, against 32 SSRAM primitives and ~100 LUTs for the single-port
-/// version (k2g_regfile.sv:18-24). So the write port is a fixed part of the
-/// shape here, and several writes in the source mux onto it rather than
-/// multiplying it.
+/// ONE WRITE PORT IS WHAT AN FPGA CAN INFER, and K2G paid for learning it: a
+/// second write port on the 32x32 value array inferred no RAM at all and the
+/// array collapsed to 1120 flip-flops and ~3700 LUTs of read muxing, against
+/// 32 SSRAM primitives and ~100 LUTs for the single-port version
+/// (k2g_regfile.sv:18-24).
+///
+/// That is a cost on one target, though, not a rule about what a design may
+/// say. A memory compiler on an ASIC flow emits a real multi-write cell, and
+/// capping the language at one port would put an FPGA's limit in the way of
+/// every other target. So the count follows the source -- one port per write
+/// that can happen in a cycle -- and the two answers to what that costs are
+/// both available: emit the ports and let the target's compiler build the
+/// cell, or `--lvt-bram` to build one out of one-write blocks and a live
+/// value table, which is what gets a block RAM back on an FPGA.
+///
+/// Writes that CANNOT happen together still share a port, which is the case
+/// the measurement above is really about: the arms of an `if` both write slot
+/// 0 and the SSA join muxes them, so the ordinary conditional write is one
+/// port as it always was.
 #[derive(Debug, Clone)]
 pub struct Memory {
     pub name: String,
@@ -187,17 +199,42 @@ pub struct Memory {
     /// up undefined. The reset loop costs area -- roughly 85 LUTs on the K2G
     /// value array -- so it is a choice the source makes, not a default.
     pub reset: Option<u128>,
-    /// The write port, as ordinary values in the same graph.
+    /// The write ports, as ordinary values in the same graph, in source
+    /// order: a later one overrides an earlier one at the same address.
+    ///
+    /// A LIST because two writes that can happen in the same cycle are two
+    /// ports and there is nothing to mux them onto. Writes that CANNOT --
+    /// the two arms of an `if` -- share one, and the SSA join is what proves
+    /// it: both arms write slot 0, and the join muxes them together.
+    pub write: Vec<WritePort>,
+    /// A port that never fires, emitted once with the memory.
+    ///
+    /// Every join needs one for the arm that wrote fewer times, and every
+    /// mux chain needs one to start from. Kept here rather than emitted where
+    /// it is wanted, so a memory contributes three constants to the value
+    /// graph and not three per question asked about it.
+    pub idle: WritePort,
+    /// The synchronous read ports, in the order the source asked for them.
+    ///
+    /// Empty for a `lutram`, whose reads are combinational and need no port --
+    /// that is the whole difference between the two kinds, and it is the
+    /// difference the backend has to emit for a synthesizer to infer the right
+    /// primitive.
+    ///
+    /// A LIST because a pipeline's stages are concurrent: two reads in one
+    /// stage are two addresses in the same cycle and there is nothing to mux
+    /// them onto. A `process` still settles its reads onto one port, because
+    /// one state is current and the mux is free -- so the length here is what
+    /// the lowering decided it needed, not a property of the kind.
+    pub read: Vec<ReadPort>,
+}
+
+/// One write port: when, where, and what.
+#[derive(Debug, Clone, Copy)]
+pub struct WritePort {
     pub we: ValueId,
     pub addr: ValueId,
     pub data: ValueId,
-    /// The synchronous read port, for a memory that has one.
-    ///
-    /// `None` for a `lutram`, whose reads are combinational and need no port
-    /// -- that is the whole difference between the two kinds, and it is the
-    /// difference the backend has to emit for a synthesizer to infer the right
-    /// primitive.
-    pub read: Option<ReadPort>,
 }
 
 /// A synchronous read: an address, an enable, and the register the value
@@ -342,9 +379,9 @@ pub fn render_module(m: &Module) -> String {
             mem.kind.display(),
             mem.addr_width,
             reset,
-            mem.we.0,
-            mem.addr.0,
-            mem.data.0
+            mem.write.iter().map(|w| w.we.0.to_string()).collect::<Vec<_>>().join(","),
+            mem.write.iter().map(|w| w.addr.0.to_string()).collect::<Vec<_>>().join(","),
+            mem.write.iter().map(|w| w.data.0.to_string()).collect::<Vec<_>>().join(",")
         ));
     }
     for (ix, r) in m.regs.iter().enumerate() {
@@ -413,7 +450,7 @@ fn render_op_ir(m: &Module, op: &Op) -> String {
             text.push_str(&format!(" [_ -> %{}]", default.0));
             text
         }
-        Op::MemReadReg { mem } => format!("memq #{}", mem),
+        Op::MemReadReg { mem, port } => format!("memq #{}.{}", mem, port),
         Op::MemRead { mem, addr } => {
             format!("memread {}[%{}]", m.mems[*mem as usize].name, addr.0)
         }
@@ -653,6 +690,13 @@ pub struct Lowerer<'a> {
     pub port_outs: Vec<PortOut>,
     /// Memories in declaration order. Reads name one by index.
     pub mems: Vec<Memory>,
+    /// How many write ports each memory has taken on the path being lowered.
+    ///
+    /// Beside the environment rather than in it, because it is a count the
+    /// compiler keeps and not a value the hardware holds -- a branch join
+    /// takes the LARGER of its two arms' counts, which is not something a mux
+    /// could express.
+    mem_slots: Vec<usize>,
     /// Immediate assertions, in source order.
     pub asserts: Vec<Assertion>,
     /// Constant parameters, in declaration order.
@@ -660,6 +704,12 @@ pub struct Lowerer<'a> {
     /// `!done` for a process that stops, so its memories stop being written
     /// when it does. `None` for one that repeats.
     pub stop_writes: Option<ValueId>,
+    /// Set while lowering a `sequence`.
+    ///
+    /// Read only by diagnostics, which have to name the place a cycle can be
+    /// spent, and the two kinds of declaration spell it differently: a state
+    /// in a process, a `|||` cut in a pipeline.
+    pub in_pipeline: bool,
     /// The conditions under which the statements being lowered right now run,
     /// outermost first. Empty means unconditionally.
     ///
@@ -696,9 +746,11 @@ impl<'a> Lowerer<'a> {
             port_ins: Vec::new(),
             port_outs: Vec::new(),
             mems: Vec::new(),
+            mem_slots: Vec::new(),
             asserts: Vec::new(),
             params: Vec::new(),
             stop_writes: None,
+            in_pipeline: false,
             path: Vec::new(),
             anchors: Vec::new(),
             values: Vec::new(),
@@ -964,19 +1016,225 @@ impl<'a> Lowerer<'a> {
         id
     }
 
-    /// Env keys holding a memory's write port while the body runs.
+    /// Env keys holding one of a memory's write ports while the body runs.
     ///
     /// `#` cannot appear in an identifier, so these cannot collide with a name
     /// the source chose. Keeping them in the ordinary environment is what
     /// makes a write inside an `if` work with no extra machinery: the SSA join
     /// muxes them exactly as it muxes any other binding, so
     /// `if we_value: values[w_addr] = w_value` becomes a write enable.
-    pub fn mem_port_keys(name: &str) -> (String, String, String) {
+    ///
+    /// The slot is which port. They are created ON DEMAND, one per write the
+    /// path has performed, so a memory nothing writes has none at all and a
+    /// branch that writes once more than the other is a slot only one arm
+    /// filled -- which the join finishes with an idle port.
+    pub fn mem_port_keys(name: &str, slot: usize) -> (String, String, String) {
         (
-            format!("{}#we", name),
-            format!("{}#addr", name),
-            format!("{}#data", name),
+            format!("{}#{}#we", name, slot),
+            format!("{}#{}#addr", name, slot),
+            format!("{}#{}#data", name, slot),
         )
+    }
+
+    /// How many write ports `mems[ix]` has taken on the path being lowered.
+    pub fn mem_slots(&self, ix: usize) -> usize {
+        self.mem_slots[ix]
+    }
+
+    /// Sets that count, for a join that reconciles two arms or a state that
+    /// starts over.
+    pub fn set_mem_slots(&mut self, ix: usize, n: usize) {
+        self.mem_slots[ix] = n;
+    }
+
+    /// A port that never fires: enabled never, addressing nothing, zero data.
+    pub fn idle_write(&mut self, ix: usize) -> WritePort {
+        self.mems[ix].idle
+    }
+
+    /// Reads slot `slot` of `mems[ix]` out of `env`, if it has one.
+    ///
+    /// Emits nothing, so probing a slot an arm never filled costs no values --
+    /// the caller supplies `idle_write` only where it turns out to need one.
+    pub fn write_slot(&self, ix: usize, slot: usize, env: &Env) -> Option<WritePort> {
+        let (we_key, addr_key, data_key) = Self::mem_port_keys(&self.mems[ix].name, slot);
+        Some(WritePort {
+            we: env.get(&we_key).and_then(|b| b.value)?,
+            addr: env.get(&addr_key).and_then(|b| b.value)?,
+            data: env.get(&data_key).and_then(|b| b.value)?,
+        })
+    }
+
+    /// Writes one slot back into `env`.
+    pub fn put_write_slot(&mut self, ix: usize, slot: usize, port: WritePort, env: &mut Env) {
+        let (we_key, addr_key, data_key) = Self::mem_port_keys(&self.mems[ix].name, slot);
+        let (aw, elem) = (self.mems[ix].addr_width, self.mems[ix].elem.clone());
+        env.insert(we_key, Binding::constant(port.we, Ty::BOOL));
+        env.insert(addr_key, Binding::constant(port.addr, Ty::UInt(aw)));
+        env.insert(data_key, Binding::constant(port.data, elem));
+    }
+
+    /// Joins the write ports two arms of a branch created.
+    ///
+    /// Slots below `base` existed before the branch and neither arm touched
+    /// them -- a write appends, it never overwrites -- so only the ones the
+    /// arms added need reconciling. An arm that added fewer gets an idle port
+    /// for the difference, which is what makes `if c then m[a] = v` with no
+    /// else come out as a write enable of `c` rather than as a second port.
+    #[allow(clippy::too_many_arguments)]
+    pub fn join_write_slots(
+        &mut self,
+        cond: ValueId,
+        base: &[usize],
+        then_env: &Env,
+        then_n: &[usize],
+        else_env: &Env,
+        else_n: &[usize],
+        env: &mut Env,
+    ) {
+        for ix in 0..self.mems.len() {
+            let n = then_n[ix].max(else_n[ix]);
+            for slot in base[ix]..n {
+                let t = self.write_slot(ix, slot, then_env);
+                let e = self.write_slot(ix, slot, else_env);
+                let (t, e) = match (t, e) {
+                    (None, None) => continue,
+                    (Some(t), None) => {
+                        let idle = self.idle_write(ix);
+                        (t, idle)
+                    }
+                    (None, Some(e)) => {
+                        let idle = self.idle_write(ix);
+                        (idle, e)
+                    }
+                    (Some(t), Some(e)) => (t, e),
+                };
+                let we = self.mux_or_same(cond, t.we, e.we, Ty::BOOL);
+                let addr_ty = Ty::UInt(self.mems[ix].addr_width);
+                let addr = self.mux_or_same(cond, t.addr, e.addr, addr_ty);
+                let elem = self.mems[ix].elem.clone();
+                let data = self.mux_or_same(cond, t.data, e.data, elem);
+                self.put_write_slot(ix, slot, WritePort { we, addr, data }, env);
+            }
+            self.mem_slots[ix] = n;
+        }
+    }
+
+    /// Joins the write ports a `match`'s arms created.
+    ///
+    /// The `if` join with more than two ways to go: `arms` is every arm's
+    /// environment and slot count in order, the LAST being the default, and
+    /// each field becomes a `Case` on the tag rather than a mux.
+    pub fn join_write_slots_case(
+        &mut self,
+        tag: ValueId,
+        base: &[usize],
+        arms: &[(Vec<u128>, Env, Vec<usize>)],
+        env: &mut Env,
+    ) {
+        let Some((_, default_env, default_n)) = arms.last() else {
+            return;
+        };
+        for ix in 0..self.mems.len() {
+            let n = arms.iter().map(|(_, _, c)| c[ix]).max().unwrap_or(0);
+            for slot in base[ix]..n {
+                let idle = self.idle_write(ix);
+                let default = if default_n[ix] > slot {
+                    self.write_slot(ix, slot, default_env).unwrap_or(idle)
+                } else {
+                    idle
+                };
+                // Only arms that differ from the default earn a label, the
+                // same rule the value join uses -- otherwise every arm would
+                // contribute an entry for every port of every memory.
+                let mut we_arms = Vec::new();
+                let mut addr_arms = Vec::new();
+                let mut data_arms = Vec::new();
+                for (labels, arm_env, counts) in arms.iter().take(arms.len() - 1) {
+                    let p = if counts[ix] > slot {
+                        match self.write_slot(ix, slot, arm_env) {
+                            Some(p) => p,
+                            None => idle,
+                        }
+                    } else {
+                        idle
+                    };
+                    if p.we != default.we {
+                        we_arms.push((labels.clone(), p.we));
+                    }
+                    if p.addr != default.addr {
+                        addr_arms.push((labels.clone(), p.addr));
+                    }
+                    if p.data != default.data {
+                        data_arms.push((labels.clone(), p.data));
+                    }
+                }
+                let addr_ty = Ty::UInt(self.mems[ix].addr_width);
+                let elem = self.mems[ix].elem.clone();
+                let we = self.case_or_same(tag, we_arms, default.we, Ty::BOOL);
+                let addr = self.case_or_same(tag, addr_arms, default.addr, addr_ty);
+                let data = self.case_or_same(tag, data_arms, default.data, elem);
+                self.put_write_slot(ix, slot, WritePort { we, addr, data }, env);
+            }
+            self.mem_slots[ix] = n;
+        }
+    }
+
+    /// A `Case`, or the default alone when no arm disagreed with it.
+    fn case_or_same(
+        &mut self,
+        tag: ValueId,
+        arms: Vec<(Vec<u128>, ValueId)>,
+        default: ValueId,
+        ty: Ty,
+    ) -> ValueId {
+        if arms.is_empty() {
+            return default;
+        }
+        self.emit(ty, Op::Case { scrutinee: tag, arms, default })
+    }
+
+    /// `cond ? a : b`, or `a` when the two cannot differ.
+    ///
+    /// The constant case is not an optimisation for its own sake. Both arms of
+    /// `if c then m[i] = x else m[j] = y` write with an enable of literal 1,
+    /// emitted separately, so without this the shared port's enable comes out
+    /// as `c ? 1'b1 : 1'b1`.
+    fn mux_or_same(&mut self, cond: ValueId, a: ValueId, b: ValueId, ty: Ty) -> ValueId {
+        if a == b {
+            return a;
+        }
+        if let (Op::Const(x), Op::Const(y)) =
+            (&self.values[a.0 as usize].op, &self.values[b.0 as usize].op)
+            && x == y
+        {
+            return a;
+        }
+        self.emit(ty, Op::Mux { cond, then_val: a, else_val: b })
+    }
+
+    /// What each memory's write-port count is right now, for a branch to
+    /// restore between its arms and reconcile after them.
+    pub fn mem_slot_counts(&self) -> Vec<usize> {
+        self.mem_slots.clone()
+    }
+
+    /// Restores those counts.
+    pub fn set_mem_slot_counts(&mut self, counts: &[usize]) {
+        self.mem_slots.copy_from_slice(counts);
+    }
+
+    /// Forgets every write port, for a state that starts its own.
+    pub fn clear_write_slots(&mut self, env: &mut Env) {
+        for ix in 0..self.mems.len() {
+            for slot in 0..self.mem_slots[ix] {
+                let (we, addr, data) = Self::mem_port_keys(&self.mems[ix].name, slot);
+                env.remove(&we);
+                env.remove(&addr);
+                env.remove(&data);
+            }
+            self.mem_slots[ix] = 0;
+        }
     }
 
     pub fn mem_index(&self, name: &str) -> Option<usize> {
@@ -996,14 +1254,11 @@ impl<'a> Lowerer<'a> {
         // `len - 1` rather than `len`: 32 entries are addressed by 5 bits, and
         // `bits_for(32)` would say 6.
         let addr_width = bits_for((len - 1) as u128);
-        let we = self.emit(Ty::BOOL, Op::Const(0));
-        let addr = self.emit(Ty::UInt(addr_width), Op::Const(0));
-        let data = self.emit(elem.clone(), Op::Const(0));
-
-        let (we_key, addr_key, data_key) = Self::mem_port_keys(&name);
-        env.insert(we_key, Binding::constant(we, Ty::BOOL));
-        env.insert(addr_key, Binding::constant(addr, Ty::UInt(addr_width)));
-        env.insert(data_key, Binding::constant(data, elem.clone()));
+        let idle = WritePort {
+            we: self.emit(Ty::BOOL, Op::Const(0)),
+            addr: self.emit(Ty::UInt(addr_width), Op::Const(0)),
+            data: self.emit(elem.clone(), Op::Const(0)),
+        };
 
         let mem_ty = Ty::Mem { elem: Box::new(elem.clone()), len, kind };
         // A memory is reached by subscript, never assigned as a whole.
@@ -1020,11 +1275,11 @@ impl<'a> Lowerer<'a> {
             kind,
             addr_width,
             reset,
-            we,
-            addr,
-            data,
-            read: None,
+            write: Vec::new(),
+            idle,
+            read: Vec::new(),
         });
+        self.mem_slots.push(0);
         ix
     }
 
@@ -1032,24 +1287,22 @@ impl<'a> Lowerer<'a> {
     /// body, so what the source did decides what the write port carries.
     pub fn settle_memories(&mut self, env: &Env) {
         for ix in 0..self.mems.len() {
-            let (we_key, addr_key, data_key) = Self::mem_port_keys(&self.mems[ix].name);
-            if let Some(v) = env.get(&we_key).and_then(|b| b.value) {
-                self.mems[ix].we = v;
+            let mut ports = Vec::with_capacity(self.mem_slots[ix]);
+            for slot in 0..self.mem_slots[ix] {
+                let Some(p) = self.write_slot(ix, slot, env) else {
+                    continue;
+                };
+                let we = match self.stop_writes {
+                    None => p.we,
+                    Some(r) => self.emit(Ty::BOOL, Op::Bin { op: BinOp::And, lhs: p.we, rhs: r }),
+                };
+                ports.push(WritePort {
+                    we,
+                    addr: self.drop_gated_mux(p.addr, we),
+                    data: self.drop_gated_mux(p.data, we),
+                });
             }
-            if let Some(v) = env.get(&addr_key).and_then(|b| b.value) {
-                self.mems[ix].addr = v;
-            }
-            if let Some(v) = env.get(&data_key).and_then(|b| b.value) {
-                self.mems[ix].data = v;
-            }
-            let we = self.mems[ix].we;
-            let we = match self.stop_writes {
-                None => we,
-                Some(r) => self.emit(Ty::BOOL, Op::Bin { op: BinOp::And, lhs: we, rhs: r }),
-            };
-            self.mems[ix].we = we;
-            self.mems[ix].addr = self.drop_gated_mux(self.mems[ix].addr, we);
-            self.mems[ix].data = self.drop_gated_mux(self.mems[ix].data, we);
+            self.mems[ix].write = ports;
         }
     }
 
@@ -1410,9 +1663,86 @@ impl<'a> Lowerer<'a> {
         self.emit(pair, Op::Concat(vec![e1, e0]))
     }
 
+    /// The literal a value is, if it is one.
+    pub fn const_of(&self, v: ValueId) -> Option<u128> {
+        match self.values[v.0 as usize].op {
+            Op::Const(k) => Some(k),
+            _ => None,
+        }
+    }
+
     /// An equality test between two already-matching operands.
     pub fn emit_eq(&mut self, lhs: ValueId, rhs: ValueId) -> ValueId {
         self.emit(Ty::BOOL, Op::Cmp { op: CmpOp::Eq, lhs, rhs })
+    }
+
+    /// Whether a read of `mem` at `addr` collides with the write the source has
+    /// offered so far, and what that write would put there.
+    ///
+    /// `None` when nothing has written the memory yet on this path -- the
+    /// common case, and worth answering separately rather than as a mux on a
+    /// constant-false: a memory that is only read should emit exactly what it
+    /// emitted before this existed.
+    ///
+    /// "So far" is the whole trick. `lower_mem_write` leaves the write port in
+    /// the environment, and every branch join muxes it like any other binding,
+    /// so at the moment a read is lowered these three values ARE the writes
+    /// that precede it in source order -- already collapsed onto the one port
+    /// the memory has, guards and all. Nothing has to walk the statements
+    /// again to work out which writes came first.
+    pub fn pending_write(
+        &mut self,
+        mem_ix: usize,
+        addr: ValueId,
+        env: &Env,
+    ) -> Option<(ValueId, ValueId)> {
+        let mut answer: Option<(ValueId, ValueId)> = None;
+        // Earliest first, each later one layered over the top: two writes to
+        // one address in a cycle are resolved by source order, and the port
+        // logic resolves them the same way, so what a read sees and what the
+        // array ends up holding cannot disagree.
+        for slot in 0..self.mem_slots[mem_ix] {
+            let (we_key, addr_key, data_key) = Self::mem_port_keys(&self.mems[mem_ix].name, slot);
+            let Some(we) = env.get(&we_key).and_then(|b| b.value) else {
+                continue;
+            };
+            if matches!(self.values[we.0 as usize].op, Op::Const(0)) {
+                continue;
+            }
+            let Some(waddr) = env.get(&addr_key).and_then(|b| b.value) else {
+                continue;
+            };
+            let Some(wdata) = env.get(&data_key).and_then(|b| b.value) else {
+                continue;
+            };
+            // `m[i] = v` then `m[i]` is the shape this exists for, and both
+            // lines lower `i` to the same value. Emitting `(i == i)` would put
+            // a comparator in the netlist that is true by construction, so the
+            // identity is worth spotting here rather than hoping a synthesizer
+            // spots it later.
+            let hit = if addr == waddr {
+                we
+            } else {
+                let same = self.emit_eq(addr, waddr);
+                self.emit(Ty::BOOL, Op::Bin { op: BinOp::And, lhs: we, rhs: same })
+            };
+            answer = Some(match answer {
+                None => (hit, wdata),
+                Some((prev_hit, prev_data)) => {
+                    let ty = self.ty_of(prev_data);
+                    let data = self.emit(
+                        ty,
+                        Op::Mux { cond: hit, then_val: wdata, else_val: prev_data },
+                    );
+                    let any = self.emit(
+                        Ty::BOOL,
+                        Op::Bin { op: BinOp::Or, lhs: prev_hit, rhs: hit },
+                    );
+                    (any, data)
+                }
+            });
+        }
+        answer
     }
 
     pub fn coerce_const_pub(&mut self, value: ValueId, want: &Ty) -> Option<ValueId> {
@@ -1644,7 +1974,7 @@ fn blocks_somewhere(body: &[PrecResInnerStmt]) -> bool {
 
 /// The half-open range a `for` runs over.
 ///
-/// Two spellings, from desc.md:65. `0..n` is the range itself. `for k in arr`
+/// Two spellings, from desc.md:94. `0..n` is the range itself. `for k in arr`
 /// iterates a memory, and means `0..len` -- the binding is the INDEX, because
 /// a memory element is reached by subscript and handing back a copy would hide
 /// that every read is a port.
@@ -2650,10 +2980,10 @@ fn lower_stmt_at(
                 sink.push(
                     Diag::error(
                         low.span(&decl.head_name()),
-                        format!("`{}` is a memory, which is state rather than a value", name),
+                        format!("`{}` is a memory, which is storage rather than a value", name),
                     )
                     .with_note(
-                        "declare it as a `var` at the top of a `process`; a `sequence` must not contain memory (desc.md:44)",
+                        "declare it as a `var` at the top of the body, where a `process` and a `sequence` both put one; a `fun` is combinational and has nowhere to keep it",
                     ),
                 );
                 return None;
@@ -3066,20 +3396,31 @@ fn lower_stmt_at(
                 return None;
             }
 
+            // Both arms start from the same write-port count, which is what
+            // makes them share a slot and so share a port.
+            let base = low.mem_slot_counts();
+
             let mut then_env = env.clone();
             let depth = low.push_cond(cond, true);
             lower_branch(low, &ite.then_case, &mut then_env, sink)?;
             low.pop_path(depth);
+            let then_n = low.mem_slot_counts();
 
+            low.set_mem_slot_counts(&base);
             let mut else_env = env.clone();
             if let Some(else_case) = &ite.else_case {
                 let depth = low.push_cond(cond, false);
                 lower_branch(low, else_case, &mut else_env, sink)?;
                 low.pop_path(depth);
             }
+            let else_n = low.mem_slot_counts();
 
             // SSA join: any binding the two arms disagree about becomes a mux.
-            let names: Vec<String> = env.keys().cloned().collect();
+            //
+            // Write ports are joined separately, below: they are created as
+            // the arms run, so the keys an arm added are not in `env` here to
+            // be walked, and the two arms can have added different numbers.
+            let names: Vec<String> = env.keys().filter(|k| !k.contains('#')).cloned().collect();
             for name in names {
                 let t = then_env.get(&name).and_then(|b| b.value);
                 let e = else_env.get(&name).and_then(|b| b.value);
@@ -3128,6 +3469,7 @@ fn lower_stmt_at(
                         b.value = Some(v);
                     }
             }
+            low.join_write_slots(cond, &base, &then_env, &then_n, &else_env, &else_n, env);
             Some(())
         }
 
@@ -3529,6 +3871,26 @@ pub fn lower_expr(
             Some(low.emit(ty, Op::Const(*value)))
         }
 
+        // `{a, b, c}` -- the operands laid down high-to-low, which is the
+        // order they are written in and the order `Op::Concat` emits.
+        //
+        // The result is `uN` however the parts were typed. A concatenation has
+        // no sign: the top bit of the leftmost operand is just a bit once
+        // something is below it, and an `iN` that wanted to keep its sign
+        // wanted `@sext`, not this. Width is the sum, so an operand of the
+        // wrong width is a width error at the USE, naming a number the reader
+        // can check against the braces.
+        PrecResExpr::Splice(parts) => {
+            let mut values = Vec::with_capacity(parts.len());
+            let mut total = 0u32;
+            for p in parts {
+                let v = lower_expr(low, p, env, sink)?;
+                total += low.ty_of(v).bit_width();
+                values.push(v);
+            }
+            Some(low.emit(Ty::UInt(total), Op::Concat(values)))
+        }
+
         PrecResExpr::Literal(other) => {
             sink.err_span(
                 low.here(),
@@ -3921,17 +4283,51 @@ fn lower_mem_read(
                 low.span(&mem_name),
                 format!("a read of `{}` takes a cycle, so it cannot sit inside an expression", name),
             )
-            .with_note(format!(
-                "bind it on its own line -- `let x = {}[i]` -- which makes the cycle a state",
-                name
-            )),
+            // The cycle has to be somewhere the source can point at, and the
+            // two kinds of declaration spell that place differently: a state
+            // in a process, a stage cut in a sequence.
+            .with_note(if low.in_pipeline {
+                format!(
+                    "bind it on its own line -- `let x = {}[i]` -- and put a `|||` after it, which is the cycle",
+                    name
+                )
+            } else {
+                format!(
+                    "bind it on its own line -- `let x = {}[i]` -- which makes the cycle a state",
+                    name
+                )
+            }),
         );
         return None;
     }
     let (elem, addr_width) = (low.mems[ix].elem.clone(), low.mems[ix].addr_width);
     let raw = lower_expr(low, index, env, sink)?;
     let addr = low.fit_address(raw, addr_width, &mem_name, sink)?;
-    Some(low.emit(elem, Op::MemRead { mem: ix as u32, addr }))
+    let array = low.emit(elem.clone(), Op::MemRead { mem: ix as u32, addr });
+
+    // A write earlier in this state -- or this stage -- has not reached the
+    // array yet. The array updates on the clock edge, so `m[a] = v` followed
+    // by `m[a]` read the OLD contents, which is not what the two lines say
+    // happened. Forwarding the pending write is what makes the source mean
+    // what it reads as.
+    //
+    // Only an ASYNCHRONOUS read needs this here. A `bram` read is scheduled
+    // into a later state or stage than any write, so by the time it looks the
+    // array has been updated -- see ir_pipe for the pipeline's version, where
+    // the write is in the same CYCLE and the mux moves to the far side of the
+    // cut.
+    match low.pending_write(ix, addr, env) {
+        None => Some(array),
+        // An UNCONDITIONAL write to the address being read answers the read by
+        // itself. Keeping the mux would leave the array read feeding a branch
+        // that can never be taken, which is a wire and a read port asked of
+        // the memory for nothing.
+        Some((hit, wdata)) if matches!(low.values[hit.0 as usize].op, Op::Const(1)) => Some(wdata),
+        Some((hit, wdata)) => Some(low.emit(
+            elem,
+            Op::Mux { cond: hit, then_val: wdata, else_val: array },
+        )),
+    }
 }
 
 /// `m[addr] = value` -- an offer to the one write port.
@@ -3984,8 +4380,16 @@ fn lower_mem_write(
         }
     }
 
+    // A NEW slot, not an overwrite of the last one. Two writes in a row can
+    // both happen this cycle, so they are two ports; before this the second
+    // replaced the first in the environment and the first was silently lost.
+    // Writes that cannot both happen -- the arms of an `if` -- still share a
+    // slot, because both arms start from the same count and the join brings
+    // them back together.
     let one = low.emit(Ty::BOOL, Op::Const(1));
-    let (we_key, addr_key, data_key) = Lowerer::mem_port_keys(&name);
+    let slot = low.mem_slots(ix);
+    low.set_mem_slots(ix, slot + 1);
+    let (we_key, addr_key, data_key) = Lowerer::mem_port_keys(&name, slot);
     env.insert(we_key, Binding::constant(one, Ty::BOOL));
     env.insert(addr_key, Binding::constant(addr, Ty::UInt(addr_width)));
     env.insert(data_key, Binding::constant(value, elem));
@@ -4321,20 +4725,6 @@ fn lower_builtin(
                 ));
             }
             return Some(low.emit(Ty::UInt(width), Op::DynSlice { arg, base, width }));
-        }
-        Concat => {
-            if args.is_empty() {
-                sink.err_span(low.here(), "`@concat` needs at least one argument");
-                return None;
-            }
-            let mut parts = Vec::new();
-            let mut total = 0u32;
-            for a in args {
-                let v = lower_expr(low, a, env, sink)?;
-                total += low.ty_of(v).bit_width();
-                parts.push(v);
-            }
-            return Some(low.emit(Ty::UInt(total), Op::Concat(parts)));
         }
         Rep => {
             let (arg, times) = cast_args(low, args, env, sink)?;
