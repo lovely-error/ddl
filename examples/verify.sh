@@ -31,13 +31,20 @@ RTL="$K2G/rtl"
 # It is here for the RAM primitive count alone: `bram` picks a physical
 # primitive, and the netlist is the only thing that can say whether it got one.
 #
-# rf_lvt is checked against ITSELF built the other way. `--lvt-bram` is a second
-# way to build one description, so the two sides come from one source: what is
-# under test is whether banks and a live value table hold the same memory as the
-# multi-write cell they stand in for, and a hand-written reference would only be
-# a second opinion about what the description meant. Its testbench carries a
-# behavioural model too, because two builds of one wrong idea agree perfectly.
-ALL_MODULES=(k2g_shift k2g_alu k2g_decode k2g_xstage k3g_stage fsm_adder mul3 bram_lookup rf_lvt)
+# rf_lvt and rf_lvt_proc are checked against THEMSELVES built the other way.
+# `--lvt-bram` is a second way to build one description, so the two sides come
+# from one source: what is under test is whether banks and a live value table
+# hold the same memory as the multi-write cell they stand in for, and a
+# hand-written reference would only be a second opinion about what the
+# description meant. Their testbenches carry a behavioural model too, because
+# two builds of one wrong idea agree with each other perfectly.
+#
+# BOTH, because a sequence and a process reach the ports through different code
+# and come out a different shape: a process muxes every read onto one port, so
+# its banks have one replica where the pipeline's have one per read. Proving
+# either says nothing about the other.
+VARIANT_MODULES=(rf_lvt rf_lvt_proc)
+ALL_MODULES=(k2g_shift k2g_alu k2g_decode k2g_xstage k3g_stage fsm_adder mul3 bram_lookup rf_lvt rf_lvt_proc)
 MODULES=("$@")
 [ ${#MODULES[@]} -eq 0 ] && MODULES=("${ALL_MODULES[@]}")
 
@@ -90,7 +97,7 @@ for m in "${MODULES[@]}"; do
   # Built from this same .ddl with a different flag rather than found on disk.
   # `ref_sv` is pointed at the generated file only so the "no reference"
   # branch below does not claim there is none.
-  if [ "$m" = "rf_lvt" ]; then
+  if printf '%s\n' "${VARIANT_MODULES[@]}" | grep -qx "$m"; then
     variant=1
     standalone=1
     ref_sv="$gen"

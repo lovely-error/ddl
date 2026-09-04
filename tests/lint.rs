@@ -79,33 +79,50 @@ fn generated_verilog() -> Vec<PathBuf> {
     out
 }
 
-/// The `--lvt-bram` build of examples/rf_lvt.ddl, written where it can be
-/// linted with the rest.
+/// The `--lvt-bram` builds, written where they can be linted with the rest.
 ///
-/// It is not a checked-in `.v` because it is a second way to build a file that
-/// already has one, and two generated outputs from one source is one of them
-/// going stale. But it is the newest emission in the backend -- bank arrays,
-/// per-read replicas, a table and the wires that select from it -- so leaving
-/// it out would mean the least-exercised path is the one nothing reads.
-fn lvt_variant() -> Option<PathBuf> {
+/// They are not checked-in `.v` files because each is a second way to build a
+/// source that already has one, and two generated outputs from one source is
+/// one of them going stale. But this is the newest emission in the backend --
+/// bank arrays, per-read replicas, a table and the wires that select from it
+/// -- so leaving it out would mean the least-exercised path is the one nothing
+/// reads.
+///
+/// BOTH constructs, because they come out a different shape: a process muxes
+/// every read onto one port, so its banks have one replica where a pipeline's
+/// have one per read.
+fn lvt_variants() -> Vec<PathBuf> {
     use ddl::driver::compile_to_verilog;
     use ddl::verilog::EmitOptions;
 
-    let src = "examples/rf_lvt.ddl".to_string();
-    let (map, load_diags) = ddl::source::load_program(std::slice::from_ref(&src), Vec::new()).ok()?;
-    if !load_diags.is_empty() {
-        return None;
+    let mut out = Vec::new();
+    for name in ["rf_lvt", "rf_lvt_proc"] {
+        let src = format!("examples/{}.ddl", name);
+        let Ok((map, load_diags)) =
+            ddl::source::load_program(std::slice::from_ref(&src), Vec::new())
+        else {
+            continue;
+        };
+        if !load_diags.is_empty() {
+            continue;
+        }
+        let opts = EmitOptions {
+            regenerate_cmd: format!("ddl build --lvt-bram {}", src),
+            lvt_bram: true,
+        };
+        let Ok(text) = compile_to_verilog(&map, &opts) else {
+            continue;
+        };
+        let dir = PathBuf::from("target/lint");
+        if std::fs::create_dir_all(&dir).is_err() {
+            continue;
+        }
+        let path = dir.join(format!("{}_lvt.v", name));
+        if std::fs::write(&path, text).is_ok() {
+            out.push(path);
+        }
     }
-    let opts = EmitOptions {
-        regenerate_cmd: "ddl build --lvt-bram examples/rf_lvt.ddl".to_string(),
-        lvt_bram: true,
-    };
-    let text = compile_to_verilog(&map, &opts).ok()?;
-    let dir = PathBuf::from("target/lint");
-    std::fs::create_dir_all(&dir).ok()?;
-    let out = dir.join("rf_lvt_lvt.v");
-    std::fs::write(&out, text).ok()?;
-    Some(out)
+    out
 }
 
 #[cfg_attr(miri, ignore = "runs a subprocess")]
@@ -128,8 +145,8 @@ fn the_generated_verilog_passes_a_linter() {
     };
 
     let mut files = generated_verilog();
-    // Generated rather than found: see `lvt_variant`.
-    files.extend(lvt_variant());
+    // Generated rather than found: see `lvt_variants`.
+    files.extend(lvt_variants());
     let mut linted = 0;
     let mut failures: Vec<String> = Vec::new();
 
