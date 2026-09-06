@@ -39,6 +39,13 @@ use crate::ty::Ty;
 /// `None` for a case that selects nothing -- an `@unreachable` arm.
 type SwitchSel = (ValueId, Vec<Option<Vec<u128>>>);
 
+struct LocalReg {
+    name: String,
+    ty: Ty,
+    held: ValueId,
+    writes: Vec<(usize, ValueId)>,
+}
+
 /// A blocking operation: what the state it ends waits on.
 pub struct Barrier {
     /// Which channel, and of which kind.
@@ -54,6 +61,8 @@ pub struct Barrier {
     pub bind: Option<String>,
     /// The value a send offers.
     pub value: Option<PrecResExpr>,
+    /// Preserve the receive declaration's mutability, type and source anchor.
+    pub declaration: Option<crate::parse::VarDeclStmt>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -515,7 +524,7 @@ fn anchor_of(stmt: &PrecResInnerStmt, sink: &DiagSink) -> crate::diag::Span {
 }
 
 fn anchor_span(stmt: &PrecResInnerStmt, sink: &DiagSink) -> Option<crate::diag::Span> {
-    crate::ir::stmt_anchor(stmt).map(|at| sink.map().span_of(&at))
+    crate::ir::stmt_anchor(stmt).map(|at| sink.span_of(&at))
 }
 
 /// The `if` that a statement is, when its arms need states of their own.
@@ -591,7 +600,7 @@ fn place_pending<'a>(
     }
     let leading: Vec<&'a PrecResInnerStmt> = pending.drain(..).rev().collect();
     match target {
-        Target::State(ix) if target != cont => {
+        Target::State(ix) if target != cont && !states[ix].pinned => {
             let mut merged = leading;
             merged.extend(std::mem::take(&mut states[ix].stmts));
             states[ix].stmts = merged;
@@ -734,6 +743,9 @@ fn schedule<'a>(
                 );
                 return None;
             }
+            // These statements FOLLOW the branch. Break must bypass them,
+            // and its condition must not observe their assignments.
+            target = place_pending(&mut pending, target, cont, states);
             let then_stmts = match arm_stmts(&ite.then_case) {
                 Some(s) => s,
                 None => {
@@ -759,7 +771,7 @@ fn schedule<'a>(
                 }
             };
             states.push(State {
-                stmts: pending.drain(..).rev().collect(),
+                stmts: Vec::new(),
                 barrier: None,
                 mem_read: None,
                 post: Vec::new(),
@@ -784,6 +796,7 @@ fn schedule<'a>(
             // the two arms of an `if` do. An arm with no statements -- a bare
             // expression, or `@unreachable` -- falls straight through, which
             // for `@unreachable` is a target nothing ever selects.
+            target = place_pending(&mut pending, target, cont, states);
             let mut targets = Vec::with_capacity(m.cases.len());
             for case in &m.cases {
                 let t = match arm_stmts(&case.rhs) {
@@ -795,7 +808,7 @@ fn schedule<'a>(
                 targets.push(t);
             }
             states.push(State {
-                stmts: pending.drain(..).rev().collect(),
+                stmts: Vec::new(),
                 barrier: None,
                 mem_read: None,
                 post: Vec::new(),
@@ -893,9 +906,13 @@ fn as_barrier(
         return Some(None);
     };
     let is_recv = bind.is_some();
+    let declaration = match stmt {
+        PrecResInnerStmt::VarDecl(d) => Some(d.clone()),
+        _ => None,
+    };
 
     if let Some(pipe_ix) = pipe_of(&pipe) {
-        return Some(Some(Barrier { on: BarrierOn::Pipe(pipe_ix), is_recv, bind, value }));
+        return Some(Some(Barrier { on: BarrierOn::Pipe(pipe_ix), is_recv, bind, value, declaration }));
     }
     if let Some((port_ix, is_input)) = port_of(&pipe) {
         if is_recv != is_input {
@@ -906,7 +923,7 @@ fn as_barrier(
             );
             return None;
         }
-        return Some(Some(Barrier { on: BarrierOn::Port(port_ix), is_recv, bind, value }));
+        return Some(Some(Barrier { on: BarrierOn::Port(port_ix), is_recv, bind, value, declaration }));
     }
     sink.err_span(
         anchor_of(stmt, sink),
@@ -1167,6 +1184,15 @@ pub fn defines_of(st: &State) -> HashSet<String> {
     out
 }
 
+fn mutable_definitions(st: &State) -> Vec<String> {
+    st.stmts.iter().chain(&st.post)
+        .filter_map(|s| match s { PrecResInnerStmt::VarDecl(d) => Some(d), _ => None })
+        .chain(st.barrier.as_ref().and_then(|b| b.declaration.as_ref()))
+        .filter(|d| d.is_mutable)
+        .flat_map(|d| d.names().iter().map(|n| anumspan_to_str(n).to_string()))
+        .collect()
+}
+
 /// Names a pattern brings into scope.
 pub fn pattern_binds(pattern: &BindingPattern, out: &mut HashSet<String>) {
     match pattern {
@@ -1293,6 +1319,19 @@ pub fn lower_blocking(
     repeats: bool,
     sink: &mut DiagSink,
 ) -> Option<crate::ir::Module> {
+    let globals = env.keys().cloned()
+        .chain(low.pipes.iter().map(|p| p.name.clone()))
+        .chain(low.port_ins.iter().map(|p| p.name.clone()))
+        .chain(low.port_outs.iter().map(|p| p.name.clone()))
+        .chain(low.syms.funcs.keys().cloned())
+        .chain(low.syms.structs.keys().cloned())
+        .chain(low.syms.enums.keys().cloned())
+        .chain(low.syms.enums.values().flat_map(|e| e.variants.iter().map(|(n, _)| n.clone())))
+        .collect();
+    let scoped = crate::ir_scope::resolve(body, globals, sink)?;
+    low.synthetic_spans = scoped.origins.clone();
+    sink.set_synthetic_spans(scoped.origins.clone());
+    let body = &scoped.stmts;
     let pipe_names: Vec<String> = low.pipes.iter().map(|p| p.name.clone()).collect();
     let pipe_of = |n: &str| pipe_names.iter().position(|p| p == n);
     // A `bram` read is a state, and the value it fetches is a register: the
@@ -1499,6 +1538,10 @@ pub fn lower_blocking(
     // Allocate a register for every binding that crosses a state, before any
     // state runs, so another one can read the registered copy.
     let mut cross = crossing(&states_sched);
+    // Mutable locals have loop-carried storage, not a one-time capture of
+    // their initializer. Their lexical identities were resolved above.
+    let mutable_locals: HashSet<String> = states_sched.iter().flat_map(mutable_definitions).collect();
+    for set in &mut cross { set.retain(|n| !mutable_locals.contains(n)); }
     // A read binding needs saving only where another read can overwrite the
     // port it names. With ONE read state per memory the output register is
     // written only while that state is current, so the name stays good until
@@ -1592,6 +1635,10 @@ pub fn lower_blocking(
         .map(|n| env.get(n).and_then(|b| b.value))
         .collect();
     let mut var_writes: Vec<Vec<(usize, ValueId)>> = vec![Vec::new(); reg_names.len()];
+    // Allocated after fixed crossing slots once each declaration's type has
+    // been inferred. Storage is reset deterministically, but its initializer
+    // is still an ordinary statement executed on every dynamic scope entry.
+    let mut locals: Vec<LocalReg> = Vec::new();
 
     // A `port out` is per-state exactly as a pipe's offer is: cleared at the
     // top of every state, and whatever a state left on it belongs to that
@@ -1622,7 +1669,7 @@ pub fn lower_blocking(
         for ix in 0..low.pipes.len() {
             let pipe = low.pipes[ix].clone();
             let handshake = pipe.movable.expect("computed once above");
-            let f = low.emit(Ty::BOOL, Op::Bin { op: BinOp::And, lhs: in_st[k], rhs: handshake });
+            let f = low.emit(Ty::BOOL, Op::Bin { op: BinOp::And, lhs: fires[k], rhs: handshake });
             low.name_value_safe(f, format!("{}_xfer_s{}", pipe.name, k));
             low.pipes[ix].fired = Some(f);
             // A barrier already spends this state's one transfer on that pipe,
@@ -1639,6 +1686,9 @@ pub fn lower_blocking(
                 b.value = Some(v);
             }
         }
+        for local in &locals {
+            env.insert(local.name.clone(), Binding::variable(local.held, local.ty.clone()));
+        }
         for port in low.port_outs.iter_mut() {
             port.sent = None;
             port.send_guard = None;
@@ -1648,9 +1698,16 @@ pub fn lower_blocking(
         // scratchpad written once per item would be rewritten every cycle.
         low.clear_write_slots(&mut env);
 
+        let assertion_start = low.asserts.len();
         for stmt in &st.stmts {
             crate::ir::lower_stmt_pub(&mut low, stmt, &mut env, sink)?;
         }
+        // Capture a send's operand before post-barrier assignments mutate its
+        // environment. The ValueId, unlike a source expression, is immutable.
+        let barrier_value = match st.barrier.as_ref().and_then(|b| b.value.as_ref()) {
+            Some(expr) => Some(crate::ir::lower_expr(&mut low, expr, &env, sink)?),
+            None => None,
+        };
         // A synchronous read: present the address now, and bind the name to
         // the register the value lands in. From this state on the name means
         // that register -- which is a state later, exactly as the hardware
@@ -1681,7 +1738,25 @@ pub fn lower_blocking(
                     (port.data, port.ty)
                 }
             };
-            env.insert(bind.clone(), Binding::constant(data, ty));
+            let declaration = barrier.declaration.as_ref().expect("a receive has a declaration");
+            if let Some(t) = &declaration.ty_expr {
+                let want = match crate::ty::resolve_type_expr(t, low.syms) {
+                    Ok(ty) => ty,
+                    Err(e) => {
+                        sink.err_at(&declaration.head_name(), e.message());
+                        return None;
+                    }
+                };
+                if want != ty {
+                    sink.err_at(&declaration.head_name(), format!(
+                        "`{}` is declared `{}` but the pipe carries `{}`", bind, want.display(), ty.display(),
+                    ));
+                    return None;
+                }
+            }
+            env.insert(bind.clone(), if declaration.is_mutable {
+                Binding::variable(data, ty)
+            } else { Binding::constant(data, ty) });
         }
         // Statements between the barrier and a branch. They see what the
         // barrier bound, which is what lets the branch decide in the same
@@ -1815,6 +1890,25 @@ pub fn lower_blocking(
         });
         let read_bind = st.mem_read.as_ref().map(|r| r.bind.clone());
 
+        // A declaration's value is its dynamic initializer, possibly followed
+        // by assignments in this state. Allocate a distinct storage identity
+        // even when an outer scope uses the same source spelling.
+        for name in mutable_definitions(st) {
+            if !locals.iter().any(|l| l.name == name) {
+                let binding = env.get(&name)?;
+                let ty = binding.ty.clone();
+                let held = low.emit(ty.clone(), Op::RegRead(next_slot as u32));
+                next_slot += 1;
+                locals.push(LocalReg { name, ty, held, writes: Vec::new() });
+            }
+        }
+        for local in &mut locals {
+            if let Some(v) = env.get(&local.name).and_then(|b| b.value)
+                && v != local.held {
+                local.writes.push((k, v));
+            }
+        }
+
         // What this state leaves behind for the others.
         for name in &cross[k] {
             let capture = match (&read_bind, read_ready) {
@@ -1861,7 +1955,7 @@ pub fn lower_blocking(
                 let span = low.span_of(&at);
                 low.push_anchor(span)
             });
-            let v = crate::ir::lower_expr(&mut low, expr, &env, sink)?;
+            let v = barrier_value.expect("a send payload was captured before its post statements");
             let have = low.ty_of(v);
             if have != want {
                 sink.err_span(
@@ -1885,6 +1979,14 @@ pub fn lower_blocking(
             if let Some(depth) = depth {
                 low.pop_anchor(depth);
             }
+        }
+        // Include checks introduced by inlining in a branch condition or
+        // match scrutinee, as well as the state's ordinary statements.
+        for ix in assertion_start..low.asserts.len() {
+            let cond = low.asserts[ix].cond;
+            let inactive = low.emit(Ty::BOOL, Op::Un { op: UnOp::LogNot, arg: fires[k] });
+            low.asserts[ix].cond =
+                low.emit(Ty::BOOL, Op::Bin { op: BinOp::Or, lhs: inactive, rhs: cond });
         }
         // From here on the name means its registered copy.
         for name in &cross[k] {
@@ -1958,7 +2060,9 @@ pub fn lower_blocking(
                     low.emit(Ty::BOOL, Op::Bin { op: BinOp::And, lhs: fires[*k], rhs: *g })
                 }
             };
-            asks.push(ask);
+            let movable = low.pipes[ix].movable.expect("computed before lowering states");
+            let transfer = low.emit(Ty::BOOL, Op::Bin { op: BinOp::And, lhs: ask, rhs: movable });
+            asks.push(transfer);
         }
         let active = any_of(&mut low, &asks);
         let pipe = low.pipes[ix].clone();
@@ -2204,6 +2308,18 @@ pub fn lower_blocking(
             );
         }
         generated.push(Reg { name: format!("{}_r", name), ty, reset: 0, next });
+    }
+
+    // Locals occupy the slots reserved after the crossing registers. Their
+    // values are committed on execution, and held on stalls and other paths.
+    for local in locals {
+        let mut next = local.held;
+        for (k, v) in local.writes {
+            next = low.emit(local.ty.clone(), Op::Mux {
+                cond: fires[k], then_val: v, else_val: next,
+            });
+        }
+        generated.push(Reg { name: local.name, ty: local.ty, reset: 0, next });
     }
 
     // Settle each memory's read port: enabled in any state that reads it, with

@@ -23,6 +23,7 @@ pub mod ir_fsm;
 pub mod ir_graph;
 pub mod ir_match;
 pub mod ir_pipe;
+mod ir_scope;
 pub mod source;
 pub mod symbols;
 pub mod ty;

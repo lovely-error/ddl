@@ -699,6 +699,8 @@ pub struct Lowerer<'a> {
     mem_slots: Vec<usize>,
     /// Immediate assertions, in source order.
     pub asserts: Vec<Assertion>,
+    /// Source locations of compiler-owned lexical identifiers.
+    pub(crate) synthetic_spans: HashMap<usize, Span>,
     /// Constant parameters, in declaration order.
     pub params: Vec<(String, Ty, u128)>,
     /// `!done` for a process that stops, so its memories stop being written
@@ -748,6 +750,7 @@ impl<'a> Lowerer<'a> {
             mems: Vec::new(),
             mem_slots: Vec::new(),
             asserts: Vec::new(),
+            synthetic_spans: HashMap::new(),
             params: Vec::new(),
             stop_writes: None,
             in_pipeline: false,
@@ -1534,11 +1537,12 @@ impl<'a> Lowerer<'a> {
     }
 
     fn span(&self, at: &AlphanumSpan) -> Span {
-        self.map.span_of(at)
+        self.span_of(at)
     }
 
     pub fn span_of(&self, at: &AlphanumSpan) -> Span {
-        self.map.span_of(at)
+        self.synthetic_spans.get(&(at.byte_ptr as usize)).copied()
+            .unwrap_or_else(|| self.map.span_of(at))
     }
 
     /// Where the diagnostic being raised right now belongs.

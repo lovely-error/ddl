@@ -82,7 +82,7 @@ fn a_match_reads_the_tag_and_only_the_tag() {
 }
 
 #[test]
-fn a_payload_binding_is_the_low_bits_at_its_own_width() {
+fn a_payload_binding_starts_below_the_tag_at_its_own_width() {
     let v = compile(&format!(
         "{}{}",
         REQ,
@@ -101,7 +101,7 @@ fn a_payload_binding_is_the_low_bits_at_its_own_width() {
     ));
     // `addr_t` is 16 bits and `u8` is 8, and each arm takes exactly its own.
     assert!(v.contains("r[15:0]"), "{}", v);
-    assert!(v.contains("= r[7:0];"), "{}", v);
+    assert!(v.contains("= r[15:8];"), "{}", v);
 }
 
 #[test]

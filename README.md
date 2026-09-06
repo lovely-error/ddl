@@ -131,6 +131,31 @@ tag here while reading as the whole value. See
 `^=`, …), `if`/`else`, `match` with exhaustiveness checking, `for i in 0..n`
 which unrolls, and calls to `fun`, which are inlined.
 
+In a blocking `process`, mutable locals have lexical lifetimes. A `var`
+inside a loop or branch is initialized each time execution reaches its
+declaration, and keeps its value across waits and inner-loop iterations until
+that scope ends. Its initializer can use a received value. Nested scopes may
+shadow outer bindings; leaving the inner scope restores the outer binding.
+Names cannot be used after their declaring scope ends. Leading process-body
+`var` declarations remain persistent registers initialized by reset.
+
+```ddl
+process count (src: buffer in u8, dst: buffer out u8)
+  loop
+    var remaining: u8 = @rcv(src)
+    loop
+      @send(dst, remaining)
+      remaining -= 8'd1
+      if remaining == 8'd0 then
+        break
+```
+
+For a positive input, this sends the countdown and then receives a new count.
+The counter is held during output backpressure. Assignments, send payloads,
+branch conditions and initializers observe source order; statements after a
+taken `break` do not execute. The scheduler may introduce a state to preserve
+a scope-entry initializer or a conditional continuation.
+
 **Anything that waits can go in an `if`, a `match` or a `loop`.** A blocking
 `@rcv`/`@send`, a `break` and a `bram` read all cost a cycle, and
 all three constructs can hold one: an `if` forks the state machine, a `match`
@@ -141,9 +166,8 @@ top of a process it stops the process (desc.md:37).
 A `match` mattered here more than it looks. `match` is the only way to reach a
 payload and `==` on an enum that carries one is refused, so before this a
 tagged union had no way to wait per variant at all — which is the shape of
-every dispatch. A name bound by more than one arm is one wire and therefore
-one type; two payload types under one name is refused rather than picked
-between.
+every dispatch. Each arm has its own binding identities, so two arms may use
+the same spelling for payloads of different types, including when they wait.
 
 **Parameters.** By value, `out` (write-only, which is how a function returns
 more than one thing), and `inout` (by reference and readable: it updates the
@@ -212,6 +236,10 @@ which is the guard this toolchain needs because GowinSynthesis does not define
 `SYNTHESIS`. In a clocked module the checks run on the edge and are held off
 during reset. A condition written inside an `if` is already guarded by the path
 it sits on, so it reads as an implication and is vacuously true elsewhere.
+In a blocking process, a check also requires its scheduled state to execute;
+idle cycles and other match arms do not check stale values. A failed
+`@try_rcv`, `@try_send` or `@drop` leaves the buffer unchanged, even in a state
+that also performs a blocking operation.
 
 **A pipe is claimed where the program asks for it, under the condition it
 asks.** One rule, and it is the same in a process that blocks and one that does
@@ -319,8 +347,6 @@ Deliberately, with a diagnostic rather than a wrong answer:
 - a `for` whose trip count is not known at compile time
 - a blocking `@rcv`/`@send` in the condition of an `if` or the scrutinee of a
   `match`, which would have to be decided before it could be waited on
-- one name bound to two different payload types across the arms of a `match`
-  that waits, where the arms are states and the name is a single wire
 - a computed index anywhere but the last step of an assignment target
 - `==` on an enum that carries payloads, which would compare the padding too
 - a width annotation on an enum that carries payloads, which would name the tag

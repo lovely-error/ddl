@@ -71,8 +71,12 @@ pub fn emit_banner(opts: &EmitOptions) -> String {
 }
 
 pub fn emit_module(module: &Module, opts: &EmitOptions) -> String {
+    // Registers and memories are referenced by IR identity, so rename them
+    // before rendering any declaration or reference. Public ports stay fixed.
+    let named_module = name_storage(module, opts);
+    let module = &named_module;
     let mut out = String::new();
-    let names = NameTable::build(module);
+    let names = NameTable::build(module, opts);
 
 
     emit_header(&mut out, module);
@@ -313,7 +317,13 @@ fn foldable(module: &Module, live: &[bool]) -> Vec<bool> {
             // `case (x)` selects on a signal, and the arm values are assigned
             // inside the block, so none of them may be folded away.
             Op::Case { scrutinee, .. } => must_be_named[scrutinee.0 as usize] = true,
-            Op::Slice { arg, .. } => must_be_named[arg.0 as usize] = true,
+            Op::Slice { arg, .. } | Op::Trunc { arg, .. } => {
+                must_be_named[arg.0 as usize] = true;
+            }
+            Op::SExt { arg, to } if module.value(*arg).ty.bit_width() < *to => {
+                // The renderer selects the sign bit, just as Slice does.
+                must_be_named[arg.0 as usize] = true;
+            }
             Op::DynSlice { arg, base, .. } => {
                 must_be_named[arg.0 as usize] = true;
                 must_be_named[base.0 as usize] = true;
@@ -1254,6 +1264,74 @@ struct NameTable {
     names: Vec<String>,
 }
 
+fn fresh_name(base: &str, used: &mut Vec<String>) -> String {
+    let mut candidate = base.to_string();
+    let mut suffix = 1;
+    while used.contains(&candidate) {
+        candidate = format!("{}_{}", base, suffix);
+        suffix += 1;
+    }
+    used.push(candidate.clone());
+    candidate
+}
+
+/// An array and all of the module-level helpers emitted with it.
+fn memory_names(module: &Module, mem: &Memory, base: &str, opts: &EmitOptions) -> Vec<String> {
+    let mut result = vec![base.to_string()];
+    let writes = live_write_ports(module, mem);
+    for p in 0..mem.read.len() {
+        result.push(read_reg_ident(base, p, mem.read.len()));
+    }
+    if lvt_shape(mem, &writes, opts) {
+        for b in 0..writes.len() {
+            for r in 0..mem.read.len().max(1) {
+                let array = bank_array(base, b, r);
+                result.push(format!("{}_q", array));
+                result.push(array);
+            }
+        }
+        result.push(format!("{}_lvt", base));
+        for r in 0..mem.read.len() {
+            result.push(format!("{}_lvt_q{}", base, r));
+        }
+        result.push(format!("{}_ix", base));
+    } else if mem.reset.is_some() {
+        result.push(format!("{}_ix", base));
+    }
+    result
+}
+
+fn fixed_names(module: &Module) -> Vec<String> {
+    module.ports.iter().map(|p| sanitize(&p.name))
+        .chain(module.nets.iter().map(|n| sanitize(&n.name)))
+        .chain(module.instances.iter().map(|i| sanitize(&i.name)))
+        .collect()
+}
+
+fn name_storage(module: &Module, opts: &EmitOptions) -> Module {
+    let mut named = module.clone();
+    let mut used = fixed_names(module);
+    for mem in &mut named.mems {
+        let base = sanitize(&mem.name);
+        let mut candidate = base.clone();
+        let mut suffix = 1;
+        loop {
+            let family = memory_names(module, mem, &candidate, opts);
+            if family.iter().all(|n| !used.contains(n)) {
+                used.extend(family);
+                mem.name = candidate;
+                break;
+            }
+            candidate = format!("{}_{}", base, suffix);
+            suffix += 1;
+        }
+    }
+    for reg in &mut named.regs {
+        reg.name = fresh_name(&sanitize(&reg.name), &mut used);
+    }
+    named
+}
+
 /// A `Cast` only changes how the bits are interpreted. When the signedness is
 /// unchanged too -- reading an enum field out of a struct, say -- the Verilog
 /// is identical to its operand, so the value is an alias rather than a wire.
@@ -1269,8 +1347,12 @@ fn is_pure_rename(module: &Module, def: &ValueDef) -> bool {
 }
 
 impl NameTable {
-    fn build(module: &Module) -> NameTable {
-        let mut used: Vec<String> = module.ports.iter().map(|p| sanitize(&p.name)).collect();
+    fn build(module: &Module, opts: &EmitOptions) -> NameTable {
+        let mut used = fixed_names(module);
+        used.extend(module.regs.iter().map(|r| sanitize(&r.name)));
+        for mem in &module.mems {
+            used.extend(memory_names(module, mem, &sanitize(&mem.name), opts));
+        }
         let mut names: Vec<String> = Vec::with_capacity(module.values.len());
 
         for def in &module.values {

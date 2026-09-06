@@ -382,7 +382,11 @@ pub fn payload_value(
     let bits = payload_ty.bit_width();
     let raw = low.emit(
         Ty::UInt(bits),
-        Op::Slice { arg: scrutinee, hi: bits - 1, lo: 0 },
+        Op::Slice {
+            arg: scrutinee,
+            hi: shape.payload_width - 1,
+            lo: shape.payload_width - bits,
+        },
     );
     let value = if low.ty_of(raw) == payload_ty {
         raw
@@ -442,7 +446,7 @@ pub fn lower_match(
             );
         }
 
-        // The payload, if the arm asked for it. It is the low bits of the
+        // The payload, if the arm asked for it. It starts below the tag of the
         // scrutinee -- the whole point of a fixed layout is that the arm knows
         // where to look once the tag has told it what is there.
         if let Some((variant_span, bind_span)) = plan.payload {

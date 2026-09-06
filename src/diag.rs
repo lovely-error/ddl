@@ -361,11 +361,12 @@ impl SourceMap {
 pub struct DiagSink<'a> {
     map: &'a SourceMap,
     diags: Vec<Diag>,
+    synthetic_spans: std::collections::HashMap<usize, Span>,
 }
 
 impl<'a> DiagSink<'a> {
     pub fn new(map: &'a SourceMap) -> Self {
-        DiagSink { map, diags: Vec::new() }
+        DiagSink { map, diags: Vec::new(), synthetic_spans: Default::default() }
     }
 
     pub fn map(&self) -> &'a SourceMap {
@@ -373,7 +374,7 @@ impl<'a> DiagSink<'a> {
     }
 
     pub fn err_at(&mut self, at: &AlphanumSpan, msg: impl Into<String>) {
-        let span = self.map.span_of(at);
+        let span = self.span_of(at);
         self.diags.push(Diag::error(span, msg));
     }
 
@@ -382,12 +383,21 @@ impl<'a> DiagSink<'a> {
     }
 
     pub fn warn_at(&mut self, at: &AlphanumSpan, msg: impl Into<String>) {
-        let span = self.map.span_of(at);
+        let span = self.span_of(at);
         self.diags.push(Diag::warning(span, msg));
     }
 
     pub fn push(&mut self, diag: Diag) {
         self.diags.push(diag);
+    }
+
+    pub(crate) fn set_synthetic_spans(&mut self, spans: std::collections::HashMap<usize, Span>) {
+        self.synthetic_spans = spans;
+    }
+
+    pub fn span_of(&self, at: &AlphanumSpan) -> Span {
+        self.synthetic_spans.get(&(at.byte_ptr as usize)).copied()
+            .unwrap_or_else(|| self.map.span_of(at))
     }
 
     pub fn has_errors(&self) -> bool {

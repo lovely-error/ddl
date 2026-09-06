@@ -33,7 +33,7 @@ module serve (
 
   wire [1:0] req_e_tag = r[17:16];
   wire [15:0] a = r[15:0];
-  wire [7:0] d = r[7:0];
+  wire [7:0] d = r[15:8];
   reg [7:0] n12;
   reg n13;
   reg [7:0] n14;
