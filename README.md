@@ -1,34 +1,126 @@
-# ddl
+# DDL (Dataflow Description Language)
 
-A dataflow description language that compiles to Verilog-2005.
+DDL is a hardware description language that compiles high-level dataflow specifications into synthesizable Verilog-2005.
 
-`desc.md` is the design: what the language is meant to become, including
-pieces that do not exist yet. This file is the opposite — what the compiler in
-this repository accepts today, and what it refuses.
+While [`desc.md`](desc.md) outlines the long-term design goals of the language, this document describes the language and features implemented in the compiler today.
+
+---
+
+## Table of Contents
+
+- [Quick Start](#quick-start)
+- [Practical Usage Guides](#practical-usage-guides)
+- [Architecture Deep Dives](#architecture-deep-dives)
+- [Design Philosophy](#design-philosophy)
+- [Core Declarations](#core-declarations)
+  - [Pipelines (`sequence`)](#pipelines-sequence)
+  - [State Machines (`process`)](#state-machines-process)
+  - [Combinational Functions (`fun`)](#combinational-functions-fun)
+  - [Structural Composition (`graph`)](#structural-composition-graph)
+  - [External Modules (`extern`)](#external-modules-extern)
+- [Channels and Interconnect](#channels-and-interconnect)
+  - [Backpressured Buffers (`buffer`)](#backpressured-buffers-buffer)
+  - [The Gray-Code Salt Protocol](#the-gray-code-salt-protocol)
+  - [Unbuffered Ports (`port`)](#unbuffered-ports-port)
+  - [Channel Operations](#channel-operations)
+  - [Combinators (`@merge` and `@split`)](#combinators-merge-and-split)
+- [Type System and Storage](#type-system-and-storage)
+  - [Integers and Bit Operations](#integers-and-bit-operations)
+  - [Structs and Tagged Unions](#structs-and-tagged-unions)
+  - [Packed Arrays](#packed-arrays)
+  - [Memories (`lutram` and `bram`)](#memories-lutram-and-bram)
+  - [Multi-Port Synthesis and LVT BRAM](#multi-port-synthesis-and-lvt-bram)
+- [Statements and Scoping](#statements-and-scoping)
+- [Assertions](#assertions)
+- [Compile-Time Diagnostics](#compile-time-diagnostics)
+- [Verilog Backend and Tooling](#verilog-backend-and-tooling)
+  - [Synthesizer Compatibility](#synthesizer-compatibility)
+  - [Multi-File Projects](#multi-file-projects)
+  - [Formatter](#formatter)
+  - [Graph Visualization](#graph-visualization)
+  - [Editor Support](#editor-support)
+- [Testing and Verification](#testing-and-verification)
+- [Repository Layout](#repository-layout)
+
+---
+
+## Practical Usage Guides
+
+For step-by-step tutorials, design patterns, and hardware integration guides, see:
+
+- [**Guide 1: Writing Your First Pipelined Accelerator**](docs/guides/1-getting-started-pipelines.md): Dataflow stage cuts (`|||`), shift-register spanning, compiling, and visualizing.
+- [**Guide 2: Control State Machines, Packet Parsers, and Register Interfaces**](docs/guides/2-fsm-and-command-processors.md): Memory-mapped CSRs, tagged union dispatchers, zero-cycle branch dispatch, and lossless relays.
+- [**Guide 3: Interfacing DDL with Existing Verilog, AXI-Stream, and FPGA Pins**](docs/guides/3-interfacing-and-integration.md): Connecting to physical chip pins via `port`, `extern` IP integration, and AXI4-Stream master/slave wrappers.
+- [**Guide 4: Memory Patterns: ROMs, Block RAMs, and Multi-Port Register Files**](docs/guides/4-memory-and-register-files.md): `lutram` vs. `bram`, zero-cost BRAM stage alignment, and multi-write register files with `--lvt-bram`.
+- [**Guide 5: Simulation, Verification, and Build Workflows**](docs/guides/5-verification-and-simulation.md): Edge-triggered simulation assertions, SystemVerilog testbench templates, Verilator `-Wall` linting, and Makefiles.
+
+---
+
+## Architecture Deep Dives
+
+For detailed hardware design documents on DDL's compilation passes, interconnect protocols, and FPGA synthesis targets, see:
+
+- [**The Gray-Code Salt Protocol**](docs/salt-protocol.md): 2-bit Gray-code pointer mathematics, cycle-by-cycle waveform traces, skid buffer proofs, and AXI-Stream adapters.
+- [**Pipeline Lowering & Memory Forwarding**](docs/pipeline-lowering.md): `sequence` stage cuts (`|||`), shift-register spanning, backpressure, and zero-cost BRAM alignment.
+- [**Finite State Machine Synthesis & Scoping**](docs/fsm-synthesis.md): `process` control-flow graph construction, zero-cycle branch dispatch, lexical register allocation, and resource sharing.
+- [**Multi-Write BRAM via Live Value Tables**](docs/lvt-bram-architecture.md): Synthesizing multi-write memories on FPGAs using single-write BRAM banks and distributed LVTs (`--lvt-bram`).
+- [**Zero-Latency Hardware Combinators**](docs/combinators.md): Pure datapath implementation of `@merge` (rotating priority) and `@split` (lossless broadcast).
+- [**Verilog Backend & Synthesizer Portability**](docs/backend-portability.md): Restrictive Verilog-2005 subset, avoiding GowinSynthesis toolchain crashes, and Verilator `-Wall` linting.
+
+---
+
+## Quick Start
+
+The DDL compiler requires a nightly Rust toolchain, pinned via `rust-toolchain.toml`.
+
+### Build the Compiler
 
 ```bash
 cargo build
 ```
 
+### Compile DDL to Verilog
+
 ```bash
 ./target/debug/ddl build examples/mul3.ddl -o examples/mul3.v
 ```
 
-The compiler needs nightly Rust; `rust-toolchain.toml` pins which one.
+Use the `--check` flag to verify that an existing output file matches what the compiler would emit without modifying it:
 
-## The idea
-
-Verilog makes you write the handshake. Every FIFO, every `valid`/`ready` pair,
-every state register that holds a value across a wait — by hand, every time,
-and each one is a chance to close a combinational loop through `ready` that
-nothing catches until the design hangs on real silicon.
-
-DDL takes the position that this is compiler work. You write what happens to
-the data; the handshake, the state register and the pipeline registers are
-generated. There is no global memory: a declaration touches its own state and
-nothing else, and everything crossing a boundary goes through a pipe.
-
+```bash
+./target/debug/ddl build examples/mul3.ddl -o examples/mul3.v --check
 ```
+
+---
+
+## Design Philosophy
+
+In conventional Verilog and SystemVerilog, designers must manually implement handshakes, FIFOs, `valid`/`ready` signals, and intermediate pipeline registers. Every manual handshake creates potential combinational paths through `ready`, risking deadlocks and timing failures that are difficult to catch prior to physical synthesis or silicon bring-up.
+
+DDL automates protocol and register management:
+- **Focus on data transformation**: The designer describes operations on data streams; the compiler generates the control logic, pipeline stages, validity signals, and skid registers.
+- **Isolated state**: There is no global or shared memory. Declarations encapsulate their own state, and all inter-block communication takes place over point-to-point pipes.
+- **Cycle-decoupled handshakes**: Channels eliminate combinational `ready` loops by construct through registered, gray-coded pointer exchange.
+
+---
+
+## Core Declarations
+
+DDL provides five primary top-level declarations:
+
+| Declaration | Hardware Equivalent | Description |
+|---|---|---|
+| `sequence` | Pipeline | Pipelined datapath partitioned into clock stages by cut operators (`\|\|\|`). |
+| `process` | Finite State Machine | Sequential control flow with blocking channel waits. |
+| `fun` | Combinational Module | Pure combinational logic; inlined at call sites or emitted as a standalone module. |
+| `graph` | Structural Netlist | Instantiates blocks and wires their communication channels together. |
+| `extern` | Module Interface | Declares third-party or hand-written Verilog modules for integration in a `graph`. |
+
+### Pipelines (`sequence`)
+
+A `sequence` represents a feed-forward pipeline. Cut markers (`|||`) separate stages executed across clock cycles:
+
+```ddl
 sequence mul3 (src: buffer in u16, dst: buffer out u32)
   let a = @rcv(src)
   let doubled: u16 = a + a
@@ -39,15 +131,18 @@ sequence mul3 (src: buffer in u16, dst: buffer out u32)
   @send(dst, scaled)
 ```
 
-`|||` is a stage cut. What comes out is a three-stage pipeline with a validity
-bit per stage, back-pressure from the sink, and a `dst_wsalt` driven by a
-register — see [examples/mul3.v](examples/mul3.v). Nothing in the source
-mentions a handshake or a clock.
+The compiler translates this into a three-stage pipeline (see [`examples/mul3.v`](examples/mul3.v)):
+- Each stage includes an automatically managed validity bit and downstream backpressure handling.
+- A `sequence` receives once from its input buffer in the first stage and sends once to its output buffer in the final stage.
+- Non-blocking buffer operations (`@peek`, `@try_rcv`, `@drop`, `@try_send`) are not permitted in pipelines; use a `process` when non-blocking buffer access is required.
 
-A `graph` connects blocks like that one to each other, and a `process` turns a
-sequential program with wait points into the state machine that implements it:
+For details on shift-register generation, BRAM stage alignment, and same-cycle hazard forwarding, see [**Pipeline Lowering & Memory Forwarding**](docs/pipeline-lowering.md).
 
-```
+### State Machines (`process`)
+
+A `process` models a sequential state machine. Blocking operations on channels delineate state transitions:
+
+```ddl
 process reg_port (cmd: buffer in u8, din: buffer in u32, dout: buffer out u32)
   var cell: u32 = @zeroed()
   loop
@@ -59,210 +154,109 @@ process reg_port (cmd: buffer in u8, din: buffer in u32, dout: buffer out u32)
       @send(dout, cell)
 ```
 
-Three states, and the branch is decided in the cycle the command arrives — see
-[examples/reg_port.v](examples/reg_port.v).
+The compiler synthesizes this into an FSM (see [`examples/reg_port.v`](examples/reg_port.v)) where branching decisions take effect in the cycle the triggering command is received.
 
-## What compiles today
+- A `loop` executes repeatedly across cycles.
+- A process body without an enclosing `loop` executes its sequential statements once and halts.
 
-**Declarations.** `fun` (combinational, becomes a module with `out`
-parameters as extra ports), `sequence` (becomes a pipeline, cut by `|||`),
-`process` (becomes a state machine, cut at blocking channel operations),
-`graph` (structural composition: instantiates the others and wires their pipes
-together), and `extern` (names a module DDL did not compile, so a graph can
-instantiate it). `struct` and `enum` lay out the same way SystemVerilog packs them,
-so a DDL type and its `.svh` counterpart meet at a module boundary without a
-cast.
+For details on CFG state construction, zero-cycle branch dispatch, and lexical register allocation across waits, see [**Finite State Machine Synthesis & Scoping**](docs/fsm-synthesis.md).
 
-**Types.** `uN` and `iN` at any width, structs, enums — including tagged
-unions, where a variant carries a payload and `match` is the only way to reach
-it — and arrays backed by `lutram` (asynchronous reads) or `bram` (synchronous:
-the read costs a cycle, and is emitted inside the memory's own clocked block so
-it infers as a block RAM rather than as distributed RAM with a flop on it).
-That cycle is a state in a `process` and a `|||` cut in a `sequence`, where the
-memory's own output register is the pipeline register for that boundary — so
-`let v = t[a]` before a cut costs no flop of ours, and `v` means the value from
-the stage below on. A read sees the writes above it in source order, forwarded
-around the array, which updates only on the edge. A memory a stage **writes**
-is read and written in one stage — every item then sees every write of every
-item before it, plus its own — while a memory nothing writes has no order to
-keep and may be read anywhere.
+### Combinational Functions (`fun`)
 
-**Ports follow the source.** One write port per write that can happen in a
-cycle: two writes in a row are two ports, the arms of an `if` share one because
-they cannot both happen, and several states of a process share one because only
-one state is current. Reads are the same — as many as a pipeline stage asks
-for, muxed onto one in a process. An FPGA infers no RAM at all from a second
-write port while an ASIC memory compiler emits the cell, so the count is the
-source's to state and what it costs is the target's to answer: `ddl build
---lvt-bram` builds a multi-write `bram` out of one-write blocks and a live value
-table instead of asking for a cell that an FPGA does not have. On a GW1NR-9C
-that is the difference between not fitting and four block RAMs —
-[examples/rf_lvt.ddl](examples/rf_lvt.ddl) carries the numbers, and
-`examples/verify.sh` re-measures them.
-A `[T; n]` without an `#[impl(...)]` is not storage but a packed value, so it
-can be a struct field, a pipe payload or a parameter; `a[k]` selects an
-element and `a[hi..lo]` a run of them, laid out the way SystemVerilog packs an
-array, and an index past the end is an error rather than a bit somewhere else.
-`a[k] = v` and `s.words[k] = v` assign one, at a constant index or a computed
-one; `@slice(x, base, w)` is the read side of the same idea on a plain `uN`,
-a `w`-bit window at a base this cycle decides. Going the other way, `{a, b, c}`
-joins values high-to-low and is spelled the way Verilog spells it — the result
-is `uN` of the summed widths, because a bit with something below it has no sign
-left to keep.
-Widths are checked and never silently adjusted: mixed widths are an
-error naming the `@zext`/`@trunc` that fixes them, and an unsized literal takes
-its width from the other operand.
+A `fun` computes pure combinational logic:
+- Function calls within other declarations are inlined during lowering.
+- When compiled as an entry point, a `fun` becomes a Verilog module with return values and `out` parameters mapped to output ports.
 
-```
-enum req_e
-  Nop
-  Read(addr_t)
-  Write(u8)
-  Halt
-```
+### Structural Composition (`graph`)
 
-Laid out as `{tag, payload}` with the tag in the high bits, every variant the
-same width. A tagged union's width is derived, not declared -- `enum e: uN`
-sets the width of an enum whose variants carry nothing, and would name only the
-tag here while reading as the whole value. See
-[examples/tagged.ddl](examples/tagged.ddl).
-
-**Statements.** `let`, `var`, assignment (plain and compound: `+=`, `<<=`,
-`^=`, …), `if`/`else`, `match` with exhaustiveness checking, `for i in 0..n`
-which unrolls, and calls to `fun`, which are inlined.
-
-In a blocking `process`, mutable locals have lexical lifetimes. A `var`
-inside a loop or branch is initialized each time execution reaches its
-declaration, and keeps its value across waits and inner-loop iterations until
-that scope ends. Its initializer can use a received value. Nested scopes may
-shadow outer bindings; leaving the inner scope restores the outer binding.
-Names cannot be used after their declaring scope ends. Leading process-body
-`var` declarations remain persistent registers initialized by reset.
+A `graph` instantiates functions, sequences, processes, and externs, binding their input and output channels:
 
 ```ddl
-process count (src: buffer in u8, dst: buffer out u8)
-  loop
-    var remaining: u8 = @rcv(src)
-    loop
-      @send(dst, remaining)
-      remaining -= 8'd1
-      if remaining == 8'd0 then
-        break
+graph top (p: buffer in u32, q: buffer in u32, o1: buffer out u32, o2: buffer out u32)
+  let m: buffer u32
+  let d: buffer u32
+  @merge(p, q, m)      -- Two producers arbitrated onto one channel
+  dbl(m, d)
+  @split(d, o1, o2)    -- One producer broadcast to two independent consumers
 ```
 
-For a positive input, this sends the countdown and then receives a new count.
-The counter is held during output backpressure. Assignments, send payloads,
-branch conditions and initializers observe source order; statements after a
-taken `break` do not execute. The scheduler may introduce a state to preserve
-a scope-entry initializer or a conditional continuation.
+### External Modules (`extern`)
 
-**Anything that waits can go in an `if`, a `match` or a `loop`.** A blocking
-`@rcv`/`@send`, a `break` and a `bram` read all cost a cycle, and
-all three constructs can hold one: an `if` forks the state machine, a `match`
-becomes a `case` on the tag choosing the next state, and a `loop` is a back
-edge. `loop`s nest to any depth and `break` leaves the innermost one; at the
-top of a process it stops the process (desc.md:37).
+The `extern` keyword declares the interface of an external or legacy Verilog module so that it can be wired inside a `graph`:
 
-A `match` mattered here more than it looks. `match` is the only way to reach a
-payload and `==` on an enum that carries one is refused, so before this a
-tagged union had no way to wait per variant at all — which is the shape of
-every dispatch. Each arm has its own binding identities, so two arms may use
-the same spelling for payloads of different types, including when they wait.
-
-**Parameters.** By value, `out` (write-only, which is how a function returns
-more than one thing), and `inout` (by reference and readable: it updates the
-caller's variable, and at a module boundary becomes `x` plus `x_out`).
-
-**Pipes.** Two kinds, reached the same way. A `buffer` has back-pressure: two
-entries, and a producer that waits. A **`port`** has none at all — a data
-port and an enable, and nothing coming back:
-
+```ddl
+extern psram (req: buffer in mem_req_t, rsp: buffer out mem_rsp_t)
 ```
+
+An `extern` declaration exposes channel ports only. Connections to an `extern` block are type-checked during compilation, but no module body is generated.
+
+---
+
+## Channels and Interconnect
+
+DDL provides two distinct communication abstractions: **`buffer`** (backpressured FIFOs) and **`port`** (direct streaming wires).
+
+### Backpressured Buffers (`buffer`)
+
+A `buffer` provides flow-controlled point-to-point communication:
+- **Depth**: Every buffer has a fixed depth of 2 entries (a primary register and a skid register).
+- **Backpressure**: Producers stall automatically when the buffer is full; consumers stall when it is empty.
+- **Lossless Guarantee**: Data is never silently dropped or overwritten. A transfer occurs only when both producer and consumer agree.
+
+### The Gray-Code Salt Protocol
+
+Rather than using traditional `valid`/`ready` handshakes, DDL flattens each `buffer` into three Verilog ports:
+- `<p>_wsalt`: 2-bit write pointer emitted by the producer.
+- `<p>_rsalt`: 2-bit read pointer emitted by the consumer.
+- `<p>_data`: Data bus carrying both FIFO slots.
+
+Both pointers are registered and gray-coded:
+
+```verilog
+wire src_empty = (src_wsalt == src_rsalt_q);     // Pointers match: buffer is empty
+wire dst_full  = (dst_wsalt_q == (~dst_rsalt));  // Differ in both bits: buffer is full
+```
+
+Advancing a pointer *is* the transfer. Because both pointers originate from registers, there are no combinational paths linking consumer readiness to producer validity. This eliminates two classic hardware handshake pitfalls by construction:
+- **Combinational timing loops**: In traditional `valid`/`ready` interfaces, downstream readiness is often combinationally coupled to upstream validity. Chaining blocks or introducing feedback paths can inadvertently close a zero-delay combinational loop through `ready`—a hazard that synthesis tools may mishandle or that causes silicon to lock up.
+- **Mutual-wait protocol deadlocks**: In standard handshakes, protocol bugs can arise where a producer waits for `ready` before asserting `valid`, while the consumer waits for `valid` before asserting `ready`, causing both to wait indefinitely. With DDL's salt protocol, neither side waits for a same-cycle response from the other; transfer decisions are determined strictly from registered pointers, and the 2-entry buffer capacity (head + skid) absorbs the 1-cycle latency of registered pointer updates.
+
+For a complete architectural breakdown, including cycle-by-cycle waveform diagrams, skid buffer analysis, and AXI-Stream adapter examples, see [**The Gray-Code Salt Protocol**](docs/salt-protocol.md).
+
+### Unbuffered Ports (`port`)
+
+A `port` represents an unbuffered hardware boundary with zero backpressure, suitable for external interfaces such as physical chip pins, bus masters, or streaming video pipelines:
+
+```ddl
 process relay (src: port in u32, dst: port out u32)
   loop
     let v = @rcv(src)
     @send(dst, v + 32'd1)
 ```
 
-`port in x: T` is `x` and `x_en` coming in; `port out y: T` is `y` and `y_en`
-going out. Both are read and written with the channel operations and not by
-name: `@rcv` to wait for one, `@try_rcv` or `@peek` to look at what is there
-this cycle, `@send` and `@try_send` to put one out. **A port is not a value.**
-Naming one where a value belongs is an error that says which operation to
-reach for instead — binding the name to the wire would make it the one
-channel in the language you read by naming it, and would lose the distinction
-between "the value" and "a value that means something this cycle" that
-`@try_rcv`'s pair carries.
+Hardware emission details:
+- `port in x: T` emits data wire `x` and enable wire `x_en`.
+- `port out y: T` emits data wire `y` and enable wire `y_en`.
+- An output port is asserted only in cycles where a send statement executes.
+- In a `sequence`, a `port out` is driven by the specific stage that executes the send. A single output port cannot be driven from multiple pipeline stages.
+- A `process` composed entirely of `port` interfaces synthesizes directly into a standard clocked Verilog module without internal FIFO or salt logic.
 
-The operations mean what they mean on a `buffer`, with only the handshake
-underneath differing. `@rcv` waits on the enable rather than on two salts
-disagreeing. `@send` never waits at all, because there is no `ready` coming
-back to wait for, so its state costs its cycle and no more. `@try_rcv` answers
-with the enable itself: on a pipe the question is "did I take one", which
-needs this side to have accepted, and a port claims nothing anywhere.
-`@try_send` always succeeds. `@drop` is refused — it spends a pipe's one
-transfer for the cycle so the next item can arrive, and a port is not holding
-one back.
+### Channel Operations
 
-`port` is deliberately not the bare `T` spelling, which already means
-something else and quietly — a plain parameter is configuration, folded at
-compile time and gone.
+Both `buffer` and `port` interfaces are accessed via built-in channel intrinsics:
 
-**A process of nothing but ports is a plain Verilog module**, which is the
-point of it: a register, a clock and the ports the source asked for, with no
-salt and no entries anywhere. That is how the ordinary sequential blocks a
-design needs get written beside the dataflow ones.
+| Operation | Buffer Behavior | Port Behavior |
+|---|---|---|
+| `@rcv(ch)` | Blocks until an item is available, then consumes it. | Waits for the input enable wire (`en`) to assert. |
+| `@send(ch, val)` | Blocks until room is available, then pushes the value. | Asserts the output enable and drives the data bus (never blocks). |
+| `@peek(ch)` | Returns `(data, present)`. Inspects the head item without consuming it. | Returns `(data, en)` for the current cycle. |
+| `@try_rcv(ch)` | Non-blocking receive: returns `(data, ok)`. Consumes the item if available. | Reads current wire value if enabled. |
+| `@try_send(ch, val)` | Non-blocking send: returns a boolean indicating whether the push succeeded. | Always succeeds; returns `true`. |
+| `@drop(ch)` | Consumes and discards the head item without reading its payload. | *Not permitted* (compile error). |
 
-In a `sequence` a `port out` belongs to the STAGE that sent to it. A process
-drives one from the state that sent, gated on that state firing; a pipeline
-has no states, so what stands in for it is "this stage has a valid item and
-the pipeline is moving". Sending in two stages is refused — every stage is
-live at once holding a different item, so that would be two answers for one
-wire, and unlike a process there is nothing to choose between them.
+#### Same-Cycle Relay Pattern
 
-A sequence receives once from its input buffer in the first stage and sends
-once to its output buffer in the last stage. Duplicate head receives and tail
-sends are errors. Nonblocking buffer operations (`@peek`, `@try_rcv`, `@drop`,
-`@try_send`) are not supported in sequences; use a process for those operations.
-Nonblocking operations on `port` inputs and outputs remain supported.
-Stage cuts preserve lexical scope: a declaration inside a branch does not
-replace a binding outside that branch, and a rebinding's initializer sees the
-previous binding. Unsized tail-send constants take the output payload type.
-
-A `port` is for the EDGE of the program, where the thing on the other side
-cannot be made to wait: a pin, a PLL, a bus master that does not take `ready`
-for an answer. That is the case the rule below already names — the sink ties
-`ready` high and says so at the boundary — and `port` is how it is said.
-Between two things DDL compiled, a `buffer` is still the answer.
-
-**Buffer pipes.** `buffer`, in and out, with `@rcv`, `@send`, `@try_rcv`,
-`@try_send`, `@peek` and `@drop`.
-
-**Communication is local by default.** An ordinary `process` uses each
-buffer's own availability. An attempted receive or drop needs its input to be
-nonempty; an attempted send needs its output to have room. An unrelated full
-output does not stop input work. An unused output stays idle. There is no
-separate process modifier or implicit all-output acceptance condition.
-
-A polling `loop` executes once per cycle; a body without `loop` executes once
-and stops. Operations in a blocking process also require their scheduled
-state to execute. Branches and explicit tests of transfer success determine
-dependencies between operations.
-
-`@peek` observes and never consumes, including when it is the only operation
-on an input. `@try_rcv`, `@drop`, and `@try_send` report an actual transfer on
-their executing path. A failed attempt leaves the buffer unchanged. The data
-returned by a failed receive or absent peek is not a valid item. Availability
-is based on the current registered pointers; concurrent transfers take effect
-at the clock edge. This introduces no combinational ready chain between
-generated blocks. One pipe still permits at most one transfer per cycle. Mutually exclusive
-`if`/`match` arms can each request that transfer: their payloads are selected
-by their paths. Requests that may both execute in one cycle are rejected,
-including a nonblocking send beside a blocking send to the same output port.
-
-A process does not implicitly make several nonblocking attempts atomic.
-In particular, receiving and then ignoring a failed send can lose the value.
-For a same-cycle relay, peek first and consume only after sending succeeds:
+Because transfers occur on clock edges, non-blocking operations allow conditional inspection and forwarding within a single cycle. To forward from one buffer to another without risking data loss on backpressure, use `@peek` before `@drop`:
 
 ```ddl
 process relay (src: buffer in u8, dst: buffer out u8)
@@ -275,289 +269,263 @@ process relay (src: buffer in u8, dst: buffer out u8)
         @assert(took)
 ```
 
-When `dst` is full, this leaves the head in `src`. When it has room, the
-send and consumption occur on the same edge. This works because the source
-has one consumer, its head remains present throughout this step, and the
-drop has no unrelated-output requirement. For a program
-that needs to retain a value across waits, use an ordinary process with
-`@rcv` followed by `@send`; the compiler allocates the holding storage.
-Explicit multi-operation atomic blocks are not implemented.
+### Combinators (`@merge` and `@split`)
 
-**Assertions.** `@assert(cond)`, `@assert(cond, "message")` and `@fatal`, which
-is the same with `$fatal` instead of `$error`. They are checked in simulation
-and absent from synthesis: the emitted block sits inside `` `ifdef SIMULATION ``,
-which is the guard this toolchain needs because GowinSynthesis does not define
-`SYNTHESIS`. In a clocked module the checks run on the edge and are held off
-during reset. A condition written inside an `if` is already guarded by the path
-it sits on, so it reads as an implication and is vacuously true elsewhere.
-In a blocking process, a check also requires its scheduled state to execute;
-idle cycles and other match arms do not check stale values. A failed
-`@try_rcv`, `@try_send` or `@drop` leaves the buffer unchanged, even in a state
-that also performs a blocking operation.
-A polling process that has finished performs no further buffer sends, state
-updates, or execution-scoped assertions.
-In a sequence, assertions check only when their stage has a valid item and
-the pipeline advances, with any enclosing branch condition also required.
-Empty stages and output stalls do not execute assertions.
+DDL includes built-in structural combinators for channel multiplexing and distribution:
 
-**A pipe is claimed where the program asks for it, under the condition it
-asks.** One rule, and it is the same in a process that blocks and one that does
-not. A `@try_rcv` or `@drop` written inside an `if` takes `ready` down on every
-other branch, so a stage that is busy finishing something declines its input by
-saying so where it is busy — there is no separate way to stall. An offer is
-made on the branch its `@try_send` is written on and no other, so a cycle that
-produces nothing publishes nothing, and a cycle that owes a result is free to
-produce one whether or not anything arrived.
+- **`@merge(in0, in1, out)`**: Arbitrates two input buffers onto a single output channel using rotating round-robin priority. Prevents starvation without introducing multi-cycle FSM latency.
+- **`@split(in, out0, out1)`**: Broadcasts a single input channel to multiple consumers. Each consumer receives its own independent 2-entry skid buffer. An item is retired from the input only when *all* consumers have accepted it.
 
-**What is on the wire is a pair of gray-coded pointers, not `valid`/`ready`.**
-Each pipe flattens to three ports: `<p>_wsalt` (2 bits, the producer's),
-`<p>_rsalt` (2 bits, the consumer's) and `<p>_data`, which carries both
-entries. Each side publishes only its own salt, and publishes it from a
-register:
+Combinators are generated as dedicated datapath modules (e.g., `ddl_merge_2x32`) without internal state machine overhead.
 
-```verilog
-wire src_empty = src_wsalt == src_rsalt_q;      // nothing to take
-wire dst_full  = dst_wsalt_q == (~dst_rsalt);   // one lap ahead: both full
+For complete datapath diagrams and starvation-free arbitration details, see [**Zero-Latency Hardware Combinators**](docs/combinators.md).
+
+---
+
+## Type System and Storage
+
+### Integers and Bit Operations
+
+- **Arbitrary-Width Types**: Unsigned `uN` and signed `iN` integers (e.g., `u1`, `u8`, `u32`, `i16`).
+- **Strict Width Safety**: Mixing bitwidths or mixing signed and unsigned values in an operation causes a compile error. Automatic truncation or extension is prohibited; use `@zext(val, width)`, `@sext(val, width)`, or `@trunc(val, width)`.
+- **Bit Slicing**: `@slice(val, base_index, width)` extracts a dynamic bit window of size `width` starting at `base_index`.
+- **Concatenation**: `{a, b, c}` packs values from most-significant to least-significant bits into an unsigned integer whose width equals the sum of operand widths.
+
+### Structs and Tagged Unions
+
+- **Structs**: Product types with named fields. Memory layout matches SystemVerilog packed structure conventions, enabling direct interoperation with `.svh` headers.
+- **Simple Enums**: Defined with an explicit backing width (e.g., `enum State: u2 { Idle, Run, Stop }`).
+- **Tagged Unions**: Enums with variant payloads:
+
+```ddl
+enum req_e
+  Nop
+  Read(addr_t)
+  Write(u8)
+  Halt
 ```
 
-Empty is the two salts agreeing; full is their differing in both bits, which
-in gray code is one lap over a buffer that holds two. Toggling your own salt
-IS the transfer — there is no separate `valid` to assert and no `ready` to
-answer it in the same cycle, so "`valid` must not depend combinationally on
-`ready`" holds by construction rather than by review. A hand-written module
-meeting a generated one matches those three ports; `extern` (below) is how to
-say so without wiring them by hand.
+Tagged unions pack into `{tag, payload}` format with the tag occupying the highest bits. The overall width is derived from the tag width plus the widest variant payload.
+- Payload fields can *only* be accessed via `match` expressions.
+- Direct equality checks (`==`) on tagged unions are disallowed to prevent comparing uninitialized payload padding.
 
-A pipe gets one transfer per cycle, and `@peek` is how you look without
-spending it: `let (v, present) = @peek(p)` reads the offer and takes nothing,
-so a `@try_rcv` or a `@drop` of the same pipe in the same cycle is still
-available. `present` is the offer where `got` is the transfer, and on a cycle
-the process is not accepting they differ — which is the whole reason to peek.
-`@drop(p)` is a `@try_rcv` that binds nothing, for when the answer is
-"whatever that was, not this". There is one kind and it never drops anything: the producer waits.
-A `buffer` is two entries deep — a head and a skid — which is what makes
-`ready` a register rather than a wire through to the sink's: the producer
-learns about a stall a cycle late and the second entry is where the item it
-had already committed to goes. A chain of blocks is therefore a chain of
-registers, not one combinational path as long as the chain. The depth cannot
-be changed.
+### Packed Arrays
 
-There is no lossy kind, and no way to ask for one. A pipe whose producer never
-waited would have to overwrite its oldest item when the sink fell behind, and
-an overwrite is a dropped transfer — not visible where it happens, but later
-and somewhere else, as a machine one item out of step. Where a sink genuinely
-cannot refuse, it ties `ready` high and says so at the boundary, which puts the
-claim somewhere a reader can check.
+A type of the form `[T; n]` without a memory attribute is a packed value:
+- Supported as struct fields, channel payloads, and parameters.
+- Elements are accessed via `a[idx]` and sliced via `a[hi..lo]`.
+- Array assignments support both constant and dynamic indexing: `a[idx] = val`.
+- Out-of-bounds indexing is rejected at compile time when constant, and bounds-checked during synthesis.
 
-**Combinators.** `@merge` and `@split` are modules the compiler writes:
+### Memories (`lutram` and `bram`)
 
-```
-graph top (p: buffer in u32, q: buffer in u32, o1: buffer out u32, o2: buffer out u32)
-  let m: buffer u32
-  let d: buffer u32
-  @merge(p, q, m)      -- two producers onto one pipe, in rotation
-  dbl(m, d)
-  @split(d, o1, o2)    -- one producer to two consumers, each its own copy
+Array storage can be backed by physical hardware memory primitives using implementation attributes:
+
+```ddl
+#[impl(lutram)]
+var lut_table: [u16; 64]
+
+#[impl(bram)]
+var block_mem: [u32; 1024]
 ```
 
-`@merge` grants one input per cycle with a rotating priority, so a busy input 0
-cannot starve input 1. `@split` takes from its input only when EVERY sink has
-room, and gives each sink its own pair of entries — a slot per sink, rather
-than ANDing the sinks' readys together, which would rebuild exactly the
-combinational coupling the salt protocol removes. Both are a datapath and no
-states, because writing either as a `process` would cost a cycle per hop for
-something whose whole job is to pass an item along. One module is emitted per
-shape (`ddl_merge_2x32`) however many times it is instantiated.
+- **`lutram` (Asynchronous Read)**: Distributed RAM. Reads complete within the same clock cycle.
+- **`bram` (Synchronous Read)**: Block RAM. Reads require one clock cycle latency and are emitted inside the memory's clocked block to ensure inference by synthesis tools.
+  - In a `process`, a `bram` read occupies a dedicated FSM state.
+  - In a `sequence`, a `bram` read must precede a stage cut (`|||`). The block RAM's built-in output register acts as the pipeline stage register.
+  - **Forwarding**: Same-cycle writes occurring earlier in source order are forwarded around the memory array, which updates on the clock edge.
 
-**Modules DDL did not compile.** `extern` names one, so a `graph` can be the
-top level instead of a guest inside a hand-written one:
+### Multi-Port Synthesis and LVT BRAM
 
-```
-extern psram (req: buffer in mem_req_t, rsp: buffer out mem_rsp_t)
-```
+The compiler infers one read/write port per concurrent access:
+- Two sequential writes in the same cycle require two physical write ports.
+- Mutually exclusive writes within `if`/`else` branches share a single write port.
 
-The connections are checked like any other instance and no module is emitted.
-An `extern` declares pipes and nothing else: a graph connects pipes, so a
-parameter of any other kind would be a port left floating in the instantiation.
-
-**Multiple files.** Either several inputs on the command line, or one input
-naming the others:
-
-```
-import "k2g_types.ddl"
-```
-
-An import is resolved against the importing file's directory, then against
-each `-I` directory. There are no namespaces — an import means "this file is
-part of the program too", and every declaration is visible to every other one
-regardless of which file it is in. A file reached twice is included once, so a
-diamond is fine and so is a cycle.
-
-## What it refuses, and says so
-
-Deliberately, with a diagnostic rather than a wrong answer:
-
-- assigning an output on only one branch of an `if`, which would be a latch
-- a `match` that does not cover every variant, for the same reason
-- mixing widths, or mixing signedness, in one operator
-- a pipe in a `graph` with two producers, or with none
-- a `bram` read in a process with no states to spend a cycle in, and a `bram`
-  with a reset, which cannot be inferred as one
-- a `for` whose trip count is not known at compile time
-- a `for` body containing a blocking transfer, synchronous read, `loop`, or
-  `break`: `for` unrolls combinational work; use an explicit process `loop`
-  for sequential work
-- a blocking `@rcv`/`@send` in the condition of an `if` or the scrutinee of a
-  `match`, which would have to be decided before it could be waited on
-- a computed index anywhere but the last step of an assignment target
-- `==` on an enum that carries payloads, which would compare the padding too
-- a width annotation on an enum that carries payloads, which would name the tag
-  and read as the value
-- reading a variant's payload without matching on its tag first
-- `bkram` memories, `~=`
-
-`desc.md` lists more that is designed but not built — `io process`, `pin`,
-`clock`.
-
-## The backend
-
-Verilog-2005, and specifically the subset GowinSynthesis survives. No
-`$clog2`, no width casts in expressions, no function calls: all three make it
-exit with an empty log. There are tests asserting none of them can appear in
-the output. Generated files carry a banner with the exact command that
-reproduces them, and `ddl build --check` verifies a checked-in file is current
-without writing it.
-
-## Tests
+When targeting FPGAs that lack native dual-write block RAM cells (such as the Gowin GW1NR-9C), pass the `--lvt-bram` flag:
 
 ```bash
-cargo test
+ddl build src/top.ddl -o build/top.v --lvt-bram
 ```
+
+This synthesizes a multi-write RAM using single-write BRAM blocks coordinated by a Live Value Table (LVT) implemented in distributed logic. See [`examples/rf_lvt.ddl`](examples/rf_lvt.ddl) for benchmarks.
+
+For an in-depth breakdown of LVT mechanics, memory banking, and FPGA synthesis benchmarks, see [**Multi-Write BRAM via Live Value Tables**](docs/lvt-bram-architecture.md).
+
+---
+
+## Statements and Scoping
+
+DDL supports structured imperative control flow:
+
+- **Bindings**:
+  - `let name: T = expr`: Immutable local binding.
+  - `var name: T = expr`: Mutable binding.
+- **Variable Scoping**:
+  - Process-level `var` declarations declared at the start of a `process` persist as registers across cycles and are initialized on reset.
+  - Local `var` declarations inside loops and conditional blocks have lexical scope. They re-initialize whenever execution enters their scope and retain state across wait cycles within that scope.
+- **Assignments**: Standard (`=`) and compound (`+=`, `-=`, `<<=`, `>>=`, `&=`, `|=`, `^=`).
+- **Conditionals (`if` / `else`)**: In FSMs, conditions can fork execution across states. In combinational blocks, all branches must assign outputs to avoid latches.
+- **Pattern Matching (`match`)**: Matches on enum variants. Exhaustiveness checking is strictly enforced.
+- **Loops**:
+  - `loop { ... }`: Infinite loop in a `process`, modeling recurring state cycles.
+  - `break`: Exits the innermost loop. At the top level of a process, `break` permanently halts execution.
+  - `for i in 0..n { ... }`: Compile-time unrolled loop. Trip bounds must be statically determinable. Blocking channel operations and synchronous memory reads are disallowed within `for` loops.
+
+---
+
+## Assertions
+
+DDL provides built-in simulation assertions:
+
+```ddl
+@assert(cond)
+@assert(cond, "Condition violated")
+@fatal("Unrecoverable state reached")
+```
+
+- **Simulation Guarded**: Assertions are emitted within `` `ifdef SIMULATION `` blocks and stripped during physical synthesis.
+- **Execution Scoped**:
+  - In a `process`, assertions evaluate only when their specific state and branch are active; idle cycles do not trigger spurious failures.
+  - In a `sequence`, assertions evaluate only when the containing stage holds a valid token and the pipeline advances.
+  - Assertions are automatically held in reset during hardware reset cycles.
+
+---
+
+## Compile-Time Diagnostics
+
+The DDL compiler emphasizes strict validation, failing fast with descriptive diagnostics:
+
+- **Incomplete assignments**: Omitting an output assignment on any branch of an `if` or `match` in combinational code (prevents unintended latches).
+- **Non-exhaustive matches**: Failing to match every variant of an enum.
+- **Width or signedness mismatches**: Mixing incompatible numeric types without explicit casts.
+- **Graph topology errors**: Binding a pipe to multiple producers, or leaving a pipe unattached.
+- **Invalid blocking operations**: Placing a blocking `@rcv` or `@send` inside an `if` condition, `match` scrutinee, or unrolled `for` loop.
+- **Unsupported memory usage**: Invoking a synchronous `bram` read within a stateless `fun`, or attaching an asynchronous reset to a BRAM primitive.
+- **Dynamic indexing restrictions**: Placing computed indices at any position other than the terminal step of an assignment target.
+- **Tagged union misuse**: Performing direct comparisons (`==`) on tagged unions, or accessing variant payloads without matching.
+
+---
+
+## Verilog Backend and Tooling
+
+### Synthesizer Compatibility
+
+DDL targets standard Verilog-2005 with strict adherence to constructs accepted by GowinSynthesis and other FPGA toolchains:
+- No use of `$clog2` in emitted code.
+- No dynamic width casting inside expressions.
+- No Verilog function calls in output netlists.
+
+All generated files carry a banner comment recording the compiler version and exact command used to build them.
+
+For complete details on toolchain failure modes, forbidden Verilog constructs, and automated Verilator `-Wall` linting, see [**Verilog Backend & Synthesizer Portability**](docs/backend-portability.md).
+
+### Multi-File Projects
+
+Projects can be split across multiple files using `import`:
+
+```ddl
+import "types.ddl"
+import "subsystem/core.ddl"
+```
+
+- Files are resolved relative to the importing file's directory, followed by paths supplied via `-I` compiler flags.
+- Declarations share a unified global namespace.
+- Circular and diamond imports are automatically deduplicated.
+
+### Formatter
+
+DDL includes an AST-preserving code formatter:
 
 ```bash
-cargo clippy --all-targets
+ddl fmt examples/*.ddl          # Format files in place
+ddl fmt --check examples/*.ddl  # Check formatting (exits with code 1 on mismatch)
 ```
 
-The suite runs under Miri, which checks the parser's pointer arithmetic for
-undefined behaviour rather than merely for crashing -- a read one past the end
-usually does not crash:
+The formatter adjusts whitespace, blank lines, and trailing spaces. It does not alter block indentation, ensuring syntax trees remain identical before and after formatting.
+
+### Graph Visualization
+
+To inspect structural connectivity and feedback loops in a `graph`, export a Graphviz DOT representation:
 
 ```bash
-MIRIFLAGS=-Zmiri-disable-isolation cargo miri test --test fuzz
+ddl build examples/pipeline_graph.ddl --emit=dot | dot -Tsvg > pipeline.svg
 ```
 
-Tests that touch the filesystem are skipped there; Miri has no Windows path
-shims. So is the fuzzer's hang check, which is a wall-clock timeout and under
-Miri measures the interpreter rather than the compiler.
+### Editor Support
 
-The suite includes a fuzzer, seeded so a failure is reproducible. It runs a
-short pass on every `cargo test`; the soak is an environment variable:
-
-```bash
-DDL_FUZZ_ITERS=1000000 cargo test --release --test fuzz
-```
-
-Clippy is clean. The two lints this codebase deliberately does not follow are
-in `Cargo.toml` with a reason each; rustfmt is deliberately NOT used, because
-the house style predates it and adopting it would rewrite every file.
-
-Unit and integration tests: the compiler's own behaviour, `import` against
-real files on disk, that every example still compiles, and that the checked-in
-`.v` files match what the compiler produces now.
-
-Every checked-in `.v` is also linted, if Verilator is installed. That is an
-oracle needing no reference: it reads the output as a synthesis tool would and
-objects to width mismatches, inferred latches, undriven or multiply-driven
-nets, combinational loops and nets flopped on both edges -- none of which an
-assertion about the text can see, because it would have to know what to look
-for. The output is clean at `-Wall`, so anything not waived in
-`examples/lint.vlt` is a change in what the compiler emits. Verilator absent
-means the check says so and passes; a check that cannot run must not be a
-check that fails.
-
-On Linux and macOS the package manager's `verilator` needs no configuration.
-On Windows, MSYS2 has one, but its `verilator` is a Perl wrapper Git Bash's
-Perl cannot load and the binary beside it carries an MSYS2-internal data path,
-so both want saying:
-
-```bash
-pacman -S mingw-w64-x86_64-verilator      # in the MSYS2 shell
-export VERILATOR=/c/msys64/mingw64/bin/verilator_bin.exe
-export VERILATOR_ROOT=/c/msys64/mingw64/share/verilator
-```
-
-Under WSL it is an ordinary Linux install and neither variable applies. The
-paths above are environment on the machine that has it, not facts in this
-repository: `tests/lint.rs` knows only `$VERILATOR`, and falls back to PATH.
-
-Equivalence and area against the hand-written SystemVerilog these examples
-replace is a separate script, because it needs Questa and the Gowin toolchain:
-
-```bash
-bash examples/verify.sh
-```
-
-It instantiates each generated module beside its reference, drives both with
-the same stimulus, and compares primitive counts after synthesis. Modules
-whose reference lives in another repository are skipped when it is absent.
-
-## Formatting
-
-```bash
-ddl fmt examples/*.ddl          # in place
-ddl fmt --check examples/*.ddl  # exit 1 if any needs it
-```
-
-Whitespace hygiene only: trailing space, line endings, runs of blank lines, the
-final newline. **It does not touch indentation.** A DDL block is delimited by
-indentation, and only the parser knows which deeper lines are blocks -- it
-discards that as trivia, so nothing downstream can tell a nested block from the
-continuation line of a wrapped parameter list. Every file it writes is parsed
-before and after and refused if the syntax tree changed.
-
-## Reading a design
-
-```bash
-ddl build examples/pipeline_graph.ddl --emit=dot | dot -Tsvg > scaler.svg
-```
-
-A `graph` is the one declaration whose meaning is its shape, and neither the
-source nor the Verilog shows it: one lists instances and leaves the reader to
-match pipe names, the other lists them again with three wires per pipe in
-between. `--emit=dot` draws one edge per pipe, with the graph's own parameters
-as the boundary, so a feedback path looks like one.
-
-## Editor support
-
-`editors/vscode/` is a syntax-highlighting extension for `.ddl`. To use it
-without packaging, symlink or copy it into your extensions directory:
+Syntax highlighting for Visual Studio Code is available in `editors/vscode/`. To install:
 
 ```bash
 cp -r editors/vscode ~/.vscode/extensions/ddl
 ```
 
-The grammar is checked against the compiler by `tests/editor.rs`: a builtin or
-keyword the compiler resolves and the grammar does not is a test failure. A
-syntax file is otherwise the one part of a toolchain nothing verifies, so it
-goes stale in silence.
+The VS Code grammar is automatically verified against compiler keywords and builtins by `tests/editor.rs`.
 
-## Layout
+---
 
-| | |
-|---|---|
-| `src/lex.rs`, `src/parse.rs` | tokens and the AST, then precedence resolution |
-| `src/source.rs` | which files a compilation is made of |
-| `src/symbols.rs`, `src/ty.rs` | the symbol table and the type rules |
-| `src/ir.rs` | typed SSA lowering, shared by every declaration kind |
-| `src/ir_pipe.rs` | `sequence` → pipeline |
-| `src/ir_fsm.rs` | `process` → state machine (a graph, not a chain) |
-| `src/ir_graph.rs` | `graph` → instances and wires |
-| `src/ir_comb.rs` | `@merge` and `@split` → modules the compiler writes |
-| `src/ir_match.rs` | `match` → case |
-| `src/verilog.rs` | the backend |
-| `src/diag.rs` | source locations and the caret rendering |
-| `src/driver.rs` | the passes, in order |
+## Testing and Verification
 
-`src/main.rs` is argument parsing and exit codes over the library in
-`src/lib.rs`; anything that wants to compile DDL without spawning a process
-links the library.
+The repository includes a comprehensive test and validation suite:
+
+### Unit Tests and Clippy
+
+```bash
+cargo test
+cargo clippy --all-targets
+```
+
+### Undefined Behavior Checks (Miri)
+
+The AST parser's pointer operations are validated under Miri:
+
+```bash
+MIRIFLAGS=-Zmiri-disable-isolation cargo miri test --test fuzz
+```
+
+### Fuzz Testing
+
+The compiler includes an integrated fuzzer for parser and type checker robustness:
+
+```bash
+# Run 1,000,000 iterations of fuzzing
+DDL_FUZZ_ITERS=1000000 cargo test --release --test fuzz
+```
+
+### Verilator Linting
+
+If [Verilator](https://www.veripool.org/verilator/) is installed, test runs automatically lint generated Verilog files at `-Wall` to check for latches, multi-driven nets, combinational loops, and unclocked registers:
+- On Linux/macOS, standard package manager installations work out of the box.
+- On Windows under MSYS2:
+  ```bash
+  pacman -S mingw-w64-x86_64-verilator
+  export VERILATOR=/c/msys64/mingw64/bin/verilator_bin.exe
+  export VERILATOR_ROOT=/c/msys64/mingw64/share/verilator
+  ```
+
+### Synthesis and Equivalence Verification
+
+The verification script [`examples/verify.sh`](examples/verify.sh) compares generated Verilog modules against reference SystemVerilog implementations using QuestaSim and the Gowin synthesis toolchain, verifying both functional cycle-equivalence and post-synthesis resource utilization.
+
+---
+
+## Repository Layout
+
+```
+src/
+├── main.rs         CLI entry point and command-line parsing
+├── lib.rs          Compiler library interface
+├── driver.rs       Pipeline driver coordinating compiler passes
+├── source.rs       Source file manager and import resolution
+├── lex.rs          Lexer and token definitions
+├── parse.rs        Recursive-descent parser and AST representation
+├── symbols.rs      Symbol table and lexical scope resolution
+├── ty.rs           Type inference, validation, and width checking
+├── ir.rs           Typed Static Single Assignment (SSA) intermediate representation
+├── ir_pipe.rs      Lowers sequence declarations into pipeline stages
+├── ir_fsm.rs       Lowers process declarations into finite state machines
+├── ir_graph.rs     Lowers graph declarations into structural instance netlists
+├── ir_comb.rs      Generates hardware for @merge and @split combinators
+├── ir_match.rs     Lowers match expressions into case statements
+├── verilog.rs      Synthesizable Verilog-2005 code generator
+└── diag.rs         Source diagnostics and caret rendering
+```
