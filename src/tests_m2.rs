@@ -1662,12 +1662,12 @@ fn sending_to_an_input_pipe_is_rejected() {
 }
 
 #[test]
-fn an_output_pipe_that_is_never_sent_to_is_rejected() {
-    let text = compile_err(&format!(
+fn an_output_pipe_that_is_never_sent_to_stays_idle() {
+    let text = compile(&format!(
         "{}process p (src: buffer in item_t, dst: buffer out item_t)\n  let (it, got) = @try_rcv(src)\n",
         PIPE
     ));
-    assert!(text.contains("is never sent to"), "{}", text);
+    assert!(text.contains("assign dst_wsalt = dst_wsalt_q;"), "{}", text);
 }
 
 #[test]
@@ -1788,7 +1788,7 @@ fn a_linear_body_runs_once_and_stops() {
     assert!(v.contains("reg done;"), "{}", v);
     assert!(v.contains("done <= 1'b1;"), "{}", v);
     // Refuses everything once it has stopped, and holds its state.
-    assert!(v.contains("(!done)"), "{}", v);
+    assert!(v.contains("!done"), "{}", v);
     assert!(v.contains("seen <= (done ? seen :"), "{}", v);
 }
 

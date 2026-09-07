@@ -161,7 +161,11 @@ fn a_drop_in_a_state_machine_consumes_in_that_state() {
     // asked for it. `src_take` is the toggle enable -- the salt protocol's
     // whole answer to "am I claiming this pipe".
     let take = v.lines().find(|l| l.contains("wire src_take")).expect("a take");
-    assert!(take.contains("fire_s0"), "{}", v);
+    assert!(
+        take.contains("src_xfer_s0") && v.contains("wire src_xfer_s0 = fire_s0 & (!src_empty);"),
+        "{}",
+        v
+    );
     assert!(take.contains("ctl_item") || take.contains("branch_s0"), "{}", v);
 }
 
@@ -231,8 +235,21 @@ fn a_guarded_receive_takes_ready_down_on_the_other_branch() {
     // something declines its input by construction.
     let v = compile(WIDEN);
     
-    assert!(v.contains("wire src_take = src_xfer & n33;"), "{}", v);
-    assert!(v.contains("wire n33 = !pending;"), "{}", v);
+    let take = v
+        .lines()
+        .find(|l| l.contains("wire src_take"))
+        .expect("a transfer condition");
+    let guard = take
+        .trim()
+        .trim_end_matches(';')
+        .rsplit(" & ")
+        .next()
+        .unwrap();
+    assert!(
+        take.contains("src_xfer") && v.contains(&format!("wire {guard} = !pending;")),
+        "{}",
+        v
+    );
 }
 
 #[test]
@@ -250,7 +267,8 @@ fn an_offer_is_made_on_its_own_branch_and_no_other() {
         "    let (x, got) = @try_rcv(src)\n",
         "    let _s = @try_send(dst, x)\n",
     ));
-    assert!(plain.contains("wire src_take = (!src_empty) & dst_push;"), "{}", plain);
+    assert!(plain.contains("wire src_take = !src_empty;"), "{}", plain);
+    assert!(plain.contains("wire dst_push = !dst_full;"), "{}", plain);
 }
 
 #[test]

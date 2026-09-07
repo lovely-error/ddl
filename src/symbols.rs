@@ -320,12 +320,12 @@ pub fn build(
             Pending::Enum(ix) => {
                 let shell = shells[*ix].as_ref().expect("only present shells are pending");
                 (
-                    enums[*ix].name,
+                    enums[*ix].name.clone(),
                     finish_enum(&enums[*ix], shell, &syms).expect_err("it did not finish"),
                 )
             }
             Pending::Struct(ix) => (
-                structs[*ix].name,
+                structs[*ix].name.clone(),
                 build_struct_quiet(&structs[*ix], &syms).expect_err("it did not finish"),
             ),
         };
@@ -433,11 +433,11 @@ fn finish_enum(
             None => continue,
         };
         let ty = crate::ty::resolve_type_expr(payload, syms).map_err(|e| {
-            (variant.name, e.message(), e.missing_type_name())
+            (variant.name.clone(), e.message(), e.missing_type_name())
         })?;
         if ty.is_memory() {
             return Err((
-                variant.name,
+                variant.name.clone(),
                 "a memory cannot be an enum payload: it is storage rather than a value"
                     .to_string(),
                 None,
@@ -465,15 +465,15 @@ fn build_struct_quiet(decl: &StructDecl, syms: &Symbols) -> Result<StructDef, Re
         let fname = anumspan_to_str(&field.name).to_string();
         let is_duplicate = fields.iter().any(|(n, _)| *n == fname);
         if is_duplicate {
-            return Err((field.name, format!("field `{}` is declared twice", fname), None));
+            return Err((field.name.clone(), format!("field `{}` is declared twice", fname), None));
         }
         let ty = crate::ty::resolve_type_expr(&field.field_type, syms)
-            .map_err(|e| (field.name, e.message(), e.missing_type_name()))?;
+            .map_err(|e| (field.name.clone(), e.message(), e.missing_type_name()))?;
         fields.push((fname, ty));
     }
 
     if fields.is_empty() {
-        return Err((decl.name, "a struct needs at least one field".to_string(), None));
+        return Err((decl.name.clone(), "a struct needs at least one field".to_string(), None));
     }
     Ok(StructDef { name, fields })
 }

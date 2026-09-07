@@ -15,8 +15,6 @@ type Scope = HashMap<String, AlphanumSpan>;
 pub struct Scoped {
     pub stmts: Vec<PrecResInnerStmt>,
     pub origins: HashMap<usize, Span>,
-    // AST identifiers borrow these boxes, whose allocations do not move.
-    _names: Vec<Box<str>>,
 }
 
 struct Resolver<'a> {
@@ -26,18 +24,15 @@ struct Resolver<'a> {
     used: HashSet<String>,
     locals: HashSet<String>,
     unresolved: Vec<AlphanumSpan>,
-    names: Vec<Box<str>>,
+    next_name: usize,
 }
 
 impl Resolver<'_> {
     fn alias(&mut self, text: Box<str>, original: AlphanumSpan) -> AlphanumSpan {
-        let span = AlphanumSpan {
-            byte_ptr: text.as_ptr(),
-            len: text.len() as u32,
-        };
+        let span = AlphanumSpan::new(text.as_ref());
         self.origins
             .insert(span.byte_ptr as usize, self.map.span_of(&original));
-        self.names.push(text);
+        self.next_name += 1;
         span
     }
     fn bind(&mut self, span: &mut AlphanumSpan, scope: &mut Scope) {
@@ -47,10 +42,10 @@ impl Resolver<'_> {
         }
         self.locals.insert(original.clone());
         if !self.used.insert(original.clone()) {
-            let text = format!("@local{}_{}", self.names.len(), original).into_boxed_str();
-            *span = self.alias(text, *span);
+            let text = format!("@local{}_{}", self.next_name, original).into_boxed_str();
+            *span = self.alias(text, span.clone());
         }
-        scope.insert(original, *span);
+        scope.insert(original, span.clone());
     }
 
     fn pattern(&mut self, p: &mut BindingPattern, scope: &mut Scope) {
@@ -77,10 +72,10 @@ impl Resolver<'_> {
                     // rename was needed. A declaration's anchor is not the
                     // location of every later use of the binding.
                     if anumspan_to_str(resolved) != anumspan_to_str(n) {
-                        *n = self.alias(anumspan_to_str(resolved).into(), *n);
+                        *n = self.alias(anumspan_to_str(resolved).into(), n.clone());
                     }
                 } else {
-                    self.unresolved.push(*n);
+                    self.unresolved.push(n.clone());
                 }
             }
             PrecResExpr::Call { base, args } => {
@@ -182,7 +177,7 @@ pub fn resolve(
         globals,
         locals: HashSet::new(),
         unresolved: Vec::new(),
-        names: Vec::new(),
+        next_name: 0,
     };
     let mut stmts = body.to_vec();
     r.block(&mut stmts, &Scope::new());
@@ -200,6 +195,5 @@ pub fn resolve(
     Some(Scoped {
         stmts,
         origins: r.origins,
-        _names: r.names,
     })
 }

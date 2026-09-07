@@ -5,6 +5,13 @@ Their comments describe the original failures, before the compiler repairs.
 `lifetimes.ddl` adds repeated dynamic initialization, shadowing and mutable
 receive bindings; `arm_scopes.ddl` checks different payload types and mutable
 locals under the same source names in separate waiting match arms.
+`backend_edges.ddl` checks scalar selection/extension and identifier
+collisions, including a graph connecting colliding module names.
+`adversarial.ddl` checks shared continuations, for-only crossing reads, BRAM
+forwarding, and exclusive sends in blocking states. Its separate
+`tb_adversarial.sv` is also run by the strict Questa runner.
+`communication.ddl` checks local channel availability, observation without
+consumption, one-shot execution, and forwarding under backpressure.
 
 `cargo test --test probe_regressions` executes the lowered circuits and checks
 observable transfers and values under backpressure, including negative
@@ -16,8 +23,9 @@ Outputs and transcripts go to `target/probe-regressions/`. The runner requires
 the pass marker and zero simulator errors; a successful process exit alone
 is insufficient.
 
-`p3` is a successful memory feature probe. `p4` compiles, but its original
-`consumed == (stale | fire)` assertion assumes output availability; it is not
-a valid invariant under arbitrary backpressure and is not used as a compiler
-correctness oracle. The positive simulator test deliberately exercises the
-compiler defects and lifetimes, not that unsupported source assumption.
+`p3` is a successful memory feature probe. With local channel availability,
+`p4`'s `consumed == (stale | fire)` assertion holds even with full outputs:
+an attempted drop needs only the observed input. The regressions check this
+case. Its original forwarding algorithm can still discard fresh data when a
+send fails; lossless forwarding must retain the input or store the pending
+output until a send succeeds.

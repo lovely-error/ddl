@@ -229,6 +229,51 @@ Between two things DDL compiled, a `buffer` is still the answer.
 **Buffer pipes.** `buffer`, in and out, with `@rcv`, `@send`, `@try_rcv`,
 `@try_send`, `@peek` and `@drop`.
 
+**Communication is local by default.** An ordinary `process` uses each
+buffer's own availability. An attempted receive or drop needs its input to be
+nonempty; an attempted send needs its output to have room. An unrelated full
+output does not stop input work. An unused output stays idle. There is no
+separate process modifier or implicit all-output acceptance condition.
+
+A polling `loop` executes once per cycle; a body without `loop` executes once
+and stops. Operations in a blocking process also require their scheduled
+state to execute. Branches and explicit tests of transfer success determine
+dependencies between operations.
+
+`@peek` observes and never consumes, including when it is the only operation
+on an input. `@try_rcv`, `@drop`, and `@try_send` report an actual transfer on
+their executing path. A failed attempt leaves the buffer unchanged. The data
+returned by a failed receive or absent peek is not a valid item. Availability
+is based on the current registered pointers; concurrent transfers take effect
+at the clock edge. This introduces no combinational ready chain between
+generated blocks. One pipe still permits at most one transfer per cycle. Mutually exclusive
+`if`/`match` arms can each request that transfer: their payloads are selected
+by their paths. Requests that may both execute in one cycle are rejected,
+including a nonblocking send beside a blocking send to the same output port.
+
+A process does not implicitly make several nonblocking attempts atomic.
+In particular, receiving and then ignoring a failed send can lose the value.
+For a same-cycle relay, peek first and consume only after sending succeeds:
+
+```ddl
+process relay (src: buffer in u8, dst: buffer out u8)
+  loop
+    let (x, present) = @peek(src)
+    if present then
+      let sent = @try_send(dst, x)
+      if sent then
+        let took = @drop(src)
+        @assert(took)
+```
+
+When `dst` is full, this leaves the head in `src`. When it has room, the
+send and consumption occur on the same edge. This works because the source
+has one consumer, its head remains present throughout this step, and the
+drop has no unrelated-output requirement. For a program
+that needs to retain a value across waits, use an ordinary process with
+`@rcv` followed by `@send`; the compiler allocates the holding storage.
+Explicit multi-operation atomic blocks are not implemented.
+
 **Assertions.** `@assert(cond)`, `@assert(cond, "message")` and `@fatal`, which
 is the same with `$fatal` instead of `$error`. They are checked in simulation
 and absent from synthesis: the emitted block sits inside `` `ifdef SIMULATION ``,
@@ -240,6 +285,8 @@ In a blocking process, a check also requires its scheduled state to execute;
 idle cycles and other match arms do not check stale values. A failed
 `@try_rcv`, `@try_send` or `@drop` leaves the buffer unchanged, even in a state
 that also performs a blocking operation.
+A polling process that has finished performs no further buffer sends, state
+updates, or execution-scoped assertions.
 
 **A pipe is claimed where the program asks for it, under the condition it
 asks.** One rule, and it is the same in a process that blocks and one that does
@@ -345,6 +392,9 @@ Deliberately, with a diagnostic rather than a wrong answer:
 - a `bram` read in a process with no states to spend a cycle in, and a `bram`
   with a reset, which cannot be inferred as one
 - a `for` whose trip count is not known at compile time
+- a `for` body containing a blocking transfer, synchronous read, `loop`, or
+  `break`: `for` unrolls combinational work; use an explicit process `loop`
+  for sequential work
 - a blocking `@rcv`/`@send` in the condition of an `if` or the scrutinee of a
   `match`, which would have to be decided before it could be waited on
 - a computed index anywhere but the last step of an assignment target

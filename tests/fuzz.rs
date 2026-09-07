@@ -82,6 +82,7 @@ fn corpus() -> Vec<String> {
     #[cfg_attr(miri, allow(unused_mut))]
     let mut seeds: Vec<String> = vec![
         "fun f (a: u8, o: out u8)\n  o = a\n".into(),
+        "process drain (src: buffer in u8)\n  loop\n    let took = @drop(src)\n".into(),
         "sequence s (src: buffer in u16, dst: buffer out u16)\n  let a = @rcv(src)\n  |||\n  @send(dst, a)\n".into(),
         "process p (src: buffer in u32, dst: buffer out u32)\n  loop\n    let a = @rcv(src)\n    @send(dst, a)\n".into(),
         "enum e\n  A\n  B(u8)\nfun f (x: e, o: out u8)\n  var v: u8 = @zeroed()\n  match x\n    .A =>\n      v = 8'd0\n    .B d =>\n      v = d\n  o = v\n".into(),

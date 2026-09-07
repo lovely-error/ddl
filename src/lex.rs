@@ -83,7 +83,7 @@ pub enum PostfixOp {
 /// Width is carried from the source because an HDL cannot infer it: `8'h00`
 /// and `16'h0000` are different hardware. An unsized literal has `width: None`
 /// and takes its width from context.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub enum RawNum {
     Int {
         span: AlphanumSpan,
@@ -100,8 +100,8 @@ pub enum RawNum {
 impl RawNum {
     pub fn span(&self) -> AlphanumSpan {
         match self {
-            RawNum::Int { span, .. } => *span,
-            RawNum::Float { span, .. } => *span,
+            RawNum::Int { span, .. } => span.clone(),
+            RawNum::Float { span, .. } => span.clone(),
         }
     }
 }
@@ -233,7 +233,7 @@ impl VarBindingKind {
 
     /// The name a diagnostic about the declaration points at.
     pub fn head(&self) -> AlphanumSpan {
-        self.names()[0]
+        self.names()[0].clone()
     }
 }
 
@@ -260,20 +260,38 @@ pub enum BindingPattern {
     AnyOf(Vec<BindingPattern>),
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct AlphanumSpan {
+    /// Source location only; safe text access never dereferences this pointer.
     pub byte_ptr: *const u8,
     pub len: u32,
+    text: std::sync::Arc<str>,
+}
+
+impl AlphanumSpan {
+    pub fn new(text: impl Into<std::sync::Arc<str>>) -> Self {
+        let text = text.into();
+        Self { byte_ptr: text.as_ptr(), len: text.len() as u32, text }
+    }
+
+    /// # Safety
+    /// `ptr..ptr+len` must be readable UTF-8 for this call. The text is copied.
+    pub(crate) unsafe fn from_raw(ptr: *const u8, len: u32) -> Self {
+        let text = core::str::from_raw_parts(ptr, len as usize);
+        Self { byte_ptr: ptr, len, text: text.into() }
+    }
+
+    pub fn as_str(&self) -> &str { &self.text }
 }
 
 /// Prints the identifier, not the pointer.
 ///
 /// Every AST dump goes through this, and a tree of raw addresses says nothing
-/// about the source it came from. The text is borrowed from the SourceMap,
-/// which outlives every AST that refers to it.
+/// about the source it came from. Text belongs to the span, independently of
+/// the source map used to locate it.
 impl core::fmt::Debug for AlphanumSpan {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        let text = unsafe { core::str::from_raw_parts(self.byte_ptr, self.len as usize) };
+        let text = self.as_str();
         write!(f, "`{}`", text)
     }
 }
@@ -293,7 +311,7 @@ pub struct RawProcessDecl {
 #[derive(Debug)]
 pub enum RawSeqInnerStmt {
     SegmentSeparator,
-    Stmt(InnerStmt)
+    Stmt(Box<InnerStmt>)
 }
 
 #[derive(Debug)]
@@ -646,10 +664,7 @@ fn try_parse_alphanum(
     if len == 0 {
         return Err(());
     }
-    let ns = AlphanumSpan {
-        byte_ptr: char_ptr,
-        len,
-    };
+    let ns = unsafe { AlphanumSpan::from_raw(char_ptr, len) };
     Ok((ns, ptr))
 }
 
@@ -810,7 +825,7 @@ fn try_parse_number(
 
 fn span_between(start: *const u8, end: *const u8) -> AlphanumSpan {
     let len = (end as usize) - (start as usize);
-    AlphanumSpan { byte_ptr: start, len: len as u32 }
+    unsafe { AlphanumSpan::from_raw(start, len as u32) }
 }
 
 fn try_parse_arg_type_qualifier(
@@ -1789,6 +1804,7 @@ unsafe fn try_parse_line_string(
             out = StrSpan {
                 start_ptr: bytes_start_addr,
                 len,
+                text: core::str::from_raw_parts(bytes_start_addr, len).into(),
             };
             break;
         }
@@ -1800,16 +1816,17 @@ unsafe fn try_parse_line_string(
 pub struct StrLiteral {
     pub pieces: Vec<StrSpan>,
 }
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct StrSpan {
     pub start_ptr: *const u8,
     pub len: usize,
+    text: std::sync::Arc<str>,
 }
 
 impl StrSpan {
-    /// The text between the quotes, borrowed from the source.
-    pub fn as_str<'a>(&self) -> &'a str {
-        unsafe { core::str::from_raw_parts(self.start_ptr, self.len) }
+    /// The text between the quotes, borrowed from this owned span.
+    pub fn as_str(&self) -> &str {
+        &self.text
     }
 }
 
@@ -2190,7 +2207,7 @@ unsafe fn try_parse_sequence_inner_stmt(
         Ok((RawSeqInnerStmt::SegmentSeparator, tail))
     } else {
         let (stmt, tail) = try_parse_inner_stmt(char_ptr, char_end_ptr, anchor_depth)?;
-        Ok((RawSeqInnerStmt::Stmt(stmt), tail))
+        Ok((RawSeqInnerStmt::Stmt(Box::new(stmt)), tail))
     }
 }
 /// # Safety

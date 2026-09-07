@@ -423,3 +423,178 @@ fn selection_bases_remain_signals_and_register_names_are_unique() {
     assert!(names.contains("reg [7:0] ans_data_1;"));
     assert!(names.contains("assign ans_data = {ans_e1, ans_e0};"));
 }
+
+#[test]
+fn receive_and_drop_ignore_unrelated_output_backpressure() {
+    for operation in ["let took = @drop(src)", "let (x, took) = @try_rcv(src)"] {
+        for available in [0, 1] {
+            let source = format!(
+                "process p (src: buffer in u8, blocked: buffer out u8, observed: port out u1)\n  loop\n    {operation}\n    @try_send(observed, took)\n"
+            );
+            let mut c = Circuit::new(&source, "p");
+            c.set("src_wsalt", available);
+            c.set("src_data", 42);
+            c.set("blocked_rsalt", 3); // wsalt=0 means full.
+            assert_eq!(c.out("observed"), available);
+            c.tick();
+            assert_eq!(c.out("src_rsalt"), available);
+            assert_eq!(c.out("blocked_wsalt"), 0);
+        }
+    }
+}
+
+#[test]
+fn peek_only_and_unrequested_inputs_never_consume() {
+    for available in [0, 1] {
+        let source = "process p (src: buffer in u8, unused: buffer in u8, observed: port out u1)\n  loop\n    let (x, present) = @peek(src)\n    @try_send(observed, present)\n";
+        let mut c = Circuit::new(source, "p");
+        c.set("src_wsalt", available);
+        c.set("unused_wsalt", 1);
+        for _ in 0..12 {
+            assert_eq!(c.out("observed"), available);
+            c.tick();
+            assert_eq!(c.out("src_rsalt"), 0);
+            assert_eq!(c.out("unused_rsalt"), 0);
+        }
+    }
+}
+
+#[test]
+fn polling_peek_send_drop_forwards_each_item_once_under_backpressure() {
+    let mut c = Circuit::new(include_str!("probes/communication.ddl"), "polling_forward");
+    c.set("unrelated_rsalt", 3);
+    let (mut w, mut r, mut produced, mut pair) = (0u128, 0u128, 0u128, 0u128);
+    let mut received = Vec::new();
+    for cycle in 0..400 {
+        if produced < 64 && w != ((!c.out("src_rsalt")) & 3) && cycle % 7 != 0 {
+            let idx = (w ^ (w >> 1)) & 1;
+            pair = (pair & !(255 << (idx * 8))) | (produced << (idx * 8));
+            produced += 1;
+            w ^= if idx == 0 { 1 } else { 2 };
+        }
+        c.set("src_wsalt", w);
+        c.set("src_data", pair);
+        if cycle % 11 >= 6 && c.out("o_wsalt") != r {
+            let idx = (r ^ (r >> 1)) & 1;
+            received.push((c.out("o_data") >> (idx * 8)) & 255);
+            r ^= if idx == 0 { 1 } else { 2 };
+        }
+        c.set("o_rsalt", r);
+        assert!(c.assertions_ok());
+        c.tick();
+        assert_eq!(c.out("unrelated_wsalt"), 0);
+    }
+    assert_eq!(received, (0..64).collect::<Vec<_>>());
+    assert_eq!(c.out("src_rsalt"), w);
+}
+
+#[test]
+fn a_finished_polling_process_stops_sends_and_execution_assertions() {
+    let mut c = Circuit::new(include_str!("probes/communication.ddl"), "polling_once");
+    c.set("src_wsalt", 1);
+    c.set("src_data", 42);
+    assert!(c.assertions_ok());
+    c.tick();
+    for _ in 0..12 {
+        assert!(c.assertions_ok());
+        assert_eq!(c.out("src_rsalt"), 1);
+        assert_eq!(c.out("o_wsalt"), 1);
+        assert_eq!(c.out("o_data") & 255, 42);
+        c.tick();
+    }
+}
+
+#[test]
+fn independent_is_an_identifier_not_a_process_modifier() {
+    use ddl::driver::compile_to_verilog;
+    use ddl::verilog::EmitOptions;
+    let ordinary = SourceMap::new(
+        "name.ddl",
+        "process independent (src: buffer in u8)\n  loop\n    let took = @drop(src)\n",
+    );
+    assert!(compile_to_verilog(&ordinary, &EmitOptions::default()).is_ok());
+    let blocking = SourceMap::new(
+        "mode.ddl",
+        "process independent p (src: buffer in u8)\n  loop\n    let x = @rcv(src)\n",
+    );
+    assert!(compile_to_verilog(&blocking, &EmitOptions::default()).is_err());
+}
+
+#[test]
+fn shared_branch_continuations_survive_every_predecessor() {
+    for first in [false, true] {
+        for second in [false, true] {
+            for use_match in [false, true] {
+                let next = if use_match {
+                    "    match b\n      .Yes =>\n        @send(o, 8'd1)\n      .No =>\n        @send(o, 8'd2)\n"
+                } else {
+                    "    if b then\n      @send(o, 8'd1)\n    else\n      @send(o, 8'd2)\n"
+                };
+                let d_ty = if use_match { "choice" } else { "u1" };
+                let src = format!("enum choice: u1\n  No\n  Yes\nprocess p (c: buffer in u1, d: buffer in {d_ty}, i: buffer in u8, o: buffer out u8)\n  loop\n    let a = @rcv(c)\n    let b = @rcv(d)\n    if a then\n      let x = @rcv(i)\n{next}");
+                let mut c = Circuit::new(&src, "p");
+                c.set("c_wsalt", 1); c.set("c_data", first as u128);
+                c.set("d_wsalt", 1); c.set("d_data", second as u128);
+                c.set("i_wsalt", 1);
+                assert_eq!(c.collect(60, 8), [if second { 1 } else { 2 }]);
+            }
+        }
+    }
+}
+
+#[test]
+fn for_only_reads_cross_waits() {
+    let mut c = Circuit::new(include_str!("probes/adversarial.ddl"), "for_read2");
+    c.set("src_wsalt", 3); c.set("src_data", 0x0703);
+    for _ in 0..8 { c.tick(); }
+    c.set("other_wsalt", 1);
+    for _ in 0..20 { c.tick(); }
+    assert_eq!(c.out("dst_wsalt"), 1);
+    assert_eq!(c.out("dst_data") & 255, 12);
+}
+
+#[test]
+fn exclusive_channel_requests_mux_data_and_transfer_results() {
+    for port in [false, true] {
+        for flag in [0, 1] {
+            for full in [false, true] {
+                let kind = if port { "port" } else { "buffer" };
+                let src = format!("process p (c: buffer in u1, o: {kind} out u8, success: port out u1)\n  loop\n    let (flag, present) = @peek(c)\n    var sent: u1 = 1'b0\n    if flag then\n      sent = @try_send(o, 8'd1)\n    else\n      sent = @try_send(o, 8'd2)\n    @try_send(success, sent)\n");
+                let mut c = Circuit::new(&src, "p");
+                c.set("c_wsalt", 1); c.set("c_data", flag);
+                if !port { c.set("o_rsalt", if full {3} else {0}); }
+                assert_eq!(c.out("success"), (port || !full) as u128);
+                if port { assert_eq!(c.out("o"), if flag == 1 {1} else {2}); }
+                c.tick();
+                if !port {
+                    assert_eq!(c.out("o_wsalt"), (!full) as u128);
+                    if !full { assert_eq!(c.out("o_data") & 255, if flag == 1 {1} else {2}); }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn overlapping_requests_and_barrier_port_duplicates_are_rejected() {
+    for body in [
+        "    @try_send(o, 8'd1)\n    @try_send(o, 8'd2)\n",
+        "    @try_send(o, 8'd1)\n    @send(o, 8'd2)\n",
+        "    @send(o, 8'd1)\n    @try_send(o, 8'd2)\n",
+    ] {
+        let map = SourceMap::new("duplicate.ddl", format!("process p (o: port out u8)\n  loop\n{body}"));
+        let errors = ddl::driver::compile_to_verilog(&map, &Default::default()).unwrap_err();
+        assert!(map.render_all(&errors).contains("sent to more than once in one cycle"));
+    }
+}
+
+#[test]
+fn for_waits_and_breaks_have_an_explicit_diagnostic() {
+    for op in ["@send(o, 8'd1)", "let x = @rcv(i)", "break", "let x = mem[0]"] {
+        let memory = if op.contains("mem") { "  var mem: #[impl(bram)] [u8; 16]\n" } else { "" };
+        let map = SourceMap::new("for_wait.ddl", format!("process p (i: buffer in u8, o: buffer out u8)\n{memory}  loop\n    for k in 0..2\n      {op}\n    @send(o, 8'd0)\n"));
+        let errors = ddl::driver::compile_to_verilog(&map, &Default::default()).unwrap_err();
+        let text = map.render_all(&errors);
+        assert!(text.contains("a `for` body must be combinational"), "{text}");
+    }
+}

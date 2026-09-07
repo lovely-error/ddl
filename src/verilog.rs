@@ -71,6 +71,115 @@ pub fn emit_banner(opts: &EmitOptions) -> String {
 }
 
 pub fn emit_module(module: &Module, opts: &EmitOptions) -> String {
+    emit_modules(std::slice::from_ref(module), opts).expect("unambiguous module interface")
+}
+
+/// Allocate interface names across the whole compilation before rendering
+/// either declarations or named instance connections.
+pub fn emit_modules(modules: &[Module], opts: &EmitOptions) -> Result<String, String> {
+    use std::collections::{HashMap, HashSet};
+    let mut originals = HashSet::new();
+    for module in modules {
+        if !originals.insert(module.name.clone()) {
+            return Err(format!(
+                "module `{}` is defined more than once",
+                module.name
+            ));
+        }
+    }
+    let mut used_modules = Vec::new();
+    let mut module_names = HashMap::new();
+    // External module names are an ABI. Reserve their existing spelling first.
+    for inst in modules.iter().flat_map(|m| &m.instances) {
+        if !originals.contains(&inst.module) && !module_names.contains_key(&inst.module) {
+            let name = sanitize(&inst.module);
+            if used_modules.contains(&name) {
+                return Err(format!(
+                    "external module `{}` collides with another Verilog module name",
+                    inst.module
+                ));
+            }
+            used_modules.push(name.clone());
+            module_names.insert(inst.module.clone(), name);
+        }
+    }
+    for module in modules {
+        module_names.insert(
+            module.name.clone(),
+            fresh_name(&sanitize(&module.name), &mut used_modules),
+        );
+    }
+    let mut interfaces = HashMap::new();
+    let mut named = modules.to_vec();
+    for module in &mut named {
+        let mut used = Vec::new();
+        let mut signals = HashMap::new();
+        for port in &mut module.ports {
+            let original = port.name.clone();
+            if signals.contains_key(&original) {
+                return Err(format!(
+                    "module `{}` has duplicate port `{}` after interface expansion",
+                    module.name, original
+                ));
+            }
+            port.name = fresh_name(&sanitize(&original), &mut used);
+            signals.insert(original, port.name.clone());
+        }
+        interfaces.insert(module.name.clone(), signals.clone());
+        for net in &mut module.nets {
+            let original = net.name.clone();
+            if signals.contains_key(&original) {
+                return Err(format!(
+                    "module `{}` has duplicate signal `{}` after interface expansion",
+                    module.name, original
+                ));
+            }
+            net.name = fresh_name(&sanitize(&original), &mut used);
+            signals.insert(original, net.name.clone());
+        }
+        for inst in &mut module.instances {
+            inst.name = fresh_name(&sanitize(&inst.name), &mut used);
+            for (_, actual) in &mut inst.conns {
+                *actual = signals
+                    .get(actual)
+                    .ok_or_else(|| {
+                        format!(
+                            "instance `{}` refers to unknown signal `{}`",
+                            inst.name, actual
+                        )
+                    })?
+                    .clone();
+            }
+        }
+    }
+    let mut out = String::new();
+    for module in &mut named {
+        module.name = module_names[&module.name].clone();
+        for inst in &mut module.instances {
+            if let Some(ports) = interfaces.get(&inst.module) {
+                for (formal, _) in &mut inst.conns {
+                    *formal = ports
+                        .get(formal)
+                        .ok_or_else(|| {
+                            format!(
+                                "instance `{}` refers to unknown port `{}`",
+                                inst.name, formal
+                            )
+                        })?
+                        .clone();
+                }
+            }
+            inst.module = module_names[&inst.module].clone();
+        }
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out.push_str(&emit_named_module(module, opts));
+    }
+    Ok(out)
+}
+
+fn emit_named_module(module: &Module, opts: &EmitOptions) -> String {
     // Registers and memories are referenced by IR identity, so rename them
     // before rendering any declaration or reference. Public ports stay fixed.
     let named_module = name_storage(module, opts);
@@ -348,6 +457,14 @@ fn foldable(module: &Module, live: &[bool]) -> Vec<bool> {
             // that is where `signed` is written.
             Op::Cast { .. } => {
                 is_pure_rename(module, def) && !must_be_named[def.id.0 as usize]
+            }
+            // A scalar identity select still changes i1 to u1. Keep the
+            // unsigned wire or folding `a[0] < b[0]` becomes signed `a < b`.
+            Op::Slice { arg, .. }
+                if module.value(*arg).ty.bit_width() == 1
+                    && module.value(*arg).ty.is_signed() != def.ty.is_signed() =>
+            {
+                false
             }
             _ if must_be_named[def.id.0 as usize] => false,
             _ => {
@@ -1171,19 +1288,27 @@ fn render_op(module: &Module, names: &NameTable, fold: &[bool], op: &Op, ty: &Ty
             UnOp::LogNot => format!("!{}", operand(module, names, fold, *arg)),
         },
 
-        Op::Slice { arg, hi, lo } => {
-            if hi == lo {
-                format!("{}[{}]", operand(module, names, fold, *arg), hi)
-            } else {
-                format!("{}[{}:{}]", operand(module, names, fold, *arg), hi, lo)
-            }
-        }
+        Op::Slice { arg, hi, lo } => select_operand(module, names, fold, *arg, *hi, *lo),
 
         // The computed-base part-select. The base is a signal, never an
         // expression containing `$clog2` -- that form is one of the silent
         // synthesis failures.
         Op::DynSlice { arg, base, width } => {
-            format!("{}[{} +: {}]", operand(module, names, fold, *arg), operand(module, names, fold, *base), width)
+            if module.value(*arg).ty.bit_width() == 1 {
+                // Preserve out-of-range selection semantics for a dynamic index.
+                format!(
+                    "({} == 0 ? {} : 1'bx)",
+                    operand(module, names, fold, *base),
+                    operand(module, names, fold, *arg)
+                )
+            } else {
+                format!(
+                    "{}[{} +: {}]",
+                    operand(module, names, fold, *arg),
+                    operand(module, names, fold, *base),
+                    width
+                )
+            }
         }
 
         Op::Concat(parts) => {
@@ -1213,22 +1338,15 @@ fn render_op(module: &Module, names: &NameTable, fold: &[bool], op: &Op, ty: &Ty
                 // Replicate the sign bit. Also a concatenation, for the same
                 // reason as ZExt.
                 format!(
-                    "{{{{{}{{{}[{}]}}}}, {}}}",
+                    "{{{{{}{{{}}}}}, {}}}",
                     to - from,
-                    operand(module, names, fold, *arg),
-                    from - 1,
+                    select_operand(module, names, fold, *arg, from - 1, from - 1),
                     operand(module, names, fold, *arg)
                 )
             }
         }
 
-        Op::Trunc { arg, to } => {
-            if *to == 1 {
-                format!("{}[0]", operand(module, names, fold, *arg))
-            } else {
-                format!("{}[{}:0]", operand(module, names, fold, *arg), to - 1)
-            }
-        }
+        Op::Trunc { arg, to } => select_operand(module, names, fold, *arg, to - 1, 0),
 
         // Reinterpretation only: the destination wire's declaration carries
         // the signedness, so nothing is needed in the expression.
@@ -1259,6 +1377,26 @@ fn render_const(value: u128, ty: &Ty) -> String {
 }
 
 // ---- naming --------------------------------------------------------------
+
+/// Verilog scalars have no selectable dimension. Keep this rule shared by
+/// ordinary slices, truncation, and the sign-bit selection of extension.
+fn select_operand(
+    module: &Module,
+    names: &NameTable,
+    fold: &[bool],
+    arg: ValueId,
+    hi: u32,
+    lo: u32,
+) -> String {
+    let value = operand(module, names, fold, arg);
+    if module.value(arg).ty.bit_width() == 1 && hi == 0 && lo == 0 {
+        value
+    } else if hi == lo {
+        format!("{}[{}]", value, hi)
+    } else {
+        format!("{}[{}:{}]", value, hi, lo)
+    }
+}
 
 struct NameTable {
     names: Vec<String>,

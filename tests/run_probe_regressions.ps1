@@ -24,14 +24,17 @@ try {
             & (Join-Path $SimTool 'vlog.exe') -quiet -work work +define+SIMULATION $verilogSource.Name *> ($verilogSource.BaseName + '.vlog.log')
             if ($LASTEXITCODE -ne 0) { throw "Verilog rejected: $($verilogSource.Name)" }
         }
-        & (Join-Path $SimTool 'vlog.exe') -quiet -work work (Join-Path $PSScriptRoot 'probes/tb_fixed.sv') *> tb.vlog.log
-        if ($LASTEXITCODE -ne 0) { throw 'Testbench compilation failed' }
-        & (Join-Path $SimTool 'vsim.exe') -c -quiet -voptargs=+acc -do 'run -all; quit -f' work.tb_fixed *> vsim.log
-        $simulationExit = $LASTEXITCODE
-        $transcript = Get-Content -Raw vsim.log
-        if ($simulationExit -ne 0 -or $transcript -notmatch 'TB_PASS:' -or $transcript -match '\*\* (Error|Fatal)') {
-            throw "Probe simulation failed; inspect $outputDirectory/vsim.log"
+        foreach ($bench in @('tb_fixed', 'tb_adversarial')) {
+            & (Join-Path $SimTool 'vlog.exe') -quiet -work work (Join-Path $PSScriptRoot "probes/$bench.sv") *> "$bench.vlog.log"
+            if ($LASTEXITCODE -ne 0) { throw "Testbench compilation failed: $bench" }
+            $log = if ($bench -eq 'tb_fixed') { 'vsim.log' } else { "$bench.vsim.log" }
+            & (Join-Path $SimTool 'vsim.exe') -c -quiet -voptargs=+acc -do 'run -all; quit -f' "work.$bench" *> $log
+            $simulationExit = $LASTEXITCODE
+            $transcript = Get-Content -Raw $log
+            if ($simulationExit -ne 0 -or $transcript -notmatch 'TB_PASS:' -or $transcript -match '\*\* (Error|Fatal)') {
+                throw "Probe simulation failed; inspect $outputDirectory/$log"
+            }
+            $transcript -split "`n" | Where-Object { $_ -match 'TB_PASS:' }
         }
-        $transcript -split "`n" | Where-Object { $_ -match 'TB_PASS:' }
     } finally { Pop-Location }
 } finally { Pop-Location }

@@ -14,7 +14,7 @@ use crate::ir::{Binding, Env, Lowerer, Op, ValueId, lower_branch, lower_stmts};
 /// The first named variant in a pattern, for anchoring diagnostics.
 fn first_variant_span(pattern: &BindingPattern) -> Option<AlphanumSpan> {
     match pattern {
-        BindingPattern::EnumCase { base, .. } => Some(*base),
+        BindingPattern::EnumCase { base, .. } => Some(base.clone()),
         BindingPattern::AnyOf(alts) => alts.iter().find_map(first_variant_span),
         BindingPattern::Alphanum(_) => None,
     }
@@ -172,12 +172,12 @@ pub fn plan_match(
         for alt in &alternatives {
             match alt {
                 BindingPattern::EnumCase { base, subbinding } => {
-                    named.push(*base);
+                    named.push(base.clone());
                     if let Some(bind) = subbinding {
-                        payload_bind = Some((*base, *bind));
+                        payload_bind = Some((base.clone(), bind.clone()));
                     }
                 }
-                BindingPattern::Alphanum(name) => catch_all_binding = Some(*name),
+                BindingPattern::Alphanum(name) => catch_all_binding = Some(name.clone()),
                 // The parser never nests one inside another.
                 BindingPattern::AnyOf(_) => unreachable!("or-patterns do not nest"),
             }
@@ -238,7 +238,7 @@ pub fn plan_match(
             labels
         };
 
-        if let Some((variant_span, bind_span)) = payload_bind {
+        if let Some((variant_span, bind_span)) = payload_bind.clone() {
             let binds_one_variant = named.len() == 1;
             if !binds_one_variant {
                 sink.err_at(
@@ -434,7 +434,7 @@ pub fn lower_match(
 
         // A plain name is an irrefutable binding: it matches anything and
         // binds the scrutinee, which is how the wildcard works too.
-        if let Some(name) = plan.catch_all {
+        if let Some(name) = plan.catch_all.clone() {
             arm_env.insert(
                 anumspan_to_str(&name).to_string(),
                 Binding {
@@ -449,7 +449,7 @@ pub fn lower_match(
         // The payload, if the arm asked for it. It starts below the tag of the
         // scrutinee -- the whole point of a fixed layout is that the arm knows
         // where to look once the tag has told it what is there.
-        if let Some((variant_span, bind_span)) = plan.payload {
+        if let Some((variant_span, bind_span)) = plan.payload.clone() {
             let (value, payload_ty) = payload_value(low, &shape, scrutinee, &variant_span)?;
             let bound = anumspan_to_str(&bind_span).to_string();
             low.name_value_safe(value, bound.clone());
@@ -751,7 +751,7 @@ fn write_back_inouts(
             continue;
         }
         let target = match args.get(ix) {
-            Some(PrecResExpr::Ref(n)) => *n,
+            Some(PrecResExpr::Ref(n)) => n.clone(),
             _ => {
                 sink.push(
                     Diag::error(

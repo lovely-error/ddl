@@ -561,7 +561,7 @@ unsafe fn resolve_stmt(char_ptr: *const u8, stmt: &InnerStmt) -> Result<PrecResI
             let tar = resolve_precedence(char_ptr, &stmt.target)?;
             let body = resolve_precedence(char_ptr, &stmt.body)?;
             Ok(PrecResInnerStmt::ForLoop(Box::new(ForLoopStmt {
-                binding: stmt.binding,
+                binding: stmt.binding.clone(),
                 target: tar,
                 body,
             })))
@@ -576,8 +576,16 @@ unsafe fn resolve_stmt(char_ptr: *const u8, stmt: &InnerStmt) -> Result<PrecResI
     }
 }
 
-pub fn anumspan_to_str<'a>(span:&AlphanumSpan) -> &'a str {
-    unsafe { core::str::from_raw_parts(span.byte_ptr, span.len as _) }
+/// Identifier text is owned by the span; the returned borrow cannot outlive it.
+///
+/// ```compile_fail
+/// use ddl::{lex::AlphanumSpan, parse::anumspan_to_str};
+/// fn escape(span: &AlphanumSpan) -> &'static str {
+///     anumspan_to_str(span)
+/// }
+/// ```
+pub fn anumspan_to_str(span: &AlphanumSpan) -> &str {
+    span.as_str()
 }
 
 pub fn int_literal_to_int(anum_span: &AlphanumSpan) -> Result<usize, <usize as core::str::FromStr>::Err> {
@@ -677,7 +685,7 @@ pub unsafe fn resolve_precedence(char_ptr: *const u8, expr: &RawExpr) -> Result<
                     },
                 }
             }
-            AnumResolution::Ref => Ok(PrecResExpr::Ref(*anum_span)),
+            AnumResolution::Ref => Ok(PrecResExpr::Ref(anum_span.clone())),
         },
         RawExpr::MemberAccess { base, field_name } => {
             // The `<int>.<int>` reassembly that used to live here is gone:
@@ -686,7 +694,7 @@ pub unsafe fn resolve_precedence(char_ptr: *const u8, expr: &RawExpr) -> Result<
             let base = resolve_precedence(char_ptr, base)?;
             Ok(PrecResExpr::FieldAccess {
                 base: Box::new(base),
-                field_name: *field_name,
+                field_name: field_name.clone(),
             })
         }
         RawExpr::SubscriptAccess(val) => {
@@ -861,7 +869,7 @@ unsafe fn resolve_type(
 ) -> Result<PrecTypeExpr, ()> {
     match raw_type_expr {
         RawTypeExpr::Ident(alphanum_span) => {
-            Ok(PrecTypeExpr::Ident(*alphanum_span))
+            Ok(PrecTypeExpr::Ident(alphanum_span.clone()))
         },
         RawTypeExpr::Array(item_type, count) => {
             let resolved_ty = resolve_type(char_ptr, item_type)?;
@@ -894,7 +902,7 @@ unsafe fn resolve_arg_tuple(
             None => None,
         };
         let x = PrecArgTupleEntry {
-            arg_name: item.arg_name,
+            arg_name: item.arg_name.clone(),
             qualifier: item.qualifier,
             type_expr: k,
             default,
@@ -920,7 +928,7 @@ pub unsafe fn resolve_precedence_for_process(
     }
     let args = resolve_arg_tuple(char_ptr, &proc_decl.args)?;
     Ok(ProcessDecl {
-        name: proc_decl.name,
+        name: proc_decl.name.clone(),
         args,
         body: items,
     })
@@ -945,7 +953,7 @@ pub unsafe fn resolve_precedence_for_function(
     }
     let args = resolve_arg_tuple(char_ptr, &proc_decl.args)?;
     Ok(FunctionDecl {
-        name: proc_decl.name,
+        name: proc_decl.name.clone(),
         args,
         body: items,
     })
@@ -974,7 +982,7 @@ pub unsafe fn resolve_precedence_for_sequence(
     }
     let args = resolve_arg_tuple(char_ptr, &proc_decl.args)?;
     Ok(SequenceDecl {
-        name: proc_decl.name,
+        name: proc_decl.name.clone(),
         args,
         body: items,
     })
@@ -993,7 +1001,7 @@ pub unsafe fn resolve_precedence_for_extern(
     decl: &crate::lex::RawExternDecl,
 ) -> Result<ExternDecl, ()> {
     Ok(ExternDecl {
-        name: decl.name,
+        name: decl.name.clone(),
         args: unsafe { resolve_arg_tuple(char_ptr, &decl.args)? },
     })
 }
@@ -1014,19 +1022,19 @@ pub unsafe fn resolve_precedence_for_graph(
     for item in &graph_decl.body {
         let item = match item {
             RawGraphStmt::Pipe(pipe) => GraphStmt::Pipe(GraphPipe {
-                name: pipe.name,
+                name: pipe.name.clone(),
                 pipe_word: pipe.pipe_word,
                 ty: resolve_type(char_ptr, &pipe.type_expr)?,
             }),
             RawGraphStmt::Instance(inst) => GraphStmt::Instance(GraphInstance {
-                module: inst.module,
+                module: inst.module.clone(),
                 args: inst.args.clone(),
             }),
         };
         body.push(item);
     }
     let args = resolve_arg_tuple(char_ptr, &graph_decl.args)?;
-    Ok(GraphDecl { name: graph_decl.name, args, body })
+    Ok(GraphDecl { name: graph_decl.name.clone(), args, body })
 }
 
 /// # Safety
@@ -1042,12 +1050,12 @@ pub unsafe fn resolve_precedence_for_struct(
     for field in &struct_decl.fields {
         let x = resolve_type(char_ptr, &field.field_type)?;
         let x = StructField {
-            name: field.name,
+            name: field.name.clone(),
             field_type: x,
         };
         fields.push(x);
     }
-    Ok(StructDecl { name: struct_decl.name, fields })
+    Ok(StructDecl { name: struct_decl.name.clone(), fields })
 }
 
 /// # Safety
@@ -1074,9 +1082,9 @@ pub unsafe fn resolve_precedence_for_enum(
             }
             None => None,
         };
-        variants.push(EnumVariant { name: field.name, value });
+        variants.push(EnumVariant { name: field.name.clone(), value });
     }
-    Ok(EnumDecl { name: enum_decl.name, tag_type, variants })
+    Ok(EnumDecl { name: enum_decl.name.clone(), tag_type, variants })
 }
 
 #[test]

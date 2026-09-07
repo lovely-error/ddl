@@ -1,8 +1,11 @@
-# Remaining compiler defects found during the probe repair review
+# Compiler defects found during the probe repair review
 
-Verified 2026-09-06 against the compiler after the probe repairs and nested
-mutable lifetime implementation. These are additional unresolved defects;
-they are not covered by the passing probe regression result.
+Initially verified 2026-09-06 after the probe repairs and nested mutable
+lifetime implementation. The scalar and identifier defects below are now
+fixed and covered by `tests/backend_edges.rs`, `tests/probes/backend_edges.ddl`,
+and the Questa regression runner. The Rust AST ownership defect was repaired
+on 2026-09-07; see `process-adversarial-review.md`.
+The descriptions below retain the original failure evidence.
 
 ## Scalar selection and sign extension
 
@@ -37,8 +40,14 @@ vlib target/review/work
 vlog -work target/review/work target/review/edge_cases.v
 ```
 
-DDL succeeds; the last command is expected to fail until these defects are
-fixed. These are review inputs, not tests that currently pass.
+Both DDL and the Verilog compilation now succeed. The backend uses a shared
+scalar-aware selection renderer and allocates module/interface names before
+rendering either definitions or instance connections. Distinct names that
+sanitize alike receive distinct suffixes; exact duplicate expanded ports are
+diagnosed rather than merged. External module spellings are reserved before
+generated modules are named. The permanent regression also simulates both
+scalar values, out-of-range dynamic selection, and a graph with colliding
+module names.
 
 ## Rust AST lifetime API
 
@@ -59,7 +68,9 @@ New-Item -ItemType Directory -Force target/review | Out-Null
 rustc --edition=2024 --crate-type=lib --emit=metadata --extern ddl=target/debug/libddl.rlib -L dependency=target/debug/deps docs/review-reproducers/lifetime_api.rs -o target/review/lifetime_api.rmeta
 ```
 
-The command currently succeeds. A repaired ownership API must prevent these
-escapes. Prefer source identifiers and offsets resolved through a borrowed
-source map, or fully lifetime-bearing AST nodes with private constructors.
-`PhantomData` on a wrapper alone cannot protect extractable raw-pointer fields.
+The command succeeded before the ownership repair and now fails: raw span
+construction cannot omit its private owned text. Identifier and string-literal
+spans own reference-counted text, and safe accessors borrow their span instead
+of choosing an unconstrained lifetime. Extracted AST nodes can safely retain
+text after their source map is destroyed. `tests/ast_ownership.rs` exercises
+that case, and a compile-fail doctest checks the returned borrow's lifetime.

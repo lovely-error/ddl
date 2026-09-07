@@ -106,11 +106,9 @@ process k2g_decode (
   -- it repeat, once per cycle, for as long as the design runs.
   loop
 
-    -- The item, and whether one transferred this cycle. `cp_valid` is the
-    -- TRANSFER, not the offer: it is already `cps_valid && cps_ready`, so it is
-    -- false on a cycle the sink is refusing -- which is exactly what
-    -- `cp_valid && !hold` used to spell out.
-    let (item, cp_valid) = @try_rcv(cps)
+    -- Decode the offered head tentatively. Consume it and commit accumulator
+    -- changes only after any resulting micro-op has been accepted.
+    let (item, cp_valid) = @peek(cps)
     let cp: u16 = item.code
 
     -- The redirect rides with the code point that begins the new stream, so it
@@ -491,16 +489,20 @@ process k2g_decode (
     -- and emits nothing. The offer is made only on the cycles that complete an
     -- instruction, and the generated handshake turns that into the write enable
     -- on the output slot.
+    var sent: u1 = 1'b0
     if emit then
-      @try_send(uop, out_uop)
+      sent = @try_send(uop, out_uop)
 
     -- ---- register update ---------------------------------------------------
     -- Mirrors the always_ff of k2g_decode.sv: `flush` abandons a partially
     -- accumulated instruction on a branch redirect and resets everything;
     -- otherwise nothing moves unless a code point is actually consumed.
-    let update: u1 = cp_valid
+    let update: u1 = cp_valid & ((!emit) | sent)
+    if update then
+      let consumed = @drop(cps)
+      @assert(consumed)
 
-    if flushing then
+    if flushing & update then
       pfx = @zeroed()
       state = S_PREFIX
       llc_dst = @zeroed()

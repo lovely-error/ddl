@@ -130,7 +130,7 @@ process k2g_xstage (uops: buffer in uop_t, wb: buffer out wb_t,
   var w: wb_t = @zeroed()
 
   loop
-    let (uop, got) = @try_rcv(uops)
+    let (uop, got) = @peek(uops)
 
     -- ---- register read -------------------------------------------------
     -- Asynchronous, straight out of the arrays. Nothing is registered between
@@ -466,9 +466,12 @@ process k2g_xstage (uops: buffer in uop_t, wb: buffer out wb_t,
     if w.we_flag then
       flagbit[w.addr] = w.flag
 
-    w = n
-    -- Guarded on the transfer rather than left to an implicit gate. An offer
-    -- is made on the branch it is written on and no other, so a cycle with no
-    -- micro-op publishes nothing.
+    -- The previous W commits above even while this candidate is stalled.
+    -- Only an accepted output consumes the input and becomes the next W.
+    w = @zeroed()
     if got then
-      @try_send(wb, n)
+      let sent = @try_send(wb, n)
+      if sent then
+        let consumed = @drop(uops)
+        @assert(consumed)
+        w = n

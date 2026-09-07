@@ -424,7 +424,13 @@ fn a_pipe_offered_in_two_states_is_valid_in_both_and_muxed_by_state() {
     // arrives, so a packet computed from data that is not there is never
     // published.
     // The nonblocking state only pushes if this output also has room.
-    assert!(v.contains("wire wb_take = fire_s1 | (fire_s0 & ") && v.contains("!wb_full"), "{}", v);
+    assert!(
+        v.contains("wire wb_take = fire_s1 | wb_xfer_s0;")
+            && v.contains("wire wb_xfer_s0 = fire_s0 & ")
+            && v.contains("!wb_full"),
+        "{}",
+        v
+    );
     // The value is PUSHED into an entry rather than muxed onto the wire.
     assert!(v.contains("wb_e0 <= "), "{}", v);
     assert!(v.contains("assign wb_data = {wb_e1, wb_e0};"), "{}", v);

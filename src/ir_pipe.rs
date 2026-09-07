@@ -692,6 +692,7 @@ pub fn lower_sequence(
             port.sent = None;
             port.send_guard = None;
         }
+        low.transfer_paths.clear();
         let is_last = k + 1 == n;
         if is_last {
             break;

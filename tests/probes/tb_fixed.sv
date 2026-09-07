@@ -1,8 +1,33 @@
 `timescale 1ns/1ps
 module tb_fixed;
+  reg scalar=0; reg [1:0] scalar_i=0;
+  wire [7:0] scalar_sx,scalar_not_sx,collision_sum;
+  wire scalar_t,scalar_s,scalar_d;
+  reg scalar_other=0; wire scalar_cmp; wire [7:0] scalar_signed_sx;
+  scalar_signed bsign(scalar,scalar_other,scalar_cmp,scalar_signed_sx);
+  scalar_sext bsx(scalar,scalar_sx);
+  scalar_expr bex(scalar,scalar_not_sx);
+  scalar_trunc btr(scalar,scalar_t);
+  scalar_slice bsl(scalar,scalar_s);
+  scalar_dynamic bdy(scalar,scalar_i,scalar_d);
+  name_collision bnames(8'd17,8'd29,8'd43,collision_sum);
   reg clk=0; always #5 clk=~clk;
   reg rst_n=0;
   reg [1:0] source_ws=0;
+  wire [1:0] graph_r,graph_w; wire [15:0] graph_d;
+  collision_graph bg(clk,rst_n,source_ws,graph_r,16'h0004,graph_w,2'b00,graph_d);
+  wire [1:0] drain_r,drain_w,peek_r,once_r,once_w;
+  wire [15:0] drain_d,once_d;
+  wire drain_observed,drain_en,peek_observed,peek_en;
+  polling_drain cd(clk,rst_n,source_ws,drain_r,16'h002a,drain_w,2'b11,drain_d,drain_observed,drain_en);
+  polling_peek cp(clk,rst_n,source_ws,peek_r,16'h002a,peek_observed,peek_en);
+  polling_once co(clk,rst_n,source_ws,once_r,16'h002a,once_w,2'b00,once_d);
+  reg [1:0] fw_source=0,fw_read=0; reg [15:0] fw_pair=0;
+  wire [1:0] fw_consumed,fw_written,fw_unused; wire [15:0] fw_data,fw_unused_data;
+  polling_forward cf(clk,rst_n,fw_source,fw_consumed,fw_pair,fw_written,fw_read,fw_data,fw_unused,2'b11,fw_unused_data);
+  integer fw_produced=0,fw_received=0;
+  wire [1:0] p4_r,p4_dw,p4_ow; wire [15:0] p4_dd,p4_od;
+  p4 u4(clk,rst_n,source_ws,p4_r,18'h00055,p4_dw,2'b11,p4_dd,p4_ow,2'b11,p4_od);
   wire [1:0] p1_ar,p1_br,p1_ow; wire [15:0] p1_od;
   p1 u1(clk,rst_n,source_ws,p1_ar,16'h002a,2'b00,p1_br,16'h0000,p1_ow,2'b00,p1_od);
   wire [1:0] p5a_sr,p5a_or,p5a_dw; wire [15:0] p5a_dd;
@@ -38,6 +63,18 @@ module tb_fixed;
   endfunction
   always @(negedge clk) if(rst_n) begin
     cycles=cycles+1;
+    if(cycles > 2 && (p4_r !== source_ws || p4_dw !== 0 || p4_ow !== 0))
+      $fatal(1,"p4 stale drop depended on full outputs");
+    if(peek_r !== 0 || fw_unused !== 0 || drain_w !== 0) $fatal(1,"unrequested transfer");
+    if(cycles % 11 >= 5 && fw_written != fw_read) begin
+      if(fw_received >= 64 || ((^fw_read) ? fw_data[15:8] : fw_data[7:0]) !== fw_received[7:0])
+        $fatal(1,"polling forwarding duplicated or lost item %0d",fw_received);
+      fw_received=fw_received+1; fw_read=advance(fw_read);
+    end
+    if(fw_produced < 64 && fw_source != (~fw_consumed) && cycles % 7 != 0) begin
+      if(^fw_source) fw_pair[15:8]=fw_produced[7:0]; else fw_pair[7:0]=fw_produced[7:0];
+      fw_source=advance(fw_source); fw_produced=fw_produced+1;
+    end
     if(p1_br !== 0 || p5a_or !== 0) $fatal(1,"empty buffer consumed");
     if(p5b_dw !== 0 || p5b_dd !== 0) $fatal(1,"full buffer overwritten");
     if(p5c_dw !== 0) $fatal(1,"send executed after break");
@@ -71,6 +108,19 @@ module tb_fixed;
     end
   end
   initial begin
+    for(j=0;j<2;j=j+1) begin
+      scalar=j; scalar_i=0; #1;
+      if(scalar_sx !== {8{scalar}} || scalar_not_sx !== {8{!scalar}} ||
+         scalar_t !== scalar || scalar_s !== scalar || scalar_d !== scalar || collision_sum !== 8'd89)
+        $fatal(1,"scalar operation or port collision failed");
+      scalar_i=1; #1;
+      if(scalar_d !== 1'bx) $fatal(1,"out of range scalar index lost X semantics");
+      for(sh=0;sh<2;sh=sh+1) begin
+        scalar_other=sh; #1;
+        if(scalar_cmp !== (scalar < scalar_other) || scalar_signed_sx !== {8{scalar}})
+          $fatal(1,"scalar selection lost its unsigned type");
+      end
+    end
     expected_l[0]=1; expected_l[1]=2; expected_l[2]=3;
     expected_l[3]=100; expected_l[4]=101; expected_l[5]=4; expected_l[6]=9;
     expected_l[7]=4; expected_l[8]=5; expected_l[9]=6; expected_l[10]=7; expected_l[11]=9;
@@ -93,7 +143,10 @@ module tb_fixed;
       $fatal(1,"missing progress: p9=%0d local=%0d receive=%0d p10=%0d entries=%0d",count9,countl,countr,count10,entries10);
     if(p1_od[7:0] !== 42 || p11_d[7:0] !== 43 || p8_pd[7:0] !== 255)
       $fatal(1,"relay or dispatch data mismatch");
-    $display("TB_PASS: all compiler probes; 256 enum bytes, 8192 select vectors, nested lifetimes under backpressure");
+    if(graph_w !== 1 || graph_d[7:0] !== 7) $fatal(1,"colliding module names changed graph behavior");
+    if(drain_r !== 1 || once_r !== 1 || once_w !== 1 || once_d[7:0] !== 42 || fw_received != 64)
+      $fatal(1,"communication progress or one-shot execution failed");
+    $display("TB_PASS: compiler probes, scalar/name edges, nested lifetimes, and 64 local transfers under backpressure");
     $finish;
   end
   initial begin #20000; $fatal(1,"TIMEOUT"); end

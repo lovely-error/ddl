@@ -561,7 +561,7 @@ pub(crate) const SALT: Ty = Ty::UInt(2);
 
 /// One narrowing of the path an assertion sits on.
 #[derive(Debug, Clone)]
-enum PathTerm {
+pub(crate) enum PathTerm {
     Cond { value: ValueId, taken: bool },
     Labels { scrutinee: ValueId, labels: Vec<u128>, taken: bool },
 }
@@ -721,6 +721,7 @@ pub struct Lowerer<'a> {
     /// every match arm in the program -- dead, stripped by the backend, and
     /// still enough to renumber every generated wire in every module.
     path: Vec<PathTerm>,
+    pub(crate) transfer_paths: HashMap<String, Vec<Vec<PathTerm>>>,
     /// Where the statement being lowered right now is, innermost last.
     ///
     /// Lowering has no other idea where it is. The AST carries a span on every
@@ -734,6 +735,71 @@ pub struct Lowerer<'a> {
 }
 
 impl<'a> Lowerer<'a> {
+    fn claim_transfer(&mut self, name: &str, occupied: bool, receive: bool, sink: &mut DiagSink) -> Option<()> {
+        fn disjoint(a: &[PathTerm], b: &[PathTerm]) -> bool {
+            a.iter().any(|x| b.iter().any(|y| match (x, y) {
+                (PathTerm::Cond { value: x, taken: a }, PathTerm::Cond { value: y, taken: b }) => x == y && a != b,
+                (PathTerm::Labels { scrutinee: x, labels: a, taken: at }, PathTerm::Labels { scrutinee: y, labels: b, taken: bt }) if x == y => {
+                    match (*at, *bt) {
+                        (true, true) => a.iter().all(|v| !b.contains(v)),
+                        (true, false) => a.iter().all(|v| b.contains(v)),
+                        (false, true) => b.iter().all(|v| a.contains(v)),
+                        _ => false,
+                    }
+                }
+                _ => false,
+            }))
+        }
+        let conflict = match self.transfer_paths.get(name) {
+            Some(paths) => paths.iter().any(|p| !disjoint(p, &self.path)),
+            None => occupied,
+        };
+        if conflict {
+            let verb = if receive { "received from" } else { "sent to" };
+            sink.err_span(self.here(), format!("`{}` is {} more than once in one cycle", name, verb));
+            return None;
+        }
+        self.transfer_paths.entry(name.to_string()).or_default().push(self.path.clone());
+        Some(())
+    }
+
+    fn union_transfer_guard(&mut self, occupied: bool, old: Option<ValueId>, new: Option<ValueId>) -> Option<ValueId> {
+        if !occupied { return new; }
+        match (old, new) {
+            (Some(lhs), Some(rhs)) => Some(self.emit(Ty::BOOL, Op::Bin { op: BinOp::Or, lhs, rhs })),
+            _ => None,
+        }
+    }
+
+    fn request_pipe(&mut self, ix: usize, data: Option<ValueId>) -> ValueId {
+        let p = self.pipes[ix].clone();
+        let path = self.materialise_path();
+        let result = narrow_to_path(self, p.fired.expect("pipe eligibility"), path);
+        if let Some(value) = data {
+            self.pipes[ix].sent = Some(match (p.sent, path) {
+                (Some(old), Some(cond)) => self.emit(p.ty, Op::Mux { cond, then_val: value, else_val: old }),
+                _ => value,
+            });
+        }
+        self.pipes[ix].send_guard = self.union_transfer_guard(p.used, p.send_guard, path);
+        self.pipes[ix].used = true;
+        result
+    }
+
+    /// One definition of a nonblocking transfer, shared by its success result
+    /// and the emitted pointer/data updates. `fired` contains execution and
+    /// availability; the operation additionally requires an actual request
+    /// on its source path. Merely observing a pipe never requests a transfer.
+    pub(crate) fn pipe_transfer(&mut self, ix: usize) -> ValueId {
+        if !self.pipes[ix].used {
+            return self.emit(Ty::BOOL, Op::Const(0));
+        }
+        let eligible = self.pipes[ix]
+            .fired
+            .expect("eligibility established before lowering");
+        narrow_to_path(self, eligible, self.pipes[ix].send_guard)
+    }
+
     pub fn new(
         map: &'a SourceMap,
         syms: &'a Symbols,
@@ -755,6 +821,7 @@ impl<'a> Lowerer<'a> {
             stop_writes: None,
             in_pipeline: false,
             path: Vec::new(),
+            transfer_paths: HashMap::new(),
             anchors: Vec::new(),
             values: Vec::new(),
             ports: Vec::new(),
@@ -2399,7 +2466,6 @@ pub fn lower_process(
     // rule 3 -- `valid` must not depend combinationally on `ready` -- holds by
     // construction rather than by review.
     let mut generated: Vec<Reg> = Vec::new();
-    let mut accepts: Vec<ValueId> = Vec::new();
 
     // A linear body runs ONCE. `done` is what makes the process stop: it is
     // low for the first cycle after reset and high forever after, and while it
@@ -2480,31 +2546,10 @@ pub fn lower_process(
         let full = low.pipe_full(ix, wsalt_q);
         let accept = low.emit(Ty::BOOL, Op::Un { op: UnOp::LogNot, arg: full });
         low.name_value_safe(accept, format!("{}_room", pname));
-        accepts.push(accept);
 
-        low.pipes[ix].fired = Some(accept);
+        low.pipes[ix].fired = Some(narrow_to_path(&mut low, accept, running));
         low.pipes[ix].slot_reg = Some(base);
     }
-
-    // An input transfers when upstream offers and every output slot can take
-    // the result. With one input and one output that is exactly
-    // `iops.ready = !busy || uops.ready`.
-    let mut can_accept: Option<ValueId> = None;
-    for a in &accepts {
-        can_accept = Some(match can_accept {
-            None => *a,
-            Some(prev) => low.emit(Ty::BOOL, Op::Bin { op: BinOp::And, lhs: prev, rhs: *a }),
-        });
-    }
-    let always_true = low.emit(Ty::BOOL, Op::Const(1));
-    let ready_out = can_accept.unwrap_or(always_true);
-
-    // Once the pass is over the process refuses everything, which is what
-    // "reaches a terminal state" has to mean at a channel boundary.
-    let ready_out = match running {
-        None => ready_out,
-        Some(r) => low.emit(Ty::BOOL, Op::Bin { op: BinOp::And, lhs: ready_out, rhs: r }),
-    };
 
     for ix in 0..low.pipes.len() {
         if !low.pipes[ix].is_input {
@@ -2516,14 +2561,28 @@ pub fn lower_process(
         };
         let empty = low.pipe_empty(ix, rsalt_q);
         let offered = low.emit(Ty::BOOL, Op::Un { op: UnOp::LogNot, arg: empty });
-        // An input transfers only when every output slot can take the result.
-        let fired =
-            low.emit(Ty::BOOL, Op::Bin { op: BinOp::And, lhs: offered, rhs: ready_out });
+        // Only this input's availability and process execution matter.
+        // Dependencies on other transfers must be explicit in source paths.
+        let fired = narrow_to_path(&mut low, offered, running);
         low.values[fired.0 as usize].name = Some(format!("{}_xfer", low.pipes[ix].name));
         low.pipes[ix].fired = Some(fired);
     }
 
     lower_stmts(&mut low, &body_stmts, &mut env, sink)?;
+    if let Some(r) = running {
+        for ix in 0..low.asserts.len() {
+            let cond = low.asserts[ix].cond;
+            let stopped = low.logical_not(r);
+            low.asserts[ix].cond = low.emit(
+                Ty::BOOL,
+                Op::Bin {
+                    op: BinOp::Or,
+                    lhs: stopped,
+                    rhs: cond,
+                },
+            );
+        }
+    }
     low.stop_writes = running;
     low.settle_memories(&env);
 
@@ -2567,11 +2626,9 @@ pub fn lower_process(
     for ix in 0..low.pipes.len() {
         let pipe = low.pipes[ix].clone();
         if pipe.is_input {
-            // Same rule, the receiving side. `send_guard` on an input pipe is
-            // the branch its `@try_rcv` or `@drop` sat on; a pipe the body
-            // never consumes keeps the old unconditional `ready`, because
-            // "never asked for" and "asked for on no path" are different
-            // claims and only the second one means stop.
+            // A request is necessary: a pipe only observed with @peek, or
+            // never referenced, must retain its item. The path further
+            // narrows the request to the branch that actually executes it.
             // Taking IS toggling, so the enable has to be the TRANSFER and not
             // merely this side's willingness. `fired` already carries the
             // "something is offered" half; under valid/ready that half lived at
@@ -2581,8 +2638,7 @@ pub fn lower_process(
             //
             // This is literally the value `got` is bound to, which is what
             // makes the claim rule hold by construction rather than by review.
-            let fired = pipe.fired.expect("an input pipe has `fired` computed");
-            let claimed = narrow_to_path(&mut low, fired, pipe.send_guard);
+            let claimed = low.pipe_transfer(ix);
             low.name_value_safe(claimed, format!("{}_take", pipe.name));
 
             let slot = pipe.salt_reg.expect("an input pipe has an rsalt register");
@@ -2600,27 +2656,16 @@ pub fn lower_process(
 
         let sent = match pipe.sent {
             Some(v) => v,
-            None => {
-                sink.err_span(
-                    map.span_of(&decl.name),
-                    format!("`{}` is never sent to", pipe.name),
-                );
-                return None;
-            }
+            None => e0,
         };
 
         // THE OFFER IS ITS OWN PATH, and nothing else. One rule, the same one
         // a process with states follows: a pipe is claimed where the program
         // asks for it, under the condition it asks.
-        let offering = match pipe.send_guard {
-            None => low.emit(Ty::BOOL, Op::Const(1)),
-            Some(g) => g,
-        };
         // ...and there has to be somewhere to put it. `@try_send` answers
         // whether there was, and a body that ignores the answer must not
         // overwrite an entry the consumer has not taken.
-        let room = low.pipes[ix].fired.expect("an output pipe has room computed");
-        let push = low.emit(Ty::BOOL, Op::Bin { op: BinOp::And, lhs: offering, rhs: room });
+        let push = low.pipe_transfer(ix);
         low.name_value_safe(push, format!("{}_push", pipe.name));
 
         // ONE entry is written and it is the one `widx` names. There is no
@@ -2785,9 +2830,8 @@ fn lower_try_rcv_binding(
         );
         return None;
     }
-    if takes && low.pipes[ix].used {
-        sink.err_at(&decl.head_name(), format!("`{}` is received from more than once in one cycle", pipe_name));
-        return None;
+    if takes {
+        low.claim_transfer(&pipe_name, low.pipes[ix].used, true, sink)?;
     }
 
     let ty = low.pipes[ix].ty.clone();
@@ -2798,11 +2842,7 @@ fn lower_try_rcv_binding(
     // needs this side to have taken it -- so on a cycle the process is not
     // accepting, the two disagree, and that disagreement is what a peek is for.
     let answer = if takes {
-        low.pipes[ix].used = true;
-        let path = low.materialise_path();
-        low.pipes[ix].send_guard = path;
-        let fired = low.pipes[ix].fired.expect("computed before each state's body");
-        narrow_to_path(low, fired, path)
+        low.request_pipe(ix, None)
     } else {
         let rsalt_q = {
             let slot = low.pipes[ix].salt_reg.expect("an input pipe has an rsalt register");
@@ -2865,7 +2905,7 @@ pub fn stmt_anchor(stmt: &PrecResInnerStmt) -> Option<AlphanumSpan> {
         }
         PrecResInnerStmt::IfThenElse(i) => expr_anchor(&i.condition),
         PrecResInnerStmt::MatchStmt(m) => m.scrutinees.iter().find_map(expr_anchor),
-        PrecResInnerStmt::ForLoop(f) => Some(f.binding),
+        PrecResInnerStmt::ForLoop(f) => Some(f.binding.clone()),
         PrecResInnerStmt::TailVal(e) => expr_anchor(e),
         PrecResInnerStmt::ReturnStmt(e) => e.as_ref().and_then(expr_anchor),
         PrecResInnerStmt::Loop(l) => expr_anchor(&l.repeat_expr),
@@ -2882,9 +2922,9 @@ pub fn stmt_anchor(stmt: &PrecResInnerStmt) -> Option<AlphanumSpan> {
 /// `x`, not at a `@zext` that has no span of its own anyway.
 pub fn expr_anchor(expr: &PrecResExpr) -> Option<AlphanumSpan> {
     match expr {
-        PrecResExpr::Ref(n) => Some(*n),
+        PrecResExpr::Ref(n) => Some(n.clone()),
         PrecResExpr::FieldAccess { base, field_name } => {
-            expr_anchor(base).or(Some(*field_name))
+            expr_anchor(base).or(Some(field_name.clone()))
         }
         PrecResExpr::SubscriptAccess(s) => expr_anchor(&s.base).or_else(|| expr_anchor(&s.index)),
         PrecResExpr::Call { base, args } => {
@@ -2933,7 +2973,7 @@ fn lower_stmt_at(
             if decl.names().len() > 1 {
                 let callee = match &decl.assign_val {
                     Some(PrecResExpr::Call { base, .. }) => match &**base {
-                        PrecResExpr::Ref(n) => Some(*n),
+                        PrecResExpr::Ref(n) => Some(n.clone()),
                         _ => None,
                     },
                     _ => None,
@@ -3054,7 +3094,7 @@ fn lower_stmt_at(
                             return None;
                         }
                         return lower_mem_write(
-                            low, *mem_name, &sub.index, &assign.rvalue, env, sink,
+                            low, mem_name.clone(), &sub.index, &assign.rvalue, env, sink,
                         );
                     }
                 }
@@ -3566,6 +3606,11 @@ fn lower_stmt_at(
         // constant parameter works: a constant parameter is already an
         // `Op::Const` by the time a body is lowered.
         PrecResInnerStmt::ForLoop(f) => {
+            let sync_mem = |name: &str| low.mem_index(name).filter(|ix| low.mems[*ix].kind != ty::MemKind::LutRam);
+            if crate::ir_fsm::needs_states(stmt, &sync_mem) {
+                sink.err_at(&f.binding, "a `for` body must be combinational; blocking transfers, synchronous reads, `loop`, and `break` require an explicit process loop");
+                return None;
+            }
             let name = anumspan_to_str(&f.binding).to_string();
             let body = match &f.body {
                 PrecResExpr::StmtBlock(b) => &b.components,
@@ -3714,10 +3759,10 @@ fn port_is_not_a_value(low: &Lowerer, at: &AlphanumSpan, name: &str) -> Option<D
 
 fn lvalue_path(expr: &PrecResExpr) -> Option<LvaluePath> {
     match expr {
-        PrecResExpr::Ref(base) => Some(LvaluePath { base: *base, steps: Vec::new() }),
+        PrecResExpr::Ref(base) => Some(LvaluePath { base: base.clone(), steps: Vec::new() }),
         PrecResExpr::FieldAccess { base, field_name } => {
             let mut path = lvalue_path(base)?;
-            path.steps.push(LvalueStep::Field(*field_name));
+            path.steps.push(LvalueStep::Field(field_name.clone()));
             Some(path)
         }
         // `a[k] = v`. A memory write is caught before this and never arrives
@@ -4135,7 +4180,7 @@ fn lower_subscript(
         let name = anumspan_to_str(mem_name);
         let is_memory = env.get(name).is_some_and(|b| b.ty.is_memory());
         if is_memory {
-            return lower_mem_read(low, *mem_name, &sub.index, env, sink);
+            return lower_mem_read(low, mem_name.clone(), &sub.index, env, sink);
         }
     }
 
@@ -4315,11 +4360,8 @@ fn lower_mem_read(
     // happened. Forwarding the pending write is what makes the source mean
     // what it reads as.
     //
-    // Only an ASYNCHRONOUS read needs this here. A `bram` read is scheduled
-    // into a later state or stage than any write, so by the time it looks the
-    // array has been updated -- see ir_pipe for the pipeline's version, where
-    // the write is in the same CYCLE and the mux moves to the far side of the
-    // cut.
+    // Synchronous reads use the same pending-write decision in ir_fsm and
+    // ir_pipe, registering it across the read's clock edge.
     match low.pending_write(ix, addr, env) {
         None => Some(array),
         // An UNCONDITIONAL write to the address being read answers the read by
@@ -4455,18 +4497,8 @@ fn lower_builtin(
             );
             return None;
         }
-        if low.pipes[ix].used {
-            sink.err_span(
-                low.here(),
-                format!("`{}` is received from more than once in one cycle", pipe_name),
-            );
-            return None;
-        }
-        low.pipes[ix].used = true;
-        let path = low.materialise_path();
-        low.pipes[ix].send_guard = path;
-        let fired = low.pipes[ix].fired.expect("computed before each state's body");
-        return Some(narrow_to_path(low, fired, path));
+        low.claim_transfer(&pipe_name, low.pipes[ix].used, true, sink)?;
+        return Some(low.request_pipe(ix, None));
     }
 
     if op == TrySend {
@@ -4514,13 +4546,7 @@ fn lower_builtin(
             );
             return None;
         }
-        if low.pipes[ix].used {
-            sink.err_span(
-                low.here(),
-                format!("`{}` is sent to more than once in one cycle", pipe_name),
-            );
-            return None;
-        }
+        low.claim_transfer(&pipe_name, low.pipes[ix].used, false, sink)?;
         let want = low.pipes[ix].ty.clone();
         let mut value = lower_expr(low, &args[1], env, sink)?;
         let have = low.ty_of(value);
@@ -4548,11 +4574,7 @@ fn lower_builtin(
         // A process with no states computes it once before the body; a state
         // machine computes one per state, because a pipe can be offered to in
         // one state and sampled in another.
-        let fired = low.pipes[ix].fired.expect("computed before each state's body");
-        low.pipes[ix].used = true;
-        low.pipes[ix].sent = Some(value);
-        low.pipes[ix].send_guard = low.materialise_path();
-        return Some(fired);
+        return Some(low.request_pipe(ix, Some(value)));
     }
 
     // `if c then a else b`, desugared by the parser. Both arms must agree on a
@@ -4879,13 +4901,7 @@ pub fn lower_port_send(
     sink: &mut DiagSink,
 ) -> Option<ValueId> {
     let port = low.port_outs[pix].clone();
-    if port.sent.is_some() {
-        sink.err_span(
-            low.here(),
-            format!("`{}` is sent to more than once in one cycle", port.name),
-        );
-        return None;
-    }
+    low.claim_transfer(&port.name, port.sent.is_some(), false, sink)?;
     let mut value = lower_expr_expecting(low, value_expr, Some(&port.ty), env, sink)?;
     let have = low.ty_of(value);
     if have != port.ty {
@@ -4908,8 +4924,12 @@ pub fn lower_port_send(
             }
         }
     }
-    low.port_outs[pix].sent = Some(value);
-    low.port_outs[pix].send_guard = low.materialise_path();
+    let path = low.materialise_path();
+    low.port_outs[pix].sent = Some(match (port.sent, path) {
+        (Some(old), Some(cond)) => low.emit(port.ty, Op::Mux { cond, then_val: value, else_val: old }),
+        _ => value,
+    });
+    low.port_outs[pix].send_guard = low.union_transfer_guard(port.sent.is_some(), port.send_guard, path);
     // Always true: there is no `ready` coming back, which is the whole of what
     // a `port` declares. `@try_send` on one answers the question it is asked
     // and the answer never varies.

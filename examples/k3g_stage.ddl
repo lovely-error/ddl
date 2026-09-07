@@ -39,11 +39,10 @@ process k3g_stage (iops: buffer in in_item_t, uops: buffer out out_item_t)
   -- The process is a program: it runs once and stops. `loop` is what makes
   -- it repeat, once per cycle, for as long as the design runs.
   loop
-    let (item, got) = @try_rcv(iops)
+    let (item, got) = @peek(iops)
 
     -- A fixed-format expansion, not a decode: unpack known fields and hand them
-    -- on. `got` is available but this stage never stalls for its own reasons, so
-    -- it does not need to look at it.
+    -- on. The input stays in its buffer until the output accepts the expansion.
     var out: out_item_t = @zeroed()
     out.epoch = item.epoch
     out.kind = item.kind
@@ -60,4 +59,7 @@ process k3g_stage (iops: buffer in in_item_t, uops: buffer out out_item_t)
     -- An offer is made on the branch it is written on, so the cycles with no
     -- item have to say so rather than relying on the slot to notice.
     if got then
-      let _taken = @try_send(uops, out)
+      let taken = @try_send(uops, out)
+      if taken then
+        let consumed = @drop(iops)
+        @assert(consumed)

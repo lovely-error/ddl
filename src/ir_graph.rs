@@ -82,7 +82,14 @@ pub fn check_extern(
     decl: &crate::parse::ExternDecl,
     sink: &mut DiagSink,
 ) {
+    let mut names = std::collections::HashSet::new();
     for arg in &decl.args.entries {
+        if !names.insert(anumspan_to_str(&arg.arg_name)) {
+            sink.err_at(
+                &arg.arg_name,
+                "an external interface cannot declare the same pipe twice",
+            );
+        }
         let is_pipe = matches!(
             arg.qualifier,
             ArgTypeQualifier::BufferIn | ArgTypeQualifier::BufferOut
@@ -197,7 +204,7 @@ pub fn lower_graph(
             name,
             GraphPipeInfo {
                 ty,
-                declared_at: arg.arg_name,
+                declared_at: arg.arg_name.clone(),
                 external: Some(is_input),
                 producers: Vec::new(),
                 consumers: Vec::new(),
@@ -250,7 +257,7 @@ pub fn lower_graph(
             name,
             GraphPipeInfo {
                 ty,
-                declared_at: pipe.name,
+                declared_at: pipe.name.clone(),
                 external: None,
                 producers: Vec::new(),
                 consumers: Vec::new(),
@@ -436,9 +443,9 @@ pub fn lower_graph(
             }
             // An instance whose port is an input CONSUMES the pipe.
             if formal.is_input {
-                info.consumers.push(*actual);
+                info.consumers.push(actual.clone());
             } else {
-                info.producers.push(*actual);
+                info.producers.push(actual.clone());
                 produces.push(actual_name.clone());
             }
 
@@ -513,8 +520,8 @@ fn check_endpoints(
             .iter()
             .chain(info.consumers.iter())
             .next()
-            .copied()
-            .unwrap_or(info.declared_at);
+            .cloned()
+            .unwrap_or(info.declared_at.clone());
         let mut report = |msg: String, note: &str| {
             ok = false;
             sink.push(

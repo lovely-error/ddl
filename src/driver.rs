@@ -16,18 +16,12 @@ use crate::parse::{
     resolve_precedence_for_struct,
 };
 use crate::symbols;
-use crate::verilog::{EmitOptions, emit_banner, emit_module};
+use crate::verilog::{EmitOptions, emit_banner, emit_modules};
 
-/// One file's declarations, borrowed from the buffer they point into.
-///
-/// The `PhantomData` is the whole point. `AlphanumSpan` is a `*const u8` with
-/// no lifetime, so nothing stopped a caller from dropping the `SourceMap` and
-/// keeping the AST -- every span in it would then be dangling, and reading one
-/// is undefined behaviour rather than a wrong answer. The rule was written in
-/// a doc comment and enforced by nothing.
-///
-/// This makes the borrow checker enforce it: `Parsed` cannot outlive the map
-/// it was parsed from, so neither can the declarations inside it.
+/// One file's declarations and their source-map context for diagnostics.
+/// Identifier and string text is owned by the AST. Extracting declarations
+/// from this wrapper is safe even after the source map has been dropped;
+/// source-location metadata is meaningful only with its original map.
 pub struct Parsed<'a> {
     pub decls: Vec<TopLevelDecl>,
     _buffer: std::marker::PhantomData<&'a SourceMap>,
@@ -35,10 +29,8 @@ pub struct Parsed<'a> {
 
 /// Parses one source file.
 ///
-/// The `SourceMap` must outlive the returned declarations: the AST holds raw
-/// pointers into its text. That is enforced here by the borrow on `map`, which
-/// is the closest thing to a lifetime the pointer-based AST can currently
-/// carry.
+/// Parsing borrows the source while scanning. Returned identifier and string
+/// spans own their text, while retaining source locations for diagnostics.
 pub fn parse_source<'a>(map: &'a SourceMap) -> Result<Parsed<'a>, Vec<Diag>> {
     let base = map.base_ptr();
     let end = map.end_ptr();
@@ -299,6 +291,28 @@ fn compile_on_this_stack(
 
     // Pass 3: lower and emit. Bodies are indexed by name so a call can be
     // inlined without searching.
+    let mut module_origins = std::collections::HashSet::new();
+    for name in funcs
+        .iter()
+        .map(|d| &d.name)
+        .chain(seqs.iter().map(|d| &d.name))
+        .chain(procs.iter().map(|d| &d.name))
+        .chain(graphs.iter().map(|d| &d.name))
+        .chain(externs.iter().map(|d| &d.name))
+    {
+        if !module_origins.insert(anumspan_to_str(name)) {
+            sink.err_at(
+                name,
+                format!(
+                    "module `{}` is declared more than once",
+                    anumspan_to_str(name)
+                ),
+            );
+        }
+    }
+    if sink.has_errors() {
+        return Err(sink.into_diags());
+    }
     let bodies: HashMap<String, &FunctionDecl> = funcs
         .iter()
         .map(|f| (anumspan_to_str(&f.name).to_string(), f))
@@ -313,16 +327,12 @@ fn compile_on_this_stack(
     // one at a time.
     let mut drawn: Vec<crate::ir::Module> = Vec::new();
     let mut render = |out: &mut String, module: &crate::ir::Module| {
-        if drawing {
+        if drawing || !dumping_ir {
             drawn.push(module.clone());
             return;
         }
         out.push('\n');
-        if dumping_ir {
-            out.push_str(&crate::ir::render_module(module));
-        } else {
-            out.push_str(&emit_module(module, opts));
-        }
+        out.push_str(&crate::ir::render_module(module));
     };
     for func in &funcs {
         if let Some(module) = lower_function(map, &syms, &bodies, func, &mut sink) {
@@ -410,6 +420,12 @@ fn compile_on_this_stack(
         return Err(vec![Diag::error_no_span(
             "nothing to emit: no `fun`, `process`, `sequence` or `graph` declarations found",
         )]);
+    }
+    if !dumping_ir {
+        let verilog =
+            emit_modules(&drawn, opts).map_err(|message| vec![Diag::error_no_span(message)])?;
+        out.push('\n');
+        out.push_str(&verilog);
     }
     Ok(out)
 }

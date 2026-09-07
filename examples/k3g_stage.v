@@ -26,22 +26,28 @@ module k3g_stage (
   wire uops_full = uops_wsalt_q == (~uops_rsalt);
   wire uops_room = !uops_full;
   wire iops_empty = iops_wsalt == iops_rsalt_q;
-  wire iops_take = (!iops_empty) & uops_room;
+  wire iops_xfer = !iops_empty;
+  wire iops_empty_1 = iops_wsalt == iops_rsalt_q;
+  wire iops_present = !iops_empty_1;
   wire [48:0] out = 49'd0;
-  wire [48:0] n26 = {iops_item[31:29], out[45:0]};
-  wire [48:0] n31 = {n26[48:46], iops_item[28:26], n26[42:0]};
-  wire [48:0] n35 = {n31[48:43], iops_item[25:21], n31[37:0]};
-  wire [48:0] n39 = {n35[48:38], iops_item[20:16], n35[32:0]};
-  wire [48:0] n45 = {n39[48:33], {16'd0, iops_item[15:0]}, n39[0]};
-  wire [2:0] n47 = iops_item[28:26];
-  reg [48:0] n54;
-  wire uops_push = iops_take & uops_room;
+  wire [48:0] n28 = {iops_item[31:29], out[45:0]};
+  wire [48:0] n33 = {n28[48:46], iops_item[28:26], n28[42:0]};
+  wire [48:0] n37 = {n33[48:43], iops_item[25:21], n33[37:0]};
+  wire [48:0] n41 = {n37[48:38], iops_item[20:16], n37[32:0]};
+  wire [48:0] n47 = {n41[48:33], {16'd0, iops_item[15:0]}, n41[0]};
+  wire [2:0] n49 = iops_item[28:26];
+  reg [48:0] n56;
+  wire taken = uops_room & iops_present;
+  wire n58 = iops_present & taken;
+  wire consumed = iops_xfer & n58;
+  wire iops_take = iops_xfer & n58;
+  wire uops_push = uops_room & iops_present;
   wire uops_widx = uops_wsalt_q[0] ^ uops_wsalt_q[1];
 
   always @* begin
-    case (n47)
-      3'd3, 3'd4: n54 = {n45[48:1], 1'b1};
-      default: n54 = {n45[48:1], 1'b0};
+    case (n49)
+      3'd3, 3'd4: n56 = {n47[48:1], 1'b1};
+      default: n56 = {n47[48:1], 1'b0};
     endcase
   end
 
@@ -57,10 +63,18 @@ module k3g_stage (
       uops_wsalt_q <= 2'd0;
     end else begin
       iops_rsalt_q <= (iops_take ? (iops_rsalt_q ^ (iops_ridx ? 2'd2 : 2'd1)) : iops_rsalt_q);
-      uops_e0 <= ((uops_push & (!uops_widx)) ? n54 : uops_e0);
-      uops_e1 <= ((uops_push & uops_widx) ? n54 : uops_e1);
+      uops_e0 <= ((uops_push & (!uops_widx)) ? n56 : uops_e0);
+      uops_e1 <= ((uops_push & uops_widx) ? n56 : uops_e1);
       uops_wsalt_q <= (uops_push ? (uops_wsalt_q ^ (uops_widx ? 2'd2 : 2'd1)) : uops_wsalt_q);
     end
   end
+
+`ifdef SIMULATION
+  always @(posedge clk) begin
+    if (rst_n) begin
+      if (!(((!(iops_present & taken)) | consumed))) $error("%m: @assert failed");
+    end
+  end
+`endif
 
 endmodule

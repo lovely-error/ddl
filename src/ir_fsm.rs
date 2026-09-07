@@ -101,6 +101,7 @@ pub enum Target {
 }
 
 /// What a state does when it fires.
+#[derive(Clone)]
 pub enum Next {
     Straight(Target),
     /// `cond` is lowered in the state's own scope, after its barrier binds, so
@@ -149,7 +150,7 @@ impl<'a> State<'a> {
     /// barrier state immediately before it can absorb it and save the cycle.
     fn is_bare_branch(&self) -> bool {
         let forks = matches!(self.next, Next::Branch { .. } | Next::Switch { .. });
-        !self.pinned && self.barrier.is_none() && forks
+        !self.pinned && self.barrier.is_none() && self.mem_read.is_none() && forks
     }
 
     /// A placeholder left where an absorbed state used to be. Unreachable by
@@ -248,6 +249,7 @@ pub fn contains_barrier(stmt: &PrecResInnerStmt) -> bool {
         }
         PrecResInnerStmt::TailVal(e) => in_expr(e),
         PrecResInnerStmt::Loop(l) => in_expr(&l.repeat_expr),
+        PrecResInnerStmt::ForLoop(f) => in_expr(&f.target) || in_expr(&f.body),
         _ => false,
     }
 }
@@ -292,8 +294,7 @@ pub(crate) fn as_sync_read<'a>(
 ///
 /// Rewriting rather than scheduling in place, because the scheduler walks
 /// borrowed statements and a lifted read is a statement that was not written.
-/// The generated names are kept beside the statements that use them: an
-/// `AlphanumSpan` is a pointer into text, so the text has to outlive the AST.
+/// Each generated identifier owns its spelling, just like a source identifier.
 ///
 /// A read is lifted to just before the statement that used it and no further.
 /// Inside an `if` arm it stays in that arm, because the cycle it costs is only
@@ -301,14 +302,10 @@ pub(crate) fn as_sync_read<'a>(
 /// which is where a value the branch depends on has to be.
 pub struct Hoisted {
     pub stmts: Vec<PrecResInnerStmt>,
-    /// Backing text for the generated names. Dropping this while `stmts` is
-    /// alive would leave every generated `Ref` dangling.
-    _names: Vec<Box<str>>,
 }
 
 struct Hoister<'m> {
     sync_mem_of: &'m dyn Fn(&str) -> Option<usize>,
-    names: Vec<Box<str>>,
     next: u32,
 }
 
@@ -318,11 +315,7 @@ impl Hoister<'_> {
     fn fresh(&mut self) -> AlphanumSpan {
         let text: Box<str> = format!("@rd{}", self.next).into_boxed_str();
         self.next += 1;
-        // The Box's contents do not move when the Box itself is pushed, so
-        // this pointer stays good for as long as `names` is held.
-        let span = AlphanumSpan { byte_ptr: text.as_ptr(), len: text.len() as u32 };
-        self.names.push(text);
-        span
+        AlphanumSpan::new(text.as_ref())
     }
 
     /// `m[i]` where `m` reads synchronously.
@@ -348,7 +341,7 @@ impl Hoister<'_> {
             let name = self.fresh();
             pre.push(PrecResInnerStmt::VarDecl(crate::parse::VarDeclStmt {
                 is_mutable: false,
-                binding: crate::lex::VarBindingKind::PlainName(name),
+                binding: crate::lex::VarBindingKind::PlainName(name.clone()),
                 ty_expr: None,
                 assign_val: Some(PrecResExpr::SubscriptAccess(Box::new(
                     crate::parse::SubscriptAccess { base: sub.base.clone(), index },
@@ -359,7 +352,7 @@ impl Hoister<'_> {
         match e {
             PrecResExpr::FieldAccess { base, field_name } => PrecResExpr::FieldAccess {
                 base: Box::new(self.expr(base, pre)),
-                field_name: *field_name,
+                field_name: field_name.clone(),
             },
             PrecResExpr::Call { base, args } => PrecResExpr::Call {
                 base: Box::new(self.expr(base, pre)),
@@ -456,7 +449,7 @@ impl Hoister<'_> {
             }),
             PrecResInnerStmt::ForLoop(f) => {
                 PrecResInnerStmt::ForLoop(Box::new(crate::parse::ForLoopStmt {
-                    binding: f.binding,
+                    binding: f.binding.clone(),
                     target: f.target.clone(),
                     body: self.arm(&f.body),
                 }))
@@ -509,9 +502,9 @@ pub fn hoist_sync_reads(
     body: &[PrecResInnerStmt],
     sync_mem_of: &dyn Fn(&str) -> Option<usize>,
 ) -> Hoisted {
-    let mut h = Hoister { sync_mem_of, names: Vec::new(), next: 0 };
+    let mut h = Hoister { sync_mem_of, next: 0 };
     let stmts = h.block(body);
-    Hoisted { stmts, _names: h.names }
+    Hoisted { stmts }
 }
 
 /// Where to blame a statement the scheduler refuses.
@@ -543,7 +536,7 @@ fn as_branching_if<'a>(
 }
 
 /// Whether a statement has to be scheduled rather than muxed.
-fn needs_states(stmt: &PrecResInnerStmt, sync_mem_of: &dyn Fn(&str) -> Option<usize>) -> bool {
+pub(crate) fn needs_states(stmt: &PrecResInnerStmt, sync_mem_of: &dyn Fn(&str) -> Option<usize>) -> bool {
     if contains_barrier(stmt) {
         return true;
     }
@@ -569,6 +562,7 @@ fn needs_states(stmt: &PrecResInnerStmt, sync_mem_of: &dyn Fn(&str) -> Option<us
                 in_arm(&i.then_case) || i.else_case.as_ref().is_some_and(in_arm)
             }
             PrecResInnerStmt::MatchStmt(m) => m.cases.iter().any(|c| in_arm(&c.rhs)),
+            PrecResInnerStmt::ForLoop(f) => in_arm(&f.body),
             _ => false,
         }
     }
@@ -677,6 +671,11 @@ fn schedule<'a>(
     let mut pending: Vec<&'a PrecResInnerStmt> = Vec::new();
 
     for stmt in stmts.iter().rev() {
+        if let PrecResInnerStmt::ForLoop(f) = stmt
+            && needs_states(stmt, sync_mem_of) {
+                sink.err_at(&f.binding, "a `for` body must be combinational; blocking transfers, synchronous reads, `loop`, and `break` require an explicit process loop");
+                return None;
+            }
         if let Some(barrier) = as_barrier(stmt, pipe_of, port_of, sink)? {
             let mut post: Vec<&PrecResInnerStmt> = pending.drain(..).rev().collect();
             // A branch state sitting right after this barrier has no wait of
@@ -687,9 +686,12 @@ fn schedule<'a>(
             // cost one cycle rather than two.
             let next = match target {
                 Target::State(ix) if states[ix].is_bare_branch() => {
-                    let absorbed = std::mem::replace(&mut states[ix], State::dead());
-                    post.extend(absorbed.stmts);
-                    absorbed.next
+                    // Other arms may already target this continuation, or
+                    // acquire an edge to it later in the backwards walk.
+                    // Copy its work; reachability pruning removes it only
+                    // when no predecessor still needs the original state.
+                    post.extend(states[ix].stmts.iter().copied());
+                    states[ix].next.clone()
                 }
                 other => Next::Straight(other),
             };
@@ -1101,6 +1103,10 @@ pub fn reads_of(stmt: &PrecResInnerStmt, out: &mut HashSet<String>) {
         }
         PrecResInnerStmt::TailVal(e) => in_expr(e, out),
         PrecResInnerStmt::Loop(l) => in_expr(&l.repeat_expr, out),
+        PrecResInnerStmt::ForLoop(f) => {
+            in_expr(&f.target, out);
+            in_expr(&f.body, out);
+        }
         _ => {}
     }
 }
@@ -1611,10 +1617,9 @@ pub fn lower_blocking(
     let mut mem_reads: Vec<(usize, usize, ValueId)> = Vec::new();
 
     let mut send_values: Vec<(usize, usize, ValueId)> = Vec::new();
-    // Per pipe: the states that touched it non-blockingly, and the branch the
-    // operation sat on when it was not at the top of the state.
-    let mut nonblocking: Vec<Vec<(usize, Option<ValueId>)>> =
-        vec![Vec::new(); low.pipes.len()];
+    // Per pipe: resolved nonblocking commit conditions, including execution,
+    // availability, and source path, captured while each state is lowered.
+    let mut nonblocking: Vec<Vec<ValueId>> = vec![Vec::new(); low.pipes.len()];
     // Several states may define the same name, one per arm of a branch, so
     // this is a list rather than a map: the register takes whichever of them
     // fired.
@@ -1666,6 +1671,7 @@ pub fn lower_blocking(
         // so it is "did it transfer while we were in state k" -- and `used`,
         // which stops two operations on one pipe colliding, resets per state
         // rather than per cycle for the same reason.
+        low.transfer_paths.clear();
         for ix in 0..low.pipes.len() {
             let pipe = low.pipes[ix].clone();
             let handshake = pipe.movable.expect("computed once above");
@@ -1722,6 +1728,22 @@ pub fn lower_blocking(
             // value computed from the array -- the array is read inside the
             // memory's own clocked block, and this is the only way to see it.
             let q = low.emit(elem.clone(), Op::MemReadReg { mem: read.mem_ix as u32, port: 0 });
+            // Writes preceding this read can share its issue state. Capture
+            // their forwarding decision alongside the RAM output, so source
+            // order does not depend on a device's read-during-write mode.
+            let q = if let Some((hit, data)) = low.pending_write(read.mem_ix, addr, &env) {
+                let mut held = Vec::new();
+                for (suffix, ty, value) in [("hit", Ty::BOOL, hit), ("data", elem.clone(), data)] {
+                    let reg = low.emit(ty.clone(), Op::RegRead(next_slot as u32));
+                    next_slot += 1;
+                    locals.push(LocalReg {
+                        name: format!("@forward_s{}_{}", k, suffix), ty, held: reg,
+                        writes: vec![(k, value)],
+                    });
+                    held.push(reg);
+                }
+                low.emit(elem.clone(), Op::Mux { cond: held[0], then_val: held[1], else_val: q })
+            } else { q };
             env.insert(read.bind.clone(), Binding::constant(q, elem));
         }
         if let Some(bind) = st.barrier.as_ref().and_then(|b| b.bind.as_ref()) {
@@ -1803,10 +1825,10 @@ pub fn lower_blocking(
                         None => bound.push((name, vec![from])),
                     }
                 };
-                if let Some(name) = plan.catch_all {
+                if let Some(name) = plan.catch_all.clone() {
                     note(anumspan_to_str(&name).to_string(), None);
                 }
-                if let Some((variant, bind)) = plan.payload {
+                if let Some((variant, bind)) = plan.payload.clone() {
                     note(anumspan_to_str(&bind).to_string(), Some(variant));
                 }
             }
@@ -1873,7 +1895,9 @@ pub fn lower_blocking(
             if !used_here || barriered_here {
                 continue;
             }
-            uses.push((k, low.pipes[ix].send_guard));
+            // Capture execution, availability, and source path while this
+            // state's environment is active. Do not reconstruct it later.
+            uses.push(low.pipe_transfer(ix));
             if !low.pipes[ix].is_input
                 && let Some(v) = low.pipes[ix].sent
             {
@@ -1974,7 +1998,13 @@ pub fn lower_blocking(
                 // No guard: a scheduled send is the whole of what its state
                 // does, so the state firing is the condition and there is no
                 // branch inside it to narrow to.
-                BarrierOn::Port(pix) => port_sends[pix].push((k, v, None)),
+                BarrierOn::Port(pix) => {
+                    if low.port_outs[pix].sent.is_some() {
+                        sink.err_span(low.here(), format!("`{}` is sent to more than once in one cycle", name));
+                        return None;
+                    }
+                    port_sends[pix].push((k, v, None));
+                }
             }
             if let Some(depth) = depth {
                 low.pop_anchor(depth);
@@ -2045,25 +2075,7 @@ pub fn lower_blocking(
             .filter(|(_, s)| s.barrier.as_ref().is_some_and(|b| b.pipe() == Some(ix)))
             .map(|(k, _)| fires[k])
             .collect();
-        for (k, guard) in uses {
-            // FIRING, not merely being in the state. A state with a barrier
-            // does its work in the cycle that barrier completes, so a pipe it
-            // touches without waiting is touched then and not before -- which
-            // for an offer means not publishing a value computed from an item
-            // that has not arrived, and for a drop means not throwing one away.
-            //
-            // And an operation written inside an `if` only happens on that
-            // branch, so the state alone is not the condition either.
-            let ask = match guard {
-                None => fires[*k],
-                Some(g) => {
-                    low.emit(Ty::BOOL, Op::Bin { op: BinOp::And, lhs: fires[*k], rhs: *g })
-                }
-            };
-            let movable = low.pipes[ix].movable.expect("computed before lowering states");
-            let transfer = low.emit(Ty::BOOL, Op::Bin { op: BinOp::And, lhs: ask, rhs: movable });
-            asks.push(transfer);
-        }
+        asks.extend(uses);
         let active = any_of(&mut low, &asks);
         let pipe = low.pipes[ix].clone();
         low.name_value_fresh(active, format!("{}_take", pipe.name));
