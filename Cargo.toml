@@ -33,3 +33,10 @@ result_unit_err = "allow"
 # struct would move the arguments rather than remove them, and would put a
 # layer between the two halves that only exists to satisfy a count.
 too_many_arguments = "allow"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true
+

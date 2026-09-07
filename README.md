@@ -66,6 +66,7 @@ For detailed hardware design documents on DDL's compilation passes, interconnect
 - [**Multi-Write BRAM via Live Value Tables**](docs/lvt-bram-architecture.md): Synthesizing multi-write memories on FPGAs using single-write BRAM banks and distributed LVTs (`--lvt-bram`).
 - [**Zero-Latency Hardware Combinators**](docs/combinators.md): Pure datapath implementation of `@merge` (rotating priority) and `@split` (lossless broadcast).
 - [**Verilog Backend & Synthesizer Portability**](docs/backend-portability.md): Restrictive Verilog-2005 subset, avoiding GowinSynthesis toolchain crashes, and Verilator `-Wall` linting.
+- [**GitHub CI/CD & Multi-Platform Release Pipeline**](docs/ci-release-pipeline.md): Automated multi-platform builds (Linux, Windows, macOS), nightly cron releases, and publishing runbook.
 
 ---
 
