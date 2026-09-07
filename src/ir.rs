@@ -2458,6 +2458,22 @@ pub fn lower_process(
         );
     }
 
+    // The nonblocking path has lexical scopes too. Resolve declarations
+    // before combinational branch lowering joins the outer environment.
+    let globals = env.keys().cloned()
+        .chain(low.pipes.iter().map(|p| p.name.clone()))
+        .chain(low.port_ins.iter().map(|p| p.name.clone()))
+        .chain(low.port_outs.iter().map(|p| p.name.clone()))
+        .chain(syms.funcs.keys().cloned())
+        .chain(syms.structs.keys().cloned())
+        .chain(syms.enums.keys().cloned())
+        .chain(syms.enums.values().flat_map(|e| e.variants.iter().map(|(n, _)| n.clone())))
+        .collect();
+    let scoped = crate::ir_scope::resolve(&body_stmts, globals, sink)?;
+    low.synthetic_spans = scoped.origins.clone();
+    sink.set_synthetic_spans(scoped.origins);
+    let body_stmts = scoped.stmts;
+
     // ---- the generated handshake ------------------------------------------
     //
     // One registered entry per output pipe, which is the shape k3g_expand.sv
@@ -4611,8 +4627,16 @@ fn lower_builtin(
             );
             return None;
         }
-        let mut then_val = lower_expr(low, &args[1], env, sink)?;
-        let mut else_val = lower_expr(low, &args[2], env, sink)?;
+        // Expressions can send to ports or inline assertions. Their effects
+        // belong to the selected arm, just as in a statement-form `if`.
+        let depth = low.push_cond(cond, true);
+        let then_result = lower_expr(low, &args[1], env, sink);
+        low.pop_path(depth);
+        let mut then_val = then_result?;
+        let depth = low.push_cond(cond, false);
+        let else_result = lower_expr(low, &args[2], env, sink);
+        low.pop_path(depth);
+        let mut else_val = else_result?;
 
         // An unsized literal on one side adopts the other side's type.
         let tt = low.ty_of(then_val);

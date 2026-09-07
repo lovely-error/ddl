@@ -57,7 +57,7 @@ use crate::ir::{
 };
 use crate::ir_fsm::{as_sync_read, reads_of};
 use crate::parse::{
-    BuiltinOp, PrecResExpr, PrecResInnerStmt, PrecSeqInnerStmt, anumspan_to_str,
+    BuiltinOp, PrecResExpr, PrecResInnerStmt, PrecSeqInnerStmt, VarDeclStmt, anumspan_to_str,
 };
 use crate::ty::{MemKind, Ty, resolve_type_expr};
 
@@ -74,7 +74,7 @@ fn split_stages(body: &[PrecSeqInnerStmt]) -> Vec<Vec<&PrecResInnerStmt>> {
 }
 
 /// `let x = @rcv(p)`, the head stage's input.
-fn as_recv(stmt: &PrecResInnerStmt) -> Option<(String, String)> {
+fn as_recv(stmt: &PrecResInnerStmt) -> Option<(&VarDeclStmt, String)> {
     let decl = match stmt {
         PrecResInnerStmt::VarDecl(d) if d.names().len() == 1 => d,
         _ => return None,
@@ -88,12 +88,37 @@ fn as_recv(stmt: &PrecResInnerStmt) -> Option<(String, String)> {
         _ => return None,
     }
     match &args[0] {
-        PrecResExpr::Ref(n) => Some((
-            anumspan_to_str(&decl.head_name()).to_string(),
-            anumspan_to_str(n).to_string(),
-        )),
+        PrecResExpr::Ref(n) => Some((decl, anumspan_to_str(n).to_string())),
         _ => None,
     }
+}
+
+/// A channel or memory read has its producer's type; an annotation must agree.
+/// These reads bypass ordinary initializer lowering to account for their
+/// handshake or latency, but must still check the declaration they initialize.
+fn check_read_type(
+    low: &Lowerer,
+    decl: &VarDeclStmt,
+    have: &Ty,
+    sink: &mut DiagSink,
+) -> Option<()> {
+    if let Some(t) = &decl.ty_expr {
+        let want = match resolve_type_expr(t, low.syms) {
+            Ok(ty) => ty,
+            Err(e) => {
+                sink.err_at(&decl.head_name(), e.message());
+                return None;
+            }
+        };
+        if want != *have {
+            sink.err_at(&decl.head_name(), format!(
+                "`{}` is declared `{}` but its initialiser is `{}`",
+                anumspan_to_str(&decl.head_name()), want.display(), have.display(),
+            ));
+            return None;
+        }
+    }
+    Some(())
 }
 
 /// `@send(p, v)`, the tail stage's output.
@@ -312,28 +337,21 @@ fn gate_writes(
 }
 
 /// Names a stage defines.
-fn defines(stage: &[&PrecResInnerStmt], recv_bind: Option<&String>) -> HashSet<String> {
+fn defines(stage: &[&PrecResInnerStmt]) -> HashSet<String> {
     let mut out = HashSet::new();
     for stmt in stage {
         if let PrecResInnerStmt::VarDecl(d) = stmt {
             out.extend(d.names().iter().map(|n| anumspan_to_str(n).to_string()));
         }
     }
-    if let Some(b) = recv_bind {
-        out.insert(b.clone());
-    }
     out
 }
 
 /// Names a stage reads.
-fn reads(stage: &[&PrecResInnerStmt], send: Option<&PrecResExpr>) -> HashSet<String> {
+fn reads(stage: &[&PrecResInnerStmt]) -> HashSet<String> {
     let mut out = HashSet::new();
     for stmt in stage {
         reads_of(stmt, &mut out);
-    }
-    if let Some(e) = send {
-        let tmp = PrecResInnerStmt::TailVal(e.clone());
-        reads_of(&tmp, &mut out);
     }
     out
 }
@@ -418,7 +436,7 @@ pub fn lower_sequence(
 
     // The head reads; the tail sends. desc.md:76 -- only the first stage may
     // block on a read, and the send belongs with the result.
-    let mut head_recv: Option<(String, String)> = None;
+    let mut head_recv: Option<(&VarDeclStmt, String)> = None;
     let mut tail_send: Option<(String, PrecResExpr)> = None;
     let mut plain: Vec<Vec<&PrecResInnerStmt>> = Vec::with_capacity(n);
 
@@ -444,7 +462,6 @@ pub fn lower_sequence(
                     return None;
                 }
                 head_recv = Some(r);
-                continue;
             }
             if let Some(s) = as_send(stmt) {
                 if k + 1 != n {
@@ -456,18 +473,15 @@ pub fn lower_sequence(
                     return None;
                 }
                 tail_send = Some(s);
-                continue;
             }
-            // A `bram` read STAYS in the stage, unlike the receive and the
-            // send. It is recognised again in the lowering loop, at its own
-            // position, because the writes it must observe are the ones
-            // written above it and lifting it out would lose that order.
+            // Keep reads and sends at their source positions. Their values
+            // and side effects must see only the statements preceding them.
             keep.push(*stmt);
         }
         plain.push(keep);
     }
 
-    let (recv_bind, recv_pipe) = match head_recv {
+    let (_, recv_pipe) = match head_recv {
         Some(r) => r,
         None => {
             sink.err_span(
@@ -484,7 +498,7 @@ pub fn lower_sequence(
         );
         return None;
     }
-    let (send_pipe, send_expr) = match tail_send {
+    let (send_pipe, _) = match tail_send {
         Some(s) => s,
         None => {
             sink.err_span(
@@ -549,17 +563,14 @@ pub fn lower_sequence(
 
     // ---- stage bodies -----------------------------------------------------
     let in_data = low.pipe_item_at(in_ix, in_rsalt_q);
-    env.insert(recv_bind.clone(), Binding::constant(in_data, low.pipes[in_ix].ty.clone()));
 
     let defs: Vec<HashSet<String>> = plain
         .iter()
-        .enumerate()
-        .map(|(k, st)| defines(st, if k == 0 { Some(&recv_bind) } else { None }))
+        .map(|st| defines(st))
         .collect();
     let rds: Vec<HashSet<String>> = plain
         .iter()
-        .enumerate()
-        .map(|(k, st)| reads(st, if k + 1 == n { Some(&send_expr) } else { None }))
+        .map(|st| reads(st))
         .collect();
 
     // ---- who owns each memory --------------------------------------------
@@ -633,10 +644,51 @@ pub fn lower_sequence(
     // branch.
     let mut port_sends: Vec<Vec<(usize, ValueId, Option<ValueId>)>> =
         vec![Vec::new(); low.port_outs.len()];
+    let out_ty = low.pipes[out_ix].ty.clone();
+    let mut sent = None;
 
     for (k, stage) in plain.iter().enumerate() {
         let assertion_start = low.asserts.len();
         for stmt in stage {
+            if let Some((declaration, _)) = as_recv(stmt) {
+                let ty = low.pipes[in_ix].ty.clone();
+                check_read_type(&low, declaration, &ty, sink)?;
+                let binding = if declaration.is_mutable {
+                    Binding::variable(in_data, ty)
+                } else {
+                    Binding::constant(in_data, ty)
+                };
+                env.insert(anumspan_to_str(&declaration.head_name()).to_string(), binding);
+                continue;
+            }
+            if let Some((_, expr)) = as_send(stmt) {
+                // Capture the payload now, before later assignments. Nested
+                // port sends and assertions are part of this stage as well,
+                // before its transfers are collected and execution-gated.
+                let at = crate::ir::stmt_anchor(stmt)
+                    .map(|a| low.span_of(&a))
+                    .unwrap_or_else(crate::driver::nowhere);
+                let depth = low.push_anchor(at);
+                let value = crate::ir::lower_expr_expecting(
+                    &mut low, &expr, Some(&out_ty), &env, sink,
+                );
+                low.pop_anchor(depth);
+                let mut value = value?;
+                if low.ty_of(value) != out_ty
+                    && let Some(coerced) = low.coerce_const_pub(value, &out_ty) {
+                        value = coerced;
+                    }
+                let have = low.ty_of(value);
+                if have != out_ty {
+                    sink.err_span(at, format!(
+                        "`{}` carries `{}` but `{}` was sent",
+                        low.pipes[out_ix].name, out_ty.display(), have.display(),
+                    ));
+                    return None;
+                }
+                sent = Some(value);
+                continue;
+            }
             // `let x = mem[i]` on a `bram`, in its own place in the stage.
             //
             // The address goes out here and the value is bound past the cut
@@ -645,6 +697,10 @@ pub fn lower_sequence(
             // write port as it stands NOW -- which is exactly the writes above
             // this line and none of the ones below it.
             if let Some(r) = as_sync_read(stmt, &sync_mem_of) {
+                let PrecResInnerStmt::VarDecl(declaration) = stmt else {
+                    unreachable!("a synchronous read is a declaration")
+                };
+                check_read_type(&low, declaration, &low.mems[r.mem_ix].elem, sink)?;
                 let at = crate::ir::stmt_anchor(stmt)
                     .map(|a| low.span_of(&a))
                     .unwrap_or_else(crate::driver::nowhere);
@@ -834,31 +890,7 @@ pub fn lower_sequence(
     }
 
     // ---- the output -------------------------------------------------------
-    let out_ty = low.pipes[out_ix].ty.clone();
-    let assertion_start = low.asserts.len();
-    let mut sent = crate::ir::lower_expr_expecting(&mut low, &send_expr, Some(&out_ty), &env, sink)?;
-    if low.ty_of(sent) != out_ty
-        && let Some(coerced) = low.coerce_const_pub(sent, &out_ty) {
-            sent = coerced;
-        }
-    if low.asserts.len() != assertion_start {
-        let live = stage_live(&mut low, n - 1, &mut offered, in_ix, in_rsalt_q, valid_base);
-        let executing = low.emit(Ty::BOOL, Op::Bin { op: BinOp::And, lhs: live, rhs: en });
-        gate_assertions(&mut low, assertion_start, executing);
-    }
-    let have = low.ty_of(sent);
-    if have != out_ty {
-        sink.err_span(
-            low.here(),
-            format!(
-                "`{}` carries `{}` but `{}` was sent",
-                low.pipes[out_ix].name,
-                out_ty.display(),
-                have.display()
-            ),
-        );
-        return None;
-    }
+    let sent = sent.expect("the validated tail send was lowered in its stage");
 
     // The last stage's result is pushed into an entry rather than registered
     // into a head, which is the same flop count arranged differently: two

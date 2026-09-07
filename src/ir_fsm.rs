@@ -122,6 +122,7 @@ pub struct MemRead<'a> {
     pub mem_ix: usize,
     pub addr: &'a PrecResExpr,
     pub bind: String,
+    pub declaration: &'a crate::parse::VarDeclStmt,
 }
 
 /// One state of the machine.
@@ -280,6 +281,7 @@ pub(crate) fn as_sync_read<'a>(
         mem_ix,
         addr: &sub.index,
         bind: anumspan_to_str(&decl.head_name()).to_string(),
+        declaration: decl,
     })
 }
 
@@ -350,6 +352,37 @@ impl Hoister<'_> {
             return PrecResExpr::Ref(name);
         }
         match e {
+            PrecResExpr::Call { base, args }
+                if matches!(&**base, PrecResExpr::Builtin(BuiltinOp::Select)) && args.len() == 3 =>
+            {
+                let condition = self.expr(&args[0], pre);
+                let (mut then_reads, mut else_reads) = (Vec::new(), Vec::new());
+                let then_value = self.expr(&args[1], &mut then_reads);
+                let else_value = self.expr(&args[2], &mut else_reads);
+                let condition = if then_reads.is_empty() && else_reads.is_empty() {
+                    condition
+                } else {
+                    // Evaluate the condition once, before any arm's waits.
+                    // Only the selected arm may issue its reads or execute
+                    // their address expressions. The final value selection
+                    // uses this same saved condition after the arms rejoin.
+                    let name = self.fresh();
+                    pre.push(PrecResInnerStmt::VarDecl(crate::parse::VarDeclStmt {
+                        is_mutable: false,
+                        binding: crate::lex::VarBindingKind::PlainName(name.clone()),
+                        ty_expr: None,
+                        assign_val: Some(condition),
+                    }));
+                    let condition = PrecResExpr::Ref(name);
+                    pre.push(PrecResInnerStmt::IfThenElse(crate::parse::ITEStmt {
+                        condition: condition.clone(),
+                        then_case: PrecResExpr::StmtBlock(crate::parse::StmtBlock { components: then_reads }),
+                        else_case: Some(PrecResExpr::StmtBlock(crate::parse::StmtBlock { components: else_reads })),
+                    }));
+                    condition
+                };
+                PrecResExpr::Call { base: base.clone(), args: vec![condition, then_value, else_value] }
+            }
             PrecResExpr::FieldAccess { base, field_name } => PrecResExpr::FieldAccess {
                 base: Box::new(self.expr(base, pre)),
                 field_name: field_name.clone(),
@@ -371,6 +404,17 @@ impl Hoister<'_> {
                 left: self.expr(&sp.left, pre),
                 right: self.expr(&sp.right, pre),
             })),
+            // A multiline conditional in value position has the same shape
+            // as Select once its single statement is unwrapped.
+            PrecResExpr::StmtBlock(b)
+                if matches!(&b.components[..], [PrecResInnerStmt::IfThenElse(i)] if i.else_case.is_some()) =>
+            {
+                let [PrecResInnerStmt::IfThenElse(i)] = &b.components[..] else { unreachable!() };
+                self.expr(&PrecResExpr::Call {
+                    base: Box::new(PrecResExpr::Builtin(BuiltinOp::Select)),
+                    args: vec![i.condition.clone(), i.then_case.clone(), i.else_case.clone().unwrap()],
+                }, pre)
+            }
             // A block is statements, and statements are the other half of this
             // walk: a read inside one belongs to that block, not out here.
             PrecResExpr::StmtBlock(b) => PrecResExpr::StmtBlock(crate::parse::StmtBlock {
@@ -1040,6 +1084,40 @@ pub fn schedule_body<'a>(
     Some(states)
 }
 
+/// Visits definitions on both forward arms before their shared continuation.
+/// State numbers retain the scheduler's source-oriented order; only lowering
+/// uses reverse postorder. A DFS preorder can reach a join before compiling
+/// the other arm's read, even though a conditional result needs both types.
+fn lowering_order(states: &[State]) -> Vec<usize> {
+    let mut seen = vec![false; states.len()];
+    let mut post = Vec::new();
+    let mut stack = vec![(0, false)];
+    while let Some((ix, leaving)) = stack.pop() {
+        if leaving {
+            post.push(ix);
+            continue;
+        }
+        if seen[ix] { continue; }
+        seen[ix] = true;
+        stack.push((ix, true));
+        let mut visit = |target: Target| {
+            if let Target::State(next) = target { stack.push((next, false)); }
+        };
+        match &states[ix].next {
+            Next::Straight(target) => visit(*target),
+            Next::Branch { then_t, else_t, .. } => {
+                visit(*then_t);
+                visit(*else_t);
+            }
+            Next::Switch { targets, .. } => {
+                for target in targets { visit(*target); }
+            }
+        }
+    }
+    post.reverse();
+    post
+}
+
 /// Names read by a statement, for deciding which bindings cross a state.
 pub fn reads_of(stmt: &PrecResInnerStmt, out: &mut HashSet<String>) {
     fn in_expr(e: &PrecResExpr, out: &mut HashSet<String>) {
@@ -1663,7 +1741,8 @@ pub fn lower_blocking(
     let mut mem_writes: Vec<Vec<(usize, usize, crate::ir::WritePort)>> =
         vec![Vec::new(); low.mems.len()];
 
-    for (k, st) in states_sched.iter().enumerate() {
+    for k in lowering_order(&states_sched) {
+        let st = &states_sched[k];
         // NON-BLOCKING OPERATIONS ARE PER-STATE, which is the whole difference
         // between them here and in a process with no states. `fired` there is
         // "did this pipe transfer this cycle", computed once before the body.
@@ -1721,6 +1800,22 @@ pub fn lower_blocking(
         if let Some(read) = &st.mem_read {
             let addr_width = low.mems[read.mem_ix].addr_width;
             let elem = low.mems[read.mem_ix].elem.clone();
+            if let Some(t) = &read.declaration.ty_expr {
+                let want = match crate::ty::resolve_type_expr(t, low.syms) {
+                    Ok(ty) => ty,
+                    Err(e) => {
+                        sink.err_at(&read.declaration.head_name(), e.message());
+                        return None;
+                    }
+                };
+                if want != elem {
+                    sink.err_at(&read.declaration.head_name(), format!(
+                        "`{}` is declared `{}` but the memory holds `{}`",
+                        read.bind, want.display(), elem.display(),
+                    ));
+                    return None;
+                }
+            }
             let raw = crate::ir::lower_expr(&mut low, read.addr, &env, sink)?;
             let addr = low.fit_address(raw, addr_width, &decl.name, sink)?;
             mem_reads.push((read.mem_ix, k, addr));

@@ -78,15 +78,23 @@ struct Circuit {
     m: Module,
     regs: Vec<u128>,
     inputs: HashMap<String, u128>,
+    memories: Vec<Vec<u128>>,
+    read_outputs: Vec<Vec<u128>>,
+    read_events: Vec<(usize, u128)>,
 }
 impl Circuit {
     fn new(src: &str, name: &str) -> Self {
         let m = modules(src).into_iter().find(|m| m.name == name).unwrap();
         let regs = m.regs.iter().map(|r| r.reset).collect();
+        let memories = m.mems.iter().map(|mem| vec![mem.reset.unwrap_or(0); mem.len as usize]).collect();
+        let read_outputs = m.mems.iter().map(|mem| vec![0; mem.read.len()]).collect();
         Self {
             m,
             regs,
             inputs: HashMap::new(),
+            memories,
+            read_outputs,
+            read_events: vec![],
         }
     }
     fn set(&mut self, n: &str, v: u128) {
@@ -175,7 +183,8 @@ impl Circuit {
                     .find(|(labels, _)| labels.contains(&v(*scrutinee)))
                     .map(|(_, x)| *x)
                     .unwrap_or(*default)),
-                other => panic!("unsupported test operation: {other:?}"),
+                Op::MemRead { mem, addr } => self.memories[*mem as usize][v(*addr) as usize],
+                Op::MemReadReg { mem, port } => self.read_outputs[*mem as usize][*port as usize],
             };
             vs[d.id.0 as usize] = result & mask(d.ty.bit_width());
         }
@@ -197,6 +206,21 @@ impl Circuit {
     }
     fn tick(&mut self) {
         let vs = self.eval();
+        // Synchronous reads observe memory before this edge's writes.
+        for (ix, mem) in self.m.mems.iter().enumerate() {
+            for (port, read) in mem.read.iter().enumerate() {
+                if vs[read.en.0 as usize] != 0 {
+                    let addr = vs[read.addr.0 as usize];
+                    self.read_outputs[ix][port] = self.memories[ix][addr as usize];
+                    self.read_events.push((ix, addr));
+                }
+            }
+            for write in &mem.write {
+                if vs[write.we.0 as usize] != 0 {
+                    self.memories[ix][vs[write.addr.0 as usize] as usize] = vs[write.data.0 as usize];
+                }
+            }
+        }
         self.regs = self.m.regs.iter().map(|r| vs[r.next.0 as usize]).collect();
     }
     fn collect(&mut self, cycles: usize, width: u32) -> Vec<u128> {
@@ -724,4 +748,243 @@ fn sequence_assertions_keep_the_enclosing_branch_guard() {
         c.tick();
         assert_eq!(c.assertions_ok(), expected);
     }
+}
+
+#[test]
+fn sequence_send_captures_the_payload_before_later_assignments() {
+    for cuts in 0..3 {
+        let src = format!(
+            "sequence s (src: buffer in u8, o: buffer out u8)\n  let a = @rcv(src)\n{}  var x: u8 = a\n  @send(o, x)\n  x = 8'd99\n  @assert(x == 8'd99)\n",
+            "  |||\n".repeat(cuts),
+        );
+        let mut c = Circuit::new(&src, "s");
+        c.set("src_wsalt", 3);
+        c.set("src_data", (42 << 8) | 7);
+        assert_eq!(c.collect(40, 8), [7, 42], "{cuts} cuts");
+    }
+}
+
+#[test]
+fn sequence_tail_port_sends_follow_items_branches_and_backpressure() {
+    let src = "sequence s (src: buffer in u8, tap: port out u8, o: buffer out u1)\n  let a = @rcv(src)\n  |||\n  @send(o, if a != 8'd9 then @try_send(tap, a) else 1'd0)\n";
+    let mut c = Circuit::new(src, "s");
+    let items = [7, 9, 42, 81];
+    let (mut sent, mut ws, mut rs, mut data) = (0, 0, 0, 0);
+    let (mut taps, mut answers) = (vec![], vec![]);
+    let mut stalled_item = false;
+    for cycle in 0..60 {
+        // A real two-entry producer; the consumer stalls long enough to fill
+        // the output and leave a valid item waiting in the last stage.
+        if cycle >= 4 && sent < items.len() && ws != (c.out("src_rsalt") ^ 3) {
+            let ix = (ws ^ (ws >> 1)) & 1;
+            let shift = ix * 8;
+            data = (data & !(255 << shift)) | (items[sent] << shift);
+            ws ^= if ix == 0 { 1 } else { 2 };
+            sent += 1;
+        }
+        c.set("src_data", data);
+        c.set("src_wsalt", ws);
+        c.set("o_rsalt", rs);
+        if c.out("o_wsalt") == (rs ^ 3) {
+            let valid = c.m.regs.iter().position(|r| r.name == "v0").unwrap();
+            stalled_item |= c.regs[valid] != 0;
+            assert_eq!(c.out("tap_en"), 0);
+        }
+        if c.out("tap_en") != 0 {
+            taps.push(c.out("tap"));
+        }
+        let next_rs = if cycle >= 18 && cycle % 3 != 0 && c.out("o_wsalt") != rs {
+            let ix = (rs ^ (rs >> 1)) & 1;
+            answers.push((c.out("o_data") >> ix) & 1);
+            rs ^ if ix == 0 { 1 } else { 2 }
+        } else {
+            rs
+        };
+        c.tick();
+        rs = next_rs;
+    }
+    assert!(stalled_item);
+    assert_eq!(taps, [7, 42, 81]);
+    assert_eq!(answers, [1, 0, 1, 1]);
+}
+
+#[test]
+fn sequence_tail_port_sends_participate_in_duplicate_checks() {
+    for (before, after, message) in [
+        ("  |||\n  @try_send(tap, a)\n", "", "more than once"),
+        ("  |||\n", "  @try_send(tap, a)\n", "more than once"),
+        ("  @try_send(tap, a)\n  |||\n", "", "is sent to in stage 0 and stage 1"),
+    ] {
+        let src = format!("sequence s (src: buffer in u8, tap: port out u8, o: buffer out u1)\n  let a = @rcv(src)\n{before}  @send(o, @try_send(tap, a))\n{after}");
+        let map = SourceMap::new("duplicate.ddl", src);
+        let errors = ddl::driver::compile_to_verilog(&map, &Default::default()).unwrap_err();
+        assert!(map.render_all(&errors).contains(message), "{}", map.render_all(&errors));
+    }
+}
+
+#[test]
+fn sequence_tail_exclusive_port_sends_and_assertions_keep_the_selected_arm() {
+    let src = "fun checked (x: u8, y: out u8)\n  @assert(x != 8'd0)\n  y = x\nsequence s (src: buffer in u8, tap: port out u8, o: buffer out u1)\n  let a = @rcv(src)\n  |||\n  @send(o, if a != 8'd0 then @try_send(tap, checked(a)) else @try_send(tap, 8'd99))\n";
+    for (item, expected) in [(0, 99), (7, 7)] {
+        let mut c = Circuit::new(src, "s");
+        assert!(c.assertions_ok());
+        assert_eq!(c.out("tap_en"), 0);
+        c.set("src_wsalt", 1);
+        c.set("src_data", item);
+        c.tick();
+        assert!(c.assertions_ok());
+        assert_eq!(c.out("tap_en"), 1);
+        assert_eq!(c.out("tap"), expected);
+        assert_eq!(c.collect(30, 1), [1]);
+        assert_eq!(c.out("tap_en"), 0);
+    }
+}
+
+#[test]
+fn sequence_receive_annotations_are_checked_and_mutability_survives_cuts() {
+    for ty in ["DoesNotExist", "u16", "i8"] {
+        let map = SourceMap::new("receive.ddl", format!("sequence s (src: buffer in u8, o: buffer out u8)\n  let a: {ty} = @rcv(src)\n  |||\n  @send(o, a)\n"));
+        let errors = ddl::driver::compile_to_verilog(&map, &Default::default()).unwrap_err();
+        let text = map.render_all(&errors);
+        assert!(text.contains("receive.ddl:2:"), "{text}");
+        assert!(text.contains(ty), "{text}");
+    }
+    let src = "sequence s (src: buffer in u8, o: buffer out u8)\n  var a: u8 = @rcv(src)\n  a += 1\n  |||\n  a += 2\n  |||\n  @send(o, a)\n";
+    let mut c = Circuit::new(src, "s");
+    c.set("src_wsalt", 3);
+    c.set("src_data", (42 << 8) | 7);
+    assert_eq!(c.collect(40, 8), [10, 45]);
+    let map = SourceMap::new("immutable.ddl", src.replace("var a", "let a"));
+    let errors = ddl::driver::compile_to_verilog(&map, &Default::default()).unwrap_err();
+    assert!(map.render_all(&errors).contains("cannot be assigned"));
+}
+
+#[test]
+fn sequence_bram_read_annotations_are_checked_before_the_cut() {
+    for ty in ["DoesNotExist", "u16", "i8", "u8"] {
+        // Rebinding also checks that diagnostics retain the source anchor
+        // after lexical resolution gives the read result a synthetic name.
+        let map = SourceMap::new("read.ddl", format!("sequence s (src: buffer in u4, o: buffer out u8)\n  var mem: #[impl(bram)] [u8; 16]\n  let a = @rcv(src)\n  let a: {ty} = mem[a]\n  |||\n  @send(o, a)\n"));
+        let result = ddl::driver::compile_to_verilog(&map, &Default::default());
+        if ty == "u8" {
+            result.unwrap();
+        } else {
+            let text = map.render_all(&result.unwrap_err());
+            assert!(text.contains("read.ddl:4:"), "{text}");
+            assert!(text.contains(ty), "{text}");
+        }
+    }
+}
+
+#[test]
+fn process_nonblocking_shadowing_preserves_outer_bindings() {
+    for inner_ty in ["u8", "u16"] {
+        for repeating in [false, true] {
+            let indent = if repeating { "    " } else { "  " };
+            let body = format!("{indent}let (a, got) = @try_rcv(src)\n{indent}let x: u8 = 10\n{indent}if a > 8'd5 then\n{indent}  let x: {inner_ty} = 20\n{indent}@try_send(o, x)\n");
+            let src = format!("process p (src: buffer in u8, o: buffer out u8)\n{}{body}", if repeating { "  loop\n" } else { "" });
+            let mut c = Circuit::new(&src, "p");
+            c.set("src_data", 6);
+            c.set("src_wsalt", 1);
+            let outputs = c.collect(20, 8);
+            assert!(!outputs.is_empty());
+            assert!(outputs.iter().all(|v| *v == 10), "{outputs:?}");
+        }
+    }
+}
+
+#[test]
+fn process_direct_bram_read_checks_its_declared_type() {
+    for ty in ["DoesNotExist", "u16", "i8", "u8"] {
+        let map = SourceMap::new("process_read.ddl", format!("process p (src: buffer in u4, o: buffer out u8)\n  var mem: #[impl(bram)] [u8; 16]\n  loop\n    let a = @rcv(src)\n    let a: {ty} = mem[a]\n    @send(o, a)\n"));
+        let result = ddl::driver::compile_to_verilog(&map, &Default::default());
+        if ty == "u8" {
+            result.unwrap();
+        } else {
+            let text = map.render_all(&result.unwrap_err());
+            assert!(text.contains("process_read.ddl:5:"), "{text}");
+            assert!(text.contains(ty), "{text}");
+        }
+    }
+}
+
+#[test]
+fn process_conditional_bram_reads_execute_only_the_selected_arm() {
+    for expression in [
+        "if a then mem[@try_send(tap, 8'd7)] else 8'd0",
+        "if a then 8'd0 else mem[@try_send(tap, 8'd7)]",
+        "if a then mem[@try_send(tap, 8'd7)] else mem[1'd0]",
+    ] {
+        for item in [0, 1] {
+            let src = format!("process p (src: buffer in u1, tap: port out u8, o: buffer out u8)\n  var mem: #[impl(bram)] [u8; 2]\n  loop\n    let a = @rcv(src)\n    let r = {expression}\n    @send(o, r)\n");
+            let mut c = Circuit::new(&src, "p");
+            c.memories[0] = vec![11, 42];
+            c.set("src_wsalt", 1);
+            c.set("src_data", item);
+            let mut taps = vec![];
+            for _ in 0..20 {
+                if c.out("tap_en") != 0 { taps.push(c.out("tap")); }
+                assert!(c.assertions_ok());
+                c.tick();
+            }
+            let selected = if expression.starts_with("if a then 8'd0") { item == 0 } else { item != 0 };
+            let other_read = expression.ends_with("else mem[1'd0]") && !selected;
+            assert_eq!(taps, if selected { vec![7] } else { vec![] }, "{expression}, {item}");
+            assert_eq!(c.read_events, if selected { vec![(0, 1)] } else if other_read { vec![(0, 0)] } else { vec![] });
+            assert_eq!(c.out("o_wsalt"), 1);
+            assert_eq!(c.out("o_data") & 255, if selected { 42 } else if other_read { 11 } else { 0 });
+        }
+    }
+}
+
+#[test]
+fn process_nested_conditional_reads_survive_reentry_and_output_stalls() {
+    for expression in [
+        "if a[1] then (if a[0] then mem[1'd1] else 8'd5) else mem[1'd0]",
+        "\n      if a[1] then (if a[0] then mem[1'd1] else 8'd5) else mem[1'd0]",
+    ] {
+        let src = format!("process p (src: buffer in u2, o: buffer out u8)\n  var mem: #[impl(bram)] [u8; 2]\n  loop\n    let a = @rcv(src)\n    let r = {expression}\n    @send(o, r)\n");
+        let mut c = Circuit::new(&src, "p");
+        c.memories[0] = vec![11, 42];
+        let items = [0, 2, 3, 1];
+        let (mut next, mut ws, mut rs, mut data) = (0, 0, 0, 0);
+        let mut outputs = vec![];
+        for cycle in 0..100 {
+            if next < items.len() && ws != (c.out("src_rsalt") ^ 3) {
+                let ix = (ws ^ (ws >> 1)) & 1;
+                data = (data & !(3 << (ix * 2))) | (items[next] << (ix * 2));
+                ws ^= if ix == 0 { 1 } else { 2 };
+                next += 1;
+            }
+            c.set("src_wsalt", ws);
+            c.set("src_data", data);
+            c.set("o_rsalt", rs);
+            let next_rs = if cycle > 40 && cycle % 3 != 0 && c.out("o_wsalt") != rs {
+                let ix = (rs ^ (rs >> 1)) & 1;
+                outputs.push((c.out("o_data") >> (ix * 8)) & 255);
+                rs ^ if ix == 0 { 1 } else { 2 }
+            } else { rs };
+            c.tick();
+            rs = next_rs;
+        }
+        assert_eq!(outputs, [11, 5, 42, 11], "{expression}");
+        assert_eq!(c.read_events, [(0, 0), (0, 1), (0, 0)]);
+    }
+}
+
+#[test]
+fn process_conditional_read_evaluates_its_condition_once() {
+    let src = "process p (src: buffer in u8, flag: port out u8, o: buffer out u8)\n  var mem: #[impl(bram)] [u8; 2]\n  loop\n    let a = @rcv(src)\n    let r = if @try_send(flag, a) then mem[1'd1] else mem[1'd0]\n    @send(o, r)\n";
+    let mut c = Circuit::new(src, "p");
+    c.memories[0] = vec![11, 42];
+    c.set("src_wsalt", 1);
+    c.set("src_data", 7);
+    let mut flags = vec![];
+    for _ in 0..20 {
+        if c.out("flag_en") != 0 { flags.push(c.out("flag")); }
+        c.tick();
+    }
+    assert_eq!(flags, [7]);
+    assert_eq!(c.read_events, [(0, 1)]);
+    assert_eq!(c.out("o_data") & 255, 42);
 }
