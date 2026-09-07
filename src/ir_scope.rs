@@ -1,4 +1,4 @@
-//! Lexical identities for bindings before the FSM flattens nested blocks.
+//! Lexical identities for bindings before process or sequence lowering flattens blocks.
 //!
 //! Keep the first spelling for readable RTL; subsequent declarations of the
 //! same name get compiler-owned identities. Initializers are resolved before

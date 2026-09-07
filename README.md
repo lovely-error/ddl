@@ -220,6 +220,15 @@ the pipeline is moving". Sending in two stages is refused — every stage is
 live at once holding a different item, so that would be two answers for one
 wire, and unlike a process there is nothing to choose between them.
 
+A sequence receives once from its input buffer in the first stage and sends
+once to its output buffer in the last stage. Duplicate head receives and tail
+sends are errors. Nonblocking buffer operations (`@peek`, `@try_rcv`, `@drop`,
+`@try_send`) are not supported in sequences; use a process for those operations.
+Nonblocking operations on `port` inputs and outputs remain supported.
+Stage cuts preserve lexical scope: a declaration inside a branch does not
+replace a binding outside that branch, and a rebinding's initializer sees the
+previous binding. Unsized tail-send constants take the output payload type.
+
 A `port` is for the EDGE of the program, where the thing on the other side
 cannot be made to wait: a pin, a PLL, a bus master that does not take `ready`
 for an answer. That is the case the rule below already names — the sink ties
@@ -287,6 +296,9 @@ idle cycles and other match arms do not check stale values. A failed
 that also performs a blocking operation.
 A polling process that has finished performs no further buffer sends, state
 updates, or execution-scoped assertions.
+In a sequence, assertions check only when their stage has a valid item and
+the pipeline advances, with any enclosing branch condition also required.
+Empty stages and output stalls do not execute assertions.
 
 **A pipe is claimed where the program asks for it, under the condition it
 asks.** One rule, and it is the same in a process that blocks and one that does

@@ -24,7 +24,7 @@ try {
             & (Join-Path $SimTool 'vlog.exe') -quiet -work work +define+SIMULATION $verilogSource.Name *> ($verilogSource.BaseName + '.vlog.log')
             if ($LASTEXITCODE -ne 0) { throw "Verilog rejected: $($verilogSource.Name)" }
         }
-        foreach ($bench in @('tb_fixed', 'tb_adversarial')) {
+        foreach ($bench in @('tb_fixed', 'tb_adversarial', 'tb_sequence')) {
             & (Join-Path $SimTool 'vlog.exe') -quiet -work work (Join-Path $PSScriptRoot "probes/$bench.sv") *> "$bench.vlog.log"
             if ($LASTEXITCODE -ne 0) { throw "Testbench compilation failed: $bench" }
             $log = if ($bench -eq 'tb_fixed') { 'vsim.log' } else { "$bench.vsim.log" }

@@ -370,7 +370,31 @@ pub fn lower_sequence(
     let in_ix = inputs[0];
     let out_ix = outputs[0];
 
-    let mut stages = split_stages(&decl.body);
+    // Cuts separate execution stages, not lexical scopes. Resolve the whole
+    // statement stream first, then restore the cuts around those identities.
+    let globals = env.keys().cloned()
+        .chain(low.pipes.iter().map(|p| p.name.clone()))
+        .chain(low.port_ins.iter().map(|p| p.name.clone()))
+        .chain(low.port_outs.iter().map(|p| p.name.clone()))
+        .chain(syms.funcs.keys().cloned())
+        .chain(syms.structs.keys().cloned())
+        .chain(syms.enums.keys().cloned())
+        .chain(syms.enums.values().flat_map(|e| e.variants.iter().map(|(n, _)| n.clone())))
+        .collect();
+    let statements: Vec<_> = decl.body.iter().filter_map(|s| match s {
+        PrecSeqInnerStmt::Stmt(s) => Some(s.clone()),
+        PrecSeqInnerStmt::SegmentSeparator => None,
+    }).collect();
+    let scoped = crate::ir_scope::resolve(&statements, globals, sink)?;
+    low.synthetic_spans = scoped.origins.clone();
+    sink.set_synthetic_spans(scoped.origins);
+    let mut resolved = scoped.stmts.into_iter();
+    let resolved_body: Vec<_> = decl.body.iter().map(|s| match s {
+        PrecSeqInnerStmt::Stmt(_) => PrecSeqInnerStmt::Stmt(
+            resolved.next().expect("scope resolution preserves statements")),
+        PrecSeqInnerStmt::SegmentSeparator => PrecSeqInnerStmt::SegmentSeparator,
+    }).collect();
+    let mut stages = split_stages(&resolved_body);
     let n = stages.len();
 
     // Memories first, so the stages below can be checked against what was
@@ -405,7 +429,7 @@ pub fn lower_sequence(
             // stack to read -- the statement in hand is the same place one
             // would have come from.
             let at = crate::ir::stmt_anchor(stmt)
-                .map(|a| map.span_of(&a))
+                .map(|a| low.span_of(&a))
                 .unwrap_or_else(crate::driver::nowhere);
             if let Some(r) = as_recv(stmt) {
                 if k != 0 {
@@ -415,12 +439,20 @@ pub fn lower_sequence(
                     );
                     return None;
                 }
+                if head_recv.is_some() {
+                    sink.err_span(at, "a sequence may receive from its input buffer only once; duplicate `@rcv`");
+                    return None;
+                }
                 head_recv = Some(r);
                 continue;
             }
             if let Some(s) = as_send(stmt) {
                 if k + 1 != n {
                     sink.err_span(at, "a sequence sends from its last stage");
+                    return None;
+                }
+                if tail_send.is_some() {
+                    sink.err_span(at, "a sequence may send to its output buffer only once; duplicate `@send`");
                     return None;
                 }
                 tail_send = Some(s);
@@ -603,6 +635,7 @@ pub fn lower_sequence(
         vec![Vec::new(); low.port_outs.len()];
 
     for (k, stage) in plain.iter().enumerate() {
+        let assertion_start = low.asserts.len();
         for stmt in stage {
             // `let x = mem[i]` on a `bram`, in its own place in the stage.
             //
@@ -613,7 +646,7 @@ pub fn lower_sequence(
             // this line and none of the ones below it.
             if let Some(r) = as_sync_read(stmt, &sync_mem_of) {
                 let at = crate::ir::stmt_anchor(stmt)
-                    .map(|a| map.span_of(&a))
+                    .map(|a| low.span_of(&a))
                     .unwrap_or_else(crate::driver::nowhere);
                 // The value arrives at the cut below. With no cut below there
                 // is nowhere for the cycle to be spent.
@@ -675,6 +708,11 @@ pub fn lower_sequence(
                 continue;
             }
             crate::ir::lower_stmt_pub(&mut low, stmt, &mut env, sink)?;
+        }
+        if low.asserts.len() != assertion_start {
+            let live = stage_live(&mut low, k, &mut offered, in_ix, in_rsalt_q, valid_base);
+            let executing = low.emit(Ty::BOOL, Op::Bin { op: BinOp::And, lhs: live, rhs: en });
+            gate_assertions(&mut low, assertion_start, executing);
         }
         // A write belongs to the item in this stage, on the cycle the pipeline
         // moves it on. Ungated, a stall would rewrite every cycle it waited and
@@ -796,8 +834,18 @@ pub fn lower_sequence(
     }
 
     // ---- the output -------------------------------------------------------
-    let sent = crate::ir::lower_expr(&mut low, &send_expr, &env, sink)?;
     let out_ty = low.pipes[out_ix].ty.clone();
+    let assertion_start = low.asserts.len();
+    let mut sent = crate::ir::lower_expr_expecting(&mut low, &send_expr, Some(&out_ty), &env, sink)?;
+    if low.ty_of(sent) != out_ty
+        && let Some(coerced) = low.coerce_const_pub(sent, &out_ty) {
+            sent = coerced;
+        }
+    if low.asserts.len() != assertion_start {
+        let live = stage_live(&mut low, n - 1, &mut offered, in_ix, in_rsalt_q, valid_base);
+        let executing = low.emit(Ty::BOOL, Op::Bin { op: BinOp::And, lhs: live, rhs: en });
+        gate_assertions(&mut low, assertion_start, executing);
+    }
     let have = low.ty_of(sent);
     if have != out_ty {
         sink.err_span(
@@ -982,5 +1030,13 @@ pub fn lower_sequence(
         nets: Vec::new(),
         instances: Vec::new(),
     })
+}
+
+fn gate_assertions(low: &mut Lowerer, start: usize, executing: ValueId) {
+    let inactive = low.emit(Ty::BOOL, Op::Un { op: UnOp::LogNot, arg: executing });
+    for ix in start..low.asserts.len() {
+        let cond = low.asserts[ix].cond;
+        low.asserts[ix].cond = low.emit(Ty::BOOL, Op::Bin { op: BinOp::Or, lhs: inactive, rhs: cond });
+    }
 }
 

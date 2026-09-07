@@ -11,6 +11,7 @@ fn modules(src: &str) -> Vec<Module> {
     let parsed = ddl::driver::parse_source(&map).unwrap();
     let mut sink = DiagSink::new(&map);
     let (mut es, mut ss, mut fs, mut ps) = (vec![], vec![], vec![], vec![]);
+    let mut sequences = vec![];
     for d in &parsed.decls {
         // All ASTs borrow map until lowering finishes.
         unsafe {
@@ -26,6 +27,9 @@ fn modules(src: &str) -> Vec<Module> {
                 }
                 TopLevelDecl::ProcessStmt(p) => {
                     ps.push(resolve_precedence_for_process(map.base_ptr(), p).unwrap())
+                }
+                TopLevelDecl::SequenceDecl(s) => {
+                    sequences.push(resolve_precedence_for_sequence(map.base_ptr(), s).unwrap())
                 }
                 _ => panic!("unsupported test declaration"),
             }
@@ -44,6 +48,11 @@ fn modules(src: &str) -> Vec<Module> {
     }
     for p in &ps {
         if let Some(m) = ir::lower_process(&map, &syms, &bodies, p, &mut sink) {
+            result.push(m);
+        }
+    }
+    for s in &sequences {
+        if let Some(m) = ddl::ir_pipe::lower_sequence(&map, &syms, &bodies, s, &mut sink) {
             result.push(m);
         }
     }
@@ -596,5 +605,123 @@ fn for_waits_and_breaks_have_an_explicit_diagnostic() {
         let errors = ddl::driver::compile_to_verilog(&map, &Default::default()).unwrap_err();
         let text = map.render_all(&errors);
         assert!(text.contains("a `for` body must be combinational"), "{text}");
+    }
+}
+
+#[test]
+fn sequence_assertions_follow_validity_and_shift_at_every_stage() {
+    for stage in 0..3 {
+        for builtin in ["assert", "fatal"] {
+            let mut body = "  let x = @rcv(src)\n".to_string();
+            for k in 0..3 {
+                if k == stage {
+                    body += &format!("  @{builtin}(x != 8'd0, \"zero item\")\n");
+                }
+                if k != 2 { body += "  |||\n"; }
+            }
+            body += "  @send(o, x)\n";
+            let src = format!("sequence s (src: buffer in u8, o: buffer out u8)\n{body}");
+            let mut c = Circuit::new(&src, "s");
+            for _ in 0..6 { assert!(c.assertions_ok()); c.tick(); }
+            // A zero-valued transaction fails only when its stage advances.
+            c.set("src_wsalt", 1);
+            for _ in 0..stage { assert!(c.assertions_ok()); c.tick(); }
+            c.set("o_rsalt", 3); // Full: write salt is still zero.
+            for _ in 0..4 { assert!(c.assertions_ok()); c.tick(); }
+            c.set("o_rsalt", 0);
+            assert!(!c.assertions_ok(), "stage {stage}, {builtin}");
+            c.tick();
+            assert!(c.assertions_ok());
+        }
+    }
+}
+
+#[test]
+fn sequence_tail_inlined_assertions_are_execution_guarded() {
+    let src = "fun checked (x: u8, y: out u8)\n  @assert(x != 8'd0)\n  y = x\nsequence s (src: buffer in u8, o: buffer out u8)\n  let x = @rcv(src)\n  |||\n  @send(o, checked(x))\n";
+    let mut c = Circuit::new(src, "s");
+    assert!(c.assertions_ok());
+    c.set("src_wsalt", 1);
+    c.tick();
+    assert!(!c.assertions_ok());
+    c.set("o_rsalt", 3);
+    assert!(c.assertions_ok());
+}
+
+#[test]
+fn sequence_shadowing_does_not_replace_outer_values() {
+    for inner_ty in ["u16", "u32"] {
+        let src = format!("sequence s (src: buffer in u16, o: buffer out u16)\n  let a = @rcv(src)\n  let x: u16 = 10\n  |||\n  if a > 16'd5 then\n    let x: {inner_ty} = 20\n  |||\n  @send(o, x)\n");
+        let mut c = Circuit::new(&src, "s");
+        c.set("src_wsalt", 3);
+        c.set("src_data", (2 << 16) | 6);
+        assert_eq!(c.collect(40, 16), [10, 10]);
+    }
+}
+
+#[test]
+fn sequence_tail_constants_use_the_output_type() {
+    for (expr, expected) in [("0", 0), ("42", 42), ("@zeroed()", 0)] {
+        let src = format!("sequence s (src: buffer in u16, o: buffer out u16)\n  let x = @rcv(src)\n  |||\n  @send(o, {expr})\n");
+        let mut c = Circuit::new(&src, "s");
+        c.set("src_wsalt", 3);
+        assert_eq!(c.collect(40, 16), [expected, expected]);
+    }
+    let map = SourceMap::new("overflow.ddl", "sequence s (src: buffer in u8, o: buffer out u8)\n  let x = @rcv(src)\n  @send(o, 256)\n");
+    assert!(ddl::driver::compile_to_verilog(&map, &Default::default()).is_err());
+}
+
+#[test]
+fn sequence_duplicate_transfers_and_nonblocking_buffers_are_diagnosed() {
+    for (body, message) in [
+        ("  let x = @rcv(src)\n  let y = @rcv(src)\n  |||\n  @send(o, x)\n", "duplicate `@rcv`"),
+        ("  let x = @rcv(src)\n  |||\n  @send(o, 8'd1)\n  @send(o, 8'd2)\n", "duplicate `@send`"),
+        ("  let x = @rcv(src)\n  |||\n  let (v, ok) = @peek(src)\n  @send(o, x)\n", "nonblocking buffer operations are not supported"),
+        ("  let x = @rcv(src)\n  |||\n  let (v, ok) = @try_rcv(src)\n  @send(o, x)\n", "nonblocking buffer operations are not supported"),
+        ("  let x = @rcv(src)\n  |||\n  @drop(src)\n  @send(o, x)\n", "nonblocking buffer operations are not supported"),
+        ("  let x = @rcv(src)\n  |||\n  @try_send(o, x)\n  @send(o, x)\n", "nonblocking buffer operations are not supported"),
+    ] {
+        let map = SourceMap::new("invalid_sequence.ddl", format!("sequence s (src: buffer in u8, o: buffer out u8)\n{body}"));
+        // Calling the API directly ensures a panic cannot masquerade as a diagnostic.
+        let errors = ddl::driver::compile_to_verilog(&map, &Default::default()).unwrap_err();
+        let text = map.render_all(&errors);
+        assert!(text.contains(message), "{text}");
+    }
+}
+
+#[test]
+fn sequence_nonblocking_ports_remain_supported() {
+    for op in ["peek", "try_rcv"] {
+        let src = format!("sequence s (src: buffer in u8, pin: port in u8, tap: port out u8, o: buffer out u8)\n  let x = @rcv(src)\n  let (v, ok) = @{op}(pin)\n  @try_send(tap, v)\n  |||\n  @send(o, x)\n");
+        let mut c = Circuit::new(&src, "s");
+        c.set("pin", 42);
+        c.set("src_wsalt", 1);
+        c.set("src_data", 7);
+        assert_eq!(c.out("tap"), 42);
+        assert_eq!(c.collect(30, 8), [7]);
+    }
+}
+
+#[test]
+fn sequence_bram_rebinding_keeps_address_and_result_distinct() {
+    let src = "sequence s (src: buffer in u4, o: buffer out u16)\n  var mem: #[impl(bram)] [u16; 16]\n  let addr = @rcv(src)\n  |||\n  let addr = mem[addr]\n  |||\n  @send(o, addr)\n";
+    let map = SourceMap::new("rebind.ddl", src);
+    ddl::driver::compile_to_verilog(&map, &Default::default()).unwrap();
+    // Distinct identities must not excuse using the new result before its edge.
+    let bad = src.replace("  |||\n  @send", "  @send");
+    let map = SourceMap::new("early.ddl", bad);
+    let errors = ddl::driver::compile_to_verilog(&map, &Default::default()).unwrap_err();
+    assert!(map.render_all(&errors).contains("stage"));
+}
+
+#[test]
+fn sequence_assertions_keep_the_enclosing_branch_guard() {
+    let src = "sequence s (src: buffer in u8, o: buffer out u8)\n  let x = @rcv(src)\n  |||\n  if x != 8'd0 then\n    @assert(x == 8'd1)\n  @send(o, x)\n";
+    for (item, expected) in [(0, true), (1, true), (2, false)] {
+        let mut c = Circuit::new(src, "s");
+        c.set("src_wsalt", 1);
+        c.set("src_data", item);
+        c.tick();
+        assert_eq!(c.assertions_ok(), expected);
     }
 }
