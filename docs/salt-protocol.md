@@ -4,7 +4,7 @@ This document provides an in-depth explanation of DDL's point-to-point channel i
 
 > **This protocol is internal.** It runs between two modules the compiler wrote, where both ends are generated together and the properties below are worth their cost. It is not what you wire up by hand.
 >
-> Every boundary a person writes Verilog against — an `extern`, or the module you asked the compiler to export — presents an ordinary FIFO instead: `p_can_receive` / `p_receive_en` / `p_data_write_in` going in, and `p_has_data` / `p_drop_item` / `p_data_read_out` coming out. The compiler puts an adapter on its own side to translate. See [Guide 3](guides/3-interfacing-and-integration.md) for that interface; read on for what sits behind it.
+> Every boundary a person writes Verilog against — an `extern`, or the module you asked the compiler to export — presents a **Show-Ahead FIFO (zero read latency)** instead: `p_can_receive` / `p_receive_en` / `p_data_write_in` going in, and `p_has_data` / `p_drop_item` / `p_data_read_out` coming out. The compiler puts an adapter on its own side to translate. See [FIFO Boundaries & Export](fifo-boundaries-and-export.md) and [Guide 3](guides/3-interfacing-and-integration.md) for that interface; read on for what sits behind it.
 
 ---
 
@@ -257,3 +257,5 @@ assign src_receive_en    = s_axis_tvalid && s_axis_tready;
 The property this document exists to establish survives the trip: `dst_has_data` is a function of the module's registered pointers and never of `m_axis_tready`, so there is no combinational path from `ready` back to `valid` — the loop AXI forbids, and the one [Motivation](#motivation-the-pitfalls-of-validready) opens with.
 
 The translation between the pointers and that FIFO lives in modules the compiler emits — `ddl_salt_to_rport_<W>` and `ddl_wport_to_salt_<W>`, plus the two mirrors of them that drive an `extern` — written in `src/ir_adapt.rs`. Each is one gray-code pointer and a handful of gates, built on the same helpers `@merge` and `@split` use, and simulated against the FIFO contract in `tests/adapters.rs`.
+
+For a full specification of the Show-Ahead boundary contract and adapter circuits, see [**FIFO Boundary Adapters & Export Architecture**](fifo-boundaries-and-export.md).

@@ -68,11 +68,36 @@ Run the DDL compiler:
 ddl build fir3.ddl -o fir3.v
 ```
 
-Let's examine key parts of the generated `fir3.v`:
+By default, the DDL compiler packages your design into two modules:
+1. **`fir3` (The Top-Level Wrapper)**: Presents standard **Show-Ahead FIFOs (zero read latency)** to the outside world (`src_can_receive`, `src_receive_en`, `src_data_write_in`, `dst_has_data`, `dst_drop_item`, `dst_data_read_out`). It instantiates compiler-generated boundary adapters that translate to and from internal salt channels.
+2. **`fir3_core` (The Pipeline Datapath)**: Contains the clock-by-clock pipeline registers, arithmetic logic, and shift registers, communicating internally over the Gray-code salt protocol.
 
-### Automatic Shift Register for `x`
+*(To emit the core directly with raw salt ports without the FIFO wrapper, pass `--bare-export fir3`.)*
 
-Notice how the compiler automatically generated `x_s1` and `x_s2` to carry `x` across two clock boundaries:
+Let's examine key parts of the generated Verilog:
+
+### 1. The Top-Level Show-Ahead FIFO Wrapper (`fir3`)
+
+The exported module presents clean, standard FIFO ports that any testbench, AXI-Stream bridge, or Verilog module can drive directly:
+
+```verilog
+module fir3 (
+    input         clk,
+    input         rst_n,
+    output        src_can_receive,
+    input         src_receive_en,
+    input  [15:0] src_data_write_in,
+    output        dst_has_data,
+    input         dst_drop_item,
+    output [31:0] dst_data_read_out
+);
+```
+
+Because the output face is **Show-Ahead**, `dst_data_read_out` already presents the current valid 32-bit word whenever `dst_has_data` is high. Pulsing `dst_drop_item = 1` acknowledges receipt and advances the pipeline.
+
+### 2. Automatic Shift Registers in `fir3_core`
+
+Inside `fir3_core`, notice how the compiler automatically generated `x_s1` and `x_s2` to carry `x` across two clock boundaries:
 
 ```verilog
 reg [15:0] x_s1;
@@ -94,7 +119,7 @@ In Stage 3, `result` uses `x_s2`, guaranteeing that `x` remains synchronized wit
 wire [31:0] result = quad_s2 + ({{16{1'b0}}, x_s2});
 ```
 
-### Unified Backpressure Gating
+### 3. Unified Backpressure Gating
 
 All stage registers share a single enable wire: `shift`:
 
@@ -103,7 +128,7 @@ wire dst_full = out_wsalt_q == (~dst_rsalt);
 wire shift    = !dst_full;
 ```
 
-When downstream stalls (`dst_full == 1`), `shift` goes low, freezing the pipeline without dropping any data.
+When downstream stalls (`dst_full == 1`), `shift` goes low, freezing all pipeline stages simultaneously without dropping or corrupting any in-flight data.
 
 ---
 

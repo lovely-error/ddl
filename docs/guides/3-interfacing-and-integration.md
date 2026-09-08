@@ -31,7 +31,9 @@ Every boundary you wire up by hand — an `extern`, or the module you asked the 
 | `p_drop_item` | input | I took it; advance |
 | `p_data_read_out [W-1:0]` | output | the item |
 
-That is `!full`/`wr_en`/`wr_data` and `!empty`/`rd_en`/`rd_data`, with first-word-fall-through: the item is on `p_data_read_out` while `p_has_data` is high, and stays there, unchanged, until you raise `p_drop_item`. Raise `p_receive_en` only while `p_can_receive` is high, and `p_drop_item` only while `p_has_data` is high — the same rule any FIFO has.
+That is `!full`/`wr_en`/`wr_data` and `!empty`/`rd_en`/`rd_data`, as a **Show-Ahead FIFO (zero read latency)**: the item is on `p_data_read_out` while `p_has_data` is high, and stays there, unchanged, until you raise `p_drop_item`. Raise `p_receive_en` only while `p_can_receive` is high, and `p_drop_item` only while `p_has_data` is high — the same rule any FIFO has.
+
+For full architectural details, timing traces, and formal invariants, see [**FIFO Boundary Adapters & Export Architecture**](../fifo-boundaries-and-export.md).
 
 ### Driving one
 
@@ -103,7 +105,27 @@ module psram_ctrl (
 );
 ```
 
-Inside `top_system`, the compiler places an adapter between each internal pipe and the extern — `ddl_salt_to_wport_32` on the way in, `ddl_rport_to_salt_32` on the way out. They are modules it writes, in the same sense `@merge` and `@split` are.
+Inside `top_system`, the compiler places an adapter between each internal pipe and the extern — `ddl_salt_to_wport_32` on the way in, `ddl_rport_to_salt_32` on the way out. They are modules it writes, in the same sense `@merge` and `@split` are:
+
+```
++-------------------------------------------------------------------------------+
+| graph top_system                                                              |
+|                                                                               |
+|  [worker] ===(to_psram salt)===> [ddl_salt_to_wport_32]                       |
+|                                           |                                   |
+|                                           | (cmd_can_receive, receive_en,     |
+|                                           |  data_write_in)                   |
+|                                           v                                   |
+|                                   +-------------------+                       |
+|                                   | extern psram_ctrl |                       |
+|                                   +-------------------+                       |
+|                                           |                                   |
+|                                           | (rsp_has_data, drop_item,         |
+|                                           |  data_read_out)                   |
+|                                           v                                   |
+|  [worker] <==(from_psram salt)== [ddl_rport_to_salt_32]                       |
++-------------------------------------------------------------------------------+
+```
 
 `examples/fanout.ddl` instantiates one, and `examples/externs.v` is the hand-written counterpart: a stub that accepts everything, and now four lines of it.
 

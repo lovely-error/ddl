@@ -49,6 +49,31 @@ process csr_node (cmd: buffer in u8, wdata: buffer in u32, rdata: buffer out u32
    - **State 2 (Read branch)**: If `is_write == 0`, reads `reg0` or `reg1` and waits for `rdata` buffer capacity (`@send(rdata, ...)`).
 3. **Zero-Cycle Branching**: The condition `if is_write then` is evaluated in the **exact same cycle** that `cmd` is received. There is no intermediate "decode" cycle penalty.
 
+### Exported Show-Ahead FIFO Interface
+
+When exported, the compiler wraps `csr_node_core` into a clean Show-Ahead FIFO interface:
+
+```verilog
+module csr_node (
+    input         clk,
+    input         rst_n,
+    // Command input FIFO
+    output        cmd_can_receive,
+    input         cmd_receive_en,
+    input  [7:0]  cmd_data_write_in,
+    // Write data payload FIFO
+    output        wdata_can_receive,
+    input         wdata_receive_en,
+    input  [31:0] wdata_data_write_in,
+    // Read data response FIFO (Show-Ahead)
+    output        rdata_has_data,
+    input         rdata_drop_item,
+    output [31:0] rdata_data_read_out
+);
+```
+
+When a read command completes, `rdata_has_data` asserts, and `rdata_data_read_out` immediately presents the register contents in the same cycle (zero read latency). The bus master samples `rdata_data_read_out` and pulses `rdata_drop_item = 1` to complete the transfer.
+
 ---
 
 ## 2. Packet Parsing with Tagged Unions

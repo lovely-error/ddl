@@ -44,12 +44,12 @@ process proc_assert (src: buffer in u8, dst: buffer out u8)
 
 ## 2. Writing a SystemVerilog Testbench for DDL Modules
 
-An exported DDL module presents a FIFO on each pipe, so a testbench drives it the way it would drive any FIFO. For a pipe `p`: `p_can_receive` / `p_receive_en` / `p_data_write_in` going in, and `p_has_data` / `p_drop_item` / `p_data_read_out` coming out.
+An exported DDL module presents a **Show-Ahead FIFO (zero read latency)** on each pipe, so a testbench drives it the way it would drive any standard FIFO. For a pipe `p`: `p_can_receive` / `p_receive_en` / `p_data_write_in` going in, and `p_has_data` / `p_drop_item` / `p_data_read_out` coming out.
 
 Two rules, and they are the only ones:
 
 - Raise `p_receive_en` only while `p_can_receive` is high, and `p_drop_item` only while `p_has_data` is high.
-- While `p_has_data` is high and `p_drop_item` is low, `p_data_read_out` holds the same item. You may look at it for as long as you like before taking it.
+- Because the FIFO is Show-Ahead, `p_data_read_out` presents the item as soon as `p_has_data` is high with zero read latency. While `p_has_data` is high and `p_drop_item` is low, `p_data_read_out` holds the same item. You may look at it for as long as you like before taking it.
 
 ```systemverilog
 `timescale 1ns/1ps
@@ -132,6 +132,8 @@ Hold `dst_drop_item` low for a while. The output fills its primary and skid slot
 ### Testing the pointer protocol directly
 
 If you built with `--bare-export`, the module has `_wsalt` / `_rsalt` / `_data` instead, and the testbench has to toggle gray-code pointers itself. `examples/tb_mul3_equiv.sv` is a worked example — it drives that form because it compares the generated logic against a hand-written module that speaks it.
+
+For full architectural details on Show-Ahead boundary adapters, see [**FIFO Boundary Adapters & Export Architecture**](../fifo-boundaries-and-export.md).
 
 ---
 
