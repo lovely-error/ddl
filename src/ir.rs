@@ -290,6 +290,12 @@ pub struct Module {
     /// Submodules, in source order. Empty for everything but a `graph`: a
     /// `fun` call is inlined, so this is the only place hierarchy comes from.
     pub instances: Vec<Instance>,
+    /// Every `fun` this module's body called. The other half of the use
+    /// graph: `instances` records the hierarchy a `graph` builds, and this
+    /// records the calls a body inlined, which leave no instance behind.
+    /// Together they say which modules nothing uses, and so what an
+    /// invocation is for.
+    pub calls: Vec<String>,
 }
 
 /// One wire in a `graph`, carrying one leg of an internal pipe.
@@ -573,59 +579,8 @@ pub(crate) enum PathTerm {
 /// separates DDL from a nicer Verilog -- a process cannot present a raw wire
 /// and hand-roll a protocol over it, because the protocol is the compiler's
 /// job and hand-rolling it is the thing this language exists to stop.
-/// A `port in` parameter: the value on the wire, and the enable beside it.
-///
-/// NOT a binding. A port is a pipe -- one without back-pressure -- so it is
-/// reached the way every other pipe is: `@rcv` to wait for one, `@try_rcv` or
-/// `@peek` to look at what is there this cycle. Binding the name to the wire
-/// instead would make it the one channel in the language you read by naming
-/// it, and would quietly lose the distinction between "the value" and "a value
-/// that means something this cycle" that `@try_rcv`'s pair exists to carry.
-#[derive(Debug, Clone)]
-pub struct PortIn {
-    pub name: String,
-    pub ty: Ty,
-    /// The data port, read directly: there is one entry, not two, because
-    /// there is no slot to skid into.
-    pub data: ValueId,
-    /// The enable, which is what `@try_rcv` answers and what `@rcv` waits on.
-    pub en: ValueId,
-}
-
-/// A `port out` parameter: the value, and the enable that says it is new.
-///
-/// `sent` and `send_guard` are the same two facts a `PipeInfo` carries and are
-/// reset in the same places -- once per cycle for a body with no states, once
-/// per state for one with them. Keeping the shape identical is what lets
-/// `@send` and `@try_send` mean the same thing on a port that they mean on a
-/// pipe, with only the handshake underneath them differing.
-#[derive(Debug, Clone)]
-pub struct PortOut {
-    pub name: String,
-    pub ty: Ty,
-    pub data_port: PortId,
-    pub en_port: PortId,
-    /// What this body offered, if it offered anything.
-    pub sent: Option<ValueId>,
-    /// The branch the offer was written on, or `None` for the top of the body.
-    /// An offer made inside an `if` is made on that branch and no other.
-    pub send_guard: Option<ValueId>,
-}
-
 pub enum ParamKind {
     Pipe { is_input: bool },
-    /// A plain data port and an enable, with no back-pressure.
-    ///
-    /// desc.md:29 draws the line this is for -- "compute only logic in ddl, io
-    /// in verilog" -- and everything on the far side of it is SystemVerilog
-    /// that cannot be made to wait: a pin, a PLL, a bus whose master does not
-    /// take `ready` for an answer. README's rule for that case is that the
-    /// sink ties `ready` high AND SAYS SO AT THE BOUNDARY, which puts the
-    /// claim where a reader can check it. `port` is how it is said.
-    ///
-    /// A `buffer` remains the right answer between two things DDL compiled.
-    /// This one is for the edge of the program.
-    Port { is_input: bool },
     Constant,
 }
 
@@ -650,8 +605,24 @@ pub fn classify_param(
     match arg.qualifier {
         ArgTypeQualifier::BufferIn => Some(ParamKind::Pipe { is_input: true }),
         ArgTypeQualifier::BufferOut => Some(ParamKind::Pipe { is_input: false }),
-        ArgTypeQualifier::PortIn => Some(ParamKind::Port { is_input: true }),
-        ArgTypeQualifier::PortOut => Some(ParamKind::Port { is_input: false }),
+        // desc.md:29 draws the line this sits on -- "compute only logic in
+        // ddl, io in verilog". A `wire` is the far side of it: a pin, a PLL,
+        // a bus whose master does not take `ready` for an answer. A body has
+        // nothing to wait on there, so a `wire` reaches the program only
+        // through the two declarations that do no computing.
+        ArgTypeQualifier::WireIn | ArgTypeQualifier::WireOut => {
+            sink.push(
+                Diag::error(
+                    low.span_of(&arg.arg_name),
+                    format!(
+                        "`{}` is a `wire`, which this declaration cannot take",
+                        anumspan_to_str(&arg.arg_name)
+                    ),
+                )
+                .with_note("only an `extern` or a `graph` takes a `wire`; a body reads a `buffer`"),
+            );
+            None
+        }
         ArgTypeQualifier::Inout => {
             sink.err_at(&arg.arg_name, "`inout` parameters are not supported");
             None
@@ -682,12 +653,14 @@ pub struct Lowerer<'a> {
     /// is not a stack overflow in hardware -- it is a circuit that does not
     /// settle -- so it is rejected rather than expanded.
     pub call_stack: Vec<String>,
+    /// Every `fun` this body called, at any depth. A call is inlined and
+    /// leaves no `Instance`, so this is the only record that the callee is
+    /// used -- which is what decides whether it is an export root.
+    pub calls: std::collections::BTreeSet<String>,
     /// Pipe parameters in declaration order.
     pub pipes: Vec<PipeInfo>,
     /// `port in` parameters in declaration order.
-    pub port_ins: Vec<PortIn>,
     /// `port out` parameters in declaration order.
-    pub port_outs: Vec<PortOut>,
     /// Memories in declaration order. Reads name one by index.
     pub mems: Vec<Memory>,
     /// How many write ports each memory has taken on the path being lowered.
@@ -810,9 +783,8 @@ impl<'a> Lowerer<'a> {
             syms,
             bodies,
             call_stack: Vec::new(),
+            calls: std::collections::BTreeSet::new(),
             pipes: Vec::new(),
-            port_ins: Vec::new(),
-            port_outs: Vec::new(),
             mems: Vec::new(),
             mem_slots: Vec::new(),
             asserts: Vec::new(),
@@ -828,65 +800,6 @@ impl<'a> Lowerer<'a> {
         }
     }
 
-    /// Declares the pipe parameters of a process or sequence.
-    ///
-    /// `port in x: T` / `port out y: T` -- a data port and an enable.
-    ///
-    /// An INPUT is two ports the body may read: the value, and `x_en` saying
-    /// whether it means anything this cycle. Nothing is captured and nothing
-    /// is refused; a producer that needs to be told to wait wants a `buffer`.
-    ///
-    /// An OUTPUT is two ports the body drives: the value it last assigned, and
-    /// `y_en`, true on the cycles it assigned one.
-    pub fn declare_port(
-        &mut self,
-        arg: &crate::parse::PrecArgTupleEntry,
-        is_input: bool,
-        sink: &mut DiagSink,
-    ) -> Option<()> {
-        let name = anumspan_to_str(&arg.arg_name).to_string();
-        let ty = match resolve_type_expr(&arg.type_expr, self.syms) {
-            Ok(t) => t,
-            Err(e) => {
-                sink.err_at(&arg.arg_name, e.message());
-                return None;
-            }
-        };
-        if ty.is_memory() {
-            sink.push(
-                Diag::error(
-                    self.span_of(&arg.arg_name),
-                    format!("`{}` is a memory, which cannot be a parameter", name),
-                )
-                .with_note("declare it inside the process with `var`"),
-            );
-            return None;
-        }
-        let dir = if is_input { PortDir::In } else { PortDir::Out };
-        let data_port = PortId(self.ports.len() as u32);
-        self.ports.push(Port { name: name.clone(), dir, ty: ty.clone() });
-        let en_port = PortId(self.ports.len() as u32);
-        self.ports.push(Port { name: format!("{}_en", name), dir, ty: Ty::BOOL });
-
-        if is_input {
-            let data = self.emit(ty.clone(), Op::Port(data_port));
-            self.values[data.0 as usize].name = Some(name.clone());
-            let en = self.emit(Ty::BOOL, Op::Port(en_port));
-            self.values[en.0 as usize].name = Some(format!("{}_en", name));
-            self.port_ins.push(PortIn { name, ty, data, en });
-            return Some(());
-        }
-
-        self.port_outs.push(PortOut {
-            name,
-            ty,
-            data_port,
-            en_port,
-            sent: None,
-            send_guard: None,
-        });
-        Some(())
-    }
 
     /// A pipe becomes three flat ports, which is the flattening k3g_chan.sv:60
     /// already pre-commits to for the yosys-slang risk.
@@ -902,10 +815,6 @@ impl<'a> Lowerer<'a> {
             let is_input = match kind {
                 ParamKind::Constant => {
                     self.declare_constant(arg, env, sink)?;
-                    continue;
-                }
-                ParamKind::Port { is_input } => {
-                    self.declare_port(arg, is_input, sink)?;
                     continue;
                 }
                 ParamKind::Pipe { is_input } => is_input,
@@ -940,12 +849,17 @@ impl<'a> Lowerer<'a> {
         }
     }
 
-    pub fn port_in_index(&self, name: &str) -> Option<usize> {
-        self.port_ins.iter().position(|p| p.name == name)
-    }
 
-    pub fn port_out_index(&self, name: &str) -> Option<usize> {
-        self.port_outs.iter().position(|p| p.name == name)
+
+    /// One port of the declared width, with nothing attached to it.
+    ///
+    /// For the modules the compiler writes at a boundary: an adapter's FIFO
+    /// face is a handshake in plain signals, not a pipe, so it cannot come
+    /// from `declare_pipe`.
+    pub(crate) fn declare_raw_port(&mut self, name: String, dir: PortDir, ty: Ty) -> PortId {
+        let id = PortId(self.ports.len() as u32);
+        self.ports.push(Port { name, dir, ty });
+        id
     }
 
     /// One pipe: three flat ports, and the bookkeeping that goes with them.
@@ -2004,6 +1918,7 @@ pub fn lower_function(
     }
 
     Some(Module {
+        calls: low.calls.iter().cloned().collect(),
         params: low.params,
         nets: Vec::new(),
         instances: Vec::new(),
@@ -2185,10 +2100,6 @@ pub fn lower_process(
         let is_input = match kind {
             ParamKind::Constant => {
                 low.declare_constant(arg, &mut env, sink)?;
-                continue;
-            }
-            ParamKind::Port { is_input } => {
-                low.declare_port(arg, is_input, sink)?;
                 continue;
             }
             ParamKind::Pipe { is_input } => is_input,
@@ -2462,8 +2373,6 @@ pub fn lower_process(
     // before combinational branch lowering joins the outer environment.
     let globals = env.keys().cloned()
         .chain(low.pipes.iter().map(|p| p.name.clone()))
-        .chain(low.port_ins.iter().map(|p| p.name.clone()))
-        .chain(low.port_outs.iter().map(|p| p.name.clone()))
         .chain(syms.funcs.keys().cloned())
         .chain(syms.structs.keys().cloned())
         .chain(syms.enums.keys().cloned())
@@ -2607,36 +2516,6 @@ pub fn lower_process(
     // One pass per cycle, so what the body offered IS what the port carries
     // this cycle. A `port` has no handshake to register against.
     //
-    // A port nothing sent to still drives: zero, with the enable low, which is
-    // the whole of what the enable is for. An output left undriven would be a
-    // floating wire, and the `if` rule exists to keep those out.
-    for (pix, port) in low.port_outs.clone().into_iter().enumerate() {
-        let (value, en) = match port.sent {
-            None => {
-                let zero = low.emit(port.ty.clone(), Op::Const(0));
-                let off = low.emit(Ty::BOOL, Op::Const(0));
-                (zero, off)
-            }
-            Some(v) => {
-                let on = low.emit(Ty::BOOL, Op::Const(1));
-                let en = narrow_to_path(&mut low, on, port.send_guard);
-                (v, en)
-            }
-        };
-        // Once the pass is over the process refuses everything, and a port is
-        // not exempt: an enable held high past the end would keep publishing
-        // the last value as though it were new. A port nothing sent to is
-        // already false and needs no help staying that way.
-        let en = match (running, port.sent) {
-            (Some(r), Some(_)) => low.emit(Ty::BOOL, Op::Bin { op: BinOp::And, lhs: en, rhs: r }),
-            _ => en,
-        };
-        low.name_value_safe(value, port.name.clone());
-        low.name_value_safe(en, format!("{}_en", port.name));
-        drivers.push((port.data_port, value));
-        drivers.push((port.en_port, en));
-        let _ = pix;
-    }
 
 
     for ix in 0..low.pipes.len() {
@@ -2740,6 +2619,7 @@ pub fn lower_process(
     }
 
     Some(Module {
+        calls: low.calls.iter().cloned().collect(),
         params: low.params,
         nets: Vec::new(),
         instances: Vec::new(),
@@ -2807,29 +2687,6 @@ fn lower_try_rcv_binding(
         }
     };
     // A `port in` answers both questions at once and spends nothing doing it.
-    // There is no slot to advance and no producer to inform, so `@try_rcv` and
-    // `@peek` are the same operation on one -- and neither uses up the pipe's
-    // one transfer per cycle, because a port has no transfer to use up.
-    if let Some(pix) = low.port_in_index(&pipe_name) {
-        let port = low.port_ins[pix].clone();
-        // The enable as it stands, not narrowed to the branch this sits on. On
-        // a pipe the answer is "did I TAKE one", which is false on a path that
-        // did not run because nothing was claimed there. A port claims nothing
-        // anywhere, so the honest answer is what the wire says.
-        let item = anumspan_to_str(&decl.head_name()).to_string();
-        let got = anumspan_to_str(&decl.names()[1]).to_string();
-        env.insert(item, Binding::constant(port.data, port.ty));
-        env.insert(got, Binding::constant(port.en, Ty::BOOL));
-        return Some(());
-    }
-    if low.port_out_index(&pipe_name).is_some() {
-        let verb = if takes { "received from" } else { "peeked at" };
-        sink.err_at(
-            &decl.head_name(),
-            format!("`{}` is a `port out`; it cannot be {}", pipe_name, verb),
-        );
-        return None;
-    }
 
     let ix = match low.pipes.iter().position(|p| p.name == pipe_name) {
         Some(i) => i,
@@ -3133,10 +2990,6 @@ fn lower_stmt_at(
             let binding = match env.get(&name) {
                 Some(b) => b.clone(),
                 None => {
-                    if let Some(diag) = port_is_not_a_value(low, &target, &name) {
-                        sink.push(diag);
-                        return None;
-                    }
                     sink.err_at(&target, format!("`{}` is not declared", name));
                     return None;
                 }
@@ -3743,39 +3596,6 @@ struct LvaluePath {
     steps: Vec<LvalueStep>,
 }
 
-/// A port named where a value was expected.
-///
-/// A port is a pipe, and a pipe is not read by naming it. Saying "not declared"
-/// would be true of the NAME and useless about the mistake, which is a reader
-/// reaching for the wire instead of the channel.
-fn port_is_not_a_value(low: &Lowerer, at: &AlphanumSpan, name: &str) -> Option<Diag> {
-    if low.port_in_index(name).is_some() {
-        return Some(
-            Diag::error(
-                low.span_of(at),
-                format!("`{}` is a `port in`, which is a pipe rather than a value", name),
-            )
-            .with_note(format!(
-                "read it with `let (v, got) = @try_rcv({})`, or wait for one with `let v = @rcv({})`",
-                name, name
-            )),
-        );
-    }
-    if low.port_out_index(name).is_some() {
-        return Some(
-            Diag::error(
-                low.span_of(at),
-                format!("`{}` is a `port out`, which is a pipe rather than a value", name),
-            )
-            .with_note(format!(
-                "write to it with `@send({}, v)`, or `@try_send({}, v)` where the cycle is not to be spent",
-                name, name
-            )),
-        );
-    }
-    None
-}
-
 fn lvalue_path(expr: &PrecResExpr) -> Option<LvaluePath> {
     match expr {
         PrecResExpr::Ref(base) => Some(LvaluePath { base: base.clone(), steps: Vec::new() }),
@@ -3911,10 +3731,6 @@ pub fn lower_expr(
                     None
                 }
                 None => {
-                    if let Some(diag) = port_is_not_a_value(low, span, name) {
-                        sink.push(diag);
-                        return None;
-                    }
                     sink.err_at(span, format!("`{}` is not defined", name));
                     None
                 }
@@ -4486,22 +4302,6 @@ fn lower_builtin(
             return None;
         };
         let pipe_name = anumspan_to_str(n).to_string();
-        // Nothing to drop. `@drop` exists because a pipe gets one transfer per
-        // cycle and taking one without binding it is how you decline what is
-        // there; a `port` has no transfer to spend, so declining is reading it
-        // and not using the answer.
-        if low.port_in_index(&pipe_name).is_some() || low.port_out_index(&pipe_name).is_some() {
-            sink.push(
-                Diag::error(
-                    low.here(),
-                    format!("`{}` is a `port`, which has nothing to drop", pipe_name),
-                )
-                .with_note(
-                    "a `@drop` spends a pipe's one transfer for the cycle so the next item can arrive; a port is not holding one back, so reading it with `@try_rcv` and ignoring the answer is the whole of it",
-                ),
-            );
-            return None;
-        }
         let Some(ix) = low.pipes.iter().position(|p| p.name == pipe_name) else {
             sink.err_span(
                 low.here(),
@@ -4537,20 +4337,6 @@ fn lower_builtin(
                 return None;
             }
         };
-        // A `port out` always takes it: there is no `ready` coming back, which
-        // is the whole of what a `port` declares. So the answer is true, and
-        // what the enable carries is the PATH -- an offer made on one branch of
-        // an `if` is made on that branch and no other, exactly as for a pipe.
-        if let Some(pix) = low.port_out_index(&pipe_name) {
-            return lower_port_send(low, pix, &args[1], env, sink);
-        }
-        if low.port_in_index(&pipe_name).is_some() {
-            sink.err_span(
-                low.here(),
-                format!("`{}` is a `port in`; it cannot be sent to", pipe_name),
-            );
-            return None;
-        }
 
         let ix = match low.pipes.iter().position(|p| p.name == pipe_name) {
             Some(i) => i,
@@ -4923,54 +4709,6 @@ fn lower_builtin(
 }
 
 /// `(value, constant)` argument pair shared by `@zext`/`@sext`/`@trunc`/`@rep`.
-/// Drives a `port out` with `value`, on whatever path the caller is on.
-///
-/// Shared by `@try_send`, which is this and an answer of true, and by the
-/// `@send` a state machine schedules -- the two differ in whether a cycle is
-/// spent, not in what reaches the wire.
-pub fn lower_port_send(
-    low: &mut Lowerer,
-    pix: usize,
-    value_expr: &PrecResExpr,
-    env: &Env,
-    sink: &mut DiagSink,
-) -> Option<ValueId> {
-    let port = low.port_outs[pix].clone();
-    low.claim_transfer(&port.name, port.sent.is_some(), false, sink)?;
-    let mut value = lower_expr_expecting(low, value_expr, Some(&port.ty), env, sink)?;
-    let have = low.ty_of(value);
-    if have != port.ty {
-        match low.coerce_const(value, &port.ty) {
-            Some(v) => value = v,
-            None => {
-                sink.push(
-                    Diag::error(
-                        low.here(),
-                        format!(
-                            "`{}` carries `{}` but `{}` was sent",
-                            port.name,
-                            port.ty.display(),
-                            have.display()
-                        ),
-                    )
-                    .with_note(cast_hint(&have, &port.ty)),
-                );
-                return None;
-            }
-        }
-    }
-    let path = low.materialise_path();
-    low.port_outs[pix].sent = Some(match (port.sent, path) {
-        (Some(old), Some(cond)) => low.emit(port.ty, Op::Mux { cond, then_val: value, else_val: old }),
-        _ => value,
-    });
-    low.port_outs[pix].send_guard = low.union_transfer_guard(port.sent.is_some(), port.send_guard, path);
-    // Always true: there is no `ready` coming back, which is the whole of what
-    // a `port` declares. `@try_send` on one answers the question it is asked
-    // and the answer never varies.
-    Some(low.emit(Ty::BOOL, Op::Const(1)))
-}
-
 fn cast_args(
     low: &mut Lowerer,
     args: &[PrecResExpr],

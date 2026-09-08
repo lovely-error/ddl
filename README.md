@@ -21,7 +21,8 @@ While [`desc.md`](desc.md) outlines the long-term design goals of the language, 
 - [Channels and Interconnect](#channels-and-interconnect)
   - [Backpressured Buffers (`buffer`)](#backpressured-buffers-buffer)
   - [The Gray-Code Salt Protocol](#the-gray-code-salt-protocol)
-  - [Unbuffered Ports (`port`)](#unbuffered-ports-port)
+  - [Bare Signals (`wire`)](#bare-signals-wire)
+  - [Boundaries and the FIFO interface](#boundaries-and-the-fifo-interface)
   - [Channel Operations](#channel-operations)
   - [Combinators (`@merge` and `@split`)](#combinators-merge-and-split)
 - [Type System and Storage](#type-system-and-storage)
@@ -50,7 +51,7 @@ For step-by-step tutorials, design patterns, and hardware integration guides, se
 
 - [**Guide 1: Writing Your First Pipelined Accelerator**](docs/guides/1-getting-started-pipelines.md): Dataflow stage cuts (`|||`), shift-register spanning, compiling, and visualizing.
 - [**Guide 2: Control State Machines, Packet Parsers, and Register Interfaces**](docs/guides/2-fsm-and-command-processors.md): Memory-mapped CSRs, tagged union dispatchers, zero-cycle branch dispatch, and lossless relays.
-- [**Guide 3: Interfacing DDL with Existing Verilog, AXI-Stream, and FPGA Pins**](docs/guides/3-interfacing-and-integration.md): Connecting to physical chip pins via `port`, `extern` IP integration, and AXI4-Stream master/slave wrappers.
+- [**Guide 3: Interfacing DDL with Existing Verilog, AXI-Stream, and FPGA Pins**](docs/guides/3-interfacing-and-integration.md): Connecting to physical chip pins via `wire`, `extern` IP integration over the FIFO boundary, and AXI4-Stream master/slave wrappers.
 - [**Guide 4: Memory Patterns: ROMs, Block RAMs, and Multi-Port Register Files**](docs/guides/4-memory-and-register-files.md): `lutram` vs. `bram`, zero-cost BRAM stage alignment, and multi-write register files with `--lvt-bram`.
 - [**Guide 5: Simulation, Verification, and Build Workflows**](docs/guides/5-verification-and-simulation.md): Edge-triggered simulation assertions, SystemVerilog testbench templates, Verilator `-Wall` linting, and Makefiles.
 
@@ -116,6 +117,7 @@ DDL provides five primary top-level declarations:
 | `fun` | Combinational Module | Pure combinational logic; inlined at call sites or emitted as a standalone module. |
 | `graph` | Structural Netlist | Instantiates blocks and wires their communication channels together. |
 | `extern` | Module Interface | Declares third-party or hand-written Verilog modules for integration in a `graph`. |
+| `wire` | Bare Signal | An unhandshaked signal on an `extern` or a `graph`: a pin, or a sideband. |
 
 ### Pipelines (`sequence`)
 
@@ -183,19 +185,38 @@ graph top (p: buffer in u32, q: buffer in u32, o1: buffer out u32, o2: buffer ou
 
 ### External Modules (`extern`)
 
-The `extern` keyword declares the interface of an external or legacy Verilog module so that it can be wired inside a `graph`:
+The `extern` keyword declares the interface of an external or hand-written Verilog module so that it can be wired inside a `graph`:
 
 ```ddl
 extern psram (req: buffer in mem_req_t, rsp: buffer out mem_rsp_t)
 ```
 
-An `extern` declaration exposes channel ports only. Connections to an `extern` block are type-checked during compilation, but no module body is generated.
+Connections to an `extern` are type-checked during compilation, but no module body is generated: the Verilog is yours, and the compiler links against it by name.
+
+Each pipe reaches the hand-written module as an ordinary FIFO interface, never as the internal salt protocol. For `psram` above:
+
+```verilog
+module psram (
+  input         clk,
+  input         rst_n,
+  output        req_can_receive,     // I have room
+  input         req_receive_en,      // write req_data_write_in now
+  input  [31:0] req_data_write_in,
+  output        rsp_has_data,        // I have an item
+  input         rsp_drop_item,       // I took it; advance
+  output [31:0] rsp_data_read_out
+);
+```
+
+The compiler puts an adapter on its own side of the boundary to translate, so nothing you write has to reconstruct the salt protocol. See [Boundaries and the FIFO interface](#boundaries-and-the-fifo-interface).
+
+An `extern` may also declare `wire in` / `wire out` parameters, for pins and sidebands that carry no handshake at all.
 
 ---
 
 ## Channels and Interconnect
 
-DDL provides two distinct communication abstractions: **`buffer`** (backpressured FIFOs) and **`port`** (direct streaming wires).
+Everything a DDL module computes with travels through a **`buffer`**: a backpressured, lossless, point-to-point channel. A **`wire`** carries a bare signal with no handshake, and is allowed only on an `extern` or a `graph` -- the two declarations that sit at the edge of the program and compute nothing.
 
 ### Backpressured Buffers (`buffer`)
 
@@ -206,7 +227,8 @@ A `buffer` provides flow-controlled point-to-point communication:
 
 ### The Gray-Code Salt Protocol
 
-Rather than using traditional `valid`/`ready` handshakes, DDL flattens each `buffer` into three Verilog ports:
+Rather than using traditional `valid`/`ready` handshakes, DDL flattens each `buffer` into three Verilog ports. This is the *internal* interconnect, between two modules the compiler wrote; a boundary you wire up by hand gets a [FIFO interface](#boundaries-and-the-fifo-interface) instead.
+
 - `<p>_wsalt`: 2-bit write pointer emitted by the producer.
 - `<p>_rsalt`: 2-bit read pointer emitted by the consumer.
 - `<p>_data`: Data bus carrying both FIFO slots.
@@ -222,38 +244,70 @@ Advancing a pointer *is* the transfer. Because both pointers originate from regi
 - **Combinational timing loops**: In traditional `valid`/`ready` interfaces, downstream readiness is often combinationally coupled to upstream validity. Chaining blocks or introducing feedback paths can inadvertently close a zero-delay combinational loop through `ready`—a hazard that synthesis tools may mishandle or that causes silicon to lock up.
 - **Mutual-wait protocol deadlocks**: In standard handshakes, protocol bugs can arise where a producer waits for `ready` before asserting `valid`, while the consumer waits for `valid` before asserting `ready`, causing both to wait indefinitely. With DDL's salt protocol, neither side waits for a same-cycle response from the other; transfer decisions are determined strictly from registered pointers, and the 2-entry buffer capacity (head + skid) absorbs the 1-cycle latency of registered pointer updates.
 
-For a complete architectural breakdown, including cycle-by-cycle waveform diagrams, skid buffer analysis, and AXI-Stream adapter examples, see [**The Gray-Code Salt Protocol**](docs/salt-protocol.md).
+For a complete architectural breakdown, including cycle-by-cycle waveform diagrams and skid buffer analysis, see [**The Gray-Code Salt Protocol**](docs/salt-protocol.md).
 
-### Unbuffered Ports (`port`)
+### Bare Signals (`wire`)
 
-A `port` represents an unbuffered hardware boundary with zero backpressure, suitable for external interfaces such as physical chip pins, bus masters, or streaming video pipelines:
+A `wire` is a signal of the declared width with no handshake at all: a pin, a clock-domain sideband, a status flag from a piece of vendor IP. Because there is nothing on it to wait for, it is legal only where nothing waits -- an `extern` or a `graph`:
 
 ```ddl
-process relay (src: port in u32, dst: port out u32)
-  loop
-    let v = @rcv(src)
-    @send(dst, v + 32'd1)
+extern pll (locked: wire out u1, cfg: buffer in u32)
+
+graph board (cfg: buffer in u32, lock_led: wire out u1)
+  pll(lock_led, cfg)
 ```
 
-Hardware emission details:
-- `port in x: T` emits data wire `x` and enable wire `x_en`.
-- `port out y: T` emits data wire `y` and enable wire `y_en`.
-- An output port is asserted only in cycles where a send statement executes.
-- In a `sequence`, a `port out` is driven by the specific stage that executes the send. A single output port cannot be driven from multiple pipeline stages.
-- A `process` composed entirely of `port` interfaces synthesizes directly into a standard clocked Verilog module without internal FIFO or salt logic.
+- `x: wire in T` emits one input `x` of `T`'s width; `y: wire out T` emits one output.
+- A graph routes a wire straight through to its own boundary, and checks that exactly one instance drives each output.
+- A `process` or `sequence` cannot take one. Their parameters are pipes and constant parameters, because a body that could present a raw wire could hand-roll a protocol over it, and the protocol is the compiler's job.
+
+### Boundaries and the FIFO interface
+
+The salt protocol above is how two DDL-compiled modules talk to each other. It never crosses a boundary a person writes Verilog against. An `extern`, and any module chosen as an **export target**, presents an ordinary FIFO instead:
+
+| `p: buffer in T` (the module consumes) | dir | meaning |
+| --- | --- | --- |
+| `p_can_receive` | output | there is room |
+| `p_receive_en` | input | write `p_data_write_in` this cycle |
+| `p_data_write_in [W-1:0]` | input | the item |
+
+| `p: buffer out T` (the module produces) | dir | meaning |
+| --- | --- | --- |
+| `p_has_data` | output | an item is available |
+| `p_drop_item` | input | I took it; advance |
+| `p_data_read_out [W-1:0]` | output | the item |
+
+This is `!full`/`wr_en`/`wr_data` and `!empty`/`rd_en`/`rd_data` with first-word-fall-through. `receive_en` and `drop_item` are honoured only while the matching flag is high; the far side gates them, as it would on any FIFO. The translation is a module the compiler writes -- `ddl_wport_to_salt_32` and friends -- so no hand-written file contains a gray-code pointer.
+
+#### Choosing the export target
+
+An **export target** is the module the invocation is for. It is found from the use graph: a **root** is a module that nothing else instantiates or calls, among the declarations in the files named on the command line. An `import` supplies a place to look for dependencies, not a list of things to ship, so its declarations are never candidates.
+
+The emitted file is **the targets and everything they use**, and nothing else. Asking for one module does not ship an unrelated one that happened to be in the same source.
+
+- One root: it is the target, and no flag is needed.
+- Several roots: the compiler names them and asks, rather than picking which module your file is for.
+
+```bash
+ddl build src.ddl -o src.v --export top          # this one presents a FIFO
+ddl build src.ddl -o src.v --bare-export top     # keep the raw salt ports
+ddl build src.ddl -o src.v --export a,b,c        # several, comma-separated
+```
+
+A target's logic keeps its shape and takes the name `<name>_core`; the wrapper under the original name holds the FIFO ports, one adapter per pipe, and one instance of the core. `--bare-export` emits the module exactly as it lowers, salt ports and all, for anyone who wants to speak the protocol directly.
 
 ### Channel Operations
 
-Both `buffer` and `port` interfaces are accessed via built-in channel intrinsics:
+A `buffer` is reached through the built-in channel intrinsics:
 
-| Operation | Buffer Behavior | Port Behavior |
-|---|---|---|
-| `@rcv(ch)` | Blocks until an item is available, then consumes it. | Waits for the input enable wire (`en`) to assert. |
-| `@send(ch, val)` | Blocks until room is available, then pushes the value. | Asserts the output enable and drives the data bus (never blocks). |
-| `@peek(ch)` | Returns `(data, present)`. Inspects the head item without consuming it. | Returns `(data, en)` for the current cycle. |
-| `@try_rcv(ch)` | Non-blocking receive: returns `(data, ok)`. Consumes the item if available. | Reads current wire value if enabled. |
-| `@try_send(ch, val)` | Non-blocking send: returns a boolean indicating whether the push succeeded. | Always succeeds; returns `true`. |
-| `@drop(ch)` | Consumes and discards the head item without reading its payload. | *Not permitted* (compile error). |
+| Operation | Behavior |
+|---|---|
+| `@rcv(ch)` | Blocks until an item is available, then consumes it.  |
+| `@send(ch, val)` | Blocks until room is available, then pushes the value.  |
+| `@peek(ch)` | Returns `(data, present)`. Inspects the head item without consuming it.  |
+| `@try_rcv(ch)` | Non-blocking receive: returns `(data, ok)`. Consumes the item if available.  |
+| `@try_send(ch, val)` | Non-blocking send: returns a boolean indicating whether the push succeeded.  |
+| `@drop(ch)` | Consumes and discards the head item without reading its payload.  |
 
 #### Same-Cycle Relay Pattern
 

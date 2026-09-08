@@ -72,8 +72,8 @@
       ]
     },
     "pipe-qualifier": {
-      "comment": "`buffer` is the pipe kind and `port` the un-handshaked one; `in`/`out`/`inout` which way it goes.",
-      "match": "\\b(buffer|port)\\b|\\b(inout|out)\\b",
+      "comment": "`buffer` is the pipe kind and `wire` the un-handshaked one; `in`/`out`/`inout` which way it goes.",
+      "match": "\\b(buffer|wire)\\b|\\b(inout|out)\\b",
       "captures": {
         "1": { "name": "storage.type.pipe.ddl" },
         "2": { "name": "storage.modifier.direction.ddl" }

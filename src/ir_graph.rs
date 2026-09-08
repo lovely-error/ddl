@@ -36,39 +36,110 @@ pub struct PipeSig {
     pub ty: Ty,
 }
 
-/// The pipe interface of a `process` or `sequence`, which is all a graph can
-/// see of it. Constant parameters are folded inside the callee and are not
-/// ports, so they do not appear here and are not connected.
+/// One `wire` parameter -- a bare signal of the declared width, carrying no
+/// handshake at all.
+///
+/// Only an `extern` and a `graph` have these. They are the two declarations
+/// that compute nothing, which is the whole reason a wire is safe there: a
+/// body would have to wait on something, and a wire gives it nothing to wait
+/// on. desc.md:29 is the line -- "compute only logic in ddl, io in verilog".
+#[derive(Debug, Clone)]
+pub struct WireSig {
+    pub name: String,
+    pub is_input: bool,
+    pub ty: Ty,
+}
+
+/// One parameter, in the position it was declared in.
+///
+/// Ordered rather than split into two lists, because a graph passes arguments
+/// POSITIONALLY and the two kinds interleave: `ext(pipe, pin, pipe)` has to
+/// bind its second argument to the wire and not to the second pipe.
+#[derive(Debug, Clone)]
+pub enum ArgSig {
+    Pipe(PipeSig),
+    Wire(WireSig),
+}
+
+impl ArgSig {
+    pub fn name(&self) -> &str {
+        match self {
+            ArgSig::Pipe(p) => &p.name,
+            ArgSig::Wire(w) => &w.name,
+        }
+    }
+
+    /// How the parameter reads back in a diagnostic, in source spelling.
+    pub fn display(&self) -> String {
+        match self {
+            ArgSig::Pipe(p) => format!(
+                "{}: buffer {} {}",
+                p.name,
+                if p.is_input { "in" } else { "out" },
+                p.ty.display()
+            ),
+            ArgSig::Wire(w) => format!(
+                "{}: wire {} {}",
+                w.name,
+                if w.is_input { "in" } else { "out" },
+                w.ty.display()
+            ),
+        }
+    }
+}
+
+/// The connectable interface of a declaration, which is all a graph can see of
+/// it. Constant parameters are folded inside the callee and are not ports, so
+/// they do not appear here and are not connected.
 #[derive(Debug, Clone)]
 pub struct BlockSig {
     pub name: String,
     pub kind: &'static str,
-    pub pipes: Vec<PipeSig>,
+    pub args: Vec<ArgSig>,
 }
 
-/// Reads the pipe interface off a declaration's parameter list.
+impl BlockSig {
+    /// The pipe parameters alone, for the callers that only ever had those.
+    pub fn pipes(&self) -> impl Iterator<Item = &PipeSig> {
+        self.args.iter().filter_map(|a| match a {
+            ArgSig::Pipe(p) => Some(p),
+            ArgSig::Wire(_) => None,
+        })
+    }
+}
+
+/// Reads the connectable interface off a declaration's parameter list.
 ///
 /// Errors are not reported here: this runs over every process and sequence
 /// before any of them is lowered, and a parameter that cannot be resolved will
 /// be reported against the declaration itself when its turn comes. Reporting
 /// twice, once without the context of the body, helps nobody.
 pub fn signature_of(name: &str, kind: &'static str, args: &PrecArgDefTuple, syms: &Symbols) -> BlockSig {
-    let mut pipes = Vec::new();
+    let mut sig_args = Vec::new();
     for arg in &args.entries {
-        let is_input = match arg.qualifier {
-            ArgTypeQualifier::BufferIn => true,
-            ArgTypeQualifier::BufferOut => false,
+        let is_wire = match arg.qualifier {
+            ArgTypeQualifier::BufferIn | ArgTypeQualifier::BufferOut => false,
+            ArgTypeQualifier::WireIn | ArgTypeQualifier::WireOut => true,
             // A constant parameter, or an error the callee will report. Both
             // are reported against the callee itself.
             _ => continue,
         };
+        let is_input = matches!(
+            arg.qualifier,
+            ArgTypeQualifier::BufferIn | ArgTypeQualifier::WireIn
+        );
         let ty = match resolve_type_expr(&arg.type_expr, syms) {
             Ok(t) => t,
             Err(_) => continue,
         };
-        pipes.push(PipeSig { name: anumspan_to_str(&arg.arg_name).to_string(), is_input, ty });
+        let arg_name = anumspan_to_str(&arg.arg_name).to_string();
+        sig_args.push(if is_wire {
+            ArgSig::Wire(WireSig { name: arg_name, is_input, ty })
+        } else {
+            ArgSig::Pipe(PipeSig { name: arg_name, is_input, ty })
+        });
     }
-    BlockSig { name: name.to_string(), kind, pipes }
+    BlockSig { name: name.to_string(), kind, args: sig_args }
 }
 
 /// What an `extern` may declare.
@@ -87,29 +158,46 @@ pub fn check_extern(
         if !names.insert(anumspan_to_str(&arg.arg_name)) {
             sink.err_at(
                 &arg.arg_name,
-                "an external interface cannot declare the same pipe twice",
+                "an external interface cannot declare the same name twice",
             );
         }
-        let is_pipe = matches!(
+        let is_connectable = matches!(
             arg.qualifier,
-            ArgTypeQualifier::BufferIn | ArgTypeQualifier::BufferOut
+            ArgTypeQualifier::BufferIn
+                | ArgTypeQualifier::BufferOut
+                | ArgTypeQualifier::WireIn
+                | ArgTypeQualifier::WireOut
         );
-        if is_pipe {
+        if is_connectable {
             continue;
         }
         sink.push(
             Diag::error(
                 map.span_of(&arg.arg_name),
                 format!(
-                    "`{}` is not a pipe, and a graph can connect nothing else",
+                    "`{}` is not a pipe or a wire, and a graph can connect nothing else",
                     anumspan_to_str(&arg.arg_name)
                 ),
             )
             .with_note(
-                "an `extern` declares the pipe interface of a module DDL did not compile; a constant, a `port` or a raw signal on one would be left unconnected",
+                "an `extern` declares the interface of a module DDL did not compile: `buffer in`/`buffer out` for a handshake, `wire in`/`wire out` for a bare signal",
             ),
         );
     }
+}
+
+/// One `wire` parameter of the graph, and who drives it.
+///
+/// A wire has no protocol to check, so the only thing worth counting is
+/// drivers: two instances driving one `wire out` is not a race the salt
+/// protocol resolves, it is two gates fighting over a net and an `x` in
+/// simulation. An input may fan out to as many readers as like it.
+struct GraphWireInfo {
+    ty: Ty,
+    declared_at: AlphanumSpan,
+    /// A graph input is driven from outside, an output from within.
+    is_input: bool,
+    drivers: Vec<AlphanumSpan>,
 }
 
 /// One pipe inside the graph: a port of the graph, or a `pipe` declaration.
@@ -144,12 +232,14 @@ pub fn lower_graph(
     sigs: &BTreeMap<String, BlockSig>,
     decl: &GraphDecl,
     combs: &mut Vec<CombUse>,
+    adapts: &mut Vec<crate::ir_adapt::AdaptUse>,
     sink: &mut DiagSink,
 ) -> Option<Module> {
     let graph_name = anumspan_to_str(&decl.name).to_string();
     let mut ports = Vec::new();
     let mut nets = Vec::new();
     let mut pipes: BTreeMap<String, GraphPipeInfo> = BTreeMap::new();
+    let mut wires: BTreeMap<String, GraphWireInfo> = BTreeMap::new();
 
     // Clock and reset first, in the same positions a process puts them, so a
     // graph can itself be an instance in another graph.
@@ -164,16 +254,18 @@ pub fn lower_graph(
             sink.err_at(&arg.arg_name, format!("`{}` is implicit on a graph", name));
             return None;
         }
-        let is_input = match arg.qualifier {
-            ArgTypeQualifier::BufferIn => true,
-            ArgTypeQualifier::BufferOut => false,
+        let (is_input, is_wire) = match arg.qualifier {
+            ArgTypeQualifier::BufferIn => (true, false),
+            ArgTypeQualifier::BufferOut => (false, false),
+            ArgTypeQualifier::WireIn => (true, true),
+            ArgTypeQualifier::WireOut => (false, true),
             _ => {
                 sink.push(
                     Diag::error(
                         map.span_of(&arg.arg_name),
-                        format!("`{}` is not a pipe, and a graph connects nothing else", name),
+                        format!("`{}` is not a pipe or a wire, and a graph connects nothing else", name),
                     )
-                    .with_note("a graph parameter is `buffer in` or `buffer out`"),
+                    .with_note("a graph parameter is `buffer in`, `buffer out`, `wire in` or `wire out`"),
                 );
                 return None;
             }
@@ -185,9 +277,25 @@ pub fn lower_graph(
                 return None;
             }
         };
-        if pipes.contains_key(&name) {
+        if pipes.contains_key(&name) || wires.contains_key(&name) {
             sink.err_at(&arg.arg_name, format!("`{}` is declared twice", name));
             return None;
+        }
+
+        // A wire is one port of the declared width and nothing else. There is
+        // no salt to carry and no enable beside it: the far side of a wire is
+        // a pin or an IP block, and neither can be told to wait.
+        if is_wire {
+            ports.push(Port {
+                name: name.clone(),
+                dir: if is_input { PortDir::In } else { PortDir::Out },
+                ty: ty.clone(),
+            });
+            wires.insert(
+                name,
+                GraphWireInfo { ty, declared_at: arg.arg_name.clone(), is_input, drivers: Vec::new() },
+            );
+            continue;
         }
 
         let (vd, rd, dd) = if is_input {
@@ -324,9 +432,9 @@ pub fn lower_graph(
             synthesised = BlockSig {
                 name: crate::ir_comb::module_name(kind, fan, &ty),
                 kind: "combinator",
-                pipes: crate::ir_comb::pipe_names(kind, fan)
+                args: crate::ir_comb::pipe_names(kind, fan)
                     .into_iter()
-                    .map(|(name, is_input)| PipeSig { name, is_input, ty: ty.clone() })
+                    .map(|(name, is_input)| ArgSig::Pipe(PipeSig { name, is_input, ty: ty.clone() }))
                     .collect(),
             };
             sigs_for_this_instance = Some(&synthesised);
@@ -355,29 +463,24 @@ pub fn lower_graph(
             }
         };
 
-        if inst.args.len() != sig.pipes.len() {
+        if inst.args.len() != sig.args.len() {
             sink.push(
                 Diag::error(
                     map.span_of(&inst.module),
                     format!(
-                        "`{}` has {} pipe parameter{}, but {} {} given",
+                        "`{}` has {} parameter{}, but {} {} given",
                         module,
-                        sig.pipes.len(),
-                        if sig.pipes.len() == 1 { "" } else { "s" },
+                        sig.args.len(),
+                        if sig.args.len() == 1 { "" } else { "s" },
                         inst.args.len(),
                         if inst.args.len() == 1 { "was" } else { "were" }
                     ),
                 )
                 .with_note(format!(
-                    "its pipes are: {}",
-                    sig.pipes
+                    "it takes: {}",
+                    sig.args
                         .iter()
-                        .map(|p| format!(
-                            "{}: buffer {} {}",
-                            p.name,
-                            if p.is_input { "in" } else { "out" },
-                            p.ty.display()
-                        ))
+                        .map(|a| a.display())
                         .collect::<Vec<_>>()
                         .join(", ")
                 )),
@@ -390,6 +493,8 @@ pub fn lower_graph(
         // the compiler wrote, whose name says its shape -- `ddl_merge_2x32`
         // rather than the `@merge` the source spelled, which is not an
         // identifier a Verilog file could carry anyway.
+        let is_extern = sig.kind == "extern";
+
         let module = sig.name.clone();
 
         // `mul3`, then `mul3_1`, `mul3_2` -- stable, and readable in a
@@ -407,9 +512,69 @@ pub fn lower_graph(
             ("rst_n".to_string(), "rst_n".to_string()),
         ];
         let mut produces: Vec<String> = Vec::new();
+        // Emitted ahead of the instance they serve, so the file still reads
+        // top to bottom: everything a connection names appears above it.
+        let mut adapters: Vec<Instance> = Vec::new();
 
-        for (formal, actual) in sig.pipes.iter().zip(inst.args.iter()) {
+        for (formal, actual) in sig.args.iter().zip(inst.args.iter()) {
             let actual_name = anumspan_to_str(actual).to_string();
+
+            let formal = match formal {
+                ArgSig::Wire(w) => {
+                    let info = match wires.get_mut(&actual_name) {
+                        Some(i) => i,
+                        None => {
+                            sink.push(
+                                Diag::error(
+                                    map.span_of(actual),
+                                    format!("`{}` is not a wire of this graph", actual_name),
+                                )
+                                .with_note(
+                                    "a wire reaches a graph only as a parameter; declare it with `<name>: wire in <T>` or `wire out <T>`",
+                                ),
+                            );
+                            return None;
+                        }
+                    };
+                    if info.ty != w.ty {
+                        sink.push(
+                            Diag::error(
+                                map.span_of(actual),
+                                format!(
+                                    "`{}` carries `{}`, but `{}.{}` carries `{}`",
+                                    actual_name,
+                                    info.ty.display(),
+                                    module,
+                                    w.name,
+                                    w.ty.display()
+                                ),
+                            )
+                            .with_note("a wire and the port it connects to must be the same width"),
+                        );
+                        return None;
+                    }
+                    // An instance whose wire port is an OUTPUT drives the net.
+                    // Driving a graph input means two sources on one wire, one
+                    // of them off-chip, which no protocol arbitrates.
+                    if !w.is_input {
+                        if info.is_input {
+                            sink.push(
+                                Diag::error(
+                                    map.span_of(actual),
+                                    format!("`{}` is an input of this graph, and `{}.{}` drives it", actual_name, module, w.name),
+                                )
+                                .with_note("an input wire is driven from outside; declare it `wire out` to drive it here"),
+                            );
+                            return None;
+                        }
+                        info.drivers.push(actual.clone());
+                    }
+                    conns.push((w.name.clone(), actual_name));
+                    continue;
+                }
+                ArgSig::Pipe(p) => p,
+            };
+
             let info = match pipes.get_mut(&actual_name) {
                 Some(i) => i,
                 None => {
@@ -449,11 +614,56 @@ pub fn lower_graph(
                 produces.push(actual_name.clone());
             }
 
-            conns.push((format!("{}_wsalt", formal.name), format!("{}_wsalt", actual_name)));
-            conns.push((format!("{}_rsalt", formal.name), format!("{}_rsalt", actual_name)));
-            conns.push((format!("{}_data", formal.name), format!("{}_data", actual_name)));
+            // A module DDL compiled speaks salt, because both ends of the
+            // wire were written by the same compiler. A module it did not
+            // gets a FIFO, and the translation is a module the compiler
+            // writes -- so the hand-written file never sees a salt.
+            if !is_extern {
+                conns.push((format!("{}_wsalt", formal.name), format!("{}_wsalt", actual_name)));
+                conns.push((format!("{}_rsalt", formal.name), format!("{}_rsalt", actual_name)));
+                conns.push((format!("{}_data", formal.name), format!("{}_data", actual_name)));
+                continue;
+            }
+
+            let kind = crate::ir_adapt::Adapt::at(formal.is_input, true);
+            let use_ = crate::ir_adapt::AdaptUse { kind, ty: formal.ty.clone() };
+            if !adapts.contains(&use_) {
+                adapts.push(use_);
+            }
+
+            // Three nets between the adapter and the extern, named for the
+            // instance and the port so two instances of one extern do not
+            // collide.
+            let [flag, go, data] = kind.face();
+            let leg = |suffix: &str| format!("{}_{}_{}", inst_name, formal.name, suffix);
+            nets.push(Net { name: leg(flag), ty: Ty::BOOL });
+            nets.push(Net { name: leg(go), ty: Ty::BOOL });
+            nets.push(Net { name: leg(data), ty: formal.ty.clone() });
+
+            let salt = kind.salt_pipe();
+            let mut adapt_conns = vec![
+                ("clk".to_string(), "clk".to_string()),
+                ("rst_n".to_string(), "rst_n".to_string()),
+                (format!("{}_wsalt", salt), format!("{}_wsalt", actual_name)),
+                (format!("{}_rsalt", salt), format!("{}_rsalt", actual_name)),
+                (format!("{}_data", salt), format!("{}_data", actual_name)),
+            ];
+            for suffix in [flag, go, data] {
+                adapt_conns.push((suffix.to_string(), leg(suffix)));
+                conns.push((format!("{}_{}", formal.name, suffix), leg(suffix)));
+            }
+            // The adapter drives no pipe of its own as far as the picture is
+            // concerned: the extern is what the source named, and blaming the
+            // adapter for a connection nobody wrote would be a worse drawing.
+            adapters.push(Instance {
+                module: crate::ir_adapt::module_name(kind, &formal.ty),
+                name: format!("{}_{}_adapt", inst_name, formal.name),
+                conns: adapt_conns,
+                produces: Vec::new(),
+            });
         }
 
+        instances.extend(adapters);
         instances.push(Instance { module, name: inst_name, conns, produces });
     }
 
@@ -468,11 +678,16 @@ pub fn lower_graph(
         return None;
     }
 
+    if !check_wires(map, &wires, sink) {
+        return None;
+    }
+
     if !check_endpoints(map, &graph_name, &pipes, sink) {
         return None;
     }
 
     Some(Module {
+        calls: Vec::new(),
         name: graph_name,
         ports,
         values: Vec::new(),
@@ -494,6 +709,50 @@ pub fn lower_graph(
 /// entries and its own salt, so the pipe has somewhere to put the copies. Two
 /// instances on one net have nowhere, and what comes out is two drivers on a
 /// salt leg for the simulator to resolve to `x`.
+/// Every `wire out` of the graph is driven exactly once.
+///
+/// A wire carries no protocol, so this is the whole of what can be checked
+/// about one -- and it is worth checking, because the two failures are silent.
+/// Two drivers is an `x` the simulator resolves and the synthesizer may not;
+/// none is a floating output, which on real hardware is a pin that reads as
+/// whatever the board leaks into it.
+fn check_wires(
+    map: &SourceMap,
+    wires: &BTreeMap<String, GraphWireInfo>,
+    sink: &mut DiagSink,
+) -> bool {
+    let mut ok = true;
+    for (name, info) in wires {
+        if info.is_input {
+            continue;
+        }
+        match info.drivers.len() {
+            1 => {}
+            0 => {
+                sink.push(
+                    Diag::error(
+                        map.span_of(&info.declared_at),
+                        format!("`{}` is an output wire that nothing drives", name),
+                    )
+                    .with_note("connect it to a `wire out` parameter of something this graph instantiates"),
+                );
+                ok = false;
+            }
+            n => {
+                sink.push(
+                    Diag::error(
+                        map.span_of(&info.drivers[1]),
+                        format!("`{}` is driven by {} instances", name, n),
+                    )
+                    .with_note("a wire has no arbitration; exactly one thing may drive it"),
+                );
+                ok = false;
+            }
+        }
+    }
+    ok
+}
+
 fn check_endpoints(
     map: &SourceMap,
     graph_name: &str,

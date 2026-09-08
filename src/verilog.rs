@@ -37,6 +37,10 @@ pub struct EmitOptions {
     /// SDPBs. So it is not a size optimisation -- on that target it is the
     /// difference between the design existing and not.
     pub lvt_bram: bool,
+    /// Which modules present the FIFO interface, and which keep the salt
+    /// ports. Empty means the compilation decides for itself, which it can
+    /// do whenever exactly one root survives.
+    pub export: crate::ir_export::ExportFlags,
 }
 
 impl Default for EmitOptions {
@@ -44,6 +48,7 @@ impl Default for EmitOptions {
         EmitOptions {
             regenerate_cmd: "ddl build <source.ddl>".to_string(),
             lvt_bram: false,
+            export: crate::ir_export::ExportFlags::default(),
         }
     }
 }

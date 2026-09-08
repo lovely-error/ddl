@@ -121,16 +121,16 @@ fn all_of(low: &mut Lowerer, conds: &[ValueId]) -> ValueId {
 /// the consumer reads an entry on a cycle this side may already have left, so
 /// what it reads has to be a register rather than a wire off this side's
 /// current state.
-struct OutSide {
-    e0: ValueId,
-    e1: ValueId,
-    wsalt_q: ValueId,
-    widx: ValueId,
-    full: ValueId,
-    base: usize,
+pub(crate) struct OutSide {
+    pub(crate) e0: ValueId,
+    pub(crate) e1: ValueId,
+    pub(crate) wsalt_q: ValueId,
+    pub(crate) widx: ValueId,
+    pub(crate) full: ValueId,
+    pub(crate) base: usize,
 }
 
-fn out_side(low: &mut Lowerer, ix: usize, base: usize) -> OutSide {
+pub(crate) fn out_side(low: &mut Lowerer, ix: usize, base: usize) -> OutSide {
     let ty = low.pipes[ix].ty.clone();
     let name = low.pipes[ix].name.clone();
     let e0 = low.emit(ty.clone(), Op::RegRead(base as u32));
@@ -145,7 +145,7 @@ fn out_side(low: &mut Lowerer, ix: usize, base: usize) -> OutSide {
 }
 
 /// Pushes `item` into an output when `push` holds, and advances its salt.
-fn push_out(
+pub(crate) fn push_out(
     low: &mut Lowerer,
     ix: usize,
     side: &OutSide,
@@ -372,6 +372,7 @@ pub fn build(
 
     let (values, ports) = low.take_values();
     Some(Module {
+        calls: Vec::new(),
         name: module_name(kind, fan, ty),
         ports,
         values,

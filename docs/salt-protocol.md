@@ -2,6 +2,10 @@
 
 This document provides an in-depth explanation of DDL's point-to-point channel interconnect: the **Gray-Code Salt Protocol**.
 
+> **This protocol is internal.** It runs between two modules the compiler wrote, where both ends are generated together and the properties below are worth their cost. It is not what you wire up by hand.
+>
+> Every boundary a person writes Verilog against — an `extern`, or the module you asked the compiler to export — presents an ordinary FIFO instead: `p_can_receive` / `p_receive_en` / `p_data_write_in` going in, and `p_has_data` / `p_drop_item` / `p_data_read_out` coming out. The compiler puts an adapter on its own side to translate. See [Guide 3](guides/3-interfacing-and-integration.md) for that interface; read on for what sits behind it.
+
 ---
 
 ## Table of Contents
@@ -71,7 +75,7 @@ DDL solves these challenges by replacing `valid`/`ready` handshakes with a **Gra
 
 ### Port Interface
 
-Every DDL `buffer` channel between a producer and a consumer flattens into exactly three Verilog ports:
+Every DDL `buffer` channel between two compiled modules flattens into exactly three Verilog ports:
 
 | Port | Direction (Producer $\rightarrow$ Consumer) | Width | Description |
 |---|---|---|---|
@@ -234,55 +238,22 @@ Producer Push  :  STALLED RESUMED Active Active
 
 ## Interfacing with AXI4-Stream (`valid`/`ready`)
 
-When connecting a DDL-generated module to third-party IP cores using traditional AXI4-Stream or `valid`/`ready` interfaces, a lightweight adapter module bridges the protocols:
+You do not write this adapter. The compiler writes it.
 
-### DDL Buffer to AXI-Stream Producer Adapter
-
-This adapter converts a DDL `buffer in` (receiving from an upstream DDL module) into an outgoing AXI4-Stream master (`m_axis_tvalid`, `m_axis_tready`, `m_axis_tdata`):
+An `extern`, or a module chosen as an export target, presents a FIFO — so bridging from there to AXI4-Stream is a renaming, with no state and no arithmetic:
 
 ```verilog
-module ddl_to_axis #(
-    parameter WIDTH = 32
-)(
-    input  wire             clk,
-    input  wire             rst_n,
+// producing side
+assign m_axis_tvalid = dst_has_data;
+assign m_axis_tdata  = dst_data_read_out;
+assign dst_drop_item = m_axis_tvalid && m_axis_tready;
 
-    // DDL Buffer Interface (Consumer side)
-    input  wire [1:0]       ddl_wsalt,
-    output wire [1:0]       ddl_rsalt,
-    input  wire [2*WIDTH-1:0] ddl_data,
-
-    // AXI-Stream Master Interface
-    output wire             m_axis_tvalid,
-    input  wire             m_axis_tready,
-    output wire [WIDTH-1:0] m_axis_tdata
-);
-
-  reg [1:0] rsalt_q;
-
-  // Buffer is not empty when salts differ
-  wire empty = (ddl_wsalt == rsalt_q);
-  assign m_axis_tvalid = !empty;
-
-  // Extract current slot item based on rsalt
-  wire ridx = rsalt_q[0] ^ rsalt_q[1];
-  assign m_axis_tdata = ridx ? ddl_data[2*WIDTH-1:WIDTH] : ddl_data[WIDTH-1:0];
-
-  // Transfer occurs when AXI handshake completes
-  wire transfer = m_axis_tvalid && m_axis_tready;
-  wire [1:0] toggle = ridx ? 2'd2 : 2'd1;
-
-  assign ddl_rsalt = rsalt_q;
-
-  always @(posedge clk) begin
-    if (!rst_n) begin
-      rsalt_q <= 2'b00;
-    end else if (transfer) begin
-      rsalt_q <= rsalt_q ^ toggle;
-    end
-  end
-
-endmodule
+// consuming side
+assign s_axis_tready     = src_can_receive;
+assign src_data_write_in = s_axis_tdata;
+assign src_receive_en    = s_axis_tvalid && s_axis_tready;
 ```
 
-Notice that inside the adapter, `ddl_rsalt` is registered, preserving the decoupled timing boundary toward the DDL domain while speaking standard `valid`/`ready` to the outside world.
+The property this document exists to establish survives the trip: `dst_has_data` is a function of the module's registered pointers and never of `m_axis_tready`, so there is no combinational path from `ready` back to `valid` — the loop AXI forbids, and the one [Motivation](#motivation-the-pitfalls-of-validready) opens with.
+
+The translation between the pointers and that FIFO lives in modules the compiler emits — `ddl_salt_to_rport_<W>` and `ddl_wport_to_salt_<W>`, plus the two mirrors of them that drive an `extern` — written in `src/ir_adapt.rs`. Each is one gray-code pointer and a handful of gates, built on the same helpers `@merge` and `@split` use, and simulated against the FIFO contract in `tests/adapters.rs`.

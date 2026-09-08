@@ -326,6 +326,9 @@ fn compile_on_this_stack(
     // from what it instantiates -- so they are collected rather than rendered
     // one at a time.
     let mut drawn: Vec<crate::ir::Module> = Vec::new();
+    // Collected across graphs and again across export wrappers: one module per
+    // shape, however many boundaries ask for it.
+    let mut adapts: Vec<crate::ir_adapt::AdaptUse> = Vec::new();
     let mut render = |out: &mut String, module: &crate::ir::Module| {
         if drawing || !dumping_ir {
             drawn.push(module.clone());
@@ -356,9 +359,14 @@ fn compile_on_this_stack(
     // Graphs last, and after their contents: a graph is the only declaration
     // that emits an instantiation, so everything it names has to have been
     // emitted above it for the file to be readable top to bottom.
-    if !graphs.is_empty() {
-        let mut sigs: std::collections::BTreeMap<String, crate::ir_graph::BlockSig> =
-            std::collections::BTreeMap::new();
+    // Built whether or not the file has a graph. A signature is what a graph
+    // connects to AND what the export pass reads a boundary off, and an
+    // `extern` that is never instantiated is still worth checking -- before
+    // this was hoisted, a malformed one in a graph-less file was silently
+    // accepted.
+    let mut sigs: std::collections::BTreeMap<String, crate::ir_graph::BlockSig> =
+        std::collections::BTreeMap::new();
+    {
         // An `extern` contributes a signature and no module. That is the whole
         // of the feature: a graph can instantiate something DDL did not
         // compile, and the connections are still checked, because what a graph
@@ -384,6 +392,9 @@ fn compile_on_this_stack(
             let name = anumspan_to_str(&graph.name).to_string();
             sigs.insert(name.clone(), crate::ir_graph::signature_of(&name, "graph", &graph.args, &syms));
         }
+    }
+
+    if !graphs.is_empty() {
         // Combinators first, in the file: a graph instantiates them, and the
         // rule for this file is that everything a graph names has been emitted
         // above it so the whole thing reads top to bottom.
@@ -391,9 +402,17 @@ fn compile_on_this_stack(
         let mut lowered = Vec::new();
         for graph in &graphs {
             if let Some(module) =
-                crate::ir_graph::lower_graph(map, &syms, &sigs, graph, &mut combs, &mut sink)
+                crate::ir_graph::lower_graph(map, &syms, &sigs, graph, &mut combs, &mut adapts, &mut sink)
             {
                 lowered.push(module);
+            }
+        }
+        for use_ in &adapts {
+            if let Some(module) =
+                crate::ir_adapt::build(map, &syms, use_.kind, &use_.ty, &mut sink)
+            {
+                render(&mut out, &module);
+                emitted += 1;
             }
         }
         for use_ in &combs {
@@ -422,6 +441,56 @@ fn compile_on_this_stack(
         )]);
     }
     if !dumping_ir {
+        // Which module is this invocation FOR? Only the declarations the
+        // author named can answer: an `import` supplies dependencies, and one
+        // of those being unused does not make it the deliverable.
+        let mut candidates: std::collections::BTreeSet<String> =
+            std::collections::BTreeSet::new();
+        for name in funcs
+            .iter()
+            .map(|d| &d.name)
+            .chain(seqs.iter().map(|d| &d.name))
+            .chain(procs.iter().map(|d| &d.name))
+            .chain(graphs.iter().map(|d| &d.name))
+        {
+            if map.is_root_at(map.span_of(name).lo) {
+                candidates.insert(anumspan_to_str(name).to_string());
+            }
+        }
+
+        let exports = crate::ir_export::resolve(&drawn, &candidates, &opts.export)
+            .map_err(|d| vec![d])?;
+
+        // The file is the targets and what they use. A module that has nothing
+        // to do with what was asked for is one a synthesizer would elaborate
+        // and a reader would have to account for.
+        let keep = crate::ir_export::closure(&drawn, &exports.keep);
+        drawn.retain(|m| keep.contains(&m.name));
+
+        let wrappers_at = drawn.len();
+        drawn = crate::ir_export::apply(drawn, &exports.wrap, &sigs, &mut adapts);
+
+        // Wrapping asks for adapters of its own, and they have to appear
+        // above the wrapper that names them.
+        let have: std::collections::BTreeSet<String> =
+            drawn.iter().map(|m| m.name.clone()).collect();
+        let mut fresh = Vec::new();
+        for use_ in &adapts {
+            let name = crate::ir_adapt::module_name(use_.kind, &use_.ty);
+            if have.contains(&name) {
+                continue;
+            }
+            if let Some(module) =
+                crate::ir_adapt::build(map, &syms, use_.kind, &use_.ty, &mut sink)
+            {
+                fresh.push(module);
+            }
+        }
+        if sink.has_errors() {
+            return Err(sink.into_diags());
+        }
+        drawn.splice(wrappers_at..wrappers_at, fresh);
+
         let verilog =
             emit_modules(&drawn, opts).map_err(|message| vec![Diag::error_no_span(message)])?;
         out.push('\n');

@@ -58,6 +58,39 @@ module scale (
 
 endmodule
 
+module ddl_salt_to_wport_32 (
+    input         clk,
+    input         rst_n,
+    input  [1:0]  i_wsalt,
+    output [1:0]  i_rsalt,
+    input  [63:0] i_data,
+    input         can_receive,
+    output        receive_en,
+    output [31:0] data_write_in
+);
+
+  reg [1:0] rsalt_q;
+
+  wire i_empty = i_wsalt == rsalt_q;
+  wire has_item = !i_empty;
+  wire i_ridx = rsalt_q[0] ^ rsalt_q[1];
+  wire [31:0] i_item = i_ridx ? i_data[63:32] : i_data[31:0];
+  wire take = has_item & can_receive;
+
+  assign data_write_in = i_item;
+  assign receive_en = take;
+  assign i_rsalt = rsalt_q;
+
+  always @(posedge clk) begin
+    if (!rst_n) begin
+      rsalt_q <= 2'd0;
+    end else begin
+      rsalt_q <= (take ? (rsalt_q ^ (i_ridx ? 2'd2 : 2'd1)) : rsalt_q);
+    end
+  end
+
+endmodule
+
 module ddl_merge_2x32 (
     input         clk,
     input         rst_n,
@@ -182,7 +215,7 @@ module ddl_split_2x32 (
 
 endmodule
 
-module fanout (
+module fanout_core (
     input         clk,
     input         rst_n,
     input  [1:0]  hi_wsalt,
@@ -205,6 +238,9 @@ module fanout (
   wire [1:0] copy_wsalt;
   wire [1:0] copy_rsalt;
   wire [63:0] copy_data;
+  wire u_sink_ext_a_can_receive;
+  wire u_sink_ext_a_receive_en;
+  wire [31:0] u_sink_ext_a_data_write_in;
 
   ddl_merge_2x32 u_ddl_merge_2x32 (
     .clk      (clk),
@@ -245,12 +281,167 @@ module fanout (
     .o1_data  (copy_data)
   );
 
+  ddl_salt_to_wport_32 u_sink_ext_a_adapt (
+    .clk           (clk),
+    .rst_n         (rst_n),
+    .i_wsalt       (copy_wsalt),
+    .i_rsalt       (copy_rsalt),
+    .i_data        (copy_data),
+    .can_receive   (u_sink_ext_a_can_receive),
+    .receive_en    (u_sink_ext_a_receive_en),
+    .data_write_in (u_sink_ext_a_data_write_in)
+  );
+
   sink_ext u_sink_ext (
-    .clk     (clk),
-    .rst_n   (rst_n),
-    .a_wsalt (copy_wsalt),
-    .a_rsalt (copy_rsalt),
-    .a_data  (copy_data)
+    .clk             (clk),
+    .rst_n           (rst_n),
+    .a_can_receive   (u_sink_ext_a_can_receive),
+    .a_receive_en    (u_sink_ext_a_receive_en),
+    .a_data_write_in (u_sink_ext_a_data_write_in)
+  );
+
+endmodule
+
+module ddl_wport_to_salt_32 (
+    input         clk,
+    input         rst_n,
+    output [1:0]  o_wsalt,
+    input  [1:0]  o_rsalt,
+    output [63:0] o_data,
+    output        can_receive,
+    input         receive_en,
+    input  [31:0] data_write_in
+);
+
+  reg [31:0] o_e0;
+  reg [31:0] o_e1;
+  reg [1:0] o_wsalt_q;
+
+  wire o_widx = o_wsalt_q[0] ^ o_wsalt_q[1];
+  wire o_full = o_wsalt_q == (~o_rsalt);
+  wire room = !o_full;
+  wire push = receive_en & room;
+
+  assign can_receive = room;
+  assign o_data = {o_e1, o_e0};
+  assign o_wsalt = o_wsalt_q;
+
+  always @(posedge clk) begin
+    if (!rst_n) begin
+      o_e0 <= 32'd0;
+      o_e1 <= 32'd0;
+      o_wsalt_q <= 2'd0;
+    end else begin
+      o_e0 <= ((push & (!o_widx)) ? data_write_in : o_e0);
+      o_e1 <= ((push & o_widx) ? data_write_in : o_e1);
+      o_wsalt_q <= (push ? (o_wsalt_q ^ (o_widx ? 2'd2 : 2'd1)) : o_wsalt_q);
+    end
+  end
+
+endmodule
+
+module ddl_salt_to_rport_32 (
+    input         clk,
+    input         rst_n,
+    input  [1:0]  i_wsalt,
+    output [1:0]  i_rsalt,
+    input  [63:0] i_data,
+    output        has_data,
+    input         drop_item,
+    output [31:0] data_read_out
+);
+
+  reg [1:0] rsalt_q;
+
+  wire i_empty = i_wsalt == rsalt_q;
+  wire has_item = !i_empty;
+  wire i_ridx = rsalt_q[0] ^ rsalt_q[1];
+  wire [31:0] i_item = i_ridx ? i_data[63:32] : i_data[31:0];
+  wire take = has_item & drop_item;
+
+  assign data_read_out = i_item;
+  assign has_data = has_item;
+  assign i_rsalt = rsalt_q;
+
+  always @(posedge clk) begin
+    if (!rst_n) begin
+      rsalt_q <= 2'd0;
+    end else begin
+      rsalt_q <= (take ? (rsalt_q ^ (i_ridx ? 2'd2 : 2'd1)) : rsalt_q);
+    end
+  end
+
+endmodule
+
+module fanout (
+    input         clk,
+    input         rst_n,
+    output        hi_can_receive,
+    input         hi_receive_en,
+    input  [31:0] hi_data_write_in,
+    output        lo_can_receive,
+    input         lo_receive_en,
+    input  [31:0] lo_data_write_in,
+    output        out_a_has_data,
+    input         out_a_drop_item,
+    output [31:0] out_a_data_read_out
+);
+
+  wire [1:0] hi_wsalt;
+  wire [1:0] hi_rsalt;
+  wire [63:0] hi_data;
+  wire [1:0] lo_wsalt;
+  wire [1:0] lo_rsalt;
+  wire [63:0] lo_data;
+  wire [1:0] out_a_wsalt;
+  wire [1:0] out_a_rsalt;
+  wire [63:0] out_a_data;
+
+  ddl_wport_to_salt_32 u_hi_adapt (
+    .clk           (clk),
+    .rst_n         (rst_n),
+    .o_wsalt       (hi_wsalt),
+    .o_rsalt       (hi_rsalt),
+    .o_data        (hi_data),
+    .can_receive   (hi_can_receive),
+    .receive_en    (hi_receive_en),
+    .data_write_in (hi_data_write_in)
+  );
+
+  ddl_wport_to_salt_32 u_lo_adapt (
+    .clk           (clk),
+    .rst_n         (rst_n),
+    .o_wsalt       (lo_wsalt),
+    .o_rsalt       (lo_rsalt),
+    .o_data        (lo_data),
+    .can_receive   (lo_can_receive),
+    .receive_en    (lo_receive_en),
+    .data_write_in (lo_data_write_in)
+  );
+
+  ddl_salt_to_rport_32 u_out_a_adapt (
+    .clk           (clk),
+    .rst_n         (rst_n),
+    .i_wsalt       (out_a_wsalt),
+    .i_rsalt       (out_a_rsalt),
+    .i_data        (out_a_data),
+    .has_data      (out_a_has_data),
+    .drop_item     (out_a_drop_item),
+    .data_read_out (out_a_data_read_out)
+  );
+
+  fanout_core u_fanout_core (
+    .clk         (clk),
+    .rst_n       (rst_n),
+    .hi_wsalt    (hi_wsalt),
+    .hi_rsalt    (hi_rsalt),
+    .hi_data     (hi_data),
+    .lo_wsalt    (lo_wsalt),
+    .lo_rsalt    (lo_rsalt),
+    .lo_data     (lo_data),
+    .out_a_wsalt (out_a_wsalt),
+    .out_a_rsalt (out_a_rsalt),
+    .out_a_data  (out_a_data)
   );
 
 endmodule

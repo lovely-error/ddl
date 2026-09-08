@@ -44,116 +44,77 @@ process proc_assert (src: buffer in u8, dst: buffer out u8)
 
 ## 2. Writing a SystemVerilog Testbench for DDL Modules
 
-Because DDL channels use registered Gray-code pointers (`_wsalt`, `_rsalt`, `_data`), a testbench drives them by toggling salts.
+An exported DDL module presents a FIFO on each pipe, so a testbench drives it the way it would drive any FIFO. For a pipe `p`: `p_can_receive` / `p_receive_en` / `p_data_write_in` going in, and `p_has_data` / `p_drop_item` / `p_data_read_out` coming out.
 
-Here is a complete reusable SystemVerilog testbench template for testing any DDL buffer:
+Two rules, and they are the only ones:
+
+- Raise `p_receive_en` only while `p_can_receive` is high, and `p_drop_item` only while `p_has_data` is high.
+- While `p_has_data` is high and `p_drop_item` is low, `p_data_read_out` holds the same item. You may look at it for as long as you like before taking it.
 
 ```systemverilog
 `timescale 1ns/1ps
 
 module tb_ddl_example;
 
-  reg clk;
-  reg rst_n;
-
-  // DUT Interface signals
-  reg  [1:0]  src_wsalt;
-  wire [1:0]  src_rsalt;
-  reg  [63:0] src_data;
-
-  wire [1:0]  dst_wsalt;
-  reg  [1:0]  dst_rsalt;
-  wire [63:0] dst_data;
-
-  // Clock generation
-  initial clk = 0;
+  logic clk = 0;
+  logic rst_n;
   always #5 clk = ~clk;
 
-  // DUT Instantiation
+  logic        src_can_receive, src_receive_en;
+  logic [31:0] src_data_write_in;
+  logic        dst_has_data, dst_drop_item;
+  logic [31:0] dst_data_read_out;
+
   worker dut (
-    .clk       (clk),
-    .rst_n     (rst_n),
-    .src_wsalt (src_wsalt),
-    .src_rsalt (src_rsalt),
-    .src_data  (src_data),
-    .dst_wsalt (dst_wsalt),
-    .dst_rsalt (dst_rsalt),
-    .dst_data  (dst_data)
+    .clk               (clk),
+    .rst_n             (rst_n),
+    .src_can_receive   (src_can_receive),
+    .src_receive_en    (src_receive_en),
+    .src_data_write_in (src_data_write_in),
+    .dst_has_data      (dst_has_data),
+    .dst_drop_item     (dst_drop_item),
+    .dst_data_read_out (dst_data_read_out)
   );
 
-  // -------------------------------------------------------------
-  // Testbench Task: Send one item into DDL buffer
-  // -------------------------------------------------------------
-  task send_item(input [31:0] val);
+  // Offer one item, and wait until it is taken.
+  task send_item(input logic [31:0] val);
     begin
-      // Wait until DUT's input buffer has space: wsalt != ~rsalt
-      while (src_wsalt == (~src_rsalt)) @(posedge clk);
-
-      // Write data to the slot indicated by current wsalt
-      if (src_wsalt[0] ^ src_wsalt[1])
-        src_data[63:32] = val; // Slot 1
-      else
-        src_data[31:0]  = val; // Slot 0
-
-      // Toggle wsalt to commit transfer
-      if (src_wsalt[0] ^ src_wsalt[1])
-        src_wsalt <= src_wsalt ^ 2'd2;
-      else
-        src_wsalt <= src_wsalt ^ 2'd1;
-
-      @(posedge clk);
+      src_data_write_in <= val;
+      src_receive_en    <= 1'b1;
+      do @(posedge clk); while (!src_can_receive);
+      src_receive_en <= 1'b0;
     end
   endtask
 
-  // -------------------------------------------------------------
-  // Testbench Task: Receive one item from DDL buffer
-  // -------------------------------------------------------------
-  task receive_item(output [31:0] val);
+  // Wait for one item, read it, and acknowledge it.
+  task receive_item(output logic [31:0] val);
     begin
-      // Wait until DUT's output buffer is not empty: wsalt != rsalt
-      while (dst_wsalt == dst_rsalt) @(posedge clk);
-
-      // Read from active slot
-      if (dst_rsalt[0] ^ dst_rsalt[1])
-        val = dst_data[63:32];
-      else
-        val = dst_data[31:0];
-
-      // Toggle rsalt to commit receive
-      if (dst_rsalt[0] ^ dst_rsalt[1])
-        dst_rsalt <= dst_rsalt ^ 2'd2;
-      else
-        dst_rsalt <= dst_rsalt ^ 2'd1;
-
+      while (!dst_has_data) @(posedge clk);
+      val           = dst_data_read_out;
+      dst_drop_item <= 1'b1;
       @(posedge clk);
+      dst_drop_item <= 1'b0;
     end
   endtask
 
-  // -------------------------------------------------------------
-  // Test Stimulus
-  // -------------------------------------------------------------
   initial begin
-    reg [31:0] res;
+    logic [31:0] res;
 
-    // Reset sequence
-    rst_n = 0;
-    src_wsalt = 2'b00;
-    dst_rsalt = 2'b00;
-    src_data  = 64'd0;
+    rst_n             = 0;
+    src_receive_en    = 0;
+    src_data_write_in = 0;
+    dst_drop_item     = 0;
     #20;
     rst_n = 1;
     @(posedge clk);
 
-    // Stream 10 items
-    for (int i = 1; i <= 10; i++) begin
-      send_item(i * 10);
-    end
-
-    // Receive 10 results
-    for (int i = 1; i <= 10; i++) begin
-      receive_item(res);
-      $display("Received result: %0d", res);
-    end
+    fork
+      for (int i = 1; i <= 10; i++) send_item(i * 10);
+      for (int i = 1; i <= 10; i++) begin
+        receive_item(res);
+        $display("Received result: %0d", res);
+      end
+    join
 
     $display("TEST PASSED");
     $finish;
@@ -162,8 +123,15 @@ module tb_ddl_example;
 endmodule
 ```
 
-### Testing Backpressure:
-To simulate downstream stalls, simply delay calling `receive_item(...)`. The DUT's output buffer will fill its primary slot and skid slot, after which the DUT will cleanly stall its upstream pipeline without losing data.
+The two loops run concurrently because a pipeline holds several items at once: sending all ten before reading any would deadlock as soon as the design filled, which is the design working correctly.
+
+### Testing backpressure
+
+Hold `dst_drop_item` low for a while. The output fills its primary and skid slots, the pipeline stalls cleanly behind it, and `src_can_receive` goes low — nothing is lost. Holding `src_receive_en` high permanently is also safe: the module ignores it while `src_can_receive` is low, which `tests/adapters.rs` checks by simulation.
+
+### Testing the pointer protocol directly
+
+If you built with `--bare-export`, the module has `_wsalt` / `_rsalt` / `_data` instead, and the testbench has to toggle gray-code pointers itself. `examples/tb_mul3_equiv.sv` is a worked example — it drives that form because it compares the generated logic against a hand-written module that speaks it.
 
 ---
 

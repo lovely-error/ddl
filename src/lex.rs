@@ -363,10 +363,12 @@ pub enum ArgTypeQualifier {
     Inout,
     BufferIn,
     BufferOut,
-    /// `port in T` / `port out T` -- a plain data port with an enable beside
-    /// it, and no back-pressure at all.
-    PortIn,
-    PortOut,
+    /// `wire in T` / `wire out T` -- a bare signal of the declared width, with
+    /// no handshake of any kind. Legal only on an `extern` or a `graph`: those
+    /// are the two declarations that sit at the edge of the program, and a
+    /// wire has nothing a body could wait on.
+    WireIn,
+    WireOut,
 }
 #[derive(Debug, Clone)]
 pub struct RawStructField {
@@ -846,17 +848,17 @@ fn try_parse_arg_type_qualifier(
             char_ptr = new_ptr;
             break 'qualifier ArgTypeQualifier::Out
         }
-        let (is_port, new_ptr) = strip_prefix_on_match(char_ptr, char_end_ptr, "port ");
-        if is_port {
+        let (is_wire, new_ptr) = strip_prefix_on_match(char_ptr, char_end_ptr, "wire ");
+        if is_wire {
             let (is_in, ptr) = strip_prefix_on_match(new_ptr, char_end_ptr, "in ");
             if is_in {
                 char_ptr = ptr;
-                break 'qualifier ArgTypeQualifier::PortIn
+                break 'qualifier ArgTypeQualifier::WireIn
             }
             let (is_out, ptr) = strip_prefix_on_match(new_ptr, char_end_ptr, "out ");
             if is_out {
                 char_ptr = ptr;
-                break 'qualifier ArgTypeQualifier::PortOut
+                break 'qualifier ArgTypeQualifier::WireOut
             }
             return Err(());
         }

@@ -7,7 +7,18 @@ use ddl::verilog::{EmitOptions, emit_modules};
 #[test]
 fn scalar_operations_and_collision_fixture_compile() {
     let map = SourceMap::new("edges.ddl", include_str!("probes/backend_edges.ddl"));
-    let v = compile_to_verilog(&map, &EmitOptions::default())
+    // A bag of unrelated probes, so it has many roots and the compiler will
+    // not pick between them. Nothing here is about a boundary: the graph keeps
+    // its salt ports, and what is under test is how the backend names two
+    // modules that sanitize to the same thing.
+    let opts = EmitOptions {
+        export: ddl::ir_export::ExportFlags {
+            export: Vec::new(),
+            bare: vec!["collision_graph".to_string()],
+        },
+        ..EmitOptions::default()
+    };
+    let v = compile_to_verilog(&map, &opts)
         .unwrap_or_else(|d| panic!("{}", map.render_all(&d)));
     assert!(!v.contains("x[0]"), "{v}");
     assert!(v.contains("module cell_ ("));
@@ -28,6 +39,7 @@ fn empty(name: &str) -> Module {
         params: vec![],
         nets: vec![],
         instances: vec![],
+        calls: vec![],
     }
 }
 fn input(name: &str) -> Port {
@@ -66,7 +78,10 @@ fn named_connections_follow_the_callee_interface_and_caller_namespace() {
 fn duplicate_expanded_ports_are_diagnosed_instead_of_merged() {
     let map = SourceMap::new(
         "duplicate.ddl",
-        "process p (ans: buffer out u8, ans_data: port in u8)\n  loop\n    let x = @rcv(ans_data)\n    @send(ans, x)\n",
+        "extern e (a: buffer out u8, w: wire in u8)
+graph g (ans: buffer out u8, ans_data: wire in u8)
+  e(ans, ans_data)
+",
     );
     let error = compile_to_verilog(&map, &EmitOptions::default()).unwrap_err();
     assert!(map.render_all(&error).contains("duplicate port `ans_data`"));
@@ -77,7 +92,7 @@ fn ambiguous_external_and_module_declarations_are_diagnosed() {
     for (source, expected) in [
         (
             "extern ext (src: buffer in u8, src: buffer out u8)\ngraph g (a: buffer in u8, b: buffer out u8)\n  ext(a, b)\n",
-            "same pipe twice",
+            "same name twice",
         ),
         (
             "extern p (a: buffer in u8)\nprocess p (a: buffer in u8)\n  loop\n    let took = @drop(a)\n",

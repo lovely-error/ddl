@@ -51,7 +51,7 @@ The compiler (`src/ir_fsm.rs`) converts this sequential code into a hardware sta
 An ordinary combinational block executes in 0 cycles, while a clocked pipeline executes across fixed stages. A `process`, by contrast, contains operations that may stall for an unpredictable duration.
 
 The compiler identifies **barriers** that require hardware wait states:
-1. **Blocking Channel Operations**: `@rcv` and `@send` on `buffer` or `port` interfaces.
+1. **Blocking Channel Operations**: `@rcv` and `@send` on `buffer` interfaces.
 2. **Synchronous Memory Reads**: Reads from `#[impl(bram)]` arrays that take 1 clock cycle to return data.
 3. **Loop Boundaries and Explicit Continuations**: Points where control flow loops back or branches to a shared continuation.
 

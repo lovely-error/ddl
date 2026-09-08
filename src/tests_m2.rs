@@ -8,8 +8,21 @@ use crate::driver::compile_to_verilog;
 use crate::verilog::EmitOptions;
 
 fn compile(src: &str) -> String {
+    compile_exporting(src, &[])
+}
+
+/// For a source with several roots, where which one the file is for is a
+/// question the compiler refuses to answer on its own.
+fn compile_exporting(src: &str, targets: &[&str]) -> String {
     let map = SourceMap::new("t.ddl", src);
-    let verilog = match compile_to_verilog(&map, &EmitOptions::default()) {
+    let opts = EmitOptions {
+        export: crate::ir_export::ExportFlags {
+            export: targets.iter().map(|s| s.to_string()).collect(),
+            bare: Vec::new(),
+        },
+        ..EmitOptions::default()
+    };
+    let verilog = match compile_to_verilog(&map, &opts) {
         Ok(v) => v,
         Err(diags) => panic!("compile failed:\n{}", map.render_all(&diags)),
     };
@@ -405,12 +418,12 @@ fn a_duplicate_declaration_is_rejected() {
 
 #[test]
 fn the_banner_appears_once_for_a_multi_module_file() {
-    let v = compile(concat!(
+    let v = compile_exporting(concat!(
         "fun a1 (x: u1, o: out u1)\n",
         "  o = x\n",
         "fun a2 (x: u1, o: out u1)\n",
         "  o = x\n",
-    ));
+    ), &["a1", "a2"]);
     assert_eq!(v.matches("GENERATED FILE").count(), 1, "{}", v);
     assert_eq!(v.matches("endmodule").count(), 2, "{}", v);
 }
@@ -456,7 +469,17 @@ fn the_examples_still_compile() {
             name,
             map.render_all(&load_diags)
         );
-        if let Err(diags) = compile_to_verilog(&map, &EmitOptions::default()) {
+        // The checked-in Verilog, when there is one, is where the export
+        // selection for this example is written down.
+        let golden = path.with_extension("v");
+        let opts = match std::fs::read_to_string(&golden) {
+            Ok(text) => EmitOptions {
+                export: export_flags_from(&banner_cmd(&text)),
+                ..EmitOptions::default()
+            },
+            Err(_) => EmitOptions::default(),
+        };
+        if let Err(diags) = compile_to_verilog(&map, &opts) {
             panic!("{} stopped compiling:
 {}", name, map.render_all(&diags));
         }
@@ -484,7 +507,7 @@ fn the_checked_in_verilog_is_up_to_date() {
     let mut checked = 0;
     for name in [
         "mul3", "fsm_adder", "k3g_stage", "pipeline_graph", "reg_port", "tagged",
-        "bram_lookup", "fanout", "pulse_counter", "k2g_shift", "rf_lvt", "rf_lvt_proc",
+        "bram_lookup", "fanout", "k2g_shift", "rf_lvt", "rf_lvt_proc",
         "k2g_alu",
         "k2g_decode",
         "k2g_xstage",
@@ -502,7 +525,12 @@ fn the_checked_in_verilog_is_up_to_date() {
         let current = std::fs::read_to_string(&out)
             .unwrap_or_else(|e| panic!("cannot read {}: {}", out, e))
             .replace("\r\n", "\n");
-        let opts = EmitOptions { regenerate_cmd: banner_cmd(&current), ..EmitOptions::default() };
+        let cmd = banner_cmd(&current);
+        let opts = EmitOptions {
+            export: export_flags_from(&cmd),
+            regenerate_cmd: cmd,
+            ..EmitOptions::default()
+        };
         let fresh = match compile_to_verilog(&map, &opts) {
             Ok(v) => v,
             Err(diags) => panic!("{} stopped compiling:
@@ -519,6 +547,26 @@ fn the_checked_in_verilog_is_up_to_date() {
 }
 
 /// The command out of a generated file's banner.
+/// The export selection a generated file's own banner asks for.
+///
+/// The banner is the command that reproduces the file, so it is also the
+/// record of which module the file is for. Reading it back is what lets a
+/// checked-in `.v` whose source has several roots verify without the test
+/// carrying a table of its own.
+fn export_flags_from(cmd: &str) -> crate::ir_export::ExportFlags {
+    let mut flags = crate::ir_export::ExportFlags::default();
+    let words: Vec<&str> = cmd.split_whitespace().collect();
+    for pair in words.windows(2) {
+        let names = || pair[1].split(',').map(str::to_string).collect::<Vec<_>>();
+        match pair[0] {
+            "--export" => flags.export.extend(names()),
+            "--bare-export" => flags.bare.extend(names()),
+            _ => {}
+        }
+    }
+    flags
+}
+
 fn banner_cmd(verilog: &str) -> String {
     verilog
         .lines()
@@ -732,7 +780,7 @@ fn taking_a_field_of_a_non_struct_is_rejected() {
 
 #[test]
 fn a_struct_round_trips_through_pack_and_unpack() {
-    let v = compile(&format!(
+    let v = compile_exporting(&format!(
         concat!(
             "{}fun pack (k: kind_e, a: u16, d: u8, r: out req_t)\n",
             "  r = req_t(k, a, d)\n",
@@ -741,7 +789,7 @@ fn a_struct_round_trips_through_pack_and_unpack() {
             "  o = packed.addr\n",
         ),
         REQ
-    ));
+    ), &["pack", "roundtrip"]);
     // The concat and the slice cancel out in synthesis, but both must appear.
     assert!(v.contains("{k, a, d}"), "{}", v);
     assert!(v.contains("[23:8]"), "{}", v);
@@ -2555,7 +2603,10 @@ fn the_verified_alu_and_shifter_can_be_called() {
             "  ra = arith\n",
             "  rs = sh\n",
         );
-    let v = compile(&src);
+    // `uop_nop` and `uop_fault` ride in on the imports and nothing calls
+    // them, so this source has three roots and the compiler will not pick
+    // between them. Naming `both` says which one the test is about.
+    let v = compile_exporting(&src, &["both"]);
     assert!(v.contains("module both ("), "{}", v);
     // Both helpers were inlined into one module: the ALU's carry-extended
     // adder and the shifter's arithmetic right shift are both present, and

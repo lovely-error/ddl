@@ -68,22 +68,13 @@ pub struct Barrier {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BarrierOn {
     Pipe(usize),
-    Port(usize),
 }
 
 impl Barrier {
-    /// The pipe this waits on, or `None` when it waits on a port.
-    pub fn pipe(&self) -> Option<usize> {
+    /// The pipe this waits on.
+    pub fn pipe(&self) -> usize {
         match self.on {
-            BarrierOn::Pipe(ix) => Some(ix),
-            BarrierOn::Port(_) => None,
-        }
-    }
-
-    pub fn port(&self) -> Option<usize> {
-        match self.on {
-            BarrierOn::Port(ix) => Some(ix),
-            BarrierOn::Pipe(_) => None,
+            BarrierOn::Pipe(ix) => ix,
         }
     }
 }
@@ -706,7 +697,6 @@ fn schedule<'a>(
     brk: Target,
     states: &mut Vec<State<'a>>,
     pipe_of: &dyn Fn(&str) -> Option<usize>,
-    port_of: &dyn Fn(&str) -> Option<(usize, bool)>,
     sync_mem_of: &dyn Fn(&str) -> Option<usize>,
     sink: &mut DiagSink,
 ) -> Option<Target> {
@@ -720,7 +710,7 @@ fn schedule<'a>(
                 sink.err_at(&f.binding, "a `for` body must be combinational; blocking transfers, synchronous reads, `loop`, and `break` require an explicit process loop");
                 return None;
             }
-        if let Some(barrier) = as_barrier(stmt, pipe_of, port_of, sink)? {
+        if let Some(barrier) = as_barrier(stmt, pipe_of, sink)? {
             let mut post: Vec<&PrecResInnerStmt> = pending.drain(..).rev().collect();
             // A branch state sitting right after this barrier has no wait of
             // its own, so its work belongs in this state's post scope and its
@@ -799,7 +789,7 @@ fn schedule<'a>(
                     return None;
                 }
             };
-            let then_t = schedule(then_stmts, target, brk, states, pipe_of, port_of, sync_mem_of, sink)?;
+            let then_t = schedule(then_stmts, target, brk, states, pipe_of, sync_mem_of, sink)?;
             let else_t = match &ite.else_case {
                 None => target,
                 Some(arm) => {
@@ -813,7 +803,7 @@ fn schedule<'a>(
                             return None;
                         }
                     };
-                    schedule(else_stmts, target, brk, states, pipe_of, port_of, sync_mem_of, sink)?
+                    schedule(else_stmts, target, brk, states, pipe_of, sync_mem_of, sink)?
                 }
             };
             states.push(State {
@@ -847,7 +837,7 @@ fn schedule<'a>(
             for case in &m.cases {
                 let t = match arm_stmts(&case.rhs) {
                     Some(arm) => {
-                        schedule(arm, target, brk, states, pipe_of, port_of, sync_mem_of, sink)?
+                        schedule(arm, target, brk, states, pipe_of, sync_mem_of, sink)?
                     }
                     None => target,
                 };
@@ -890,7 +880,7 @@ fn schedule<'a>(
             states.push(State::dead());
             let head = states.len() - 1;
             let entry =
-                schedule(body, Target::State(head), after, states, pipe_of, port_of, sync_mem_of, sink)?;
+                schedule(body, Target::State(head), after, states, pipe_of, sync_mem_of, sink)?;
             let body_has_no_states = entry == Target::State(head);
             if body_has_no_states {
                 sink.err_span(
@@ -941,7 +931,6 @@ fn schedule<'a>(
 fn as_barrier(
     stmt: &PrecResInnerStmt,
     pipe_of: &dyn Fn(&str) -> Option<usize>,
-    port_of: &dyn Fn(&str) -> Option<(usize, bool)>,
     sink: &mut DiagSink,
 ) -> Option<Option<Barrier>> {
     let (pipe, bind, value) = if let Some((bind, pipe)) = as_blocking_recv(stmt) {
@@ -960,20 +949,9 @@ fn as_barrier(
     if let Some(pipe_ix) = pipe_of(&pipe) {
         return Some(Some(Barrier { on: BarrierOn::Pipe(pipe_ix), is_recv, bind, value, declaration }));
     }
-    if let Some((port_ix, is_input)) = port_of(&pipe) {
-        if is_recv != is_input {
-            let what = if is_input { "received from" } else { "sent to" };
-            sink.err_span(
-                anchor_of(stmt, sink),
-                format!("`{}` can only be {}", pipe, what),
-            );
-            return None;
-        }
-        return Some(Some(Barrier { on: BarrierOn::Port(port_ix), is_recv, bind, value, declaration }));
-    }
     sink.err_span(
         anchor_of(stmt, sink),
-        format!("`{}` is not a pipe or `port` of this process", pipe),
+        format!("`{}` is not a pipe of this process", pipe),
     );
     None
 }
@@ -991,7 +969,6 @@ fn contains_barrier_in_expr(e: &PrecResExpr) -> bool {
 pub fn schedule_body<'a>(
     body: &'a [PrecResInnerStmt],
     pipe_of: &dyn Fn(&str) -> Option<usize>,
-    port_of: &dyn Fn(&str) -> Option<(usize, bool)>,
     sync_mem_of: &dyn Fn(&str) -> Option<usize>,
     sink: &mut DiagSink,
 ) -> Option<Vec<State<'a>>> {
@@ -999,7 +976,7 @@ pub fn schedule_body<'a>(
     // At the top of a process, `break` is what makes it stop: desc.md:37, "may
     // stop (reach terminal state)". Inside a nested loop it means leave that
     // loop, which is what the `brk` parameter carries down.
-    let entry = schedule(body, Target::Exit, Target::Halt, &mut built, pipe_of, port_of, sync_mem_of, sink)?;
+    let entry = schedule(body, Target::Exit, Target::Halt, &mut built, pipe_of, sync_mem_of, sink)?;
 
     let entry = match entry {
         Target::State(ix) => ix,
@@ -1405,8 +1382,6 @@ pub fn lower_blocking(
 ) -> Option<crate::ir::Module> {
     let globals = env.keys().cloned()
         .chain(low.pipes.iter().map(|p| p.name.clone()))
-        .chain(low.port_ins.iter().map(|p| p.name.clone()))
-        .chain(low.port_outs.iter().map(|p| p.name.clone()))
         .chain(low.syms.funcs.keys().cloned())
         .chain(low.syms.structs.keys().cloned())
         .chain(low.syms.enums.keys().cloned())
@@ -1446,28 +1421,7 @@ pub fn lower_blocking(
     // below and must outlive them, which is why it is bound here.
     let hoisted = hoist_sync_reads(body, &sync_mem_of);
     let body = &hoisted.stmts[..];
-    // `@rcv`/`@send` reach a `port` by the same names they reach a pipe by, so
-    // the scheduler has to be able to tell which it is looking at.
-    let port_names: Vec<(String, bool)> = low
-        .port_ins
-        .iter()
-        .map(|p| (p.name.clone(), true))
-        .chain(low.port_outs.iter().map(|p| (p.name.clone(), false)))
-        .collect();
-    let port_of = |n: &str| {
-        port_names.iter().position(|(name, _)| name == n).map(|ix| {
-            let (_, is_input) = port_names[ix];
-            // Re-indexed into whichever list it came from: the two are separate
-            // vectors and a `BarrierOn::Port` names a position in one of them.
-            let own = if is_input {
-                ix
-            } else {
-                ix - port_names.iter().filter(|(_, i)| *i).count()
-            };
-            (own, is_input)
-        })
-    };
-    let states_sched = schedule_body(body, &pipe_of, &port_of, &sync_mem_of, sink)?;
+    let states_sched = schedule_body(body, &pipe_of, &sync_mem_of, sink)?;
     let n_states = states_sched.len();
 
     // Reject a pipe used in a direction it was not declared for.
@@ -1476,11 +1430,7 @@ pub fn lower_blocking(
             Some(b) => b,
             None => continue,
         };
-        let Some(pipe_ix) = barrier.pipe() else {
-            // A port barrier had its direction settled when the name was
-            // resolved, because a port's direction is which list it is in.
-            continue;
-        };
+        let pipe_ix = barrier.pipe();
         let pipe = &low.pipes[pipe_ix];
         if barrier.is_recv != pipe.is_input {
             let what = if pipe.is_input { "received from" } else { "sent to" };
@@ -1596,8 +1546,6 @@ pub fn lower_blocking(
         // costs its cycle and no more.
         let handshake = match barrier.on {
             BarrierOn::Pipe(ix) => Some(low.pipes[ix].movable.expect("computed once above")),
-            BarrierOn::Port(pix) if barrier.is_recv => Some(low.port_ins[pix].en),
-            BarrierOn::Port(_) => None,
         };
         let fire = match handshake {
             None => in_st[k],
@@ -1729,8 +1677,6 @@ pub fn lower_blocking(
     // because a port has no entries to push into -- the wire IS the offer.
     //
     // Per port: which state offered, what it offered, and on which branch.
-    let mut port_sends: Vec<Vec<(usize, ValueId, Option<ValueId>)>> =
-        vec![Vec::new(); low.port_outs.len()];
 
     // A memory's write port is per-state exactly as a `var` is: the address
     // and data a state computed take effect only when that state fires.
@@ -1761,7 +1707,7 @@ pub fn lower_blocking(
             // so anything else consuming from it here would be a second
             // transfer in a cycle that has one. Marking it used is what makes
             // `@drop(p)` beside `@rcv(p)` an error instead of a no-op.
-            low.pipes[ix].used = st.barrier.as_ref().is_some_and(|b| b.pipe() == Some(ix));
+            low.pipes[ix].used = st.barrier.as_ref().is_some_and(|b| b.pipe() == ix);
             low.pipes[ix].sent = None;
             low.pipes[ix].send_guard = None;
         }
@@ -1773,10 +1719,6 @@ pub fn lower_blocking(
         }
         for local in &locals {
             env.insert(local.name.clone(), Binding::variable(local.held, local.ty.clone()));
-        }
-        for port in low.port_outs.iter_mut() {
-            port.sent = None;
-            port.send_guard = None;
         }
         // Every state starts its write ports over. A port a state took would
         // otherwise still be in the environment for the next one, and a
@@ -1847,12 +1789,6 @@ pub fn lower_blocking(
                 BarrierOn::Pipe(ix) => {
                     let pipe = low.pipes[ix].clone();
                     (pipe.item.expect("an input pipe has an item"), pipe.ty)
-                }
-                // One entry, read straight off the wire: a `port` has no slot
-                // to skid into, so there is no pair to select from.
-                BarrierOn::Port(pix) => {
-                    let port = low.port_ins[pix].clone();
-                    (port.data, port.ty)
                 }
             };
             let declaration = barrier.declaration.as_ref().expect("a receive has a declaration");
@@ -1986,7 +1922,7 @@ pub fn lower_blocking(
         // does NOT contribute to `fires`, which is what "does not wait" means.
         for (ix, uses) in nonblocking.iter_mut().enumerate() {
             let used_here = low.pipes[ix].used;
-            let barriered_here = st.barrier.as_ref().is_some_and(|b| b.pipe() == Some(ix));
+            let barriered_here = st.barrier.as_ref().is_some_and(|b| b.pipe() == ix);
             if !used_here || barriered_here {
                 continue;
             }
@@ -2046,11 +1982,6 @@ pub fn lower_blocking(
                     var_writes[ix].push((k, v));
                 }
         }
-        for (port, sends) in low.port_outs.iter().zip(port_sends.iter_mut()) {
-            if let Some(v) = port.sent {
-                sends.push((k, v, port.send_guard));
-            }
-        }
         for (ix, writes) in mem_writes.iter_mut().enumerate() {
             for slot in 0..low.mem_slots(ix) {
                 if let Some(p) = low.write_slot(ix, slot, &env) {
@@ -2063,9 +1994,6 @@ pub fn lower_blocking(
             let barrier = st.barrier.as_ref().expect("a value implies a barrier");
             let (name, want) = match barrier.on {
                 BarrierOn::Pipe(ix) => (low.pipes[ix].name.clone(), low.pipes[ix].ty.clone()),
-                BarrierOn::Port(pix) => {
-                    (low.port_outs[pix].name.clone(), low.port_outs[pix].ty.clone())
-                }
             };
             // The send is not a statement as far as lowering is concerned --
             // the scheduler took it apart -- so its anchor has to be pushed
@@ -2090,16 +2018,6 @@ pub fn lower_blocking(
             }
             match barrier.on {
                 BarrierOn::Pipe(ix) => send_values.push((ix, k, v)),
-                // No guard: a scheduled send is the whole of what its state
-                // does, so the state firing is the condition and there is no
-                // branch inside it to narrow to.
-                BarrierOn::Port(pix) => {
-                    if low.port_outs[pix].sent.is_some() {
-                        sink.err_span(low.here(), format!("`{}` is sent to more than once in one cycle", name));
-                        return None;
-                    }
-                    port_sends[pix].push((k, v, None));
-                }
             }
             if let Some(depth) = depth {
                 low.pop_anchor(depth);
@@ -2167,7 +2085,7 @@ pub fn lower_blocking(
         let mut asks: Vec<ValueId> = states_sched
             .iter()
             .enumerate()
-            .filter(|(_, s)| s.barrier.as_ref().is_some_and(|b| b.pipe() == Some(ix)))
+            .filter(|(_, s)| s.barrier.as_ref().is_some_and(|b| b.pipe() == ix))
             .map(|(k, _)| fires[k])
             .collect();
         asks.extend(uses);
@@ -2451,31 +2369,6 @@ pub fn lower_blocking(
         low.mems[ix].read = vec![crate::ir::ReadPort { addr, en }];
     }
 
-    for (port, sends) in low.port_outs.clone().into_iter().zip(port_sends.clone()) {
-        // A port nothing sent to still drives: zero, with the enable low. An
-        // output left undriven would be a floating wire.
-        let mut value = low.emit(port.ty.clone(), Op::Const(0));
-        let mut enable = low.emit(Ty::BOOL, Op::Const(0));
-        for (k, v, guard) in &sends {
-            // FIRING, not merely being in the state. A state with a barrier
-            // does its work in the cycle that barrier completes, so a port it
-            // sends to is sent to then and not while it is still waiting --
-            // and a send written inside an `if` happens on that branch only.
-            let asks = match guard {
-                None => fires[*k],
-                Some(g) => low.emit(Ty::BOOL, Op::Bin { op: BinOp::And, lhs: fires[*k], rhs: *g }),
-            };
-            value = low.emit(
-                port.ty.clone(),
-                Op::Mux { cond: asks, then_val: *v, else_val: value },
-            );
-            enable = low.emit(Ty::BOOL, Op::Bin { op: BinOp::Or, lhs: enable, rhs: asks });
-        }
-        low.name_value_safe(value, port.name.clone());
-        low.name_value_safe(enable, format!("{}_en", port.name));
-        drivers.push((port.data_port, value));
-        drivers.push((port.en_port, enable));
-    }
 
     for (port_id, name) in &out_ports {
         match env.get(name).and_then(|b| b.value) {
@@ -2515,8 +2408,10 @@ pub fn lower_blocking(
     let asserts = std::mem::take(&mut low.asserts);
     let params = std::mem::take(&mut low.params);
     let mems = std::mem::take(&mut low.mems);
+    let calls: Vec<String> = low.calls.iter().cloned().collect();
     let (values, ports) = low.take_values();
     Some(crate::ir::Module {
+        calls,
         params,
         asserts,
         mems,

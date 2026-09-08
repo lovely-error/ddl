@@ -53,11 +53,13 @@ pub struct Loader {
     seen: HashSet<PathBuf>,
     files: Vec<Loaded>,
     bad: Vec<BadImport>,
+    /// Display paths of the files named on the command line.
+    roots: Vec<String>,
 }
 
 impl Loader {
     pub fn new(search: Vec<PathBuf>) -> Self {
-        Loader { search, seen: HashSet::new(), files: Vec::new(), bad: Vec::new() }
+        Loader { search, seen: HashSet::new(), files: Vec::new(), bad: Vec::new(), roots: Vec::new() }
     }
 
     /// Reads `path` and everything it imports, transitively.
@@ -68,6 +70,7 @@ impl Loader {
     pub fn add_root(&mut self, path: &Path) -> Result<(), String> {
         match std::fs::read_to_string(path) {
             Ok(text) => {
+                self.roots.push(display(path));
                 self.load(path, text);
                 Ok(())
             }
@@ -153,12 +156,14 @@ impl Loader {
     /// Both are returned: an unresolved import is an error, but the files that
     /// did load still carry the spans the diagnostic needs.
     pub fn finish(self) -> (SourceMap, Vec<Diag>) {
-        let map = SourceMap::from_rewritten(
+        let roots = self.roots.clone();
+        let mut map = SourceMap::from_rewritten(
             self.files
                 .into_iter()
                 .map(|f| (f.path, f.text, Some(f.original)))
                 .collect(),
         );
+        map.mark_roots(&roots);
         let diags = self
             .bad
             .iter()

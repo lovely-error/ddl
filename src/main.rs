@@ -41,6 +41,22 @@ OPTIONS:
                     the declarations after precedence resolution, or `dot`
                     Graphviz of what each `graph` connects to what.
                     `--check` applies to `v` only.
+    --export <a>,<b>
+                    these modules present the FIFO interface a person wires up:
+                    `p_can_receive`/`p_receive_en`/`p_data_write_in` on a pipe
+                    they consume, `p_has_data`/`p_drop_item`/`p_data_read_out`
+                    on one they produce. The module's own logic keeps its shape
+                    under the name `<name>_core`, and the name it was declared
+                    with becomes a wrapper holding the adapters.
+                    Without this the compiler picks the one module nothing else
+                    instantiates or calls, among the files named here. If
+                    several qualify it names them and stops, rather than
+                    choosing which module the build is for.
+    --bare-export <a>,<b>
+                    these keep the raw salt ports instead: two gray-code
+                    pointers and a packed pair of entries, exactly as the
+                    lowering produces them. For someone who would rather speak
+                    the protocol directly than through a FIFO.
     --lvt-bram      build a `bram` that has more than one write port out of
                     one-write blocks: one bank per write port, replicated per
                     read port, and a live value table saying which bank holds
@@ -80,6 +96,7 @@ struct BuildArgs {
     check_only: bool,
     emit: Emit,
     lvt_bram: bool,
+    export: ddl::ir_export::ExportFlags,
 }
 
 fn parse_build_args(args: &[String]) -> Result<BuildArgs, String> {
@@ -89,6 +106,7 @@ fn parse_build_args(args: &[String]) -> Result<BuildArgs, String> {
     let mut check_only = false;
     let mut emit = Emit::Verilog;
     let mut lvt_bram = false;
+    let mut export = ddl::ir_export::ExportFlags::default();
     let mut ix = 0;
     while ix < args.len() {
         match args[ix].as_str() {
@@ -107,6 +125,21 @@ fn parse_build_args(args: &[String]) -> Result<BuildArgs, String> {
                 }
             }
             "--check" => check_only = true,
+            "--export" | "--bare-export" => {
+                let flag = args[ix].clone();
+                ix += 1;
+                match args.get(ix) {
+                    Some(list) => {
+                        let names = split_names(list, &flag)?;
+                        if flag == "--export" {
+                            export.export.extend(names);
+                        } else {
+                            export.bare.extend(names);
+                        }
+                    }
+                    None => return Err(format!("{} needs a module name", flag)),
+                }
+            }
             "--lvt-bram" => lvt_bram = true,
             other if other.starts_with("--emit=") => {
                 emit = match &other["--emit=".len()..] {
@@ -132,7 +165,23 @@ fn parse_build_args(args: &[String]) -> Result<BuildArgs, String> {
     if inputs.is_empty() {
         return Err("no input file given".to_string());
     }
-    Ok(BuildArgs { inputs, include, output, check_only, emit, lvt_bram })
+    Ok(BuildArgs { inputs, include, output, check_only, emit, lvt_bram, export })
+}
+
+/// Splits `a,b,c` into names, refusing an empty one.
+///
+/// An empty entry is almost always a stray comma, and silently dropping it
+/// would export something other than what was asked for.
+fn split_names(list: &str, flag: &str) -> Result<Vec<String>, String> {
+    let mut out = Vec::new();
+    for part in list.split(',') {
+        let name = part.trim();
+        if name.is_empty() {
+            return Err(format!("{} has an empty name in `{}`", flag, list));
+        }
+        out.push(name.to_string());
+    }
+    Ok(out)
 }
 
 /// Loads the inputs and everything they import.
@@ -167,6 +216,7 @@ fn run_build(args: &[String]) -> ExitCode {
     let opts = EmitOptions {
         regenerate_cmd: regenerate_cmd(&args),
         lvt_bram: args.lvt_bram,
+        export: args.export.clone(),
     };
 
     // `--check` compares against a checked-in generated file, and only the
@@ -308,6 +358,18 @@ fn regenerate_cmd(args: &BuildArgs) -> String {
     if let Some(out) = &args.output {
         cmd.push_str(" -o ");
         cmd.push_str(out);
+    }
+    // The export selection changes which module the file presents, so a
+    // banner that left it out would name a command that does not reproduce
+    // the file it heads.
+    for (flag, names) in [("--export", &args.export.export), ("--bare-export", &args.export.bare)] {
+        if names.is_empty() {
+            continue;
+        }
+        cmd.push(' ');
+        cmd.push_str(flag);
+        cmd.push(' ');
+        cmd.push_str(&names.join(","));
     }
     cmd
 }
