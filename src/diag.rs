@@ -82,6 +82,15 @@ struct FileInfo {
     /// Index into `line_starts` of this file's first line, so a line number
     /// can be reported relative to the file rather than to the buffer.
     first_line: usize,
+    /// Named on the command line, rather than reached by an `import`.
+    ///
+    /// What an invocation is FOR comes from the files the author asked for.
+    /// An import is a dependency: its declarations are emitted, because
+    /// something needs them, but none of them is what the build is about.
+    /// Everything is a root until a loader says otherwise, so a `SourceMap`
+    /// built straight from text -- every test does this -- behaves the way
+    /// its single file being named on a command line would.
+    is_root: bool,
 }
 
 pub struct SourceMap {
@@ -138,6 +147,7 @@ impl SourceMap {
                 path,
                 start: text.len() as u32,
                 first_line: line_starts.len() - 1,
+                is_root: true,
             });
             let base = text.len();
             text.push_str(&body);
@@ -192,6 +202,19 @@ impl SourceMap {
     /// The path a diagnostic at this offset should name.
     pub fn path_at(&self, offset: u32) -> &str {
         &self.files[self.file_at(offset)].path
+    }
+
+    /// Whether this offset is in a file the author named on the command line.
+    pub fn is_root_at(&self, offset: u32) -> bool {
+        self.files[self.file_at(offset)].is_root
+    }
+
+    /// Records which files were roots. Anything not listed became part of the
+    /// buffer through an `import`.
+    pub fn mark_roots(&mut self, roots: &[String]) {
+        for info in &mut self.files {
+            info.is_root = roots.iter().any(|r| *r == info.path);
+        }
     }
 
     /// A span from a file-relative position, which is what a stage running

@@ -5,7 +5,7 @@ use ddl::parse::anumspan_to_str;
 #[test]
 fn extracted_ast_owns_identifiers_and_string_literals() {
     let decls = {
-        let map = SourceMap::new("owned.ddl", "process owned (o: port out u8)\n  loop\n    @assert(1'b1, \"owned message\")\n    @try_send(o, 8'd1)\n");
+        let map = SourceMap::new("owned.ddl", "process owned (o: buffer out u8)\n  loop\n    @assert(1'b1, \"owned message\")\n    @try_send(o, 8'd1)\n");
         ddl::driver::parse_source(&map).unwrap().decls
     };
     // Both identifier formatting and string literal formatting used to read

@@ -6,40 +6,70 @@ This guide explains how to integrate DDL-generated modules into existing FPGA or
 
 ## What You Will Learn
 
-- How to drive physical FPGA pins (LEDs, buttons, streaming wires) using `port`.
+- What a DDL module looks like from the outside, and how to drive it.
 - How to instantiate external or vendor Verilog IP inside a DDL `graph` using `extern`.
-- How to bridge DDL's Gray-Code salt protocol to standard **AMBA AXI4-Stream** master and slave interfaces.
+- How to drive physical FPGA pins using `wire`.
+- How to bridge to **AMBA AXI4-Stream** — which, at the boundary, is renaming.
 
 ---
 
-## 1. Physical Hardware Pins (`port`)
+## 1. The boundary is a FIFO
 
-When communicating with external board hardware (e.g. GPIO pins, pushbuttons, LEDs, UART wires), the other side cannot be backpressured: an input pin changes whether your logic is ready or not.
+Internally, DDL connects two compiled modules with a gray-code pointer protocol (see [The Gray-Code Salt Protocol](../salt-protocol.md)). That protocol is between two modules the compiler wrote, and it never reaches you.
 
-In DDL, direct wire connections are declared using **`port`**:
+Every boundary you wire up by hand — an `extern`, or the module you asked the compiler to export — presents an ordinary FIFO instead. For a pipe `p` carrying `W` bits:
 
-```ddl
-process blinker (btn: port in u1, led: port out u1)
-  var state: u1 = 1'b0
-  loop
-    let b = @rcv(btn)
-    if b then
-      state = ~state
-    @send(led, state)
+| the module **consumes** `p` (`buffer in`) | dir | meaning |
+| --- | --- | --- |
+| `p_can_receive` | output | there is room |
+| `p_receive_en` | input | write `p_data_write_in` this cycle |
+| `p_data_write_in [W-1:0]` | input | the item |
+
+| the module **produces** `p` (`buffer out`) | dir | meaning |
+| --- | --- | --- |
+| `p_has_data` | output | an item is available |
+| `p_drop_item` | input | I took it; advance |
+| `p_data_read_out [W-1:0]` | output | the item |
+
+That is `!full`/`wr_en`/`wr_data` and `!empty`/`rd_en`/`rd_data`, with first-word-fall-through: the item is on `p_data_read_out` while `p_has_data` is high, and stays there, unchanged, until you raise `p_drop_item`. Raise `p_receive_en` only while `p_can_receive` is high, and `p_drop_item` only while `p_has_data` is high — the same rule any FIFO has.
+
+### Driving one
+
+```verilog
+// Offer whenever it has room; take whenever it has one.
+mul3 u_dut (
+  .clk               (clk),
+  .rst_n             (rst_n),
+  .src_can_receive   (src_can_receive),
+  .src_receive_en    (src_can_receive && have_work),
+  .src_data_write_in (sample),
+  .dst_has_data      (dst_has_data),
+  .dst_drop_item     (dst_has_data),
+  .dst_data_read_out (result)
+);
 ```
 
-### Generated Port Interfaces:
-A `port` emits raw data and enable signals without FIFO storage or salt pointers:
-- `btn: port in u1` becomes input wires: `btn` and `btn_en`.
-- `led: port out u1` becomes output wires: `led` and `led_en`.
+`tests/gowin/sequence_top.v` is this pattern against real hardware.
 
-If `btn_en` is tied high (e.g. `assign btn_en = 1'b1;`), the process reads the button state every cycle. When a process consists entirely of `port` interfaces, it compiles into a standard synchronous Verilog module.
+### Choosing what gets exported
+
+The compiler works out which module the build is for: a **root** is one that nothing else instantiates or calls, counting only declarations in the files you named on the command line. With one root, no flag is needed. With several, it names them and asks:
+
+```bash
+ddl build src.ddl -o src.v --export top          # this one presents a FIFO
+ddl build src.ddl -o src.v --export a,b,c        # several, comma-separated
+ddl build src.ddl -o src.v --bare-export top     # keep the raw salt ports
+```
+
+The file it writes is the target and everything the target uses, transitively — not every declaration it compiled. Two unrelated pipelines in one source produce two different files depending on which you ask for, and an `import` you never call contributes nothing to either.
+
+The exported module's logic keeps its shape and takes the name `<name>_core`. The module under the original name is the wrapper: the FIFO ports, one compiler-written adapter per pipe, and one instance of the core. Use `--bare-export` if you would rather speak the pointer protocol directly — it emits exactly what the lowering produces.
 
 ---
 
 ## 2. Instantiating External Verilog Modules (`extern`)
 
-To incorporate vendor IP (e.g., PLLs, memory controllers, Ethernet MACs) or pre-existing hand-written Verilog modules into a DDL system, declare them with `extern`:
+To incorporate vendor IP (PLLs, memory controllers, Ethernet MACs) or pre-existing hand-written Verilog into a DDL system, declare it with `extern`:
 
 ```ddl
 extern psram_ctrl (cmd: buffer in u32, rsp: buffer out u32)
@@ -58,121 +88,74 @@ graph top_system (host_in: buffer in u32, host_out: buffer out u32)
   worker(from_psram, host_out)
 ```
 
-### Synthesis Behavior:
-- The DDL compiler type-checks all channel connections between `worker` and `psram_ctrl`.
-- In the generated `top_system.v`, the compiler instantiates `psram_ctrl` and automatically connects its `<p>_wsalt`, `<p>_rsalt`, and `<p>_data` ports to internal wires.
-- No dummy body is generated for `psram_ctrl`, allowing your synthesizer to resolve it against your vendor IP or external Verilog sources.
+The connections are type-checked, and no body is generated: your synthesizer resolves `psram_ctrl` against your own sources. What it has to match is a FIFO on each pipe:
+
+```verilog
+module psram_ctrl (
+  input         clk,
+  input         rst_n,
+  output        cmd_can_receive,
+  input         cmd_receive_en,
+  input  [31:0] cmd_data_write_in,
+  output        rsp_has_data,
+  input         rsp_drop_item,
+  output [31:0] rsp_data_read_out
+);
+```
+
+Inside `top_system`, the compiler places an adapter between each internal pipe and the extern — `ddl_salt_to_wport_32` on the way in, `ddl_rport_to_salt_32` on the way out. They are modules it writes, in the same sense `@merge` and `@split` are.
+
+`examples/fanout.ddl` instantiates one, and `examples/externs.v` is the hand-written counterpart: a stub that accepts everything, and now four lines of it.
 
 ---
 
-## 3. Bridging to AMBA AXI4-Stream (`valid`/`ready`)
+## 3. Physical Hardware Pins (`wire`)
 
-Many SoC interconnects (e.g., Xilinx AXI-Stream, Intel Avalon-ST) use traditional `valid`/`ready` handshakes. Bridging between DDL and AXI-Stream requires lightweight protocol adapters.
+A pin cannot be backpressured — an input changes whether your logic is ready or not — so it is not a pipe. In DDL a bare signal is a **`wire`**, and because there is nothing on it to wait for, it is legal only where nothing waits: an `extern` or a `graph`.
 
-### Adapter 1: DDL Buffer $\rightarrow$ AXI4-Stream Master
+```ddl
+extern pll (locked: wire out u1, cfg: buffer in u32)
 
-Use this module when a DDL block produces data that must be streamed into an external AXI-Stream slave IP:
-
-```verilog
-module ddl_to_axis #(
-    parameter WIDTH = 32
-)(
-    input  wire                 clk,
-    input  wire                 rst_n,
-
-    // DDL Buffer Interface (Consumer side)
-    input  wire [1:0]           ddl_wsalt,
-    output wire [1:0]           ddl_rsalt,
-    input  wire [2*WIDTH-1:0]   ddl_data,
-
-    // AXI4-Stream Master Interface
-    output wire                 m_axis_tvalid,
-    input  wire                 m_axis_tready,
-    output wire [WIDTH-1:0]     m_axis_tdata
-);
-
-  reg [1:0] rsalt_q;
-
-  // Buffer is not empty when write salt != read salt
-  wire empty = (ddl_wsalt == rsalt_q);
-  assign m_axis_tvalid = !empty;
-
-  // Select slot based on current read salt
-  wire ridx = rsalt_q[0] ^ rsalt_q[1];
-  assign m_axis_tdata = ridx ? ddl_data[2*WIDTH-1:WIDTH] : ddl_data[WIDTH-1:0];
-
-  // Transfer commits when both valid and ready are high
-  wire transfer = m_axis_tvalid && m_axis_tready;
-  wire [1:0] toggle = ridx ? 2'd2 : 2'd1;
-
-  assign ddl_rsalt = rsalt_q;
-
-  always @(posedge clk) begin
-    if (!rst_n) begin
-      rsalt_q <= 2'b00;
-    end else if (transfer) begin
-      rsalt_q <= rsalt_q ^ toggle;
-    end
-  end
-
-endmodule
+graph board (cfg: buffer in u32, lock_led: wire out u1)
+  pll(lock_led, cfg)
 ```
+
+- `x: wire in T` emits one input `x` of `T`'s width; `y: wire out T` emits one output. There is no enable beside it — a wire is the signal and nothing else.
+- A graph routes a wire straight through to its own boundary, and checks that exactly one instance drives each output. Two drivers on one wire is not a race the protocol arbitrates; it is an `x`.
+- A `process` or `sequence` cannot take one. Their parameters are pipes and constant parameters. This is the line `desc.md` draws — compute in DDL, I/O in Verilog — and it is what stops a body from hand-rolling a protocol over a raw wire.
+
+So pin-level logic lives in an `extern` you write, and it talks to your DDL datapath through a FIFO.
 
 ---
 
-### Adapter 2: AXI4-Stream Slave $\rightarrow$ DDL Buffer
+## 4. Bridging to AMBA AXI4-Stream (`valid`/`ready`)
 
-Use this module when an external AXI-Stream master IP streams data into a downstream DDL block:
+Many SoC interconnects use `valid`/`ready`. Against the FIFO boundary this is a **renaming**, with no state and no arithmetic — the flag is `valid`, the enable is `valid && ready`, and the data is the data.
+
+### DDL producer → AXI4-Stream master
+
+For an exported module's `buffer out`:
 
 ```verilog
-module axis_to_ddl #(
-    parameter WIDTH = 32
-)(
-    input  wire                 clk,
-    input  wire                 rst_n,
-
-    // AXI4-Stream Slave Interface
-    input  wire                 s_axis_tvalid,
-    output wire                 s_axis_tready,
-    input  wire [WIDTH-1:0]     s_axis_tdata,
-
-    // DDL Buffer Interface (Producer side)
-    output wire [1:0]           ddl_wsalt,
-    input  wire [1:0]           ddl_rsalt,
-    output wire [2*WIDTH-1:0]   ddl_data
-);
-
-  reg [1:0]         wsalt_q;
-  reg [WIDTH-1:0]   slot0;
-  reg [WIDTH-1:0]   slot1;
-
-  // Buffer is full when wsalt_q == ~ddl_rsalt
-  wire full = (wsalt_q == (~ddl_rsalt));
-  assign s_axis_tready = !full;
-
-  wire widx = wsalt_q[0] ^ wsalt_q[1];
-  wire transfer = s_axis_tvalid && s_axis_tready;
-  wire [1:0] toggle = widx ? 2'd2 : 2'd1;
-
-  assign ddl_wsalt = wsalt_q;
-  assign ddl_data  = {slot1, slot0};
-
-  always @(posedge clk) begin
-    if (!rst_n) begin
-      wsalt_q <= 2'b00;
-      slot0   <= {WIDTH{1'b0}};
-      slot1   <= {WIDTH{1'b0}};
-    end else if (transfer) begin
-      wsalt_q <= wsalt_q ^ toggle;
-      if (!widx)
-        slot0 <= s_axis_tdata;
-      else
-        slot1 <= s_axis_tdata;
-    end
-  end
-
-endmodule
+assign m_axis_tvalid = dst_has_data;
+assign m_axis_tdata  = dst_data_read_out;
+assign dst_drop_item = m_axis_tvalid && m_axis_tready;
 ```
 
-### System Integration Summary:
-By placing `axis_to_ddl` at your SoC ingress and `ddl_to_axis` at your egress, the entire core datapath of your accelerator operates within DDL's mathematically guaranteed, loop-free dataflow domain.
+### AXI4-Stream slave → DDL consumer
+
+For an exported module's `buffer in`:
+
+```verilog
+assign s_axis_tready    = src_can_receive;
+assign src_data_write_in = s_axis_tdata;
+assign src_receive_en   = s_axis_tvalid && s_axis_tready;
+```
+
+Both directions are legal AXI: `tvalid` here is a function of the module's registered pointer and never of `tready`, so there is no combinational path from `ready` to `valid` — the loop AXI forbids and the one the pointer protocol was built to avoid.
+
+`tlast`, `tkeep` and `tuser` are outside what a DDL pipe carries. Put them in the payload type if the datapath needs them, and drive them alongside.
+
+### System Integration Summary
+
+With those six assignments at your SoC ingress and egress, the entire core datapath of your accelerator operates within DDL's loop-free dataflow domain, and nothing you wrote had to implement a handshake.

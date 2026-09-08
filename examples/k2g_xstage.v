@@ -5,28 +5,6 @@
 // Verilog-2005. No `$clog2`, no width casts in expressions and no
 // function calls: all three make GowinSynthesis exit with an empty log.
 
-module uop_nop (
-    output [127:0] u
-);
-
-  assign u = 128'd0;
-
-endmodule
-
-module uop_fault (
-    input  [4:0]   cause,
-    input  [15:0]  cp,
-    output [127:0] u
-);
-
-  wire [127:0] f = 128'd0;
-  wire [127:0] n5 = {5'h12, f[122:0]};
-  wire [127:0] n8 = {n5[127:37], cause, n5[31:0]};
-
-  assign u = {n8[127:113], {16'd0, cp}, n8[80:0]};
-
-endmodule
-
 module rdt_is_signed (
     input  [2:0] t,
     output       signed_
@@ -170,7 +148,7 @@ endmodule
 // Built with:
 //   mem_bytes : u32 = 32'h800000
 //
-module k2g_xstage (
+module k2g_xstage_core (
     input          clk,
     input          rst_n,
     input  [1:0]   uops_wsalt,
@@ -533,5 +511,132 @@ module k2g_xstage (
     end
   end
 `endif
+
+endmodule
+
+module ddl_wport_to_salt_128 (
+    input          clk,
+    input          rst_n,
+    output [1:0]   o_wsalt,
+    input  [1:0]   o_rsalt,
+    output [255:0] o_data,
+    output         can_receive,
+    input          receive_en,
+    input  [127:0] data_write_in
+);
+
+  reg [127:0] o_e0;
+  reg [127:0] o_e1;
+  reg [1:0] o_wsalt_q;
+
+  wire o_widx = o_wsalt_q[0] ^ o_wsalt_q[1];
+  wire o_full = o_wsalt_q == (~o_rsalt);
+  wire room = !o_full;
+  wire push = receive_en & room;
+
+  assign can_receive = room;
+  assign o_data = {o_e1, o_e0};
+  assign o_wsalt = o_wsalt_q;
+
+  always @(posedge clk) begin
+    if (!rst_n) begin
+      o_e0 <= 128'd0;
+      o_e1 <= 128'd0;
+      o_wsalt_q <= 2'd0;
+    end else begin
+      o_e0 <= ((push & (!o_widx)) ? data_write_in : o_e0);
+      o_e1 <= ((push & o_widx) ? data_write_in : o_e1);
+      o_wsalt_q <= (push ? (o_wsalt_q ^ (o_widx ? 2'd2 : 2'd1)) : o_wsalt_q);
+    end
+  end
+
+endmodule
+
+module ddl_salt_to_rport_84 (
+    input          clk,
+    input          rst_n,
+    input  [1:0]   i_wsalt,
+    output [1:0]   i_rsalt,
+    input  [167:0] i_data,
+    output         has_data,
+    input          drop_item,
+    output [83:0]  data_read_out
+);
+
+  reg [1:0] rsalt_q;
+
+  wire i_empty = i_wsalt == rsalt_q;
+  wire has_item = !i_empty;
+  wire i_ridx = rsalt_q[0] ^ rsalt_q[1];
+  wire [83:0] i_item = i_ridx ? i_data[167:84] : i_data[83:0];
+  wire take = has_item & drop_item;
+
+  assign data_read_out = i_item;
+  assign has_data = has_item;
+  assign i_rsalt = rsalt_q;
+
+  always @(posedge clk) begin
+    if (!rst_n) begin
+      rsalt_q <= 2'd0;
+    end else begin
+      rsalt_q <= (take ? (rsalt_q ^ (i_ridx ? 2'd2 : 2'd1)) : rsalt_q);
+    end
+  end
+
+endmodule
+
+// Built with:
+//   mem_bytes : u32 = 32'h800000
+//
+module k2g_xstage (
+    input          clk,
+    input          rst_n,
+    output         uops_can_receive,
+    input          uops_receive_en,
+    input  [127:0] uops_data_write_in,
+    output         wb_has_data,
+    input          wb_drop_item,
+    output [83:0]  wb_data_read_out
+);
+
+  wire [1:0] uops_wsalt;
+  wire [1:0] uops_rsalt;
+  wire [255:0] uops_data;
+  wire [1:0] wb_wsalt;
+  wire [1:0] wb_rsalt;
+  wire [167:0] wb_data;
+
+  ddl_wport_to_salt_128 u_uops_adapt (
+    .clk           (clk),
+    .rst_n         (rst_n),
+    .o_wsalt       (uops_wsalt),
+    .o_rsalt       (uops_rsalt),
+    .o_data        (uops_data),
+    .can_receive   (uops_can_receive),
+    .receive_en    (uops_receive_en),
+    .data_write_in (uops_data_write_in)
+  );
+
+  ddl_salt_to_rport_84 u_wb_adapt (
+    .clk           (clk),
+    .rst_n         (rst_n),
+    .i_wsalt       (wb_wsalt),
+    .i_rsalt       (wb_rsalt),
+    .i_data        (wb_data),
+    .has_data      (wb_has_data),
+    .drop_item     (wb_drop_item),
+    .data_read_out (wb_data_read_out)
+  );
+
+  k2g_xstage_core u_k2g_xstage_core (
+    .clk        (clk),
+    .rst_n      (rst_n),
+    .uops_wsalt (uops_wsalt),
+    .uops_rsalt (uops_rsalt),
+    .uops_data  (uops_data),
+    .wb_wsalt   (wb_wsalt),
+    .wb_rsalt   (wb_rsalt),
+    .wb_data    (wb_data)
+  );
 
 endmodule

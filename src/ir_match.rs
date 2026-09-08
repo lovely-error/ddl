@@ -893,6 +893,11 @@ fn inline_body(
         );
     }
 
+    // Recorded here and nowhere else: this is the one place a call is
+    // actually taken, and the edge is what tells the export pass that a `fun`
+    // another `fun` calls is not a root. An inlined call leaves no `Instance`
+    // behind, so `Module.instances` cannot answer this question.
+    low.calls.insert(name.clone());
     low.call_stack.push(name.clone());
     let lowered = lower_stmts(low, &body.body, &mut callee_env, sink);
     low.call_stack.pop();

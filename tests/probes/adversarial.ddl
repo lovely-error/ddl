@@ -58,7 +58,7 @@ process exclusive_match (c: buffer in adversarial_choice, o: buffer out u8)
       .Yes =>
         @try_send(o, 8'd1)
 
-process exclusive_port (c: buffer in u1, o: port out u8)
+process exclusive_port (c: buffer in u1, o: buffer out u8)
   loop
     let flag = @rcv(c)
     if flag then

@@ -14,8 +14,21 @@ use ddl::driver::compile_to_verilog;
 use ddl::verilog::EmitOptions;
 
 fn compile(src: &str) -> String {
+    compile_exporting(src, &[])
+}
+
+/// For a source with several roots, where which one the file is for is a
+/// question the compiler refuses to answer on its own.
+fn compile_exporting(src: &str, targets: &[&str]) -> String {
     let map = SourceMap::new("t.ddl", src);
-    match compile_to_verilog(&map, &EmitOptions::default()) {
+    let opts = EmitOptions {
+        export: ddl::ir_export::ExportFlags {
+            export: targets.iter().map(|s| s.to_string()).collect(),
+            bare: Vec::new(),
+        },
+        ..EmitOptions::default()
+    };
+    match compile_to_verilog(&map, &opts) {
         Ok(v) => v,
         Err(diags) => panic!("compile failed:\n{}", map.render_all(&diags)),
     }
@@ -160,7 +173,7 @@ fn a_narrow_payload_is_padded_below_itself() {
 
 #[test]
 fn a_payload_free_variant_is_its_tag_shifted_up() {
-    let v = compile(&format!(
+    let v = compile_exporting(&format!(
         "{}{}",
         REQ,
         concat!(
@@ -169,7 +182,7 @@ fn a_payload_free_variant_is_its_tag_shifted_up() {
             "fun stop (o: out req_e)\n",
             "  o = Halt\n",
         )
-    ));
+    ), &["idle", "stop"]);
     assert!(v.contains("assign o = 18'd0;"), "{}", v);
     // Halt is discriminant 3, so 3 << 16.
     assert!(v.contains("18'h30000"), "{}", v);

@@ -41,11 +41,28 @@ impl Scratch {
 }
 
 fn build(roots: &[String], search: Vec<PathBuf>) -> Result<String, String> {
+    build_exporting(roots, search, &[])
+}
+
+/// For a program with several roots, where which one it is for is a question
+/// the compiler refuses to answer on its own.
+fn build_exporting(
+    roots: &[String],
+    search: Vec<PathBuf>,
+    targets: &[&str],
+) -> Result<String, String> {
     let (map, load_diags) = load_program(roots, search)?;
     if !load_diags.is_empty() {
         return Err(map.render_all(&load_diags));
     }
-    compile_to_verilog(&map, &EmitOptions::default()).map_err(|d| map.render_all(&d))
+    let opts = EmitOptions {
+        export: ddl::ir_export::ExportFlags {
+            export: targets.iter().map(|s| s.to_string()).collect(),
+            bare: Vec::new(),
+        },
+        ..EmitOptions::default()
+    };
+    compile_to_verilog(&map, &opts).map_err(|d| map.render_all(&d))
 }
 
 const ADDER: &str = "fun adder (a: u8, b: u8, sum: out u8)\n  sum = a + b\n";
@@ -239,7 +256,10 @@ fn one_banner_covers_the_whole_program() {
     let a = s.write("a.ddl", ADDER);
     let b = s.write("b.ddl", "fun other (a: u8, o: out u8)\n  o = a\n");
 
-    let v = build(&[a, b], Vec::new()).expect("should compile");
+    // Two files named on the command line, one declaration each: which of
+    // them the build is for is a question only the author can answer.
+    let v = build_exporting(&[a, b], Vec::new(), &["adder", "other"])
+        .expect("should compile");
     assert_eq!(v.matches("GENERATED FILE").count(), 1, "{}", v);
     assert_eq!(v.matches("endmodule").count(), 2, "{}", v);
 }

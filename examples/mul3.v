@@ -5,7 +5,7 @@
 // Verilog-2005. No `$clog2`, no width casts in expressions and no
 // function calls: all three make GowinSynthesis exit with an empty log.
 
-module mul3 (
+module mul3_core (
     input         clk,
     input         rst_n,
     input  [1:0]  src_wsalt,
@@ -63,5 +63,129 @@ module mul3 (
       wide_s2 <= (shift ? wide : wide_s2);
     end
   end
+
+endmodule
+
+module ddl_wport_to_salt_16 (
+    input         clk,
+    input         rst_n,
+    output [1:0]  o_wsalt,
+    input  [1:0]  o_rsalt,
+    output [31:0] o_data,
+    output        can_receive,
+    input         receive_en,
+    input  [15:0] data_write_in
+);
+
+  reg [15:0] o_e0;
+  reg [15:0] o_e1;
+  reg [1:0] o_wsalt_q;
+
+  wire o_widx = o_wsalt_q[0] ^ o_wsalt_q[1];
+  wire o_full = o_wsalt_q == (~o_rsalt);
+  wire room = !o_full;
+  wire push = receive_en & room;
+
+  assign can_receive = room;
+  assign o_data = {o_e1, o_e0};
+  assign o_wsalt = o_wsalt_q;
+
+  always @(posedge clk) begin
+    if (!rst_n) begin
+      o_e0 <= 16'd0;
+      o_e1 <= 16'd0;
+      o_wsalt_q <= 2'd0;
+    end else begin
+      o_e0 <= ((push & (!o_widx)) ? data_write_in : o_e0);
+      o_e1 <= ((push & o_widx) ? data_write_in : o_e1);
+      o_wsalt_q <= (push ? (o_wsalt_q ^ (o_widx ? 2'd2 : 2'd1)) : o_wsalt_q);
+    end
+  end
+
+endmodule
+
+module ddl_salt_to_rport_32 (
+    input         clk,
+    input         rst_n,
+    input  [1:0]  i_wsalt,
+    output [1:0]  i_rsalt,
+    input  [63:0] i_data,
+    output        has_data,
+    input         drop_item,
+    output [31:0] data_read_out
+);
+
+  reg [1:0] rsalt_q;
+
+  wire i_empty = i_wsalt == rsalt_q;
+  wire has_item = !i_empty;
+  wire i_ridx = rsalt_q[0] ^ rsalt_q[1];
+  wire [31:0] i_item = i_ridx ? i_data[63:32] : i_data[31:0];
+  wire take = has_item & drop_item;
+
+  assign data_read_out = i_item;
+  assign has_data = has_item;
+  assign i_rsalt = rsalt_q;
+
+  always @(posedge clk) begin
+    if (!rst_n) begin
+      rsalt_q <= 2'd0;
+    end else begin
+      rsalt_q <= (take ? (rsalt_q ^ (i_ridx ? 2'd2 : 2'd1)) : rsalt_q);
+    end
+  end
+
+endmodule
+
+module mul3 (
+    input         clk,
+    input         rst_n,
+    output        src_can_receive,
+    input         src_receive_en,
+    input  [15:0] src_data_write_in,
+    output        dst_has_data,
+    input         dst_drop_item,
+    output [31:0] dst_data_read_out
+);
+
+  wire [1:0] src_wsalt;
+  wire [1:0] src_rsalt;
+  wire [31:0] src_data;
+  wire [1:0] dst_wsalt;
+  wire [1:0] dst_rsalt;
+  wire [63:0] dst_data;
+
+  ddl_wport_to_salt_16 u_src_adapt (
+    .clk           (clk),
+    .rst_n         (rst_n),
+    .o_wsalt       (src_wsalt),
+    .o_rsalt       (src_rsalt),
+    .o_data        (src_data),
+    .can_receive   (src_can_receive),
+    .receive_en    (src_receive_en),
+    .data_write_in (src_data_write_in)
+  );
+
+  ddl_salt_to_rport_32 u_dst_adapt (
+    .clk           (clk),
+    .rst_n         (rst_n),
+    .i_wsalt       (dst_wsalt),
+    .i_rsalt       (dst_rsalt),
+    .i_data        (dst_data),
+    .has_data      (dst_has_data),
+    .drop_item     (dst_drop_item),
+    .data_read_out (dst_data_read_out)
+  );
+
+  mul3_core u_mul3_core (
+    .clk       (clk),
+    .rst_n     (rst_n),
+    .src_wsalt (src_wsalt),
+    .src_rsalt (src_rsalt),
+    .src_data  (src_data),
+    .dst_wsalt (dst_wsalt),
+    .dst_rsalt (dst_rsalt),
+    .dst_data  (dst_data)
+  );
 
 endmodule

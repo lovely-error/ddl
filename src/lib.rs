@@ -18,7 +18,9 @@ pub mod lex;
 pub mod parse;
 
 pub mod ir;
+pub mod ir_adapt;
 pub mod ir_comb;
+pub mod ir_export;
 pub mod ir_fsm;
 pub mod ir_graph;
 pub mod ir_match;

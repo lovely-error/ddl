@@ -293,7 +293,7 @@ fn the_arity_error_lists_the_pipes_it_wanted() {
             "  dbl(src)\n",
         )
     ));
-    assert!(text.contains("has 2 pipe parameters, but 1 was given"), "{}", text);
+    assert!(text.contains("has 2 parameters, but 1 was given"), "{}", text);
     assert!(text.contains("src: buffer in u16, dst: buffer out u16"), "{}", text);
 }
 
@@ -408,11 +408,26 @@ fn a_graph_can_instantiate_a_module_ddl_did_not_compile() {
         "  dbl(src, mid)\n",
         "  psram(mid, dst)\n",
     ));
-    // Instantiated with the port names the protocol gives it, so a hand-written
-    // module has one spelling to match rather than a convention to remember.
+    // A plain FIFO, and no salt anywhere on it. This is the whole feature:
+    // the hand-written module is an ordinary handshake, not a protocol its
+    // author has to reconstruct from a document.
     assert!(v.contains("psram u_psram ("), "{}", v);
-    assert!(v.contains(".req_wsalt (mid_wsalt),"), "{}", v);
-    assert!(v.contains(".rsp_data  (dst_data)"), "{}", v);
+    for port in [
+        ".req_can_receive",
+        ".req_receive_en",
+        ".req_data_write_in",
+        ".rsp_has_data",
+        ".rsp_drop_item",
+        ".rsp_data_read_out",
+    ] {
+        assert!(v.contains(port), "{} missing from
+{}", port, v);
+    }
+    assert!(!v.contains(".req_wsalt"), "{}", v);
+    assert!(!v.contains(".rsp_data  ("), "{}", v);
+    // The translation is a module the compiler wrote, one per shape.
+    assert!(v.contains("module ddl_salt_to_wport_32 ("), "{}", v);
+    assert!(v.contains("module ddl_rport_to_salt_32 ("), "{}", v);
 }
 
 #[test]
@@ -441,7 +456,7 @@ fn the_connections_to_an_extern_are_still_checked() {
         "graph top (src: buffer in u32, dst: buffer out u32)\n",
         "  psram(src)\n",
     ));
-    assert!(text.contains("pipe parameter"), "{}", text);
+    assert!(text.contains("has 2 parameters, but 1 was given"), "{}", text);
 }
 
 #[test]
@@ -458,16 +473,75 @@ fn two_producers_on_a_pipe_are_refused_even_when_one_is_extern() {
 }
 
 #[test]
-fn an_extern_declares_pipes_and_nothing_else() {
-    // A graph connects pipes. A parameter of any other kind would be a port
-    // the graph has no way to reach, left unconnected in the instantiation --
-    // a floating wire, which is the shape of bug that shows up as a hang.
+fn an_extern_declares_pipes_and_wires_and_nothing_else() {
+    // A graph connects pipes and wires. A parameter of any other kind would be
+    // a port the graph has no way to reach, left unconnected in the
+    // instantiation -- a floating wire, which is the shape of bug that shows
+    // up as a hang.
     let text = compile_err(concat!(
-        "extern pll (lock: port out u1, rsp: buffer out u32)\n",
-        "graph top (dst: buffer out u32)\n",
-        "  pll(dst)\n",
+        "extern pll (lock: inout u1, rsp: buffer out u32)
+",
+        "graph top (dst: buffer out u32)
+",
+        "  pll(dst)
+",
     ));
-    assert!(text.contains("is not a pipe"), "{}", text);
+    assert!(text.contains("is not a pipe or a wire"), "{}", text);
+}
+
+#[test]
+fn an_extern_takes_a_wire_and_the_graph_carries_it_to_its_boundary() {
+    // The whole point of a `wire`: a pin, or a sideband on a piece of vendor
+    // IP, reaching the outside of the design without a handshake wrapped
+    // around it. It is one port of the declared width, and the graph passes it
+    // straight through.
+    let v = compile(concat!(
+        "extern pll (locked: wire out u1, rsp: buffer out u32)
+",
+        "graph top (dst: buffer out u32, lock_led: wire out u1)
+",
+        "  pll(lock_led, dst)
+",
+    ));
+    // The padding is the emitter's column alignment, so match on the
+    // parts rather than the spacing between them.
+    assert!(v.contains("output") && v.contains("lock_led
+);"), "{}", v);
+    assert!(v.contains(".locked") && v.contains("(lock_led)"), "{}", v);
+    // No enable beside it, and no salt: a wire is the bare signal.
+    assert!(!v.contains("lock_led_en"), "{}", v);
+    assert!(!v.contains("lock_led_wsalt"), "{}", v);
+}
+
+#[test]
+fn a_wire_driven_by_two_instances_is_refused() {
+    let text = compile_err(concat!(
+        "extern a (o: wire out u1)
+",
+        "extern b (o: wire out u1)
+",
+        "extern sink_ (i: buffer in u32)
+",
+        "graph top (src: buffer in u32, led: wire out u1)
+",
+        "  a(led)
+",
+        "  b(led)
+",
+        "  sink_(src)
+",
+    ));
+    assert!(text.contains("driven by 2 instances"), "{}", text);
+}
+
+#[test]
+fn a_wire_on_a_process_names_where_a_wire_is_allowed() {
+    let text = compile_err("process p (led: wire out u1, src: buffer in u32)
+  loop
+    let took = @drop(src)
+");
+    assert!(text.contains("is a `wire`, which this declaration cannot take"), "{}", text);
+    assert!(text.contains("only an `extern` or a `graph`"), "{}", text);
 }
 
 // ---- @merge and @split ----------------------------------------------------

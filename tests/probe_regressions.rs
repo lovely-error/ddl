@@ -1,245 +1,9 @@
 //! Behavioral checks of the lowered circuit, independent of emitted names.
 //! The companion Questa runner also checks the emitted Verilog itself.
-use ddl::diag::{DiagSink, SourceMap};
-use ddl::ir::{self, BinOp, CmpOp, Module, Op, UnOp};
-use ddl::lex::TopLevelDecl;
-use ddl::parse::*;
-use std::collections::HashMap;
+mod common;
 
-fn modules(src: &str) -> Vec<Module> {
-    let map = SourceMap::new("regression.ddl", src);
-    let parsed = ddl::driver::parse_source(&map).unwrap();
-    let mut sink = DiagSink::new(&map);
-    let (mut es, mut ss, mut fs, mut ps) = (vec![], vec![], vec![], vec![]);
-    let mut sequences = vec![];
-    for d in &parsed.decls {
-        // All ASTs borrow map until lowering finishes.
-        unsafe {
-            match d {
-                TopLevelDecl::EnumDecl(e) => {
-                    es.push(resolve_precedence_for_enum(map.base_ptr(), e).unwrap())
-                }
-                TopLevelDecl::StructDecl(s) => {
-                    ss.push(resolve_precedence_for_struct(map.base_ptr(), s).unwrap())
-                }
-                TopLevelDecl::FunctionStmt(f) => {
-                    fs.push(resolve_precedence_for_function(map.base_ptr(), f).unwrap())
-                }
-                TopLevelDecl::ProcessStmt(p) => {
-                    ps.push(resolve_precedence_for_process(map.base_ptr(), p).unwrap())
-                }
-                TopLevelDecl::SequenceDecl(s) => {
-                    sequences.push(resolve_precedence_for_sequence(map.base_ptr(), s).unwrap())
-                }
-                _ => panic!("unsupported test declaration"),
-            }
-        }
-    }
-    let syms = ddl::symbols::build(&es, &ss, &fs, &mut sink);
-    let bodies = fs
-        .iter()
-        .map(|f| (anumspan_to_str(&f.name).to_string(), f))
-        .collect();
-    let mut result = vec![];
-    for f in &fs {
-        if let Some(m) = ir::lower_function(&map, &syms, &bodies, f, &mut sink) {
-            result.push(m);
-        }
-    }
-    for p in &ps {
-        if let Some(m) = ir::lower_process(&map, &syms, &bodies, p, &mut sink) {
-            result.push(m);
-        }
-    }
-    for s in &sequences {
-        if let Some(m) = ddl::ir_pipe::lower_sequence(&map, &syms, &bodies, s, &mut sink) {
-            result.push(m);
-        }
-    }
-    let diags = sink.into_diags();
-    assert!(
-        !diags
-            .iter()
-            .any(|d| d.severity == ddl::diag::Severity::Error),
-        "{}",
-        map.render_all(&diags)
-    );
-    result
-}
-
-fn mask(w: u32) -> u128 {
-    u128::MAX >> (128 - w)
-}
-fn signed(v: u128, w: u32) -> i128 {
-    ((v << (128 - w)) as i128) >> (128 - w)
-}
-
-struct Circuit {
-    m: Module,
-    regs: Vec<u128>,
-    inputs: HashMap<String, u128>,
-    memories: Vec<Vec<u128>>,
-    read_outputs: Vec<Vec<u128>>,
-    read_events: Vec<(usize, u128)>,
-}
-impl Circuit {
-    fn new(src: &str, name: &str) -> Self {
-        let m = modules(src).into_iter().find(|m| m.name == name).unwrap();
-        let regs = m.regs.iter().map(|r| r.reset).collect();
-        let memories = m.mems.iter().map(|mem| vec![mem.reset.unwrap_or(0); mem.len as usize]).collect();
-        let read_outputs = m.mems.iter().map(|mem| vec![0; mem.read.len()]).collect();
-        Self {
-            m,
-            regs,
-            inputs: HashMap::new(),
-            memories,
-            read_outputs,
-            read_events: vec![],
-        }
-    }
-    fn set(&mut self, n: &str, v: u128) {
-        self.inputs.insert(n.into(), v);
-    }
-    fn eval(&self) -> Vec<u128> {
-        let mut vs = vec![0u128; self.m.values.len()];
-        for d in &self.m.values {
-            let v = |id: ir::ValueId| vs[id.0 as usize];
-            let width = |id| self.m.value(id).ty.bit_width();
-            let result = match &d.op {
-                Op::Port(p) => *self.inputs.get(&self.m.port(*p).name).unwrap_or(&0),
-                Op::RegRead(i) => self.regs[*i as usize],
-                Op::Const(c) => *c,
-                Op::Bin { op, lhs, rhs } => {
-                    let (a, b) = (v(*lhs), v(*rhs));
-                    match op {
-                        BinOp::Add => a.wrapping_add(b),
-                        BinOp::Sub => a.wrapping_sub(b),
-                        BinOp::Mul => a.wrapping_mul(b),
-                        BinOp::Div => a.checked_div(b).unwrap_or(0),
-                        BinOp::Mod => a.checked_rem(b).unwrap_or(0),
-                        BinOp::And => a & b,
-                        BinOp::Or => a | b,
-                        BinOp::Xor => a ^ b,
-                        BinOp::Shl => {
-                            if b < 128 {
-                                a << b
-                            } else {
-                                0
-                            }
-                        }
-                        BinOp::Shr if self.m.value(*lhs).ty.is_signed() => {
-                            (signed(a, width(*lhs)) >> b.min(127)) as u128
-                        }
-                        BinOp::Shr => {
-                            if b < 128 {
-                                a >> b
-                            } else {
-                                0
-                            }
-                        }
-                    }
-                }
-                Op::Cmp { op, lhs, rhs } => {
-                    let ord = if self.m.value(*lhs).ty.is_signed() {
-                        signed(v(*lhs), width(*lhs)).cmp(&signed(v(*rhs), width(*rhs)))
-                    } else {
-                        v(*lhs).cmp(&v(*rhs))
-                    };
-                    (match op {
-                        CmpOp::Eq => ord.is_eq(),
-                        CmpOp::Ne => !ord.is_eq(),
-                        CmpOp::Lt => ord.is_lt(),
-                        CmpOp::Gt => ord.is_gt(),
-                        CmpOp::Le => !ord.is_gt(),
-                        CmpOp::Ge => !ord.is_lt(),
-                    }) as u128
-                }
-                Op::Un { op, arg } => match op {
-                    UnOp::BitNot => !v(*arg),
-                    UnOp::Neg => 0u128.wrapping_sub(v(*arg)),
-                    UnOp::LogNot => (v(*arg) == 0) as u128,
-                },
-                Op::Slice { arg, lo, .. } => v(*arg) >> lo,
-                Op::DynSlice { arg, base, .. } => v(*arg).checked_shr(v(*base) as u32).unwrap_or(0),
-                Op::Concat(parts) => parts
-                    .iter()
-                    .fold(0u128, |a, p| a.checked_shl(width(*p)).unwrap_or(0) | v(*p)),
-                Op::Repeat { arg, times } => (0..*times).fold(0u128, |a, _| {
-                    a.checked_shl(width(*arg)).unwrap_or(0) | v(*arg)
-                }),
-                Op::SExt { arg, .. } => signed(v(*arg), width(*arg)) as u128,
-                Op::ZExt { arg, .. } | Op::Trunc { arg, .. } | Op::Cast { arg } => v(*arg),
-                Op::Mux {
-                    cond,
-                    then_val,
-                    else_val,
-                } => v(if v(*cond) != 0 { *then_val } else { *else_val }),
-                Op::Case {
-                    scrutinee,
-                    arms,
-                    default,
-                } => v(arms
-                    .iter()
-                    .find(|(labels, _)| labels.contains(&v(*scrutinee)))
-                    .map(|(_, x)| *x)
-                    .unwrap_or(*default)),
-                Op::MemRead { mem, addr } => self.memories[*mem as usize][v(*addr) as usize],
-                Op::MemReadReg { mem, port } => self.read_outputs[*mem as usize][*port as usize],
-            };
-            vs[d.id.0 as usize] = result & mask(d.ty.bit_width());
-        }
-        vs
-    }
-    fn out(&self, n: &str) -> u128 {
-        let vs = self.eval();
-        let (_, v) = self
-            .m
-            .drivers
-            .iter()
-            .find(|(p, _)| self.m.port(*p).name == n)
-            .unwrap();
-        vs[v.0 as usize]
-    }
-    fn assertions_ok(&self) -> bool {
-        let vs = self.eval();
-        self.m.asserts.iter().all(|a| vs[a.cond.0 as usize] != 0)
-    }
-    fn tick(&mut self) {
-        let vs = self.eval();
-        // Synchronous reads observe memory before this edge's writes.
-        for (ix, mem) in self.m.mems.iter().enumerate() {
-            for (port, read) in mem.read.iter().enumerate() {
-                if vs[read.en.0 as usize] != 0 {
-                    let addr = vs[read.addr.0 as usize];
-                    self.read_outputs[ix][port] = self.memories[ix][addr as usize];
-                    self.read_events.push((ix, addr));
-                }
-            }
-            for write in &mem.write {
-                if vs[write.we.0 as usize] != 0 {
-                    self.memories[ix][vs[write.addr.0 as usize] as usize] = vs[write.data.0 as usize];
-                }
-            }
-        }
-        self.regs = self.m.regs.iter().map(|r| vs[r.next.0 as usize]).collect();
-    }
-    fn collect(&mut self, cycles: usize, width: u32) -> Vec<u128> {
-        let mut result = vec![];
-        let mut r = 0;
-        for cycle in 0..cycles {
-            // Irregular backpressure, including more than a FIFO's capacity.
-            if cycle % 11 >= 5 && self.out("o_wsalt") != r {
-                let ix = (r ^ (r >> 1)) & 1;
-                result.push((self.out("o_data") >> (ix as u32 * width)) & mask(width));
-                r ^= if ix == 0 { 1 } else { 2 };
-                self.set("o_rsalt", r);
-            }
-            assert!(self.assertions_ok());
-            self.tick();
-        }
-        result
-    }
-}
+use common::{Circuit, mask, modules};
+use ddl::diag::SourceMap;
 
 #[test]
 fn empty_nonblocking_input_never_advances_even_beside_a_barrier() {
@@ -445,14 +209,23 @@ fn a_shadowed_reference_keeps_its_own_source_location() {
 
 #[test]
 fn selection_bases_remain_signals_and_register_names_are_unique() {
-    let emit = |src| {
-        ddl::driver::compile_to_verilog(&SourceMap::new("test.ddl", src), &Default::default())
-            .unwrap()
+    // p7.ddl holds two independent funs, so which one the file is for is a
+    // question the compiler will not answer on its own; naming both says
+    // "all of them", which is what a probe fixture wants.
+    let emit = |src, targets: &[&str]| {
+        let opts = ddl::verilog::EmitOptions {
+            export: ddl::ir_export::ExportFlags {
+                export: targets.iter().map(|s| s.to_string()).collect(),
+                bare: Vec::new(),
+            },
+            ..Default::default()
+        };
+        ddl::driver::compile_to_verilog(&SourceMap::new("test.ddl", src), &opts).unwrap()
     };
-    let selects = emit(include_str!("probes/p7.ddl"));
+    let selects = emit(include_str!("probes/p7.ddl"), &["p7a", "p7b"]);
     assert!(!selects.contains("[7:0][7]"));
     assert!(!selects.contains("(v >> k)["));
-    let names = emit(include_str!("probes/p11.ddl"));
+    let names = emit(include_str!("probes/p11.ddl"), &[]);
     assert!(names.contains("reg [7:0] ans_data_1;"));
     assert!(names.contains("assign ans_data = {ans_e1, ans_e0};"));
 }
@@ -462,16 +235,19 @@ fn receive_and_drop_ignore_unrelated_output_backpressure() {
     for operation in ["let took = @drop(src)", "let (x, took) = @try_rcv(src)"] {
         for available in [0, 1] {
             let source = format!(
-                "process p (src: buffer in u8, blocked: buffer out u8, observed: port out u1)\n  loop\n    {operation}\n    @try_send(observed, took)\n"
+                "process p (src: buffer in u8, blocked: buffer out u8, observed: buffer out u1)\n  loop\n    {operation}\n    @try_send(observed, took)\n"
             );
             let mut c = Circuit::new(&source, "p");
             c.set("src_wsalt", available);
             c.set("src_data", 42);
             c.set("blocked_rsalt", 3); // wsalt=0 means full.
-            assert_eq!(c.out("observed"), available);
             c.tick();
             assert_eq!(c.out("src_rsalt"), available);
             assert_eq!(c.out("blocked_wsalt"), 0);
+            // The tap is a pipe, so it shows what was committed last cycle
+            // rather than what is being decided this one.
+            assert_eq!(c.out("observed_wsalt"), 1);
+            assert_eq!(c.out("observed_data") & 1, available);
         }
     }
 }
@@ -479,15 +255,20 @@ fn receive_and_drop_ignore_unrelated_output_backpressure() {
 #[test]
 fn peek_only_and_unrequested_inputs_never_consume() {
     for available in [0, 1] {
-        let source = "process p (src: buffer in u8, unused: buffer in u8, observed: port out u1)\n  loop\n    let (x, present) = @peek(src)\n    @try_send(observed, present)\n";
+        let source = "process p (src: buffer in u8, unused: buffer in u8, observed: buffer out u1)\n  loop\n    let (x, present) = @peek(src)\n    @try_send(observed, present)\n";
         let mut c = Circuit::new(source, "p");
         c.set("src_wsalt", available);
         c.set("unused_wsalt", 1);
         for _ in 0..12 {
-            assert_eq!(c.out("observed"), available);
+            // Drain the tap every cycle, so it never fills and the process
+            // keeps being asked the question. This is what the old `port`
+            // spelling gave for free: a sink that is always ready.
+            let rsalt = c.out("observed_wsalt");
+            c.set("observed_rsalt", rsalt);
             c.tick();
             assert_eq!(c.out("src_rsalt"), 0);
             assert_eq!(c.out("unused_rsalt"), 0);
+            assert_eq!(c.out("observed_data") & 1, available);
         }
     }
 }
@@ -588,22 +369,29 @@ fn for_only_reads_cross_waits() {
 
 #[test]
 fn exclusive_channel_requests_mux_data_and_transfer_results() {
-    for port in [false, true] {
-        for flag in [0, 1] {
-            for full in [false, true] {
-                let kind = if port { "port" } else { "buffer" };
-                let src = format!("process p (c: buffer in u1, o: {kind} out u8, success: port out u1)\n  loop\n    let (flag, present) = @peek(c)\n    var sent: u1 = 1'b0\n    if flag then\n      sent = @try_send(o, 8'd1)\n    else\n      sent = @try_send(o, 8'd2)\n    @try_send(success, sent)\n");
-                let mut c = Circuit::new(&src, "p");
-                c.set("c_wsalt", 1); c.set("c_data", flag);
-                if !port { c.set("o_rsalt", if full {3} else {0}); }
-                assert_eq!(c.out("success"), (port || !full) as u128);
-                if port { assert_eq!(c.out("o"), if flag == 1 {1} else {2}); }
-                c.tick();
-                if !port {
-                    assert_eq!(c.out("o_wsalt"), (!full) as u128);
-                    if !full { assert_eq!(c.out("o_data") & 255, if flag == 1 {1} else {2}); }
-                }
-            }
+    for flag in [0, 1] {
+        for full in [false, true] {
+            let src = "process p (c: buffer in u1, o: buffer out u8, success: buffer out u1)
+  loop
+    let (flag, present) = @peek(c)
+    var sent: u1 = 1'b0
+    if flag then
+      sent = @try_send(o, 8'd1)
+    else
+      sent = @try_send(o, 8'd2)
+    @try_send(success, sent)
+".to_string();
+            let mut c = Circuit::new(&src, "p");
+            c.set("c_wsalt", 1); c.set("c_data", flag);
+            c.set("o_rsalt", if full {3} else {0});
+            c.tick();
+            // The transfer result rides out on `success`, one cycle behind the
+            // decision that produced it: a buffer's entry is a register, so
+            // what the consumer reads is what the sender committed last cycle.
+            assert_eq!(c.out("success_wsalt"), 1);
+            assert_eq!(c.out("success_data") & 1, (!full) as u128);
+            assert_eq!(c.out("o_wsalt"), (!full) as u128);
+            if !full { assert_eq!(c.out("o_data") & 255, if flag == 1 {1} else {2}); }
         }
     }
 }
@@ -615,7 +403,7 @@ fn overlapping_requests_and_barrier_port_duplicates_are_rejected() {
         "    @try_send(o, 8'd1)\n    @send(o, 8'd2)\n",
         "    @send(o, 8'd1)\n    @try_send(o, 8'd2)\n",
     ] {
-        let map = SourceMap::new("duplicate.ddl", format!("process p (o: port out u8)\n  loop\n{body}"));
+        let map = SourceMap::new("duplicate.ddl", format!("process p (o: buffer out u8)\n  loop\n{body}"));
         let errors = ddl::driver::compile_to_verilog(&map, &Default::default()).unwrap_err();
         assert!(map.render_all(&errors).contains("sent to more than once in one cycle"));
     }
@@ -714,19 +502,6 @@ fn sequence_duplicate_transfers_and_nonblocking_buffers_are_diagnosed() {
 }
 
 #[test]
-fn sequence_nonblocking_ports_remain_supported() {
-    for op in ["peek", "try_rcv"] {
-        let src = format!("sequence s (src: buffer in u8, pin: port in u8, tap: port out u8, o: buffer out u8)\n  let x = @rcv(src)\n  let (v, ok) = @{op}(pin)\n  @try_send(tap, v)\n  |||\n  @send(o, x)\n");
-        let mut c = Circuit::new(&src, "s");
-        c.set("pin", 42);
-        c.set("src_wsalt", 1);
-        c.set("src_data", 7);
-        assert_eq!(c.out("tap"), 42);
-        assert_eq!(c.collect(30, 8), [7]);
-    }
-}
-
-#[test]
 fn sequence_bram_rebinding_keeps_address_and_result_distinct() {
     let src = "sequence s (src: buffer in u4, o: buffer out u16)\n  var mem: #[impl(bram)] [u16; 16]\n  let addr = @rcv(src)\n  |||\n  let addr = mem[addr]\n  |||\n  @send(o, addr)\n";
     let map = SourceMap::new("rebind.ddl", src);
@@ -761,82 +536,6 @@ fn sequence_send_captures_the_payload_before_later_assignments() {
         c.set("src_wsalt", 3);
         c.set("src_data", (42 << 8) | 7);
         assert_eq!(c.collect(40, 8), [7, 42], "{cuts} cuts");
-    }
-}
-
-#[test]
-fn sequence_tail_port_sends_follow_items_branches_and_backpressure() {
-    let src = "sequence s (src: buffer in u8, tap: port out u8, o: buffer out u1)\n  let a = @rcv(src)\n  |||\n  @send(o, if a != 8'd9 then @try_send(tap, a) else 1'd0)\n";
-    let mut c = Circuit::new(src, "s");
-    let items = [7, 9, 42, 81];
-    let (mut sent, mut ws, mut rs, mut data) = (0, 0, 0, 0);
-    let (mut taps, mut answers) = (vec![], vec![]);
-    let mut stalled_item = false;
-    for cycle in 0..60 {
-        // A real two-entry producer; the consumer stalls long enough to fill
-        // the output and leave a valid item waiting in the last stage.
-        if cycle >= 4 && sent < items.len() && ws != (c.out("src_rsalt") ^ 3) {
-            let ix = (ws ^ (ws >> 1)) & 1;
-            let shift = ix * 8;
-            data = (data & !(255 << shift)) | (items[sent] << shift);
-            ws ^= if ix == 0 { 1 } else { 2 };
-            sent += 1;
-        }
-        c.set("src_data", data);
-        c.set("src_wsalt", ws);
-        c.set("o_rsalt", rs);
-        if c.out("o_wsalt") == (rs ^ 3) {
-            let valid = c.m.regs.iter().position(|r| r.name == "v0").unwrap();
-            stalled_item |= c.regs[valid] != 0;
-            assert_eq!(c.out("tap_en"), 0);
-        }
-        if c.out("tap_en") != 0 {
-            taps.push(c.out("tap"));
-        }
-        let next_rs = if cycle >= 18 && cycle % 3 != 0 && c.out("o_wsalt") != rs {
-            let ix = (rs ^ (rs >> 1)) & 1;
-            answers.push((c.out("o_data") >> ix) & 1);
-            rs ^ if ix == 0 { 1 } else { 2 }
-        } else {
-            rs
-        };
-        c.tick();
-        rs = next_rs;
-    }
-    assert!(stalled_item);
-    assert_eq!(taps, [7, 42, 81]);
-    assert_eq!(answers, [1, 0, 1, 1]);
-}
-
-#[test]
-fn sequence_tail_port_sends_participate_in_duplicate_checks() {
-    for (before, after, message) in [
-        ("  |||\n  @try_send(tap, a)\n", "", "more than once"),
-        ("  |||\n", "  @try_send(tap, a)\n", "more than once"),
-        ("  @try_send(tap, a)\n  |||\n", "", "is sent to in stage 0 and stage 1"),
-    ] {
-        let src = format!("sequence s (src: buffer in u8, tap: port out u8, o: buffer out u1)\n  let a = @rcv(src)\n{before}  @send(o, @try_send(tap, a))\n{after}");
-        let map = SourceMap::new("duplicate.ddl", src);
-        let errors = ddl::driver::compile_to_verilog(&map, &Default::default()).unwrap_err();
-        assert!(map.render_all(&errors).contains(message), "{}", map.render_all(&errors));
-    }
-}
-
-#[test]
-fn sequence_tail_exclusive_port_sends_and_assertions_keep_the_selected_arm() {
-    let src = "fun checked (x: u8, y: out u8)\n  @assert(x != 8'd0)\n  y = x\nsequence s (src: buffer in u8, tap: port out u8, o: buffer out u1)\n  let a = @rcv(src)\n  |||\n  @send(o, if a != 8'd0 then @try_send(tap, checked(a)) else @try_send(tap, 8'd99))\n";
-    for (item, expected) in [(0, 99), (7, 7)] {
-        let mut c = Circuit::new(src, "s");
-        assert!(c.assertions_ok());
-        assert_eq!(c.out("tap_en"), 0);
-        c.set("src_wsalt", 1);
-        c.set("src_data", item);
-        c.tick();
-        assert!(c.assertions_ok());
-        assert_eq!(c.out("tap_en"), 1);
-        assert_eq!(c.out("tap"), expected);
-        assert_eq!(c.collect(30, 1), [1]);
-        assert_eq!(c.out("tap_en"), 0);
     }
 }
 
@@ -916,16 +615,24 @@ fn process_conditional_bram_reads_execute_only_the_selected_arm() {
         "if a then mem[@try_send(tap, 8'd7)] else mem[1'd0]",
     ] {
         for item in [0, 1] {
-            let src = format!("process p (src: buffer in u1, tap: port out u8, o: buffer out u8)\n  var mem: #[impl(bram)] [u8; 2]\n  loop\n    let a = @rcv(src)\n    let r = {expression}\n    @send(o, r)\n");
+            let src = format!("process p (src: buffer in u1, tap: buffer out u8, o: buffer out u8)\n  var mem: #[impl(bram)] [u8; 2]\n  loop\n    let a = @rcv(src)\n    let r = {expression}\n    @send(o, r)\n");
             let mut c = Circuit::new(&src, "p");
             c.memories[0] = vec![11, 42];
             c.set("src_wsalt", 1);
             c.set("src_data", item);
             let mut taps = vec![];
             for _ in 0..20 {
-                if c.out("tap_en") != 0 { taps.push(c.out("tap")); }
                 assert!(c.assertions_ok());
+                // Drain the tap so it is always ready, which is what the old
+                // `port` spelling gave for free and what makes the
+                // `@try_send` under test succeed whenever it is reached.
+                let ws = c.out("tap_wsalt");
+                c.set("tap_rsalt", ws);
                 c.tick();
+                if c.out("tap_wsalt") != ws {
+                    let ix = (ws ^ (ws >> 1)) & 1;
+                    taps.push((c.out("tap_data") >> (ix * 8)) & 255);
+                }
             }
             let selected = if expression.starts_with("if a then 8'd0") { item == 0 } else { item != 0 };
             let other_read = expression.ends_with("else mem[1'd0]") && !selected;
@@ -974,15 +681,20 @@ fn process_nested_conditional_reads_survive_reentry_and_output_stalls() {
 
 #[test]
 fn process_conditional_read_evaluates_its_condition_once() {
-    let src = "process p (src: buffer in u8, flag: port out u8, o: buffer out u8)\n  var mem: #[impl(bram)] [u8; 2]\n  loop\n    let a = @rcv(src)\n    let r = if @try_send(flag, a) then mem[1'd1] else mem[1'd0]\n    @send(o, r)\n";
+    let src = "process p (src: buffer in u8, flag: buffer out u8, o: buffer out u8)\n  var mem: #[impl(bram)] [u8; 2]\n  loop\n    let a = @rcv(src)\n    let r = if @try_send(flag, a) then mem[1'd1] else mem[1'd0]\n    @send(o, r)\n";
     let mut c = Circuit::new(src, "p");
     c.memories[0] = vec![11, 42];
     c.set("src_wsalt", 1);
     c.set("src_data", 7);
     let mut flags = vec![];
     for _ in 0..20 {
-        if c.out("flag_en") != 0 { flags.push(c.out("flag")); }
+        let ws = c.out("flag_wsalt");
+        c.set("flag_rsalt", ws);
         c.tick();
+        if c.out("flag_wsalt") != ws {
+            let ix = (ws ^ (ws >> 1)) & 1;
+            flags.push((c.out("flag_data") >> (ix * 8)) & 255);
+        }
     }
     assert_eq!(flags, [7]);
     assert_eq!(c.read_events, [(0, 1)]);

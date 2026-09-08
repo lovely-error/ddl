@@ -85,6 +85,22 @@ for m in "${MODULES[@]}"; do
   ( cd "$DDL_ROOT" && "$DDL_BIN" build "$src" "${inc[@]}" -o "examples/$m.v" )       || { fail "ddl build"; continue; }
   note "generated $(basename "$gen")"
 
+  # A SECOND build, with the boundary left bare.
+  #
+  # What is under test here is the LOWERING: the generated logic against the
+  # hand-written module it replaces, which speaks the salt protocol because
+  # both ends of that wire were written by hand. The checked-in file above
+  # presents a FIFO instead -- right for someone instantiating it, wrong for
+  # this comparison, which would otherwise measure two adapters and a wrapper
+  # against a module that has neither.
+  #
+  # The adapters and the wrapper are proven separately, and by simulation:
+  # tests/adapters.rs drives them cycle by cycle against the FIFO contract.
+  bare="$WORK/$m/bare.v"
+  mkdir -p "$WORK/$m"
+  ( cd "$DDL_ROOT" && "$DDL_BIN" build "$src" "${inc[@]}" --bare-export "$m" -o "$bare" ) \
+      || { fail "ddl build --bare-export"; continue; }
+
   # A module with a *_ref.sv beside it is checked against that hand-written
   # reference rather than against a K2G module: for k3g_stage what is under
   # test is the GENERATED handshake, so the reference has to be the handshake
@@ -127,7 +143,7 @@ for m in "${MODULES[@]}"; do
   eq="$WORK/$m/equiv"
   mkdir -p "$eq"
   if [ "$variant" = "1" ]; then
-    ( cd "$DDL_ROOT" && "$DDL_BIN" build --lvt-bram "$src" -o "$eq/raw_lvt.v" ) \
+    ( cd "$DDL_ROOT" && "$DDL_BIN" build --lvt-bram "$src" --bare-export "$m" -o "$eq/raw_lvt.v" ) \
         || { fail "ddl build --lvt-bram"; continue; }
     # Renamed so both builds can be instantiated in one testbench.
     sed "s/^module $m (/module ${m}_lvt (/" "$eq/raw_lvt.v" > "$eq/${m}_lvt.v"
@@ -136,10 +152,10 @@ for m in "${MODULES[@]}"; do
     note "generated ${m}_lvt.v with --lvt-bram"
   fi
   if [ "$standalone" = "1" ]; then
-    cp "$gen" "$eq/${m}_ddl.v"
+    cp "$bare" "$eq/${m}_ddl.v"
   else
     # Renamed so both can be instantiated in one testbench.
-    sed "s/module $m (/module ${m}_ddl (/" "$gen" > "$eq/${m}_ddl.v"
+    sed "s/module $m (/module ${m}_ddl (/" "$bare" > "$eq/${m}_ddl.v"
   fi
 
   if [ "$no_reference" = "1" ]; then
@@ -178,7 +194,9 @@ for m in "${MODULES[@]}"; do
 
   syn="$WORK/$m/syn"
   mkdir -p "$syn/ddl" "$syn/ref"
-  cp "$gen" "$syn/ddl/"
+  # The bare build again: an area comparison against a module with salt ports
+  # has to be of the thing that has salt ports.
+  cp "$bare" "$syn/ddl/$m.v"
   cat > "$syn/ddl/syn.tcl" <<TCL
 set_device -name GW1NR-9C GW1NR-LV9QN88PC6/I5
 add_file -type verilog {$m.v}

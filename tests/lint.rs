@@ -109,6 +109,7 @@ fn lvt_variants() -> Vec<PathBuf> {
         let opts = EmitOptions {
             regenerate_cmd: format!("ddl build --lvt-bram {}", src),
             lvt_bram: true,
+            ..EmitOptions::default()
         };
         let Ok(text) = compile_to_verilog(&map, &opts) else {
             continue;
