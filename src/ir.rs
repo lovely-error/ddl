@@ -3596,9 +3596,6 @@ struct LvaluePath {
     steps: Vec<LvalueStep>,
 }
 
-/// A port named where a value was expected.
-///
-
 fn lvalue_path(expr: &PrecResExpr) -> Option<LvaluePath> {
     match expr {
         PrecResExpr::Ref(base) => Some(LvaluePath { base: base.clone(), steps: Vec::new() }),
@@ -4712,9 +4709,6 @@ fn lower_builtin(
 }
 
 /// `(value, constant)` argument pair shared by `@zext`/`@sext`/`@trunc`/`@rep`.
-/// Drives a `port out` with `value`, on whatever path the caller is on.
-///
-
 fn cast_args(
     low: &mut Lowerer,
     args: &[PrecResExpr],

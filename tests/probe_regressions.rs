@@ -2,7 +2,7 @@
 //! The companion Questa runner also checks the emitted Verilog itself.
 mod common;
 
-use common::{Circuit, mask, modules};
+use common::Circuit;
 use ddl::diag::SourceMap;
 
 #[test]

@@ -213,7 +213,7 @@ impl SourceMap {
     /// buffer through an `import`.
     pub fn mark_roots(&mut self, roots: &[String]) {
         for info in &mut self.files {
-            info.is_root = roots.iter().any(|r| *r == info.path);
+            info.is_root = roots.contains(&info.path);
         }
     }
 
