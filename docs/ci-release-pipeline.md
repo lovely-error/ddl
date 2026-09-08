@@ -53,12 +53,11 @@ The DDL repository includes automated GitHub Actions pipelines located in [`.git
     └─────────────────────────┘                                                │
                                                                                ▼
                                                    ┌───────────────────────────────────────────────┐
-                                                   │ Build Matrix (5 Platforms):                   │
+                                                   │ Build Matrix (4 Platforms):                   │
                                                    │ • Linux x86_64 (static musl)                  │
                                                    │ • Linux aarch64 (static musl via cross)       │
                                                    │ • Windows x86_64 (MSVC)                       │
                                                    │ • macOS Apple Silicon (M1-M4)                 │
-                                                   │ • macOS Intel (x86_64)                        │
                                                    └───────────────────────┬───────────────────────┘
                                                                            │
                                                                            ▼
@@ -99,7 +98,6 @@ Located at [`.github/workflows/release.yml`](../.github/workflows/release.yml).
 | **Linux ARM64** | `ubuntu-latest` | `aarch64-unknown-linux-musl` | `.tar.gz` | Cross-compiled using `cross`. Runs on Raspberry Pi 4/5, AWS Graviton, Ampere servers. |
 | **Windows x86_64** | `windows-latest` | `x86_64-pc-windows-msvc` | `.zip` | Standalone `ddl.exe`. |
 | **macOS Apple Silicon** | `macos-14` | `aarch64-apple-darwin` | `.tar.gz` | Native ARM64 binary for M1, M2, M3, and M4 Macs. |
-| **macOS Intel** | `macos-13` | `x86_64-apple-darwin` | `.tar.gz` | Native x86_64 binary for older Intel Macs. |
 
 ### Trigger Modes
 
