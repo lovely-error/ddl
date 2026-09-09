@@ -63,6 +63,20 @@ fn verilator() -> OsString {
     std::env::var_os("VERILATOR").unwrap_or_else(|| OsString::from("verilator"))
 }
 
+/// Whether a missing or broken Verilator is a failure rather than a skip.
+///
+/// Locally, skipping is right: not everybody has Verilator, and a suite that
+/// goes red because a tool is absent teaches people to ignore red. In CI it is
+/// the opposite -- the job exists to run the linter, so a skip there is the
+/// check quietly not happening. The test passed, cargo swallowed the `SKIP` it
+/// wrote to stderr, and the workflow went green having linted nothing.
+///
+/// CI sets `DDL_REQUIRE_VERILATOR=1`, which is what keeps passed, skipped and
+/// failed distinguishable where it matters.
+fn verilator_is_required() -> bool {
+    std::env::var("DDL_REQUIRE_VERILATOR").is_ok_and(|v| v != "0" && !v.is_empty())
+}
+
 /// Every `.v` the compiler wrote, which is every `.v` here except the stubs.
 ///
 /// The `.sv` files are hand-written references for examples/verify.sh and are
@@ -136,11 +150,12 @@ fn the_generated_verilog_passes_a_linter() {
     let version = match Command::new(&bin).arg("--version").output() {
         Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout).trim().to_string(),
         _ => {
-            eprintln!(
-                "SKIP: no Verilator ({}). Install it and re-run; see the header of tests/lint.rs \
-                 for the two environment variables Windows needs.",
+            let how = format!(
+                "no Verilator ({}). Install it and re-run; see the header of tests/lint.rs for the two environment variables Windows needs.",
                 bin.to_string_lossy()
             );
+            assert!(!verilator_is_required(), "DDL_REQUIRE_VERILATOR is set, but {}", how);
+            eprintln!("SKIP: {}", how);
             return;
         }
     };
@@ -171,11 +186,12 @@ fn the_generated_verilog_passes_a_linter() {
         // broken netlist. Reporting it as a lint failure would send a reader
         // looking for a compiler bug that is not there.
         if text.contains("Cannot find verilated_std") {
-            eprintln!(
-                "SKIP: {} cannot find its data directory. Set VERILATOR_ROOT; see the header of \
-                 tests/lint.rs.",
+            let how = format!(
+                "{} cannot find its data directory. Set VERILATOR_ROOT; see the header of tests/lint.rs.",
                 bin.to_string_lossy()
             );
+            assert!(!verilator_is_required(), "DDL_REQUIRE_VERILATOR is set, but {}", how);
+            eprintln!("SKIP: {}", how);
             return;
         }
         failures.push(format!("--- {}\n{}", file.display(), text.trim()));
@@ -200,4 +216,82 @@ fn the_generated_verilog_passes_a_linter() {
         "only {} files linted; the standalone examples alone are nine",
         linted
     );
+}
+
+/// The regenerate command a generated file carries in its own banner.
+///
+/// Returned as the argument list after `ddl build`, so this test drives the
+/// compiler the same way the banner tells a reader to.
+fn regenerate_args(text: &str) -> Option<Vec<String>> {
+    let line = text.lines().find_map(|l| l.trim_start_matches("//").trim().strip_prefix("Regenerate with: ddl build "))?;
+    Some(line.split_whitespace().map(|s| s.to_string()).collect())
+}
+
+#[test]
+fn the_checked_in_verilog_is_what_this_compiler_produces() {
+    // Most of what the linter reads is checked in, so linting it says what the
+    // compiler USED to emit unless something ties the two together. Nothing
+    // did: `examples/*.v` could drift arbitrarily far from the compiler in
+    // this commit and every test would still pass, including the lint.
+    //
+    // Each file names its own regenerate command in its banner, so that is
+    // what gets run -- which also keeps the banners honest.
+    let mut checked = 0;
+    for path in generated_verilog() {
+        let text = std::fs::read_to_string(&path).expect("a generated file is readable");
+        let Some(args) = regenerate_args(&text) else {
+            panic!("{} has no `Regenerate with:` banner", path.display());
+        };
+
+        let mut inputs = Vec::new();
+        let mut include = Vec::new();
+        let mut lvt_bram = false;
+        let mut export = ddl::ir_export::ExportFlags::default();
+        let mut it = args.iter().peekable();
+        let mut skip_output = false;
+        while let Some(arg) = it.next() {
+            match arg.as_str() {
+                "-o" => {
+                    it.next();
+                    skip_output = true;
+                }
+                "-I" => include.push(PathBuf::from(it.next().expect("-I takes a path"))),
+                "--lvt-bram" => lvt_bram = true,
+                "--export" => export.export = it.next().expect("--export takes names")
+                    .split(',').map(|s| s.to_string()).collect(),
+                "--bare-export" => export.bare = it.next().expect("--bare-export takes names")
+                    .split(',').map(|s| s.to_string()).collect(),
+                other => inputs.push(other.to_string()),
+            }
+        }
+        assert!(skip_output, "{}: banner has no -o", path.display());
+
+        // A file whose sources are not in this repository is not this
+        // repository's to answer for; `generated_verilog` already drops the
+        // hand-written stubs, and an unresolvable import is the K2G tree.
+        let Ok((map, load_diags)) = ddl::source::load_program(&inputs, include) else {
+            continue;
+        };
+        if !load_diags.is_empty() {
+            continue;
+        }
+        let opts = ddl::verilog::EmitOptions {
+            regenerate_cmd: format!("ddl build {}", args.join(" ")),
+            lvt_bram,
+            export,
+        };
+        let Ok(fresh) = ddl::driver::compile_to_verilog(&map, &opts) else {
+            continue;
+        };
+        assert_eq!(
+            fresh.replace("\r\n", "\n"),
+            text.replace("\r\n", "\n"),
+            "{} is out of date; regenerate with `ddl build {}`",
+            path.display(),
+            args.join(" ")
+        );
+        checked += 1;
+    }
+    assert!(checked > 0, "no generated Verilog was checked, so this proves nothing");
+    eprintln!("freshness: {} generated file(s) match the compiler", checked);
 }

@@ -364,3 +364,109 @@ fn the_two_ends_of_an_unusable_length_read_differently() {
     ));
     assert!(huge.contains("past what an index can address"), "{}", huge);
 }
+
+#[test]
+fn a_dynamic_write_gives_every_element_a_distinct_number() {
+    // The element numbers are compared against the index. Typing them as the
+    // index truncates the ones that do not fit: with a one-bit index into four
+    // elements, 2 and 3 became 0 and 1, so writing element 0 also wrote
+    // element 2. That is a wrong write on a VALID index, which is why it is
+    // asserted here at three index widths rather than only at the narrow one.
+    for (idx_ty, cmp_w) in [("u1", 2), ("u2", 2), ("u8", 8)] {
+        let v = compile(&format!(
+            "fun w (a: [u8; 4], i: {}, val: u8, o: out [u8; 4])\n  \
+             var b: [u8; 4] = a\n  b[i] = val\n  o = b\n",
+            idx_ty
+        ));
+        for k in 0..4 {
+            let want = format!("== {}'d{})", cmp_w, k);
+            assert_eq!(
+                v.matches(&want).count(),
+                1,
+                "element {} should be compared exactly once, in {}-bit form\n{}",
+                k,
+                cmp_w,
+                v
+            );
+        }
+    }
+}
+
+#[test]
+fn a_narrow_dynamic_write_leaves_unreachable_elements_alone() {
+    // A one-bit index cannot select elements 2 and 3, so their old value has
+    // to survive. Before the fix they aliased 0 and 1 and were overwritten.
+    let v = compile(
+        "fun w (a: [u8; 4], i: u1, val: u8, o: out [u8; 4])\n  \
+         var b: [u8; 4] = a\n  b[i] = val\n  o = b\n",
+    );
+    assert!(v.contains("(n3 == 2'd2) ? val : a[23:16]"), "{}", v);
+    assert!(v.contains("(n3 == 2'd3) ? val : a[31:24]"), "{}", v);
+}
+
+#[test]
+fn a_computed_read_past_the_end_does_not_alias_a_real_element() {
+    // The scaled bit address was forced into the width the array needs, which
+    // threw away the index bits that made it out of range. `[u8; 4]` read with
+    // a `u8` index answered element 0 for index 4 and element 3 for index 255:
+    // real data, at an index the array does not have.
+    let v = compile("fun f (a: [u8; 4], i: u8, o: out u8)\n  o = a[i]\n");
+    assert!(v.contains("i < 8'd4"), "the bound is tested at the index's width\n{}", v);
+    assert!(v.contains("8'd0"), "out of range reads as zero\n{}", v);
+}
+
+#[test]
+fn the_bound_is_tested_at_lengths_that_are_not_powers_of_two() {
+    for (len, bound) in [(3u32, "8'd3"), (1, "8'd1"), (5, "8'd5")] {
+        let v = compile(&format!(
+            "fun f (a: [u8; {}], i: u8, o: out u8)\n  o = a[i]\n",
+            len
+        ));
+        assert!(v.contains(&format!("i < {}", bound)), "len {}\n{}", len, v);
+    }
+}
+
+#[test]
+fn an_index_that_cannot_leave_the_array_costs_no_check() {
+    // Four elements and a two-bit index: every value the index can hold is a
+    // real element, so a bound would be logic that can never be false.
+    let v = compile("fun f (a: [u8; 4], i: u2, o: out u8)\n  o = a[i]\n");
+    assert!(!v.contains(" < "), "no bound should be emitted\n{}", v);
+}
+
+#[test]
+fn a_computed_write_past_the_end_changes_nothing() {
+    // The write side gets this from element numbers being compared at a width
+    // that holds them all: an out-of-range index simply matches no element.
+    let v = compile(
+        "fun f (a: [u8; 4], i: u8, val: u8, o: out [u8; 4])\n  \
+         var b: [u8; 4] = a\n  b[i] = val\n  o = b\n",
+    );
+    for k in 0..4 {
+        assert!(v.contains(&format!("i == 8'd{}", k)), "element {} at index width\n{}", k, v);
+    }
+}
+
+#[test]
+fn a_type_wider_than_the_width_representation_is_refused_under_both_profiles() {
+    // `[u65536; 65536]` is 2^32 bits. The width is a `u32`, so the product
+    // panicked in debug and wrapped to 0 in release -- and the release build
+    // then declared the port `[4294967295:0]` off an internal width of
+    // nothing. Rejecting it at type construction is what makes `bit_width`
+    // safe to leave unchecked everywhere else.
+    let e = compile_err("fun f (a: [u65536; 65536], o: out u1)\n  o = a[0][0]\n");
+    assert!(e.contains("widest the compiler can represent"), "{}", e);
+}
+
+#[test]
+fn a_struct_whose_fields_sum_past_the_limit_is_refused() {
+    // Every field fits on its own; the sum is what does not.
+    let e = compile_err(concat!(
+        "struct s_t\n",
+        "  a: [u32; 100000000]\n",
+        "  b: [u32; 100000000]\n",
+        "fun f (x: s_t, o: out s_t)\n",
+        "  o = x\n",
+    ));
+    assert!(e.contains("widest the compiler can represent"), "{}", e);
+}

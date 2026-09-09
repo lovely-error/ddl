@@ -308,6 +308,11 @@ Combinators are generated as dedicated datapath modules (e.g. `ddl_merge_2x32`) 
 
 - **Arbitrary-Width Types**: Unsigned `uN` and signed `iN` integers (e.g., `u1`, `u8`, `u32`, `i16`).
 - **Strict Width Safety**: Mixing bitwidths or mixing signed and unsigned values in an operation causes a compile error. Automatic truncation or extension is prohibited; use `@zext(val, width)`, `@sext(val, width)`, or `@trunc(val, width)`.
+- **Compile-time arithmetic has two domains**, and a literal's spelling picks which one:
+  - *Unsized* literals (`4`, `0xFF`) are mathematical integers. `4 * 64` is `256`, and an expression that runs past 128 bits is an error rather than a wrap. Array lengths, loop bounds and widths are written in this domain.
+  - *Sized* literals (`8'd255`) carry their width, and arithmetic on them wraps exactly as the hardware would: `8'd255 + 8'd1` is `0`, whether it is folded at compile time or computed at runtime.
+
+  A constant expression means the same thing in every position that accepts one, so moving a subexpression into a `let` never changes what a program does.
 - **Bit Slicing**: `@slice(val, base_index, width)` extracts a dynamic bit window of size `width` starting at `base_index`.
 - **Concatenation**: `{a, b, c}` packs values from most-significant to least-significant bits into an unsigned integer whose width equals the sum of operand widths.
 
@@ -333,7 +338,8 @@ A type of the form `[T; n]` without a memory attribute is a packed value:
 - Supported as struct fields, channel payloads, and parameters.
 - Elements are accessed via `a[idx]` and sliced via `a[hi..lo]`.
 - Array assignments support both constant and dynamic indexing: `a[idx] = val`.
-- Out-of-bounds indexing is rejected at compile time when constant, and bounds-checked during synthesis.
+- Out-of-bounds indexing is rejected at compile time when the index is constant.
+- A computed index is bounds-checked in the generated hardware: an index outside the array reads as zero, and a write to one changes nothing. The check is emitted only when the index is wide enough to express an out-of-range value, so a `u2` index into `[T; 4]` costs no extra logic.
 
 ### Memories (`lutram` and `bram`)
 

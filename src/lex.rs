@@ -89,6 +89,10 @@ pub enum RawNum {
         span: AlphanumSpan,
         width: Option<u32>,
         value: u128,
+        /// The digits did not fit 128 bits. Carried rather than reported here
+        /// because the lexer has no diagnostic sink, and dropped rather than
+        /// carried is how `2^128` became a literal `0`.
+        overflow: bool,
     },
     Float {
         span: AlphanumSpan,
@@ -682,13 +686,16 @@ fn digit_value(ch: u8) -> Option<u32> {
 /// Reads digits in `radix`, allowing `_` as a separator between them.
 /// Returns the accumulated value, the digit count, and the new cursor.
 /// A leading `_` is not a digit, so it will not start a run.
+/// Returns the value, how many digits it had, where it stopped, and whether
+/// the digits overflowed 128 bits.
 fn scan_digits(
     char_ptr: *const u8,
     char_end_ptr: *const u8,
     radix: u32,
-) -> (u128, u32, *const u8) {
+) -> (u128, u32, *const u8, bool) {
     let mut value: u128 = 0;
     let mut count = 0u32;
+    let mut overflow = false;
     let mut ptr = char_ptr;
     loop {
         if ptr == char_end_ptr {
@@ -705,14 +712,23 @@ fn scan_digits(
         }
         match digit_value(ch) {
             Some(d) if d < radix => {
-                value = value.wrapping_mul(radix as u128).wrapping_add(d as u128);
+                // Checked, not wrapping. `2^128` wrapped to 0 here, and 0 is a
+                // legal value at every width, so no later check could tell it
+                // from a literal `0` -- the width-fit test downstream was
+                // handed the already-corrupted number and passed it.
+                match value.checked_mul(radix as u128).and_then(|v| v.checked_add(d as u128)) {
+                    Some(v) => value = v,
+                    // Keep consuming: the span and the tail have to cover the
+                    // whole literal even though its value is now unusable.
+                    None => overflow = true,
+                }
                 count += 1;
                 ptr = unsafe { ptr.add(1) };
             }
             _ => break,
         }
     }
-    (value, count, ptr)
+    (value, count, ptr, overflow)
 }
 
 fn radix_of(ch: u8) -> Option<u32> {
@@ -760,12 +776,12 @@ fn try_parse_number(
         };
         if let Some(radix) = radix {
             let digits_at = unsafe { after_zero.add(1) };
-            let (value, count, tail) = scan_digits(digits_at, char_end_ptr, radix);
+            let (value, count, tail, overflow) = scan_digits(digits_at, char_end_ptr, radix);
             if count == 0 {
                 return Err(());
             }
             return Ok((
-                RawNum::Int { span: span_between(char_ptr, tail), width: None, value },
+                RawNum::Int { span: span_between(char_ptr, tail), width: None, value, overflow },
                 tail,
             ));
         }
@@ -773,7 +789,7 @@ fn try_parse_number(
 
     // A plain decimal run. It is either the whole literal, the width of a
     // sized literal, or the whole part of a float.
-    let (lead, lead_count, after_lead) = scan_digits(char_ptr, char_end_ptr, 10);
+    let (lead, lead_count, after_lead, lead_overflow) = scan_digits(char_ptr, char_end_ptr, 10);
     if lead_count == 0 {
         return Err(());
     }
@@ -786,11 +802,13 @@ fn try_parse_number(
             None => return Err(()),
         };
         let digits_at = unsafe { after_tick.add(1) };
-        let (value, count, tail) = scan_digits(digits_at, char_end_ptr, radix);
+        let (value, count, tail, overflow) = scan_digits(digits_at, char_end_ptr, radix);
         if count == 0 {
             return Err(());
         }
-        if lead > u32::MAX as u128 {
+        // An overflowed width has already wrapped, so the bound below would be
+        // asking about the wrong number.
+        if lead_overflow || lead > u32::MAX as u128 {
             return Err(());
         }
         return Ok((
@@ -798,6 +816,7 @@ fn try_parse_number(
                 span: span_between(char_ptr, tail),
                 width: Some(lead as u32),
                 value,
+                overflow,
             },
             tail,
         ));
@@ -808,7 +827,7 @@ fn try_parse_number(
     let (is_dot, after_dot) = strip_prefix_on_match(after_lead, char_end_ptr, ".");
     if is_dot && after_dot != char_end_ptr
         && digit_value(deref(after_dot)).filter(|d| *d < 10).is_some() {
-            let (frac, _, tail) = scan_digits(after_dot, char_end_ptr, 10);
+            let (frac, _, tail, _) = scan_digits(after_dot, char_end_ptr, 10);
             return Ok((
                 RawNum::Float {
                     span: span_between(char_ptr, tail),
@@ -820,7 +839,12 @@ fn try_parse_number(
         }
 
     Ok((
-        RawNum::Int { span: span_between(char_ptr, after_lead), width: None, value: lead },
+        RawNum::Int {
+            span: span_between(char_ptr, after_lead),
+            width: None,
+            value: lead,
+            overflow: lead_overflow,
+        },
         after_lead,
     ))
 }

@@ -693,3 +693,88 @@ fn a_combinator_needs_two_sides() {
     ));
     assert!(text.contains("needs at least two pipes"), "{}", text);
 }
+
+#[test]
+fn an_extern_parameter_whose_type_is_unknown_is_reported() {
+    // `signature_of` skips a parameter it cannot resolve, on the grounds that
+    // lowering the declaration will report it. An `extern` has no body and is
+    // never lowered, so nothing ever did: the port silently left the interface
+    // and the instantiation below connected `ok` and nothing else, leaving a
+    // hardware input floating because of a typo.
+    let e = compile_err(concat!(
+        "extern ext (ok: wire in u1, bad: wire in MissingType)\n",
+        "graph g (x: wire in u1)\n",
+        "  ext(x)\n",
+    ));
+    assert!(e.contains("`MissingType` is not a type"), "{}", e);
+}
+
+#[test]
+fn an_extern_is_checked_even_when_nothing_instantiates_it() {
+    // The interface is the whole of the declaration, so there is no later pass
+    // that would catch this one.
+    let e = compile_err(concat!(
+        "extern ext (ok: wire in u1, bad: wire in MissingType)\n",
+        "fun h (a: u1, o: out u1)\n",
+        "  o = a\n",
+    ));
+    assert!(e.contains("`MissingType` is not a type"), "{}", e);
+}
+
+#[test]
+fn two_graphs_cannot_instantiate_each_other() {
+    // Self-instantiation was caught while lowering one declaration, which is
+    // the only cycle visible from inside one declaration. This pair compiled
+    // into two Verilog modules instantiating one another -- not a finite piece
+    // of hardware, and the compiler did not loop, so nothing complained.
+    let text = compile_err(concat!(
+        "graph a (x: buffer in u8, y: buffer out u8)\n",
+        "  b(x, y)\n",
+        "graph b (x: buffer in u8, y: buffer out u8)\n",
+        "  a(x, y)\n",
+    ));
+    assert!(text.contains("instantiates itself through"), "{}", text);
+    assert!(text.contains("a -> b -> a"), "the whole cycle is named\n{}", text);
+}
+
+#[test]
+fn a_longer_instantiation_cycle_is_reported_whole() {
+    let text = compile_err(concat!(
+        "graph a (x: buffer in u8, y: buffer out u8)\n",
+        "  b(x, y)\n",
+        "graph b (x: buffer in u8, y: buffer out u8)\n",
+        "  c(x, y)\n",
+        "graph c (x: buffer in u8, y: buffer out u8)\n",
+        "  a(x, y)\n",
+    ));
+    assert!(text.contains("a -> b -> c -> a"), "{}", text);
+}
+
+#[test]
+fn a_deep_acyclic_hierarchy_is_not_a_cycle() {
+    // The check must not fire on nesting, only on a hierarchy that reaches
+    // itself. Three graphs deep over a process.
+    let map = SourceMap::new(
+        "t.ddl",
+        concat!(
+            "process p (x: buffer in u8, y: buffer out u8)\n",
+            "  loop\n",
+            "    let v = @rcv(x)\n",
+            "    @send(y, v)\n",
+            "graph c (x: buffer in u8, y: buffer out u8)\n",
+            "  p(x, y)\n",
+            "graph b (x: buffer in u8, y: buffer out u8)\n",
+            "  c(x, y)\n",
+            "graph a (x: buffer in u8, y: buffer out u8)\n",
+            "  b(x, y)\n",
+        ),
+    );
+    let opts = EmitOptions {
+        export: ddl::ir_export::ExportFlags {
+            export: Vec::new(),
+            bare: vec!["a".to_string()],
+        },
+        ..EmitOptions::default()
+    };
+    compile_to_verilog(&map, &opts).expect("a nested hierarchy is not a cycle");
+}

@@ -14,8 +14,11 @@ on:
         type: boolean
         default: false
 
+# Read by default. Publishing is the only step that writes, and it asks for
+# the permission itself -- a workflow-wide `contents: write` handed it to the
+# metadata, build and validation jobs too, none of which create anything.
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -45,9 +48,50 @@ jobs:
             echo "is_prerelease=true" >> $GITHUB_OUTPUT
           fi
 
+  # Nothing here used to test anything. `on: push: tags` fires this workflow,
+  # the CI workflow triggers only on branch pushes and pull requests, and the
+  # publish job depended on metadata and binaries -- so a tag could publish a
+  # revision that merely COMPILED, with no test, lint or RTL check anywhere in
+  # the chain, and a nightly did it on a schedule.
+  validate:
+    name: Validate
+    needs: setup
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-06-25
+          components: clippy
+
+      - name: Install Verilator
+        run: sudo apt-get update && sudo apt-get install -y verilator
+
+      - name: Run tests
+        run: cargo test --locked
+
+      # Release is what gets shipped, and it is not the profile the tests
+      # above ran under. Overflow checks are off here, so the arithmetic that
+      # panics in debug wraps instead: enum tag construction and width
+      # products both changed behaviour by profile, and only a release-profile
+      # run can see it.
+      - name: Run tests in the release profile
+        run: cargo test --locked --release
+
+      - name: Run Clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+      - name: Lint the generated Verilog, and check it is current
+        env:
+          DDL_REQUIRE_VERILATOR: '1'
+        run: cargo test --locked --test lint
+
   build:
     name: Build - ${{ matrix.target }}
-    needs: setup
+    needs: [setup, validate]
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -98,7 +142,10 @@ jobs:
 
       - name: Install cross (for ARM64 Linux)
         if: matrix.use_cross
-        run: cargo install cross --git https://github.com/cross-rs/cross
+        # Pinned: an unpinned `--git` install builds whatever is on the
+        # default branch at the moment the job runs, so the same tag can
+        # produce different binaries on different days.
+        run: cargo install cross --git https://github.com/cross-rs/cross --tag v0.2.5 --locked
 
       - name: Build release binary
         shell: bash
@@ -139,8 +186,11 @@ jobs:
 
   publish:
     name: Publish Release
-    needs: [setup, build]
+    needs: [setup, validate, build]
     runs-on: ubuntu-latest
+    # The one job that creates anything, and the only one that can.
+    permissions:
+      contents: write
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4

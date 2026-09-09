@@ -73,13 +73,43 @@ pub fn modules(src: &str) -> Vec<Module> {
     result
 }
 
+/// Low `w` bits set.
+///
+/// The ends are handled rather than assumed: `128 - w` is a shift by 128 at
+/// `w == 0` and a negative one above 128, and this is reached with whatever
+/// widths the compiler accepted, not only the ones this file writes.
 pub fn mask(w: u32) -> u128 {
-    u128::MAX >> (128 - w)
-}
-pub fn signed(v: u128, w: u32) -> i128 {
-    ((v << (128 - w)) as i128) >> (128 - w)
+    match w {
+        0 => 0,
+        w if w >= 128 => u128::MAX,
+        w => u128::MAX >> (128 - w),
+    }
 }
 
+/// Reinterprets the low `w` bits as a two's-complement signed value.
+pub fn signed(v: u128, w: u32) -> i128 {
+    match w {
+        0 => 0,
+        w if w >= 128 => v as i128,
+        w => ((v << (128 - w)) as i128) >> (128 - w),
+    }
+}
+
+/// A behavioural interpreter for a lowered module, used as a test oracle.
+///
+/// What it models, stated so a test can tell whether its answer means
+/// anything:
+///
+/// - Two-state. There is no `x` and no `z`, so a value is always SOME number.
+///   Division by zero answers zero, and an uninitialised memory or read
+///   register reads as zero, where hardware and Verilog would say `x`. A test
+///   about undefined state cannot be written against this.
+/// - Widths from 1 to 128. `mask` and `signed` handle the ends, but a value
+///   wider than 128 bits does not fit the `u128` a value is held in at all.
+/// - Signedness is honoured by the operators that need it: comparison, shift
+///   right, division and remainder.
+///
+/// Anything outside that belongs in an RTL test against a real simulator.
 pub struct Circuit {
     pub m: Module,
     pub regs: Vec<u128>,
@@ -121,6 +151,26 @@ impl Circuit {
                         BinOp::Add => a.wrapping_add(b),
                         BinOp::Sub => a.wrapping_sub(b),
                         BinOp::Mul => a.wrapping_mul(b),
+                        // Signedness decides what these MEAN, and ignoring it
+                        // made the oracle wrong rather than approximate: `i8`
+                        // `-4 / 2` folded as `252 / 2` and answered 126 where
+                        // the hardware answers 254 (`-2`). The backend emits a
+                        // typed Verilog operator, so the simulator and the
+                        // thing it is checking disagreed.
+                        //
+                        // `wrapping_*` covers `MIN / -1`, which overflows and
+                        // panics in every profile.
+                        BinOp::Div if self.m.value(*lhs).ty.is_signed() => {
+                            let (x, y) = (signed(a, width(*lhs)), signed(b, width(*rhs)));
+                            if y == 0 { 0 } else { x.wrapping_div(y) as u128 }
+                        }
+                        BinOp::Mod if self.m.value(*lhs).ty.is_signed() => {
+                            let (x, y) = (signed(a, width(*lhs)), signed(b, width(*rhs)));
+                            if y == 0 { 0 } else { x.wrapping_rem(y) as u128 }
+                        }
+                        // Division by zero answers zero. Verilog says `x`, and
+                        // this is a two-state simulator; see the note on
+                        // `Circuit`.
                         BinOp::Div => a.checked_div(b).unwrap_or(0),
                         BinOp::Mod => a.checked_rem(b).unwrap_or(0),
                         BinOp::And => a & b,

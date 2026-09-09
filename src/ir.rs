@@ -26,8 +26,8 @@ use crate::parse::{
 };
 use crate::symbols::Symbols;
 use crate::ty::{
-    self, MemKind, OpTyError, Ty, binop_result, bits_for, comparison_operand_ty, const_eval,
-    literal_fits, resolve_type_expr,
+    self, ConstError, MemKind, OpTyError, Ty, binop_result, bits_for, comparison_operand_ty,
+    const_eval, literal_fits, resolve_type_expr,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -150,6 +150,15 @@ pub struct ValueDef {
     /// Set when the value came from a named `let`, so the backend can emit a
     /// readable wire name instead of a numbered temporary.
     pub name: Option<String>,
+    /// This constant was written WITHOUT a width (`1`, not `8'd1`).
+    ///
+    /// The strict-width rule has exactly one exception: an unsized literal
+    /// takes the width of what it is used with, because it never claimed one.
+    /// A sized literal did claim one, so silently re-materialising `16'd1` as
+    /// `8'd1` is the truncation the rule exists to forbid -- and that is what
+    /// happened, because after lowering both are just `Op::Const` and the
+    /// distinction had been thrown away.
+    pub unsized_literal: bool,
 }
 
 /// A register: state that survives the clock edge.
@@ -1505,7 +1514,7 @@ impl<'a> Lowerer<'a> {
             }
         }
         let id = ValueId(self.values.len() as u32);
-        self.values.push(ValueDef { id, ty, op, name: None });
+        self.values.push(ValueDef { id, ty, op, name: None, unsized_literal: false });
         id
     }
 
@@ -1742,6 +1751,13 @@ impl<'a> Lowerer<'a> {
         if have == *want {
             return Some(value);
         }
+        // Only a literal that never named a width may take one from context.
+        // `a + 16'd1` on a `u8` used to compile, emitting `a + 8'd1`: the
+        // literal said sixteen bits and got eight, which is precisely the
+        // silent truncation the strict-width rule promises never happens.
+        if !self.values[value.0 as usize].unsized_literal {
+            return None;
+        }
         let konst = match &self.values[value.0 as usize].op {
             Op::Const(k) => *k,
             _ => return None,
@@ -1749,7 +1765,16 @@ impl<'a> Lowerer<'a> {
         if !literal_fits(konst, want) {
             return None;
         }
-        Some(self.emit(want.clone(), Op::Const(konst)))
+        let id = self.emit(want.clone(), Op::Const(konst));
+        // Still unsized: it may be adapted again further up the expression.
+        self.mark_unsized_literal(id);
+        Some(id)
+    }
+
+    /// Records that a value is an unsized literal, so it may take its width
+    /// from context.
+    fn mark_unsized_literal(&mut self, id: ValueId) {
+        self.values[id.0 as usize].unsized_literal = true;
     }
 
     /// Extends both operands of a comparison to a common type wide enough that
@@ -1812,6 +1837,10 @@ pub fn lower_function(
     decl: &FunctionDecl,
     sink: &mut DiagSink,
 ) -> Option<Module> {
+    // Errors from EARLIER declarations are not this one's failure: the sink
+    // is shared by the whole compilation, so `has_errors` would make every
+    // declaration after the first bad one return `None` without a reason.
+    let errors_before = sink.error_mark();
     let mut low = Lowerer::new(map, syms, bodies);
     let mut env: Env = Env::new();
     let mut out_ports: Vec<(PortId, String)> = Vec::new();
@@ -1913,7 +1942,7 @@ pub fn lower_function(
         }
     }
 
-    if sink.has_errors() {
+    if sink.errored_since(errors_before) {
         return None;
     }
 
@@ -2015,6 +2044,20 @@ fn const_operand(
     env: &Env,
     sink: &mut DiagSink,
 ) -> Option<u128> {
+    // Two paths reach a compile-time constant and they used to accept
+    // different things: `const_eval` reads the syntax and folds literal
+    // arithmetic, while this lowered first and demanded the result BE a
+    // literal. Lowering does not fold `2 * 2`, so `[u8; 2 * 2]` and
+    // `@slice(x, b, 2 * 2)` were fine and `for i in 0..(2 * 2)` was not --
+    // the same expression, constant in one place and not in another.
+    //
+    // Syntax first because it is pure: it raises no diagnostics and emits no
+    // values for an expression that was never going to be used at runtime.
+    // Lowering still gets its turn, and is the one that can see a constant
+    // parameter, which the syntax cannot.
+    if let Ok(k) = const_eval(expr) {
+        return Some(k);
+    }
     let v = lower_expr(low, expr, env, sink)?;
     match low.values[v.0 as usize].op {
         Op::Const(k) => Some(k),
@@ -2082,6 +2125,10 @@ pub fn lower_process(
     decl: &ProcessDecl,
     sink: &mut DiagSink,
 ) -> Option<Module> {
+    // Errors from EARLIER declarations are not this one's failure: the sink
+    // is shared by the whole compilation, so `has_errors` would make every
+    // declaration after the first bad one return `None` without a reason.
+    let errors_before = sink.error_mark();
     let mut low = Lowerer::new(map, syms, bodies);
     let mut env: Env = Env::new();
 
@@ -2614,7 +2661,7 @@ pub fn lower_process(
 
     regs.extend(generated);
 
-    if sink.has_errors() {
+    if sink.errored_since(errors_before) {
         return None;
     }
 
@@ -3236,14 +3283,25 @@ fn lower_stmt_at(
                     None => current,
                     Some((hi, lo)) => low.emit(array_ty.clone(), Op::Slice { arg: current, hi, lo }),
                 };
-                let idx_ty = low.ty_of(idx);
+                // Element numbers are compared against the index, so the
+                // comparison type has to hold BOTH of them. Giving the element
+                // numbers the index's own type truncates every one that does
+                // not fit it: with a one-bit index, elements 2 and 3 become 0
+                // and 1, and each in-range index then matches two elements --
+                // a wrong write on a valid index, not an out-of-bounds case.
+                // The index is known unsigned here; a signed one is rejected
+                // where `dynamic` is set.
+                let cmp_ty = Ty::UInt(
+                    low.ty_of(idx).bit_width().max(ty::bits_for(n.saturating_sub(1) as u128)),
+                );
+                let idx = low.extend_to(idx, &cmp_ty);
                 // High-to-low, matching `Op::Concat` and the packed layout the
                 // reads use: element k is bits [(k+1)*w-1 : k*w].
                 let mut parts = Vec::with_capacity(n as usize);
                 for k in (0..n).rev() {
                     let old_k =
                         low.emit(elem.clone(), Op::Slice { arg: whole, hi: (k + 1) * w - 1, lo: k * w });
-                    let konst = low.emit(idx_ty.clone(), Op::Const(k as u128));
+                    let konst = low.emit(cmp_ty.clone(), Op::Const(k as u128));
                     let hit = low.emit(
                         Ty::BOOL,
                         Op::Cmp { op: CmpOp::Eq, lhs: idx, rhs: konst },
@@ -3519,6 +3577,9 @@ fn lower_stmt_at(
                 // rather than demanding a cast at every use.
                 let ty = Ty::UInt(ty::bits_for(i));
                 let v = low.emit(ty.clone(), Op::Const(i));
+                // Unsized in the same sense a bare `1` is: it names no width,
+                // so it may take one from whatever it is used with.
+                low.mark_unsized_literal(v);
                 // Deliberately unnamed: a named value gets its own `wire`, and
                 // eight wires holding the numbers 0 to 7 is not what anybody
                 // wants to read in the output.
@@ -3717,7 +3778,24 @@ pub fn lower_expr(
                         return None;
                     }
                     let ty = def.ty();
-                    let whole = def.bare_value(discriminant);
+                    let whole = match def.bare_value(discriminant) {
+                        Some(w) => w,
+                        None => {
+                            sink.push(
+                                Diag::error(
+                                    low.span_of(span),
+                                    format!(
+                                        "`{}` is {} bits wide, which is wider than a constant can be",
+                                        def.name, def.width
+                                    ),
+                                )
+                                .with_note(
+                                    "a compile-time constant is held in 128 bits; narrow the widest payload so the tag still fits above it",
+                                ),
+                            );
+                            return None;
+                        }
+                    };
                     return Some(low.emit(ty, Op::Const(whole)));
                 }
             match env.get(name) {
@@ -3737,13 +3815,39 @@ pub fn lower_expr(
             }
         }
 
-        PrecResExpr::Literal(Literal::IntLiteral { value, width }) => {
+        PrecResExpr::Literal(Literal::IntLiteral { value, width, overflow }) => {
+            // Reported here rather than in the lexer, which has no sink and no
+            // span to point at. Before this, the digits wrapped silently: the
+            // decimal for 2^128 became `0`, and `o = <2^128>` on a `u8` output
+            // compiled to `8'd0` under both profiles. The width-fit check
+            // below cannot see it -- by then the number IS zero.
+            if *overflow {
+                sink.err_span(
+                    low.here(),
+                    "this literal does not fit in 128 bits".to_string(),
+                );
+                return None;
+            }
+            // Scalar type NAMES reject a zero width (`u0` is not a type), but
+            // the literal path built `Ty::UInt(w)` straight from the digits
+            // before the tick, so `0'd0` made a zero-bit type that nothing
+            // else in the compiler expects. It reached the backend and came
+            // out as `0'd0`, which `vlog` rejects outright: a file that
+            // compiled with exit code 0 and was not valid Verilog.
+            if *width == Some(0) {
+                sink.err_span(
+                    low.here(),
+                    "a sized literal cannot be zero bits wide".to_string(),
+                );
+                return None;
+            }
             let ty = match width {
                 Some(w) => Ty::UInt(*w),
                 // Unsized: provisionally as narrow as possible. The operand
                 // rules re-materialise it at the width of its partner.
                 None => Ty::UInt(ty::bits_for(*value)),
             };
+            let is_unsized = width.is_none();
             if let Some(w) = width
                 && !literal_fits(*value, &Ty::UInt(*w)) {
                     sink.err_span(
@@ -3752,7 +3856,11 @@ pub fn lower_expr(
                     );
                     return None;
                 }
-            Some(low.emit(ty, Op::Const(*value)))
+            let id = low.emit(ty, Op::Const(*value));
+            if is_unsized {
+                low.mark_unsized_literal(id);
+            }
+            Some(id)
         }
 
         // `{a, b, c}` -- the operands laid down high-to-low, which is the
@@ -3905,6 +4013,36 @@ pub fn lower_expr(
     }
 }
 
+/// Folds one end of an `a[hi..lo]` range, saying why if it will not fold.
+///
+/// This used to be `const_eval(..).ok()?`, which returned `None` with nothing
+/// added to the sink. A declaration that fails to lower without recording an
+/// error is dropped from the module list while the build still reports
+/// success (see `lower_all` in driver.rs), so the reason has to be said here.
+fn range_bound(
+    low: &Lowerer,
+    sink: &mut DiagSink,
+    end: &PrecResExpr,
+    which: &str,
+) -> Option<u128> {
+    match const_eval(end) {
+        Ok(v) => Some(v),
+        Err(e) => {
+            let mut diag =
+                Diag::error(low.here(), format!("the {} end of a range {}", which, e.reason()));
+            // A range is a constant bit selection, so a computed one is not a
+            // narrower version of the same thing -- it is the other builtin.
+            if matches!(e, ConstError::NotConstant) {
+                diag = diag.with_note(
+                    "a range needs constant ends so the result has a known width; for a computed position use `@slice(value, base, width)`",
+                );
+            }
+            sink.push(diag);
+            None
+        }
+    }
+}
+
 /// `a[i]` and `a[hi..lo]` on a packed `[T; n]`, in elements.
 ///
 /// Element `k` occupies bits `[(k+1)*w-1 : k*w]`, which is how a packed array
@@ -3934,8 +4072,8 @@ fn lower_array_index(
 
     // `a[hi..lo]` -- a run of elements, which is a shorter array.
     if let PrecResExpr::Span(range) = &sub.index {
-        let hi = const_eval(&range.left).ok()?;
-        let lo = const_eval(&range.right).ok()?;
+        let hi = range_bound(low, sink, &range.left, "high")?;
+        let lo = range_bound(low, sink, &range.right, "low")?;
         if hi < lo {
             sink.err_span(low.here(), format!("this range runs backwards: `{}..{}`", hi, lo));
             return None;
@@ -3990,7 +4128,37 @@ fn lower_array_index(
         return None;
     }
     let addr_w = u32::BITS - (n * w - 1).leading_zeros();
-    let wide = low.emit(Ty::UInt(addr_w), Op::ZExt { arg: idx, to: addr_w });
+    let idx_w = idx_ty.bit_width();
+
+    // Whether the index can even say a number this array does not have. A
+    // two-bit index into four elements cannot, and guarding it would be dead
+    // logic; a `u8` index into four elements can, and that is the case that
+    // used to read back plausible data.
+    let index_can_leave_the_array = idx_w >= 128 || (1u128 << idx_w) > n as u128;
+
+    // Tested at the index's OWN width, before the narrowing below. `addr_w`
+    // holds the largest legal bit address and no more, so an index that
+    // overflows it has already lost the bits that put it out of range: with
+    // `[u8; 4]` and a `u8` index, 0 and 4 both scaled to bit address 0 and the
+    // read answered with element 0.
+    let in_bounds = index_can_leave_the_array.then(|| {
+        // `n` is representable in `idx_w` bits exactly when the test above
+        // said the index can reach past it.
+        let limit = low.emit(idx_ty.clone(), Op::Const(n as u128));
+        let (lhs, rhs) = low.extend_for_compare(idx, limit);
+        low.emit(Ty::BOOL, Op::Cmp { op: CmpOp::Lt, lhs, rhs })
+    });
+
+    // Narrowing is a truncation and is spelled as one. It stays correct
+    // because the guard above forces every index it would have mangled to the
+    // out-of-range answer instead.
+    let wide = match idx_w.cmp(&addr_w) {
+        std::cmp::Ordering::Equal => idx,
+        std::cmp::Ordering::Less => low.emit(Ty::UInt(addr_w), Op::ZExt { arg: idx, to: addr_w }),
+        std::cmp::Ordering::Greater => {
+            low.emit(Ty::UInt(addr_w), Op::Trunc { arg: idx, to: addr_w })
+        }
+    };
     // A shift where the element width allows one. `*` is a multiplier as far
     // as GowinSynthesis is concerned, and an address is the last place to
     // spend a DSP on a constant.
@@ -4001,7 +4169,21 @@ fn lower_array_index(
         let width = low.emit(Ty::UInt(addr_w), Op::Const(w as u128));
         low.emit(Ty::UInt(addr_w), Op::Bin { op: BinOp::Mul, lhs: wide, rhs: width })
     };
-    Some(low.emit(elem.clone(), Op::DynSlice { arg: base, base: scaled, width: w }))
+    let picked = low.emit(elem.clone(), Op::DynSlice { arg: base, base: scaled, width: w });
+    match in_bounds {
+        None => Some(picked),
+        Some(ok) => {
+            // Out of range reads as zero, which is the contract written down
+            // in docs/overview.md. Anything is better than the old answer:
+            // aliasing onto a real element returns data that looks right, and
+            // that is the hardest kind of wrong to see in a waveform.
+            let out_of_range = low.emit(elem.clone(), Op::Const(0));
+            Some(low.emit(
+                elem.clone(),
+                Op::Mux { cond: ok, then_val: picked, else_val: out_of_range },
+            ))
+        }
+    }
 }
 
 fn lower_subscript(
@@ -4039,8 +4221,8 @@ fn lower_subscript(
 
     // `x[hi..lo]` -- a constant range.
     if let PrecResExpr::Span(range) = &sub.index {
-        let hi = const_eval(&range.left).ok()?;
-        let lo = const_eval(&range.right).ok()?;
+        let hi = range_bound(low, sink, &range.left, "high")?;
+        let lo = range_bound(low, sink, &range.right, "low")?;
         let range_is_in_bounds = hi >= lo && hi < base_w as u128;
         if !range_is_in_bounds {
             sink.err_span(
@@ -4579,7 +4761,10 @@ fn lower_builtin(
                 sink.err_span(low.here(), "`@rep` count must be at least 1");
                 return None;
             }
-            let w = low.ty_of(arg).bit_width() * times;
+            let Some(w) = low.ty_of(arg).bit_width().checked_mul(times) else {
+                sink.err_span(low.here(), crate::ty::TyError::WidthOutOfRange.message());
+                return None;
+            };
             return Some(low.emit(Ty::UInt(w), Op::Repeat { arg, times }));
         }
         _ => {}

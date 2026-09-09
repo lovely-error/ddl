@@ -102,8 +102,47 @@ impl Ty {
         }
     }
 
+    /// Total bits, or `None` if the product does not fit a `u32`.
+    ///
+    /// `bit_width` multiplies without checking, which is right only because
+    /// every type that exists has been through this on the way in. It is the
+    /// construction sites that enforce it -- `resolve_type_expr` for arrays
+    /// and memories, `build_struct_quiet` for the field sum -- so a `Ty` whose
+    /// width does not fit can never be built. Before that, `[u65536; 65536]`
+    /// panicked in debug at the multiply and wrapped to zero in release, which
+    /// then produced a port declared `[4294967295:0]` from an internal width
+    /// of nothing.
+    pub fn checked_bit_width(&self) -> Option<u32> {
+        match self {
+            Ty::UInt(w) | Ty::SInt(w) => Some(*w),
+            Ty::Array(elem, n) => elem.checked_bit_width()?.checked_mul(*n),
+            Ty::Enum { width, .. } | Ty::Struct { width, .. } => Some(*width),
+            Ty::Mem { elem, len, .. } => elem.checked_bit_width()?.checked_mul(*len),
+        }
+    }
+
     pub fn is_memory(&self) -> bool {
         matches!(self, Ty::Mem { .. })
+    }
+
+    /// Whether storage appears anywhere inside this type.
+    ///
+    /// `is_memory` asks about the top level only, which is the right question
+    /// for "can this be used as a value here" and the wrong one for building
+    /// an aggregate. A struct field or an array element that was a memory got
+    /// past every check and then lost its meaning: `#[impl(bram)] [u8; 4]`
+    /// inside a struct lowered to an ordinary 32-bit packed vector, with the
+    /// storage annotation silently discarded.
+    ///
+    /// `Ty::Struct` carries only a width, not its fields -- which is sound
+    /// here because a struct containing storage is refused at construction, so
+    /// no such type can exist to be asked about.
+    pub fn contains_memory(&self) -> bool {
+        match self {
+            Ty::Mem { .. } => true,
+            Ty::Array(elem, _) => elem.contains_memory(),
+            Ty::UInt(_) | Ty::SInt(_) | Ty::Enum { .. } | Ty::Struct { .. } => false,
+        }
     }
 
     pub fn is_signed(&self) -> bool {
@@ -148,6 +187,8 @@ pub enum TyError {
     ArrayLenOutOfRange(u128),
     /// Arrays are parsed but not yet lowered.
     Unsupported(String),
+    /// The packed width does not fit a `u32`, whatever the length was.
+    WidthOutOfRange,
 }
 
 impl TyError {
@@ -171,6 +212,10 @@ impl TyError {
                 u32::MAX
             ),
             TyError::Unsupported(what) => format!("{} is not supported yet", what),
+            TyError::WidthOutOfRange => format!(
+                "this type is wider than {} bits, which is the widest the compiler can represent",
+                u32::MAX
+            ),
         }
     }
 
@@ -234,13 +279,24 @@ pub fn resolve_type_expr(expr: &PrecTypeExpr, syms: &Symbols) -> Result<Ty, TyEr
             if !len_is_usable {
                 return Err(TyError::ArrayLenOutOfRange(len));
             }
-            Ok(Ty::Array(Box::new(elem), len as u32))
+            // An array of storage is not storage-shaped: the annotation names
+            // one backing store, and the array would need one per element.
+            if elem.contains_memory() {
+                return Err(TyError::Unsupported("an array of memories".to_string()));
+            }
+            let ty = Ty::Array(Box::new(elem), len as u32);
+            // A length that fits and an element that fits can still multiply
+            // to something that does not.
+            if ty.checked_bit_width().is_none() {
+                return Err(TyError::WidthOutOfRange);
+            }
+            Ok(ty)
         }
         PrecTypeExpr::MemArray { elem, len, kind } => {
             let elem_ty = resolve_type_expr(elem, syms)?;
             // A memory of memories has no meaning: the annotation names one
             // backing store, and nesting would need two.
-            if elem_ty.is_memory() {
+            if elem_ty.contains_memory() {
                 return Err(TyError::Unsupported("a memory of memories".to_string()));
             }
             let len = const_eval(len).map_err(TyError::BadArrayLen)?;
@@ -248,7 +304,11 @@ pub fn resolve_type_expr(expr: &PrecTypeExpr, syms: &Symbols) -> Result<Ty, TyEr
             if !len_is_usable {
                 return Err(TyError::ArrayLenOutOfRange(len));
             }
-            Ok(Ty::Mem { elem: Box::new(elem_ty), len: len as u32, kind: *kind })
+            let ty = Ty::Mem { elem: Box::new(elem_ty), len: len as u32, kind: *kind };
+            if ty.checked_bit_width().is_none() {
+                return Err(TyError::WidthOutOfRange);
+            }
+            Ok(ty)
         }
     }
 }
@@ -287,60 +347,151 @@ impl ConstError {
 /// and on width casts in expressions (docs/bring-up.md). Emitting a folded
 /// literal is the only safe option, so folding must happen in the compiler.
 pub fn const_eval(expr: &PrecResExpr) -> Result<u128, ConstError> {
+    fold(expr).map(|f| f.value)
+}
+
+/// A folded constant together with the width it carries.
+///
+/// Two domains, and which one an expression is in comes from its literals.
+///
+/// `None` is the mathematical domain: an unsized literal has no width, so
+/// `4 * 64` is 256 and running past `u128` is an error rather than a wrap.
+/// This is what an array length or a loop bound is written in.
+///
+/// `Some(w)` is the hardware domain, where the answer is what a `w`-bit
+/// register would hold. The IR computes sized arithmetic that way, and this
+/// used not to: `a[8'd255 + 8'd1]` folded to 256 here and was rejected as an
+/// index past the end, while `let i = 8'd255 + 8'd1` then `a[i]` lowered to an
+/// eight-bit sum that wrapped to 0 and read element 0. Naming the expression
+/// changed both whether it was accepted and what it meant.
+#[derive(Clone, Copy)]
+struct Folded {
+    value: u128,
+    /// The width of the sized literals this was folded from, if any.
+    width: Option<u32>,
+}
+
+impl Folded {
+    fn math(value: u128) -> Self {
+        Folded { value, width: None }
+    }
+
+    /// A predicate is a `u1` whichever domain its operands came from.
+    fn bool(b: bool) -> Self {
+        Folded { value: b as u128, width: Some(1) }
+    }
+
+    /// Truncates to the carried width, the way a register would.
+    fn wrapped(value: u128, width: Option<u32>) -> Self {
+        let value = match width {
+            Some(w) if w < 128 => value & ((1u128 << w) - 1),
+            _ => value,
+        };
+        Folded { value, width }
+    }
+}
+
+/// The width an operation's result carries.
+///
+/// Mixing two different widths is a width error, which lowering reports
+/// against the operands with a span to point at. Folding has neither, so it
+/// takes the wider of the two and lets the real check speak.
+fn joined_width(a: Option<u32>, b: Option<u32>) -> Option<u32> {
+    match (a, b) {
+        (Some(x), Some(y)) => Some(x.max(y)),
+        (Some(x), None) | (None, Some(x)) => Some(x),
+        (None, None) => None,
+    }
+}
+
+fn fold(expr: &PrecResExpr) -> Result<Folded, ConstError> {
     match expr {
-        PrecResExpr::Literal(Literal::IntLiteral { value, .. }) => Ok(*value),
+        PrecResExpr::Literal(Literal::IntLiteral { overflow: true, .. }) => {
+            Err(ConstError::Overflow)
+        }
+        PrecResExpr::Literal(Literal::IntLiteral { value, width, .. }) => {
+            Ok(Folded::wrapped(*value, *width))
+        }
         PrecResExpr::Call { base, args } => {
             let op = match &**base {
                 PrecResExpr::Builtin(op) => op,
                 _ => return Err(ConstError::NotConstant),
             };
             if args.len() == 1 {
-                let a = const_eval(&args[0])?;
+                let a = fold(&args[0])?;
                 return match op {
-                    BuiltinOp::Neg => Ok(a.wrapping_neg()),
-                    BuiltinOp::BitInvert => Ok(!a),
-                    BuiltinOp::LogNot => Ok((a == 0) as u128),
+                    BuiltinOp::Neg => Ok(Folded::wrapped(a.value.wrapping_neg(), a.width)),
+                    BuiltinOp::BitInvert => Ok(Folded::wrapped(!a.value, a.width)),
+                    BuiltinOp::LogNot => Ok(Folded::bool(a.value == 0)),
                     _ => Err(ConstError::NotConstant),
                 };
             }
             if args.len() != 2 {
                 return Err(ConstError::NotConstant);
             }
-            let a = const_eval(&args[0])?;
-            let b = const_eval(&args[1])?;
+            let lhs = fold(&args[0])?;
+            let rhs = fold(&args[1])?;
+            let (a, b) = (lhs.value, rhs.value);
+            let w = joined_width(lhs.width, rhs.width);
+            // In the hardware domain the answer is what the register holds, so
+            // running off the top is a wrap and not an error. In the
+            // mathematical domain there is no top to run off, so it is.
+            let sized = w.is_some();
             match op {
-                BuiltinOp::Add => a.checked_add(b).ok_or(ConstError::Overflow),
-                BuiltinOp::Sub => a.checked_sub(b).ok_or(ConstError::Overflow),
-                BuiltinOp::Mul => a.checked_mul(b).ok_or(ConstError::Overflow),
+                BuiltinOp::Add if sized => Ok(Folded::wrapped(a.wrapping_add(b), w)),
+                BuiltinOp::Sub if sized => Ok(Folded::wrapped(a.wrapping_sub(b), w)),
+                BuiltinOp::Mul if sized => Ok(Folded::wrapped(a.wrapping_mul(b), w)),
+                BuiltinOp::Add => a.checked_add(b).map(Folded::math).ok_or(ConstError::Overflow),
+                BuiltinOp::Sub => a.checked_sub(b).map(Folded::math).ok_or(ConstError::Overflow),
+                BuiltinOp::Mul => a.checked_mul(b).map(Folded::math).ok_or(ConstError::Overflow),
                 // `checked_*` like the four around it, and not only for the
                 // symmetry: `/` and `%` by zero panic in every profile, so the
                 // guard is load-bearing, and on a signed type the hand-written
                 // `b == 0` would still miss `MIN / -1`, which overflows and
                 // panics too. This folds in `u128`, where that case does not
                 // exist -- but the spelling that cannot be wrong costs nothing.
-                BuiltinOp::Div => a.checked_div(b).ok_or(ConstError::DivideByZero),
-                BuiltinOp::Mod => a.checked_rem(b).ok_or(ConstError::DivideByZero),
+                BuiltinOp::Div => a
+                    .checked_div(b)
+                    .map(|v| Folded::wrapped(v, w))
+                    .ok_or(ConstError::DivideByZero),
+                BuiltinOp::Mod => a
+                    .checked_rem(b)
+                    .map(|v| Folded::wrapped(v, w))
+                    .ok_or(ConstError::DivideByZero),
                 BuiltinOp::Pow => {
                     let exp: u32 = b.try_into().map_err(|_| ConstError::Overflow)?;
-                    a.checked_pow(exp).ok_or(ConstError::Overflow)
+                    match a.checked_pow(exp) {
+                        Some(v) => Ok(Folded::wrapped(v, w)),
+                        // A sized power wraps like the multiplications it is.
+                        None if sized => {
+                            let mut acc: u128 = 1;
+                            for _ in 0..exp {
+                                acc = acc.wrapping_mul(a);
+                            }
+                            Ok(Folded::wrapped(acc, w))
+                        }
+                        None => Err(ConstError::Overflow),
+                    }
                 }
                 BuiltinOp::Shl => {
-                    if b >= 128 { Ok(0) } else { Ok(a << b) }
+                    let v = if b >= 128 { 0 } else { a << b };
+                    Ok(Folded::wrapped(v, w))
                 }
                 BuiltinOp::Shr => {
-                    if b >= 128 { Ok(0) } else { Ok(a >> b) }
+                    let v = if b >= 128 { 0 } else { a >> b };
+                    Ok(Folded::wrapped(v, w))
                 }
-                BuiltinOp::And => Ok(a & b),
-                BuiltinOp::Or => Ok(a | b),
-                BuiltinOp::Xor => Ok(a ^ b),
-                BuiltinOp::Eq => Ok((a == b) as u128),
-                BuiltinOp::Ne => Ok((a != b) as u128),
-                BuiltinOp::Lt => Ok((a < b) as u128),
-                BuiltinOp::Gt => Ok((a > b) as u128),
-                BuiltinOp::Le => Ok((a <= b) as u128),
-                BuiltinOp::Ge => Ok((a >= b) as u128),
-                BuiltinOp::LogAnd => Ok((a != 0 && b != 0) as u128),
-                BuiltinOp::LogOr => Ok((a != 0 || b != 0) as u128),
+                BuiltinOp::And => Ok(Folded::wrapped(a & b, w)),
+                BuiltinOp::Or => Ok(Folded::wrapped(a | b, w)),
+                BuiltinOp::Xor => Ok(Folded::wrapped(a ^ b, w)),
+                BuiltinOp::Eq => Ok(Folded::bool(a == b)),
+                BuiltinOp::Ne => Ok(Folded::bool(a != b)),
+                BuiltinOp::Lt => Ok(Folded::bool(a < b)),
+                BuiltinOp::Gt => Ok(Folded::bool(a > b)),
+                BuiltinOp::Le => Ok(Folded::bool(a <= b)),
+                BuiltinOp::Ge => Ok(Folded::bool(a >= b)),
+                BuiltinOp::LogAnd => Ok(Folded::bool(a != 0 && b != 0)),
+                BuiltinOp::LogOr => Ok(Folded::bool(a != 0 || b != 0)),
                 _ => Err(ConstError::NotConstant),
             }
         }

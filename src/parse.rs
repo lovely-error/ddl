@@ -196,6 +196,10 @@ pub enum Literal {
     IntLiteral {
         value: u128,
         width: Option<u32>,
+        /// The digits did not fit 128 bits, so `value` is meaningless. Kept on
+        /// the literal so the error can be raised where there is a span to
+        /// point at rather than swallowed in the lexer.
+        overflow: bool,
     },
     FloatLiteral {
         whole: u64,
@@ -644,9 +648,10 @@ pub unsafe fn resolve_precedence(char_ptr: *const u8, expr: &RawExpr) -> Result<
         }
         RawExpr::NumLiteral(num) => {
             let lit = match num {
-                RawNum::Int { width, value, .. } => Literal::IntLiteral {
+                RawNum::Int { width, value, overflow, .. } => Literal::IntLiteral {
                     value: *value,
                     width: *width,
+                    overflow: *overflow,
                 },
                 RawNum::Float { whole, frac, .. } => Literal::FloatLiteral {
                     whole: *whole,
@@ -678,6 +683,9 @@ pub unsafe fn resolve_precedence(char_ptr: *const u8, expr: &RawExpr) -> Result<
                         Ok(PrecResExpr::Literal(Literal::IntLiteral {
                             value: int as u128,
                             width: None,
+                            // `int_literal_to_int` has already refused
+                            // anything that did not fit.
+                            overflow: false,
                         }))
                     },
                     Err(_) => {
@@ -1247,8 +1255,8 @@ fn resolve_expr_in(src_body: &str) -> PrecResExpr {
 fn shape(expr: &PrecResExpr) -> String {
     match expr {
         PrecResExpr::Ref(s) => anumspan_to_str(s).to_string(),
-        PrecResExpr::Literal(Literal::IntLiteral { value, width: None }) => format!("{}", value),
-        PrecResExpr::Literal(Literal::IntLiteral { value, width: Some(w) }) => {
+        PrecResExpr::Literal(Literal::IntLiteral { value, width: None, .. }) => format!("{}", value),
+        PrecResExpr::Literal(Literal::IntLiteral { value, width: Some(w), .. }) => {
             format!("{}'{}", w, value)
         }
         PrecResExpr::Literal(lit) => format!("{:?}", lit),
