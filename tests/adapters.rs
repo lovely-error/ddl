@@ -353,3 +353,76 @@ fn the_wrapper_runs_back_to_back_with_no_stalls() {
     let want: Vec<u128> = (0..20).map(|i| i * 4).collect();
     assert_eq!(got, want);
 }
+
+// An adapter is named for the width it carries, so the list of adapters to
+// build has to be keyed on the width too.
+
+/// Compiles a snippet the way `ddl build` does, and renders the diagnostics
+/// rather than a `Vec<Diag>` when it fails.
+fn compile(src: &str) -> String {
+    let map = SourceMap::new("t.ddl", src);
+    match ddl::driver::compile_to_verilog(&map, &ddl::verilog::EmitOptions::default()) {
+        Ok(v) => v,
+        Err(diags) => panic!("should compile:\n{}", map.render_all(&diags)),
+    }
+}
+
+/// How many times `\nmodule <name> (` appears -- a definition rather than an
+/// instantiation, which is indented.
+fn definitions_of(verilog: &str, name: &str) -> usize {
+    verilog.matches(&format!("\nmodule {} (", name)).count()
+}
+
+#[test]
+fn two_pipes_of_one_width_and_different_types_share_one_adapter() {
+    // `u16` and a struct of two `u8`s are different types and the same shape.
+    // `module_name` has only ever known the width, so keying the build list on
+    // the whole `Ty` asked for `ddl_wport_to_salt_16` twice and the design was
+    // rejected for defining it twice -- a hard error on a program with nothing
+    // wrong with it, and no way to write around it short of changing a type.
+    let v = compile(concat!(
+        "struct pair_t\n",
+        "  lo: u8\n",
+        "  hi: u8\n",
+        "process p (cmd: buffer in u16, din: buffer in pair_t, resp: buffer out u8)\n",
+        "  loop\n",
+        "    let c = @rcv(cmd)\n",
+        "    let d = @rcv(din)\n",
+        "    let sum: u8 = d.lo + d.hi\n",
+        "    @send(resp, sum)\n",
+    ));
+
+    assert_eq!(
+        definitions_of(&v, "ddl_wport_to_salt_16"),
+        1,
+        "one module for the shape, not one per type:\n{}",
+        v
+    );
+    assert_eq!(
+        v.matches("ddl_wport_to_salt_16 u_").count(),
+        2,
+        "both pipes instantiate it:\n{}",
+        v
+    );
+}
+
+#[test]
+fn a_signed_and_an_unsigned_pipe_of_one_width_share_one_adapter() {
+    // The same collision by the other route. An adapter copies its payload and
+    // never does arithmetic on it, so signedness reaches no further than the
+    // `signed` on a declaration and the two are the same module.
+    let v = compile(concat!(
+        "process p (a: buffer in u16, b: buffer in i16, o: buffer out u16)\n",
+        "  loop\n",
+        "    let x = @rcv(a)\n",
+        "    let y = @rcv(b)\n",
+        "    @send(o, x)\n",
+    ));
+
+    assert_eq!(
+        definitions_of(&v, "ddl_wport_to_salt_16"),
+        1,
+        "signedness is not part of an adapter's shape:\n{}",
+        v
+    );
+}

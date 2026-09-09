@@ -110,11 +110,28 @@ impl Adapt {
 ///
 /// Keyed by shape rather than by use, exactly as `CombUse` is: two boundaries
 /// of the same width and direction are one module instantiated twice.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub struct AdaptUse {
     pub kind: Adapt,
     pub ty: Ty,
 }
+
+/// The shape, which is the width and not the type.
+///
+/// Written out rather than derived because the `ty` is along for the ride: an
+/// adapter copies its payload and never looks inside it, so `module_name`
+/// names one by `bit_width` alone and every part of the body -- `entry_of`,
+/// `push_out`, the port declarations -- is a function of that same width. A
+/// derived `PartialEq` made `u16` and a two-`u8` struct two uses, both of
+/// which then built a module called `ddl_wport_to_salt_16`, and the design was
+/// rejected for defining it twice. The dedup key has to be what the name is.
+impl PartialEq for AdaptUse {
+    fn eq(&self, other: &Self) -> bool {
+        self.kind == other.kind && self.ty.bit_width() == other.ty.bit_width()
+    }
+}
+
+impl Eq for AdaptUse {}
 
 /// The module name for one shape.
 ///
