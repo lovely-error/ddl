@@ -8,6 +8,9 @@
 // after its address, and until a process had states there was nowhere in the
 // language to point at and say "there, that is where the cycle went".
 
+mod common;
+
+use common::Circuit;
 use ddl::diag::SourceMap;
 use ddl::driver::compile_to_verilog;
 use ddl::verilog::EmitOptions;
@@ -1075,4 +1078,168 @@ fn storage_cannot_hide_inside_an_array_either() {
         "  o = 8'd0\n",
     ));
     assert!(e.contains("array of memories") || e.contains("is storage"), "{}", e);
+}
+
+// ---- writing part of an element ------------------------------------------
+//
+// `t[a][k] = v` and `t[a].f = v` still offer the port a WHOLE element: the
+// parts not named come from a read of the same address, which is the
+// read-modify-write the source used to have to spell out. Only where that read
+// is free -- an asynchronous memory -- because a synchronous one costs a cycle
+// and a single statement has nowhere to put one.
+
+#[test]
+fn a_lane_of_an_element_is_writable_on_an_async_memory() {
+    let v = compile(concat!(
+        "process lane (cmd: buffer in u16, din: buffer in u8, resp: buffer out u8)\n",
+        "  var t: #[impl(lutram)] [[u8; 4]; 16] = @zeroed()\n",
+        "  loop\n",
+        "    let c = @rcv(cmd)\n",
+        "    let addr: u4 = c[3..0]\n",
+        "    let lane: u2 = c[5..4]\n",
+        "    if c[15] then\n",
+        "      let d = @rcv(din)\n",
+        "      t[addr][lane] = d\n",
+        "    else\n",
+        "      @send(resp, t[addr][lane])\n",
+    ));
+    // The element is read back and written whole, and the lane the source
+    // named picks which part of it the new byte reaches.
+    assert!(v.contains("= t[addr_r]"), "{}", v);
+    assert!(v.contains("t[addr_r] <="), "{}", v);
+    assert!(v.contains("lane_r =="), "{}", v);
+}
+
+#[test]
+fn two_lanes_of_one_row_written_in_one_cycle_both_land() {
+    // The case that separates a correct read-modify-write from a lost one. The
+    // second lane's read has to see the first lane's write, which has not
+    // reached the array yet; without that forwarding the second write port
+    // carries a stale element and lane 0 is silently dropped.
+    let mut c = Circuit::new(
+        concat!(
+            "process two (cmd: buffer in u8, o: buffer out [u8; 4])\n",
+            "  var t: #[impl(lutram)] [[u8; 4]; 16] = @zeroed()\n",
+            "  loop\n",
+            "    let cm = @rcv(cmd)\n",
+            "    let a: u4 = cm[3..0]\n",
+            "    t[a][2'd0] = 8'd170\n",
+            "    t[a][2'd1] = 8'd187\n",
+            "    @send(o, t[a])\n",
+        ),
+        "two",
+    );
+    c.set("cmd_wsalt", 1);
+    c.set("cmd_data", 5);
+    assert_eq!(c.collect(40, 32), [0x0000_BBAA]);
+}
+
+#[test]
+fn a_field_of_an_element_is_writable_on_an_async_memory() {
+    let mut c = Circuit::new(
+        concat!(
+            "struct pair_t\n",
+            "  lo: u8\n",
+            "  hi: u8\n",
+            "process fld (cmd: buffer in u8, o: buffer out pair_t)\n",
+            "  var t: #[impl(lutram)] [pair_t; 16] = @zeroed()\n",
+            "  loop\n",
+            "    let cm = @rcv(cmd)\n",
+            "    let a: u4 = cm[3..0]\n",
+            "    t[a].lo = 8'd9\n",
+            "    t[a].hi = 8'd4\n",
+            "    @send(o, t[a])\n",
+        ),
+        "fld",
+    );
+    c.set("cmd_wsalt", 1);
+    c.set("cmd_data", 3);
+    // The first field takes the high bits (`StructDef::field_range`), so `lo`
+    // is the upper byte however it reads.
+    assert_eq!(c.collect(40, 16), [0x0904]);
+}
+
+#[test]
+fn a_nested_write_to_a_bram_says_where_the_cycle_would_go() {
+    // Before this, the hoister lifted the `t[...]` inside the TARGET into a
+    // read temporary and the assignment landed on that temporary: the error
+    // named `@rd0`, which no source contains, at a line the minted span
+    // clamped to. The rule underneath is real -- the load half costs a cycle
+    // and one statement has nowhere to put it -- so that is what gets said.
+    let text = compile_err(concat!(
+        "process p (cmd: buffer in u16, din: buffer in u8, resp: buffer out u8)\n",
+        "  var t: #[impl(bram)] [[u8; 4]; 16]\n",
+        "  loop\n",
+        "    let c = @rcv(cmd)\n",
+        "    let d = @rcv(din)\n",
+        "    t[c[3..0]][c[5..4]] = d\n",
+        "    @send(resp, 8'd0)\n",
+    ));
+    assert!(text.contains("writing part of an element of `t`"), "{}", text);
+    assert!(text.contains("takes a cycle"), "{}", text);
+    assert!(text.contains("var row = t[i]"), "{}", text);
+    assert!(!text.contains("@rd"), "{}", text);
+    // The target's own line, not wherever a minted span happened to clamp.
+    assert!(text.contains("t.ddl:6:5"), "{}", text);
+}
+
+#[test]
+fn a_nested_write_still_lifts_a_synchronous_read_in_its_address() {
+    // The target chain is a place and must not be lifted; an address inside it
+    // is an ordinary expression whose own reads still cost their cycle. Guards
+    // the hoister against over-correcting into "never descend at all".
+    let v = compile(concat!(
+        "process addrp (cmd: buffer in u8, din: buffer in u8, resp: buffer out u8)\n",
+        "  var u: #[impl(bram)] [u4; 16]\n",
+        "  var t: #[impl(lutram)] [[u8; 4]; 16] = @zeroed()\n",
+        "  loop\n",
+        "    let c = @rcv(cmd)\n",
+        "    let d = @rcv(din)\n",
+        "    let k: u4 = c[3..0]\n",
+        "    t[u[k]][2'd1] = d\n",
+        "    @send(resp, t[4'd0][2'd1])\n",
+    ));
+    // `u`'s read kept its state and its output register.
+    assert!(v.contains("u_q <= u["), "{}", v);
+    // `t`'s target stayed a target: it is written, not loaded and assigned to.
+    assert!(v.lines().any(|l| l.contains("t[") && l.contains("<=")), "{}", v);
+}
+
+#[test]
+fn a_memory_written_only_through_a_nested_target_is_still_a_written_memory() {
+    // Stage ownership is built from "which memories does this statement
+    // write", and a nested target used to answer "none" -- so a written memory
+    // read in another stage passed as a read-only table, which is a wrong
+    // pipeline rather than an error.
+    let text = compile_err(concat!(
+        "struct rq\n",
+        "  wa: u8\n",
+        "  wd: u8\n",
+        "  ra: u8\n",
+        "sequence s (req: buffer in rq, resp: buffer out u8)\n",
+        "  var t: #[impl(lutram)] [[u8; 4]; 256] = @zeroed()\n",
+        "  let q = @rcv(req)\n",
+        "  t[q.wa][2'd0] = q.wd\n",
+        "  |||\n",
+        "  let x = t[q.ra]\n",
+        "  @send(resp, x[2'd0])\n",
+    ));
+    assert!(text.contains("`t` is written"), "{}", text);
+    assert!(text.contains("stage 0") && text.contains("stage 1"), "{}", text);
+}
+
+#[test]
+fn a_compound_assignment_to_part_of_an_element_is_refused_like_any_other() {
+    // The nested form would lower without complaint -- its rvalue read is an
+    // ordinary one -- and then `t[a] += v` next to it would not. One answer.
+    let text = compile_err(concat!(
+        "process p (cmd: buffer in u8, resp: buffer out u8)\n",
+        "  var t: #[impl(lutram)] [[u8; 4]; 16] = @zeroed()\n",
+        "  loop\n",
+        "    let c = @rcv(cmd)\n",
+        "    let a: u4 = c[3..0]\n",
+        "    t[a][2'd0] += 8'd1\n",
+        "    @send(resp, t[a][2'd0])\n",
+    ));
+    assert!(text.contains("compound assignment to a memory"), "{}", text);
 }

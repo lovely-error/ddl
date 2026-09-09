@@ -3065,26 +3065,6 @@ fn lower_stmt_at(
             // An assignment target is a path: a name, optionally followed by
             // field accesses. `uop.cond_reg = arg1` is how k2g_decode builds a
             // 28-field struct, so a bare name is not enough.
-            // `m[addr] = v` is a memory write, and the only assignment whose
-            // target is not a path.
-            if let PrecResExpr::SubscriptAccess(sub) = &assign.lvalue
-                && let PrecResExpr::Ref(mem_name) = &sub.base {
-                    let is_memory = env
-                        .get(anumspan_to_str(mem_name))
-                        .is_some_and(|b| b.ty.is_memory());
-                    if is_memory {
-                        let plain =
-                            assign.kind == crate::lex::AssignStmtKind::PlainAssign;
-                        if !plain {
-                            sink.err_at(mem_name, "compound assignment to a memory is not supported yet");
-                            return None;
-                        }
-                        return lower_mem_write(
-                            low, mem_name.clone(), &sub.index, &assign.rvalue, env, sink,
-                        );
-                    }
-                }
-
             let path = match lvalue_path(&assign.lvalue) {
                 Some(p) => p,
                 None => {
@@ -3105,6 +3085,15 @@ fn lower_stmt_at(
                 }
             };
             let base_ty = binding.ty.clone();
+
+            // `m[addr] = v` reaches the one write port, and `m[addr][k] = v`
+            // reaches it with the rest of the element carried along. Storage is
+            // not a variable and the mutability gate below does not apply to
+            // it: `declare_memory` binds every memory `is_mutable: false`,
+            // because a memory is never assigned as a whole.
+            if base_ty.is_memory() {
+                return lower_memory_assign(low, &target, &path.steps, assign, env, sink);
+            }
 
             // `let` is a constant. An `out` parameter is assignable without
             // being a variable: it is written once and read back by the
@@ -3163,255 +3152,9 @@ fn lower_stmt_at(
                 }
             };
 
-            // Resolve the step chain to one absolute bit range.
-            //
-            // Every step is static except possibly the last, which may be an
-            // array index this cycle computes. A dynamic step has no bit range
-            // to be part of, so nothing may follow it: the whole point of the
-            // range is that the steps after it know where they are.
-            let mut want = base_ty.clone();
-            let mut offset = 0u32;
-            let mut span: Option<(u32, u32)> = None;
-            let mut dynamic: Option<(ValueId, Ty, u32)> = None;
-            for (step_ix, step) in path.steps.iter().enumerate() {
-                let field = match step {
-                    LvalueStep::Field(f) => f,
-                    LvalueStep::Index(index) => {
-                        let (elem, n) = match &want {
-                            Ty::Array(elem, n) => ((**elem).clone(), *n),
-                            other => {
-                                sink.push(
-                                    Diag::error(
-                                        low.here(),
-                                        format!("`{}` is not an array", other.display()),
-                                    )
-                                    .with_note(
-                                        "only an `[T; n]` can have an element assigned; a bit of an `uN` is not an lvalue",
-                                    ),
-                                );
-                                return None;
-                            }
-                        };
-                        let w = elem.bit_width();
-                        let last = step_ix + 1 == path.steps.len();
-                        // A constant index is an ordinary bit range and stays
-                        // one wherever it sits: `a[1].f = x` knows exactly
-                        // where it is writing.
-                        //
-                        // `const_eval` reads the syntax, so it misses a
-                        // constant parameter and misses the induction variable
-                        // of an unrolled `for`. Both arrive as an `Op::Const`
-                        // and must not cost a mux tree, so the fallback lowers
-                        // once and asks.
-                        let konst = match const_eval(index) {
-                            Ok(k) => Some(k),
-                            Err(_) => {
-                                let idx = lower_expr(low, index, env, sink)?;
-                                match low.values[idx.0 as usize].op {
-                                    Op::Const(k) => Some(k),
-                                    _ => {
-                                        if !last {
-                                            sink.push(
-                                                Diag::error(
-                                                    low.here(),
-                                                    "a computed index must be the last step of an assignment target",
-                                                )
-                                                .with_note(
-                                                    "bind the element first -- `let e = a[i]` -- then assign its parts and write `a[i] = e` back",
-                                                ),
-                                            );
-                                            return None;
-                                        }
-                                        let idx_ty = low.ty_of(idx);
-                                        if idx_ty.is_signed() {
-                                            sink.push(
-                                                Diag::error(
-                                                    low.here(),
-                                                    format!(
-                                                        "an index must be unsigned, found `{}`",
-                                                        idx_ty.display()
-                                                    ),
-                                                )
-                                                .with_note("convert with `@unsigned(x)`"),
-                                            );
-                                            return None;
-                                        }
-                                        dynamic = Some((idx, elem.clone(), n));
-                                        want = elem;
-                                        continue;
-                                    }
-                                }
-                            }
-                        };
-                        let k = konst.expect("the dynamic path continued above");
-                        if k >= n as u128 {
-                            sink.push(
-                                Diag::error(
-                                    low.here(),
-                                    format!(
-                                        "element {} is out of bounds for `{}`",
-                                        k,
-                                        want.display()
-                                    ),
-                                )
-                                .with_note(format!("it has {} element(s), indexed from 0", n)),
-                            );
-                            return None;
-                        }
-                        let k = k as u32;
-                        span = Some((offset + (k + 1) * w - 1, offset + k * w));
-                        offset += k * w;
-                        want = elem;
-                        continue;
-                    }
-                };
-                let struct_name = match &want {
-                    Ty::Struct { name, .. } => name.clone(),
-                    other => {
-                        sink.err_at(
-                            field,
-                            format!("`{}` has no fields", other.display()),
-                        );
-                        return None;
-                    }
-                };
-                let def = low.syms.structs.get(&struct_name)?.clone();
-                let fname = anumspan_to_str(field);
-                let (hi, lo) = match def.field_range(fname) {
-                    Some(r) => r,
-                    None => {
-                        let known: Vec<&str> =
-                            def.fields.iter().map(|(n, _)| n.as_str()).collect();
-                        sink.push(
-                            Diag::error(
-                                low.span(field),
-                                format!("`{}` has no field `{}`", struct_name, fname),
-                            )
-                            .with_note(format!("fields are: {}", known.join(", "))),
-                        );
-                        return None;
-                    }
-                };
-                want = def.field_ty(fname).expect("range implies a type");
-                span = Some((offset + hi, offset + lo));
-                offset += lo;
-            }
-
-            let mut value = lower_expr_expecting(low, rvalue, Some(&want), env, sink)?;
-            let have = low.ty_of(value);
-            if have != want {
-                match low.coerce_const(value, &want) {
-                    Some(v) => value = v,
-                    None => {
-                        sink.push(
-                            Diag::error(
-                                low.span(&target),
-                                format!(
-                                    "cannot assign `{}` to `{}`, which is `{}`",
-                                    have.display(),
-                                    name,
-                                    want.display()
-                                ),
-                            )
-                            .with_note(cast_hint(&have, &want)),
-                        );
-                        return None;
-                    }
-                }
-            }
-
-            // A computed index has no bit range, so the read-modify-write
-            // below cannot place it. It becomes a whole-array value instead:
-            // every element muxed against the index, which is the same shape
-            // the synthesizer would build from a `case` and does not need a
-            // procedural block to express.
-            //
-            // `+:` is what a computed READ lowers to (`lower_array_index`),
-            // and there is no `+:` on the left of an assignment in a pure
-            // value graph -- the array is a wire here, not a variable.
-            if let Some((idx, elem, n)) = dynamic {
-                let array_ty = Ty::Array(Box::new(elem.clone()), n);
-                let w = elem.bit_width();
-                let current = match env.get(&name).and_then(|b| b.value) {
-                    Some(v) => v,
-                    None => {
-                        sink.err_at(
-                            &target,
-                            format!("`{}` is assigned an element before it has a value", name),
-                        );
-                        return None;
-                    }
-                };
-                let whole = match span {
-                    None => current,
-                    Some((hi, lo)) => low.emit(array_ty.clone(), Op::Slice { arg: current, hi, lo }),
-                };
-                // Element numbers are compared against the index, so the
-                // comparison type has to hold BOTH of them. Giving the element
-                // numbers the index's own type truncates every one that does
-                // not fit it: with a one-bit index, elements 2 and 3 become 0
-                // and 1, and each in-range index then matches two elements --
-                // a wrong write on a valid index, not an out-of-bounds case.
-                // The index is known unsigned here; a signed one is rejected
-                // where `dynamic` is set.
-                let cmp_ty = Ty::UInt(
-                    low.ty_of(idx).bit_width().max(ty::bits_for(n.saturating_sub(1) as u128)),
-                );
-                let idx = low.extend_to(idx, &cmp_ty);
-                // High-to-low, matching `Op::Concat` and the packed layout the
-                // reads use: element k is bits [(k+1)*w-1 : k*w].
-                let mut parts = Vec::with_capacity(n as usize);
-                for k in (0..n).rev() {
-                    let old_k =
-                        low.emit(elem.clone(), Op::Slice { arg: whole, hi: (k + 1) * w - 1, lo: k * w });
-                    let konst = low.emit(cmp_ty.clone(), Op::Const(k as u128));
-                    let hit = low.emit(
-                        Ty::BOOL,
-                        Op::Cmp { op: CmpOp::Eq, lhs: idx, rhs: konst },
-                    );
-                    parts.push(low.emit(
-                        elem.clone(),
-                        Op::Mux { cond: hit, then_val: value, else_val: old_k },
-                    ));
-                }
-                value = low.emit(array_ty, Op::Concat(parts));
-            }
-
-            // Writing a field is a read-modify-write on the whole value: keep
-            // the bits above and below, splice the new ones in between.
-            let new_base = match span {
-                None => value,
-                Some((hi, lo)) => {
-                    let current = match env.get(&name).and_then(|b| b.value) {
-                        Some(v) => v,
-                        None => {
-                            sink.err_at(
-                                &target,
-                                format!("`{}` is assigned a field before it has a value", name),
-                            );
-                            return None;
-                        }
-                    };
-                    let total = base_ty.bit_width();
-                    let mut parts = Vec::new();
-                    let has_bits_above = hi + 1 < total;
-                    if has_bits_above {
-                        parts.push(low.emit(
-                            Ty::UInt(total - hi - 1),
-                            Op::Slice { arg: current, hi: total - 1, lo: hi + 1 },
-                        ));
-                    }
-                    parts.push(value);
-                    let has_bits_below = lo > 0;
-                    if has_bits_below {
-                        parts.push(low.emit(
-                            Ty::UInt(lo),
-                            Op::Slice { arg: current, hi: lo - 1, lo: 0 },
-                        ));
-                    }
-                    low.emit(base_ty.clone(), Op::Concat(parts))
-                }
-            };
+            let current = env.get(&name).and_then(|b| b.value);
+            let new_base =
+                splice_path(low, &base_ty, current, &path.steps, rvalue, &target, env, sink)?;
 
             if let Some(b) = env.get_mut(&name) {
                 b.value = Some(new_base);
@@ -3709,18 +3452,299 @@ fn cast_hint(have: &Ty, want: &Ty) -> String {
 /// `uop.cond_reg` is one `Field`; `line.words[1]` is a `Field` then an
 /// `Index`. Both resolve to a bit range of the same base name, which is what
 /// makes a write to either a splice rather than a separate storage location.
-enum LvalueStep {
+pub(crate) enum LvalueStep {
     Field(AlphanumSpan),
     Index(PrecResExpr),
 }
 
-struct LvaluePath {
-    base: AlphanumSpan,
+pub(crate) struct LvaluePath {
+    pub(crate) base: AlphanumSpan,
     /// As written, outermost first: `u.a.b` gives `[a, b]`.
-    steps: Vec<LvalueStep>,
+    pub(crate) steps: Vec<LvalueStep>,
 }
 
-fn lvalue_path(expr: &PrecResExpr) -> Option<LvaluePath> {
+/// Walks an assignment target's step chain and splices the new value into the
+/// base it names, returning the base's new whole value.
+///
+/// Shared by the two things that have a step chain. A variable starts from the
+/// value the name already holds and the result goes back into `env`; an element
+/// of storage starts from a read of the memory and the result goes to the write
+/// port. Everything between those two ends -- which steps are legal, where the
+/// bits are, what a computed index costs -- is one decision, so it is one
+/// walker. Two of them drift: `docs/codebase-review-2026-09-09.md` records that
+/// as the failure mode of this file.
+///
+/// `current` is the base's present value, and `None` says it has none yet. That
+/// is an error exactly when a step narrows the write to part of the base, since
+/// the bits outside it have to come from somewhere; a whole-base assignment does
+/// not read it and does not care.
+#[allow(clippy::too_many_arguments)]
+fn splice_path(
+    low: &mut Lowerer,
+    base_ty: &Ty,
+    current: Option<ValueId>,
+    steps: &[LvalueStep],
+    rvalue: &PrecResExpr,
+    target: &AlphanumSpan,
+    env: &Env,
+    sink: &mut DiagSink,
+) -> Option<ValueId> {
+    let name = anumspan_to_str(target).to_string();
+    // Resolve the step chain to one absolute bit range.
+    //
+    // Every step is static except possibly the last, which may be an
+    // array index this cycle computes. A dynamic step has no bit range
+    // to be part of, so nothing may follow it: the whole point of the
+    // range is that the steps after it know where they are.
+    let mut want = base_ty.clone();
+    let mut offset = 0u32;
+    let mut span: Option<(u32, u32)> = None;
+    let mut dynamic: Option<(ValueId, Ty, u32)> = None;
+    for (step_ix, step) in steps.iter().enumerate() {
+        let field = match step {
+            LvalueStep::Field(f) => f,
+            LvalueStep::Index(index) => {
+                let (elem, n) = match &want {
+                    Ty::Array(elem, n) => ((**elem).clone(), *n),
+                    other => {
+                        sink.push(
+                            Diag::error(
+                                low.here(),
+                                format!("`{}` is not an array", other.display()),
+                            )
+                            .with_note(
+                                "only an `[T; n]` can have an element assigned; a bit of an `uN` is not an lvalue",
+                            ),
+                        );
+                        return None;
+                    }
+                };
+                let w = elem.bit_width();
+                let last = step_ix + 1 == steps.len();
+                // A constant index is an ordinary bit range and stays
+                // one wherever it sits: `a[1].f = x` knows exactly
+                // where it is writing.
+                //
+                // `const_eval` reads the syntax, so it misses a
+                // constant parameter and misses the induction variable
+                // of an unrolled `for`. Both arrive as an `Op::Const`
+                // and must not cost a mux tree, so the fallback lowers
+                // once and asks.
+                let konst = match const_eval(index) {
+                    Ok(k) => Some(k),
+                    Err(_) => {
+                        let idx = lower_expr(low, index, env, sink)?;
+                        match low.values[idx.0 as usize].op {
+                            Op::Const(k) => Some(k),
+                            _ => {
+                                if !last {
+                                    sink.push(
+                                        Diag::error(
+                                            low.here(),
+                                            "a computed index must be the last step of an assignment target",
+                                        )
+                                        .with_note(
+                                            "bind the element first -- `let e = a[i]` -- then assign its parts and write `a[i] = e` back",
+                                        ),
+                                    );
+                                    return None;
+                                }
+                                let idx_ty = low.ty_of(idx);
+                                if idx_ty.is_signed() {
+                                    sink.push(
+                                        Diag::error(
+                                            low.here(),
+                                            format!(
+                                                "an index must be unsigned, found `{}`",
+                                                idx_ty.display()
+                                            ),
+                                        )
+                                        .with_note("convert with `@unsigned(x)`"),
+                                    );
+                                    return None;
+                                }
+                                dynamic = Some((idx, elem.clone(), n));
+                                want = elem;
+                                continue;
+                            }
+                        }
+                    }
+                };
+                let k = konst.expect("the dynamic path continued above");
+                if k >= n as u128 {
+                    sink.push(
+                        Diag::error(
+                            low.here(),
+                            format!(
+                                "element {} is out of bounds for `{}`",
+                                k,
+                                want.display()
+                            ),
+                        )
+                        .with_note(format!("it has {} element(s), indexed from 0", n)),
+                    );
+                    return None;
+                }
+                let k = k as u32;
+                span = Some((offset + (k + 1) * w - 1, offset + k * w));
+                offset += k * w;
+                want = elem;
+                continue;
+            }
+        };
+        let struct_name = match &want {
+            Ty::Struct { name, .. } => name.clone(),
+            other => {
+                sink.err_at(
+                    field,
+                    format!("`{}` has no fields", other.display()),
+                );
+                return None;
+            }
+        };
+        let def = low.syms.structs.get(&struct_name)?.clone();
+        let fname = anumspan_to_str(field);
+        let (hi, lo) = match def.field_range(fname) {
+            Some(r) => r,
+            None => {
+                let known: Vec<&str> =
+                    def.fields.iter().map(|(n, _)| n.as_str()).collect();
+                sink.push(
+                    Diag::error(
+                        low.span(field),
+                        format!("`{}` has no field `{}`", struct_name, fname),
+                    )
+                    .with_note(format!("fields are: {}", known.join(", "))),
+                );
+                return None;
+            }
+        };
+        want = def.field_ty(fname).expect("range implies a type");
+        span = Some((offset + hi, offset + lo));
+        offset += lo;
+    }
+
+    let mut value = lower_expr_expecting(low, rvalue, Some(&want), env, sink)?;
+    let have = low.ty_of(value);
+    if have != want {
+        match low.coerce_const(value, &want) {
+            Some(v) => value = v,
+            None => {
+                sink.push(
+                    Diag::error(
+                        low.span(target),
+                        format!(
+                            "cannot assign `{}` to `{}`, which is `{}`",
+                            have.display(),
+                            name,
+                            want.display()
+                        ),
+                    )
+                    .with_note(cast_hint(&have, &want)),
+                );
+                return None;
+            }
+        }
+    }
+
+    // A computed index has no bit range, so the read-modify-write
+    // below cannot place it. It becomes a whole-array value instead:
+    // every element muxed against the index, which is the same shape
+    // the synthesizer would build from a `case` and does not need a
+    // procedural block to express.
+    //
+    // `+:` is what a computed READ lowers to (`lower_array_index`),
+    // and there is no `+:` on the left of an assignment in a pure
+    // value graph -- the array is a wire here, not a variable.
+    if let Some((idx, elem, n)) = dynamic {
+        let array_ty = Ty::Array(Box::new(elem.clone()), n);
+        let w = elem.bit_width();
+        let current = match current {
+            Some(v) => v,
+            None => {
+                sink.err_at(
+                    target,
+                    format!("`{}` is assigned an element before it has a value", name),
+                );
+                return None;
+            }
+        };
+        let whole = match span {
+            None => current,
+            Some((hi, lo)) => low.emit(array_ty.clone(), Op::Slice { arg: current, hi, lo }),
+        };
+        // Element numbers are compared against the index, so the
+        // comparison type has to hold BOTH of them. Giving the element
+        // numbers the index's own type truncates every one that does
+        // not fit it: with a one-bit index, elements 2 and 3 become 0
+        // and 1, and each in-range index then matches two elements --
+        // a wrong write on a valid index, not an out-of-bounds case.
+        // The index is known unsigned here; a signed one is rejected
+        // where `dynamic` is set.
+        let cmp_ty = Ty::UInt(
+            low.ty_of(idx).bit_width().max(ty::bits_for(n.saturating_sub(1) as u128)),
+        );
+        let idx = low.extend_to(idx, &cmp_ty);
+        // High-to-low, matching `Op::Concat` and the packed layout the
+        // reads use: element k is bits [(k+1)*w-1 : k*w].
+        let mut parts = Vec::with_capacity(n as usize);
+        for k in (0..n).rev() {
+            let old_k =
+                low.emit(elem.clone(), Op::Slice { arg: whole, hi: (k + 1) * w - 1, lo: k * w });
+            let konst = low.emit(cmp_ty.clone(), Op::Const(k as u128));
+            let hit = low.emit(
+                Ty::BOOL,
+                Op::Cmp { op: CmpOp::Eq, lhs: idx, rhs: konst },
+            );
+            parts.push(low.emit(
+                elem.clone(),
+                Op::Mux { cond: hit, then_val: value, else_val: old_k },
+            ));
+        }
+        value = low.emit(array_ty, Op::Concat(parts));
+    }
+
+    // Writing a field is a read-modify-write on the whole value: keep
+    // the bits above and below, splice the new ones in between.
+    let new_base = match span {
+        None => value,
+        Some((hi, lo)) => {
+            let current = match current {
+                Some(v) => v,
+                None => {
+                    sink.err_at(
+                        target,
+                        format!("`{}` is assigned a field before it has a value", name),
+                    );
+                    return None;
+                }
+            };
+            let total = base_ty.bit_width();
+            let mut parts = Vec::new();
+            let has_bits_above = hi + 1 < total;
+            if has_bits_above {
+                parts.push(low.emit(
+                    Ty::UInt(total - hi - 1),
+                    Op::Slice { arg: current, hi: total - 1, lo: hi + 1 },
+                ));
+            }
+            parts.push(value);
+            let has_bits_below = lo > 0;
+            if has_bits_below {
+                parts.push(low.emit(
+                    Ty::UInt(lo),
+                    Op::Slice { arg: current, hi: lo - 1, lo: 0 },
+                ));
+            }
+            low.emit(base_ty.clone(), Op::Concat(parts))
+        }
+    };
+
+    Some(new_base)
+}
+
+
+pub(crate) fn lvalue_path(expr: &PrecResExpr) -> Option<LvaluePath> {
     match expr {
         PrecResExpr::Ref(base) => Some(LvaluePath { base: base.clone(), steps: Vec::new() }),
         PrecResExpr::FieldAccess { base, field_name } => {
@@ -4406,7 +4430,7 @@ fn lower_mem_read(
             return None;
         }
     };
-    if low.mems[ix].kind != MemKind::LutRam {
+    if !low.mems[ix].kind.reads_async() {
         sink.push(
             Diag::error(
                 low.span(&mem_name),
@@ -4429,9 +4453,21 @@ fn lower_mem_read(
         );
         return None;
     }
-    let (elem, addr_width) = (low.mems[ix].elem.clone(), low.mems[ix].addr_width);
+    let addr_width = low.mems[ix].addr_width;
     let raw = lower_expr(low, index, env, sink)?;
     let addr = low.fit_address(raw, addr_width, &mem_name, sink)?;
+    Some(lower_mem_read_at(low, ix, addr, env))
+}
+
+/// The read itself, given an address that already fits the memory.
+///
+/// Split out so a read-modify-write can share it: the load half of
+/// `m[a][k] = v` is this exact read, forwarding and bounds guard included, and
+/// re-deriving it there would be the second copy of a decision that has to be
+/// the same one. The caller owns the kind check -- the read costs no cycle only
+/// if `reads_async`, and this cannot say where a cycle would go.
+fn lower_mem_read_at(low: &mut Lowerer, ix: usize, addr: ValueId, env: &Env) -> ValueId {
+    let elem = low.mems[ix].elem.clone();
     let in_range = low.address_in_bounds(ix, addr);
     let array = low.emit(elem.clone(), Op::MemRead { mem: ix as u32, addr });
 
@@ -4458,7 +4494,94 @@ fn lower_mem_read(
     // Outermost, so an out-of-range read answers zero whether the array or a
     // forwarded write would have answered it. A write to that address did not
     // land either.
-    Some(low.guarded_read(in_range, answer, &elem))
+    low.guarded_read(in_range, answer, &elem)
+}
+
+/// Any assignment whose target names a memory.
+///
+/// A memory is reached by subscript and by nothing else, so the first step of
+/// the path picks the element; anything after it picks a part of that element.
+///
+/// Writing a part still has to offer the port a WHOLE element, so the parts not
+/// being written come from a read of the same address -- the read-modify-write
+/// the source had to spell out by hand before. That is only free where the read
+/// is: a synchronous read costs a cycle and this statement has nowhere to put
+/// one, and inside a `sequence` the value would not arrive until after the stage
+/// cut, so there is no cycle to spend there at all. Those kinds keep saying so.
+fn lower_memory_assign(
+    low: &mut Lowerer,
+    target: &AlphanumSpan,
+    steps: &[LvalueStep],
+    assign: &crate::parse::AssignStmt,
+    env: &mut Env,
+    sink: &mut DiagSink,
+) -> Option<()> {
+    let name = anumspan_to_str(target).to_string();
+    let is_plain = assign.kind == crate::lex::AssignStmtKind::PlainAssign;
+    if !is_plain {
+        sink.err_at(target, "compound assignment to a memory is not supported yet");
+        return None;
+    }
+
+    // The element, and then whatever part of it the rest of the path names.
+    let (row, within_element) = match steps.split_first() {
+        Some((LvalueStep::Index(row), rest)) => (row, rest),
+        // A bare name, or a field of one: neither is a place. `m = v` has no
+        // meaning because a memory is not a value, and `m.f` has no meaning
+        // because storage has no fields.
+        _ => {
+            sink.push(
+                Diag::error(
+                    low.span_of(target),
+                    format!("`{}` is storage, and storage is written one element at a time", name),
+                )
+                .with_note(format!("name the element -- `{}[i] = v`", name)),
+            );
+            return None;
+        }
+    };
+    if within_element.is_empty() {
+        return lower_mem_write(low, target.clone(), row, &assign.rvalue, env, sink);
+    }
+
+    let ix = match low.mem_index(&name) {
+        Some(ix) => ix,
+        None => {
+            sink.err_at(target, format!("`{}` is not a memory of this process", name));
+            return None;
+        }
+    };
+    let the_read_is_free = low.mems[ix].kind.reads_async();
+    if !the_read_is_free {
+        sink.push(
+            Diag::error(
+                low.span_of(target),
+                format!(
+                    "writing part of an element of `{}` needs a read of it, and a read of `{}` takes a cycle",
+                    name, name
+                ),
+            )
+            .with_note(format!(
+                "bind the element first -- `var row = {}[i]` -- then assign its parts and write `{}[i] = row` back",
+                name, name
+            )),
+        );
+        return None;
+    }
+
+    let (elem, addr_width) = (low.mems[ix].elem.clone(), low.mems[ix].addr_width);
+    let raw = lower_expr(low, row, env, sink)?;
+    let addr = low.fit_address(raw, addr_width, target, sink)?;
+    // Read before the port is claimed. `lower_mem_read_at` forwards whatever
+    // writes this cycle has already offered, and the slot this one is about to
+    // take is not among them -- which is what makes two lanes of one row,
+    // written on two lines, both survive. Claiming the slot first would leave
+    // the second read looking at an address and data it had just installed.
+    let old = lower_mem_read_at(low, ix, addr, env);
+    let merged =
+        splice_path(low, &elem, Some(old), within_element, &assign.rvalue, target, env, sink)?;
+    put_mem_write(low, ix, addr, merged, env);
+    Some(())
 }
 
 /// `m[addr] = value` -- an offer to the one write port.
@@ -4511,12 +4634,20 @@ fn lower_mem_write(
         }
     }
 
-    // A NEW slot, not an overwrite of the last one. Two writes in a row can
-    // both happen this cycle, so they are two ports; before this the second
-    // replaced the first in the environment and the first was silently lost.
-    // Writes that cannot both happen -- the arms of an `if` -- still share a
-    // slot, because both arms start from the same count and the join brings
-    // them back together.
+    put_mem_write(low, ix, addr, value, env);
+    Some(())
+}
+
+/// Offers one whole element to the write port.
+///
+/// A NEW slot, not an overwrite of the last one. Two writes in a row can both
+/// happen this cycle, so they are two ports; before this the second replaced
+/// the first in the environment and the first was silently lost. Writes that
+/// cannot both happen -- the arms of an `if` -- still share a slot, because
+/// both arms start from the same count and the join brings them back together.
+fn put_mem_write(low: &mut Lowerer, ix: usize, addr: ValueId, value: ValueId, env: &mut Env) {
+    let (name, addr_width) = (low.mems[ix].name.clone(), low.mems[ix].addr_width);
+    let elem = low.mems[ix].elem.clone();
     let one = low.emit(Ty::BOOL, Op::Const(1));
     let slot = low.mem_slots(ix);
     low.set_mem_slots(ix, slot + 1);
@@ -4524,7 +4655,6 @@ fn lower_mem_write(
     env.insert(we_key, Binding::constant(one, Ty::BOOL));
     env.insert(addr_key, Binding::constant(addr, Ty::UInt(addr_width)));
     env.insert(data_key, Binding::constant(value, elem));
-    Some(())
 }
 
 fn lower_builtin(

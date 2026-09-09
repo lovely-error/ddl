@@ -83,6 +83,18 @@ impl MemKind {
             MemKind::BankedRam => "bkram",
         }
     }
+
+    /// Whether a read answers in the cycle it was addressed.
+    ///
+    /// The question every caller is actually asking is "is the value there
+    /// now", and the answer decides what the PROGRAM may do rather than which
+    /// cell comes out: a read that costs a cycle needs somewhere to spend it,
+    /// so it cannot sit inside an expression and cannot be the load half of a
+    /// read-modify-write. `bkram` is on the synchronous side of that line
+    /// along with `bram`.
+    pub fn reads_async(&self) -> bool {
+        matches!(self, MemKind::LutRam)
+    }
 }
 
 impl Ty {
