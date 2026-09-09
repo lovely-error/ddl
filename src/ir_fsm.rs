@@ -500,17 +500,33 @@ impl Hoister<'_> {
     /// read of it, so the subscript stays where it is -- lifting it would turn
     /// every store into a load and then assign to the loaded value. Anything
     /// inside the address is still an ordinary expression.
+    ///
+    /// The whole chain is a place, not just its last step. `m[a][k] = d` used
+    /// to be checked only at the top -- which is not a sync read, because its
+    /// base is a subscript rather than a name -- and then handed to `expr`,
+    /// where the `m[a]` inside it WAS one. So the store became `let @rdN = m[a]`
+    /// followed by an assignment to `@rdN`: the load this function exists to
+    /// prevent, reported later as a write to a `let` under a name no source
+    /// contains. Walking the chain here keeps every step of it a place, while
+    /// the address of each step stays an ordinary expression whose own reads
+    /// still lift -- `m[t[i]][k] = d` needs the `t[i]` read to have happened.
     fn lvalue(&mut self, e: &PrecResExpr, pre: &mut Vec<PrecResInnerStmt>) -> PrecResExpr {
-        if self.is_sync_read(e) {
-            let PrecResExpr::SubscriptAccess(sub) = e else {
-                unreachable!("checked by is_sync_read")
-            };
-            return PrecResExpr::SubscriptAccess(Box::new(crate::parse::SubscriptAccess {
-                base: sub.base.clone(),
-                index: self.expr(&sub.index, pre),
-            }));
+        match e {
+            PrecResExpr::SubscriptAccess(sub) => {
+                PrecResExpr::SubscriptAccess(Box::new(crate::parse::SubscriptAccess {
+                    base: self.lvalue(&sub.base, pre),
+                    index: self.expr(&sub.index, pre),
+                }))
+            }
+            PrecResExpr::FieldAccess { base, field_name } => PrecResExpr::FieldAccess {
+                base: Box::new(self.lvalue(base, pre)),
+                field_name: field_name.clone(),
+            },
+            // The root of a chain. Anything else is not a target at all, which
+            // is a diagnostic in the lowerer rather than something to rewrite.
+            PrecResExpr::Ref(_) => e.clone(),
+            other => self.expr(other, pre),
         }
-        self.expr(e, pre)
     }
 
     /// A branch arm: its reads stay inside it.
@@ -1184,10 +1200,21 @@ pub(crate) fn writes_of(stmt: &PrecResInnerStmt, out: &mut HashSet<String>) {
     }
     match stmt {
         PrecResInnerStmt::AssignStmt(a) => {
-            if let PrecResExpr::SubscriptAccess(sub) = &a.lvalue
-                && let PrecResExpr::Ref(n) = &sub.base
-            {
-                out.insert(anumspan_to_str(n).to_string());
+            // The base of the target, when the target reaches into it by
+            // subscript: `t[i] = v` writes `t`, and so do `t[i][k] = v` and
+            // `t[i].f = v`. Only the first shape was recognised here, so a
+            // memory written exclusively through a nested target looked like a
+            // read-only table -- and ir_pipe builds stage ownership from this,
+            // where a miss is a silently wrong pipeline rather than an error.
+            //
+            // A target with no subscript at all -- `x = v`, `s.f = v` -- names
+            // a variable, and no memory is written.
+            if let Some(path) = crate::ir::lvalue_path(&a.lvalue) {
+                let reaches_into_the_base =
+                    matches!(path.steps.first(), Some(crate::ir::LvalueStep::Index(_)));
+                if reaches_into_the_base {
+                    out.insert(anumspan_to_str(&path.base).to_string());
+                }
             }
         }
         PrecResInnerStmt::IfThenElse(i) => {

@@ -22,6 +22,7 @@ $exportManifest = @{
     'backend_edges' = @('collision_graph','name_collision','scalar_dynamic','scalar_expr','scalar_sext','scalar_signed','scalar_slice','scalar_trunc')
     'communication' = @('polling_drain','polling_forward','polling_once','polling_peek')
     'lifetimes'     = @('lifetimes','received_local')
+    'nested_mem'    = @('nm_lane','nm_two','nm_field','nm_branch','nm_seq')
     'p1'            = @('p1')
     'p10'           = @('p10')
     'p11'           = @('p11')
@@ -58,7 +59,7 @@ try {
             & (Join-Path $SimTool 'vlog.exe') -quiet -work work +define+SIMULATION $verilogSource.Name *> ($verilogSource.BaseName + '.vlog.log')
             if ($LASTEXITCODE -ne 0) { throw "Verilog rejected: $($verilogSource.Name)" }
         }
-        foreach ($bench in @('tb_fixed', 'tb_adversarial', 'tb_sequence')) {
+        foreach ($bench in @('tb_fixed', 'tb_adversarial', 'tb_sequence', 'tb_nested_mem')) {
             $benchLog = "$bench.vlog.log"
             & (Join-Path $SimTool 'vlog.exe') -quiet -work work (Join-Path $PSScriptRoot "probes/$bench.sv") *> $benchLog
             if ($LASTEXITCODE -ne 0) { throw "Testbench compilation failed: $bench" }

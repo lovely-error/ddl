@@ -359,6 +359,27 @@ var block_mem: [u32; 1024]
   - In a `sequence`, a `bram` read must precede a stage cut (`|||`). The block RAM's built-in output register acts as the pipeline stage register.
   - **Forwarding**: Same-cycle writes occurring earlier in source order are forwarded around the memory array, which updates on the clock edge.
 
+#### Writing part of an element
+
+An element may be an aggregate — `#[impl(lutram)] [[u8; 4]; 16]`, or a memory of structs — and part of one can be assigned directly:
+
+```ddl
+t[addr][lane] = byte
+t[addr].field = value
+```
+
+The write port always carries a whole element, so the parts not named come from a read of the same address: a read-modify-write, with the same forwarding as any other read, so two lanes of one row written in the same cycle both land.
+
+This needs the read to be free, so it is available on `lutram` only. On `bram` and `bkram` the read costs a cycle and a single statement has nowhere to spend it — inside a `sequence` the value would not arrive until after the stage cut — so the compiler asks for the two steps to be written out, where the cycle is visible:
+
+```ddl
+var row = t[addr]
+row[lane] = byte
+t[addr] = row
+```
+
+Each such write claims a write port, exactly as a whole-element write does. Compound assignment (`+=`) to a memory is not supported, nested or not.
+
 ### Multi-Port Synthesis and LVT BRAM
 
 The compiler infers one read/write port per concurrent access:
