@@ -469,3 +469,60 @@ fn a_discriminant_that_divides_by_zero_says_so() {
     ));
     assert!(text.contains("discriminant divides by zero"), "{}", text);
 }
+
+#[test]
+fn a_bare_tag_sits_above_the_payload_at_every_width_that_fits() {
+    // `bare_value` shifted the tag up by the payload width and let the result
+    // wrap. At a 128-bit payload the tag belongs in bit 128, which a `u128`
+    // does not have: debug panicked, release emitted `129'd1` and put the tag
+    // in the payload's LOWEST bit. 127 is the widest payload that still leaves
+    // room, so it is the case most worth pinning.
+    for (payload, width, tag) in [
+        (126u32, 127u32, "40000000000000000000000000000000"),
+        (127, 128, "80000000000000000000000000000000"),
+    ] {
+        let v = compile(&format!(
+            "enum E\n  A(u{})\n  B\nfun f (o: out E)\n  o = B\n",
+            payload
+        ));
+        let want = format!("{}'h{}", width, tag);
+        assert!(v.contains(&want), "payload u{} should emit {}\n{}", payload, want, v);
+    }
+}
+
+#[test]
+fn an_enum_too_wide_for_a_constant_is_refused_rather_than_wrapped() {
+    // The same input under both profiles: this used to be a debug panic and a
+    // release miscompile, which is the pair a profile-blind test suite misses.
+    let e = compile_err("enum E\n  A(u128)\n  B\nfun f (o: out E)\n  o = B\n");
+    assert!(e.contains("129 bits wide"), "{}", e);
+    assert!(e.contains("wider than a constant can be"), "{}", e);
+}
+
+#[test]
+fn a_maximal_discriminant_on_the_last_variant_is_fine() {
+    // The successor was computed whether or not anything needed it, so an enum
+    // whose LAST variant was `u128::MAX` panicked in debug and wrapped in
+    // release -- on a declaration that is perfectly valid, because nothing
+    // follows it to take that successor.
+    let v = compile(concat!(
+        "enum e_t\n",
+        "  A = 340282366920938463463374607431768211455\n",
+        "fun f (o: out u1)\n",
+        "  o = 1'd1\n",
+    ));
+    assert!(!v.is_empty());
+}
+
+#[test]
+fn a_variant_after_a_maximal_discriminant_is_the_actual_error() {
+    // Here the successor really is needed, and saying so beats an overflow.
+    let e = compile_err(concat!(
+        "enum e_t\n",
+        "  A = 340282366920938463463374607431768211455\n",
+        "  B\n",
+        "fun f (o: out u1)\n",
+        "  o = 1'd1\n",
+    ));
+    assert!(e.contains("no discriminant after"), "{}", e);
+}

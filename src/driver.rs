@@ -9,7 +9,7 @@ use std::collections::HashMap;
 
 use crate::diag::{Diag, DiagSink, Severity, SourceMap, Span};
 use crate::ir::{lower_function, lower_process};
-use crate::lex::{find_tab, parse_top_level, TopLevelDecl};
+use crate::lex::{AlphanumSpan, find_tab, parse_top_level, TopLevelDecl};
 use crate::parse::{
     FunctionDecl, anumspan_to_str, resolve_precedence_for_enum, resolve_precedence_for_function,
     resolve_precedence_for_graph, resolve_precedence_for_process, resolve_precedence_for_sequence,
@@ -156,10 +156,29 @@ pub enum Emit {
     Verilog,
     /// Graphviz of the `graph` declarations: what is connected to what.
     Dot,
+    /// Everything the other modes check, and nothing they produce.
+    ///
+    /// `ddl check` used to run the whole of `Emit::Verilog`, which made it ask
+    /// which module the file was FOR -- a question about producing an artifact,
+    /// not about whether the source is correct. A file with several roots
+    /// therefore failed to CHECK until an export was chosen, and the
+    /// `--bare-export` the message suggested was parsed and then dropped on
+    /// the floor, so taking the advice changed nothing.
+    Check,
 }
 
 pub fn compile_to_verilog(map: &SourceMap, opts: &EmitOptions) -> Result<String, Vec<Diag>> {
     compile(map, opts, Emit::Verilog)
+}
+
+/// Checks a program without choosing an export or rendering anything.
+///
+/// Every declaration is parsed, resolved and lowered, so this reports what a
+/// build would report about the source itself -- and nothing about which of
+/// several roots the output should present, which is a question only a build
+/// has to answer.
+pub fn check(map: &SourceMap, opts: &EmitOptions) -> Result<(), Vec<Diag>> {
+    compile(map, opts, Emit::Check).map(|_| ())
 }
 
 /// The stack the compiler runs on.
@@ -175,6 +194,40 @@ pub fn compile_to_verilog(map: &SourceMap, opts: &EmitOptions) -> Result<String,
 /// somebody chose, and it is enforced identically everywhere.
 const COMPILER_STACK: usize = 64 * 1024 * 1024;
 
+/// Lowers one declaration, and refuses to lose it quietly.
+///
+/// A lowering that returns `None` is claiming it already explained itself. When
+/// it has not, the declaration disappears from the output while the build still
+/// reports success -- `ddl build` writing a Verilog file that is missing one of
+/// the functions it was given, exit code 0. A range whose ends would not fold
+/// did exactly that. The reason belongs at the mistake, so this does not try to
+/// produce one; it makes the silence itself an error, so no future `None` on
+/// this path can cost a declaration.
+fn lowered<T>(
+    sink: &mut DiagSink,
+    what: &str,
+    name: &AlphanumSpan,
+    lower: impl FnOnce(&mut DiagSink) -> Option<T>,
+) -> Option<T> {
+    let before = sink.error_count();
+    let lowered = lower(sink);
+    if lowered.is_none() && sink.error_count() == before {
+        let span = sink.span_of(name);
+        sink.push(
+            Diag::error(
+                span,
+                format!(
+                    "internal error: {} `{}` failed to compile without reporting why; this is a bug in the compiler",
+                    what,
+                    anumspan_to_str(name)
+                ),
+            )
+            .as_internal(),
+        );
+    }
+    lowered
+}
+
 pub fn compile(map: &SourceMap, opts: &EmitOptions, emit: Emit) -> Result<String, Vec<Diag>> {
     std::thread::scope(|scope| {
         std::thread::Builder::new()
@@ -184,7 +237,7 @@ pub fn compile(map: &SourceMap, opts: &EmitOptions, emit: Emit) -> Result<String
             .expect("a thread for the compiler")
             .join()
             .unwrap_or_else(|_| {
-                Err(vec![Diag::error_no_span(
+                Err(vec![Diag::internal_error(
                     "the compiler panicked; this is a bug in the compiler",
                 )])
             })
@@ -338,19 +391,25 @@ fn compile_on_this_stack(
         out.push_str(&crate::ir::render_module(module));
     };
     for func in &funcs {
-        if let Some(module) = lower_function(map, &syms, &bodies, func, &mut sink) {
+        if let Some(module) = lowered(&mut sink, "fun", &func.name, |sink| {
+            lower_function(map, &syms, &bodies, func, sink)
+        }) {
             render(&mut out, &module);
             emitted += 1;
         }
     }
     for seq in &seqs {
-        if let Some(module) = crate::ir_pipe::lower_sequence(map, &syms, &bodies, seq, &mut sink) {
+        if let Some(module) = lowered(&mut sink, "sequence", &seq.name, |sink| {
+            crate::ir_pipe::lower_sequence(map, &syms, &bodies, seq, sink)
+        }) {
             render(&mut out, &module);
             emitted += 1;
         }
     }
     for proc in &procs {
-        if let Some(module) = lower_process(map, &syms, &bodies, proc, &mut sink) {
+        if let Some(module) = lowered(&mut sink, "process", &proc.name, |sink| {
+            lower_process(map, &syms, &bodies, proc, sink)
+        }) {
             render(&mut out, &module);
             emitted += 1;
         }
@@ -374,7 +433,7 @@ fn compile_on_this_stack(
         // nothing else.
         for ext in &externs {
             let name = anumspan_to_str(&ext.name).to_string();
-            crate::ir_graph::check_extern(map, ext, &mut sink);
+            crate::ir_graph::check_extern(map, ext, &syms, &mut sink);
             sigs.insert(
                 name.clone(),
                 crate::ir_graph::signature_of(&name, "extern", &ext.args, &syms),
@@ -395,6 +454,12 @@ fn compile_on_this_stack(
     }
 
     if !graphs.is_empty() {
+        // Before any of them is lowered: a cycle is a property of the set, and
+        // lowering one declaration can only see the one declaration.
+        crate::ir_graph::check_graph_cycles(map, &graphs, &mut sink);
+        if sink.has_errors() {
+            return Err(sink.into_diags());
+        }
         // Combinators first, in the file: a graph instantiates them, and the
         // rule for this file is that everything a graph names has been emitted
         // above it so the whole thing reads top to bottom.
@@ -434,6 +499,12 @@ fn compile_on_this_stack(
     }
     if drawing {
         return Ok(crate::dot::render(&drawn));
+    }
+    // Everything above has run: every declaration is lowered and every
+    // diagnostic it had is in the sink. What is left below is choosing and
+    // rendering an artifact, which checking has no opinion about.
+    if emit == Emit::Check {
+        return if sink.has_errors() { Err(sink.into_diags()) } else { Ok(String::new()) };
     }
     if emitted == 0 {
         return Err(vec![Diag::error_no_span(

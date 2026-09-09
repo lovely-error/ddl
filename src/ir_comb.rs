@@ -183,6 +183,10 @@ pub fn build(
     ty: &Ty,
     sink: &mut DiagSink,
 ) -> Option<Module> {
+    // Errors from EARLIER declarations are not this one's failure: the sink
+    // is shared by the whole compilation, so `has_errors` would make every
+    // declaration after the first bad one return `None` without a reason.
+    let errors_before = sink.error_mark();
     let bodies = std::collections::HashMap::new();
     let mut low = Lowerer::new(map, syms, &bodies);
 
@@ -359,7 +363,7 @@ pub fn build(
         }
     }
 
-    if sink.has_errors() {
+    if sink.errored_since(errors_before) {
         return None;
     }
 

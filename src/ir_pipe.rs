@@ -363,6 +363,10 @@ pub fn lower_sequence(
     decl: &crate::parse::SequenceDecl,
     sink: &mut DiagSink,
 ) -> Option<crate::ir::Module> {
+    // Errors from EARLIER declarations are not this one's failure: the sink
+    // is shared by the whole compilation, so `has_errors` would make every
+    // declaration after the first bad one return `None` without a reason.
+    let errors_before = sink.error_mark();
     let mut low = Lowerer::new(map, syms, bodies);
     let mut env: Env = Env::new();
 
@@ -981,7 +985,7 @@ pub fn lower_sequence(
     // that, ANDed with the branch the send was written on and with the shift --
     // because a stalled pipeline is not producing anything, it is holding.
 
-    if sink.has_errors() {
+    if sink.errored_since(errors_before) {
         return None;
     }
     let asserts = std::mem::take(&mut low.asserts);

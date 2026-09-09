@@ -53,8 +53,19 @@ impl EnumDef {
 
     /// The whole value a payload-free variant is: the tag, shifted up over the
     /// payload field it does not use.
-    pub fn bare_value(&self, discriminant: u128) -> u128 {
-        discriminant << self.payload_width
+    ///
+    /// `None` when that value has no constant form. `Op::Const` is a `u128`,
+    /// and an enum can be declared wider: `A(u128) | B` is 129 bits, so the
+    /// tag belongs in bit 128 and the shift ran off the top of the word. Debug
+    /// panicked on the overflow; release wrapped and emitted `129'd1`, putting
+    /// the tag in the payload's lowest bit -- a wrong value that synthesizes.
+    pub fn bare_value(&self, discriminant: u128) -> Option<u128> {
+        if self.width > 128 {
+            return None;
+        }
+        let shifted = discriminant.checked_shl(self.payload_width)?;
+        // A shift that fits the word can still push the tag out of it.
+        (shifted >> self.payload_width == discriminant).then_some(shifted)
     }
 
     pub fn discriminant_of(&self, variant: &str) -> Option<u128> {
@@ -79,6 +90,13 @@ pub struct StructDef {
 }
 
 impl StructDef {
+    /// Checked counterpart of `bit_width`, used when the struct is built.
+    pub fn checked_bit_width(&self) -> Option<u32> {
+        self.fields
+            .iter()
+            .try_fold(0u32, |acc, (_, t)| acc.checked_add(t.checked_bit_width()?))
+    }
+
     pub fn bit_width(&self) -> u32 {
         self.fields.iter().map(|(_, t)| t.bit_width()).sum()
     }
@@ -435,7 +453,7 @@ fn finish_enum(
         let ty = crate::ty::resolve_type_expr(payload, syms).map_err(|e| {
             (variant.name.clone(), e.message(), e.missing_type_name())
         })?;
-        if ty.is_memory() {
+        if ty.contains_memory() {
             return Err((
                 variant.name.clone(),
                 "a memory cannot be an enum payload: it is storage rather than a value"
@@ -447,9 +465,12 @@ fn finish_enum(
         payloads.insert(anumspan_to_str(&variant.name).to_string(), ty);
     }
 
+    let Some(width) = shell.tag_width.checked_add(payload_width) else {
+        return Err((decl.name.clone(), crate::ty::TyError::WidthOutOfRange.message(), None));
+    };
     Ok(EnumDef {
         name: shell.name.clone(),
-        width: shell.tag_width + payload_width,
+        width,
         tag_width: shell.tag_width,
         payload_width,
         variants: shell.variants.clone(),
@@ -469,24 +490,63 @@ fn build_struct_quiet(decl: &StructDecl, syms: &Symbols) -> Result<StructDef, Re
         }
         let ty = crate::ty::resolve_type_expr(&field.field_type, syms)
             .map_err(|e| (field.name.clone(), e.message(), e.missing_type_name()))?;
+        // A struct is a packed value. Storage inside one used to be accepted
+        // and then flattened: the field became ordinary bits and the
+        // `#[impl(...)]` that asked for a BRAM meant nothing. An enum payload
+        // already refused this, so the two aggregates now agree.
+        if ty.contains_memory() {
+            return Err((
+                field.name.clone(),
+                format!(
+                    "field `{}` is storage, and a struct is a packed value rather than a place to keep one",
+                    fname
+                ),
+                None,
+            ));
+        }
         fields.push((fname, ty));
     }
 
     if fields.is_empty() {
         return Err((decl.name.clone(), "a struct needs at least one field".to_string(), None));
     }
-    Ok(StructDef { name, fields })
+    let def = StructDef { name, fields };
+    // Each field fits; the sum still need not.
+    if def.checked_bit_width().is_none() {
+        return Err((
+            decl.name.clone(),
+            crate::ty::TyError::WidthOutOfRange.message(),
+            None,
+        ));
+    }
+    Ok(def)
 }
 
 fn build_enum_shell(decl: &EnumDecl, sink: &mut DiagSink) -> Option<EnumShell> {
     let name = anumspan_to_str(&decl.name).to_string();
     let mut variants: Vec<(String, u128)> = Vec::new();
-    let mut next_discriminant: u128 = 0;
+    // `None` once the previous discriminant was `u128::MAX`. A maximal value
+    // on the LAST variant is legal -- nothing follows it -- so the successor
+    // is computed lazily rather than eagerly: computing it anyway panicked in
+    // debug and wrapped to 0 in release, on an enum that was perfectly valid.
+    let mut next_discriminant: Option<u128> = Some(0);
 
     for variant in &decl.variants {
         let vname = anumspan_to_str(&variant.name).to_string();
         let discriminant = match variant.discriminant() {
-            None => next_discriminant,
+            None => match next_discriminant {
+                Some(d) => d,
+                None => {
+                    sink.err_at(
+                        &variant.name,
+                        format!(
+                            "there is no discriminant after {}; give this variant one explicitly",
+                            u128::MAX
+                        ),
+                    );
+                    return None;
+                }
+            },
             Some(expr) => match const_eval(expr) {
                 Ok(v) => v,
                 Err(e) => {
@@ -507,7 +567,7 @@ fn build_enum_shell(decl: &EnumDecl, sink: &mut DiagSink) -> Option<EnumShell> {
             return None;
         }
         variants.push((vname, discriminant));
-        next_discriminant = discriminant + 1;
+        next_discriminant = discriminant.checked_add(1);
     }
 
     if variants.is_empty() {

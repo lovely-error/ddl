@@ -52,3 +52,50 @@ jobs:
 
       - name: Check example formatting with ddl fmt
         run: ./target/debug/ddl fmt --check examples/*.ddl
+
+  # A REQUIRED job, and one that cannot pass by not running.
+  #
+  # The Verilator test skips when the tool is missing or its data directory is
+  # broken, which is right on a developer's machine and wrong here: cargo hides
+  # a passing test's stderr, so the `SKIP` went unseen and the workflow was
+  # green having linted nothing. Nothing else in CI looked at the generated
+  # RTL at all. `DDL_REQUIRE_VERILATOR=1` turns those skips into failures, so
+  # this job distinguishes passed from skipped from failed.
+  rtl:
+    name: Generated RTL (Verilator)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-06-25
+
+      # Pinned and built, not apt's. See .github/install-verilator.sh for why
+      # the distro one cannot lint this repository at all.
+      - name: Cache Verilator
+        id: verilator
+        uses: actions/cache@v4
+        with:
+          path: /opt/verilator
+          key: verilator-v5.046-${{ runner.os }}
+
+      - name: Install Verilator
+        if: steps.verilator.outputs.cache-hit != 'true'
+        run: bash .github/install-verilator.sh
+
+      # Named in the log, so a lint result can be tied to a version later.
+      - name: Report Verilator version
+        run: /opt/verilator/bin/verilator --version
+
+      # Both halves, and the order matters. The freshness test ties the
+      # checked-in `.v` to the compiler in this commit; without it the linter
+      # would be judging whatever the compiler used to emit. The lint itself
+      # then runs with skips promoted to failures.
+      - name: Lint the generated Verilog, and check it is current
+        env:
+          DDL_REQUIRE_VERILATOR: '1'
+          VERILATOR: /opt/verilator/bin/verilator
+        run: cargo test --locked --test lint

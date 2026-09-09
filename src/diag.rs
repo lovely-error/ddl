@@ -53,19 +53,52 @@ pub struct Diag {
     /// Optional second line printed under the snippet, for the "and here is
     /// why" half that width-mismatch and scope errors need.
     pub note: Option<String>,
+    /// The compiler failed, rather than the input being wrong.
+    ///
+    /// Both come back as `Err(Vec<Diag>)`, which is right for a caller that
+    /// only has to decide between emitting and reporting -- and wrong for
+    /// anything judging the compiler, because "this input is invalid" and
+    /// "this input broke the compiler" are then the same answer. The fuzz
+    /// oracle counted a panic as a successful diagnosis for exactly that
+    /// reason (tests/fuzz.rs).
+    pub internal: bool,
 }
 
 impl Diag {
     pub fn error(span: Span, msg: impl Into<String>) -> Self {
-        Diag { severity: Severity::Error, span: Some(span), msg: msg.into(), note: None }
+        Diag {
+            severity: Severity::Error,
+            span: Some(span),
+            msg: msg.into(),
+            note: None,
+            internal: false,
+        }
     }
 
     pub fn error_no_span(msg: impl Into<String>) -> Self {
-        Diag { severity: Severity::Error, span: None, msg: msg.into(), note: None }
+        Diag { severity: Severity::Error, span: None, msg: msg.into(), note: None, internal: false }
+    }
+
+    /// A failure of the compiler itself, reported like any other error so the
+    /// command line still behaves, but marked so a test can tell.
+    pub fn internal_error(msg: impl Into<String>) -> Self {
+        Diag { severity: Severity::Error, span: None, msg: msg.into(), note: None, internal: true }
     }
 
     pub fn warning(span: Span, msg: impl Into<String>) -> Self {
-        Diag { severity: Severity::Warning, span: Some(span), msg: msg.into(), note: None }
+        Diag {
+            severity: Severity::Warning,
+            span: Some(span),
+            msg: msg.into(),
+            note: None,
+            internal: false,
+        }
+    }
+
+    /// Marks an already-built diagnostic as a compiler failure.
+    pub fn as_internal(mut self) -> Self {
+        self.internal = true;
+        self
     }
 
     pub fn with_note(mut self, note: impl Into<String>) -> Self {
@@ -189,6 +222,14 @@ impl SourceMap {
     /// The first input file, which is the one named on the command line.
     pub fn path(&self) -> &str {
         &self.files[0].path
+    }
+
+    /// Every file that went into this program: roots and everything imported.
+    ///
+    /// The output path is checked against all of them, not just the roots. An
+    /// import is as destroyed by being overwritten as a root is.
+    pub fn paths(&self) -> impl Iterator<Item = &str> {
+        self.files.iter().map(|f| f.path.as_str())
     }
 
     /// Index of the file that owns a byte offset.
@@ -425,6 +466,30 @@ impl<'a> DiagSink<'a> {
 
     pub fn has_errors(&self) -> bool {
         self.diags.iter().any(|d| d.severity == Severity::Error)
+    }
+
+    /// How many errors have been recorded.
+    ///
+    /// Compared across a fallible stage to tell "it failed and said why" from
+    /// "it failed silently", which are the same `None` to the caller.
+    pub fn error_count(&self) -> usize {
+        self.diags.iter().filter(|d| d.severity == Severity::Error).count()
+    }
+
+    /// A point in the error log, to ask `errored_since` about later.
+    ///
+    /// One sink serves a whole compilation, so `has_errors` answers a question
+    /// about the FILE. A pass that lowers one declaration wants the question
+    /// about that declaration: asking the broad one made every declaration
+    /// after the first failing one bail out silently, so a file with two
+    /// unrelated mistakes reported the first and quietly dropped the rest.
+    pub fn error_mark(&self) -> usize {
+        self.error_count()
+    }
+
+    /// Whether any error has been recorded since `mark`.
+    pub fn errored_since(&self, mark: usize) -> bool {
+        self.error_count() > mark
     }
 
     pub fn diags(&self) -> &[Diag] {

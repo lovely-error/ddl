@@ -297,3 +297,38 @@ fn every_file_named_on_the_command_line_is_a_candidate() {
     assert!(text.contains("`one`"), "{}", text);
     assert!(text.contains("`two`"), "{}", text);
 }
+
+#[test]
+fn checking_does_not_need_an_export_chosen() {
+    // `check` ran the whole of the Verilog path, so it asked which module the
+    // file was FOR -- a question about producing an artifact. A file with
+    // several roots could not be CHECKED until one was picked, and the
+    // `--bare-export` the error suggested was parsed and then ignored, so
+    // following the advice produced the same error again.
+    let src = concat!(
+        "fun a (x: u8, o: out u8)\n",
+        "  o = x\n",
+        "fun b (x: u8, o: out u8)\n",
+        "  o = x\n",
+    );
+    let map = SourceMap::new("t.ddl", src);
+
+    // Building is still entitled to ask.
+    let built = compile_to_verilog(&map, &ddl::verilog::EmitOptions::default());
+    assert!(built.is_err(), "a build with two roots must ask which one");
+
+    // Checking is not.
+    ddl::driver::check(&map, &ddl::verilog::EmitOptions::default())
+        .expect("checking should not require an export");
+}
+
+#[test]
+fn checking_still_reports_errors_in_the_source() {
+    // The endpoint must not have become a no-op on the way to ignoring
+    // exports: it still lowers every declaration.
+    let map = SourceMap::new("t.ddl", "fun f (a: u8, hi: u3, o: out u8)\n  o = a[hi..0]\n");
+    let diags = ddl::driver::check(&map, &ddl::verilog::EmitOptions::default())
+        .expect_err("a bad range is still an error when checking");
+    let text = map.render_all(&diags);
+    assert!(text.contains("must be a constant known at compile time"), "{}", text);
+}

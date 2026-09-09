@@ -1049,3 +1049,30 @@ fn the_flag_leaves_a_lutram_alone() {
     assert!(!v.contains("cells_lvt"), "{}", v);
     assert!(v.contains("2 sync write ports"), "{}", v);
 }
+
+#[test]
+fn storage_cannot_hide_inside_a_struct() {
+    // `is_memory` only ever looked at the top level, so a memory reached a
+    // struct field unchallenged and was then flattened: the struct lowered to
+    // an ordinary packed vector and the `#[impl(bram)]` meant nothing. An enum
+    // payload already refused this, so the rules disagreed with each other.
+    let e = compile_err(concat!(
+        "struct s_t\n",
+        "  data: #[impl(bram)] [u8; 4]\n",
+        "fun f (a: s_t, o: out s_t)\n",
+        "  o = a\n",
+    ));
+    assert!(e.contains("is storage"), "{}", e);
+}
+
+#[test]
+fn storage_cannot_hide_inside_an_array_either() {
+    // The same hole one level further out: the annotation names one backing
+    // store, and an array of them would need one per element.
+    let e = compile_err(concat!(
+        "fun f (o: out u8)\n",
+        "  var grid: [#[impl(bram)] [u8; 4]; 2] = @zeroed()\n",
+        "  o = 8'd0\n",
+    ));
+    assert!(e.contains("array of memories") || e.contains("is storage"), "{}", e);
+}

@@ -151,6 +151,7 @@ pub fn signature_of(name: &str, kind: &'static str, args: &PrecArgDefTuple, syms
 pub fn check_extern(
     map: &crate::diag::SourceMap,
     decl: &crate::parse::ExternDecl,
+    syms: &Symbols,
     sink: &mut DiagSink,
 ) {
     let mut names = std::collections::HashSet::new();
@@ -160,6 +161,16 @@ pub fn check_extern(
                 &arg.arg_name,
                 "an external interface cannot declare the same name twice",
             );
+        }
+        // An `extern` is the one declaration with no body, so nothing else
+        // ever looks at its parameter types: `signature_of` skips the ones it
+        // cannot resolve on the understanding that whoever lowers the
+        // declaration will report them, and an `extern` is never lowered. A
+        // misspelled type therefore vanished from the interface and the
+        // emitted instantiation left that port unconnected -- a floating input
+        // on real hardware, from a typo, with exit code 0.
+        if let Err(e) = resolve_type_expr(&arg.type_expr, syms) {
+            sink.err_at(&arg.arg_name, e.message());
         }
         let is_connectable = matches!(
             arg.qualifier,
@@ -183,6 +194,118 @@ pub fn check_extern(
                 "an `extern` declares the interface of a module DDL did not compile: `buffer in`/`buffer out` for a handshake, `wire in`/`wire out` for a bare signal",
             ),
         );
+    }
+}
+
+/// Reports a graph hierarchy that contains itself.
+///
+/// A graph lowering its own body catches `a` instantiating `a`, because that
+/// is the one cycle visible from inside a single declaration. It cannot see
+/// `a` instantiating `b` and `b` instantiating `a`, and that pair compiled: it
+/// produced two Verilog modules instantiating one another, which is not a
+/// finite piece of hardware. The compiler itself does not hang -- the export
+/// walk is finite -- so nothing complained.
+///
+/// Structural elaboration has no base case to stop at. There is no `if` around
+/// an instance and no recursion depth to bottom out, so a cycle in the
+/// instantiation edges is unbuildable however deep it is, and the whole cycle
+/// is named rather than just the edge that closed it.
+///
+/// Feedback through a CHANNEL inside a finite hierarchy is a different thing
+/// and stays legal. Only instantiation edges are walked here.
+pub fn check_graph_cycles(
+    map: &crate::diag::SourceMap,
+    graphs: &[crate::parse::GraphDecl],
+    sink: &mut DiagSink,
+) {
+    use std::collections::BTreeMap;
+
+    let mut edges: BTreeMap<&str, Vec<&AlphanumSpan>> = BTreeMap::new();
+    for g in graphs {
+        let from = anumspan_to_str(&g.name);
+        let out = edges.entry(from).or_default();
+        for stmt in &g.body {
+            if let crate::parse::GraphStmt::Instance(i) = stmt {
+                out.push(&i.module);
+            }
+        }
+    }
+
+    // Grey means "on the current path", black means "explored and clean".
+    #[derive(Clone, Copy, PartialEq)]
+    enum Mark {
+        Grey,
+        Black,
+    }
+    let mut marks: BTreeMap<&str, Mark> = BTreeMap::new();
+    let mut reported: std::collections::BTreeSet<&str> = Default::default();
+
+    // An explicit stack rather than recursion: the depth here is the user's
+    // graph nesting, and blowing the compiler's stack on a deep one would be
+    // its own bug report.
+    struct Frame<'a> {
+        name: &'a str,
+        next: usize,
+    }
+
+    for g in graphs {
+        let root = anumspan_to_str(&g.name);
+        if marks.contains_key(root) {
+            continue;
+        }
+        let mut stack = vec![Frame { name: root, next: 0 }];
+        marks.insert(root, Mark::Grey);
+        while let Some(top) = stack.last_mut() {
+            let name = top.name;
+            let ix = top.next;
+            top.next += 1;
+            let Some(callee) = edges.get(name).and_then(|v| v.get(ix)) else {
+                marks.insert(name, Mark::Black);
+                stack.pop();
+                continue;
+            };
+            let callee_name = anumspan_to_str(callee);
+            // Only graphs can close a cycle: everything else is a leaf.
+            if !edges.contains_key(callee_name) {
+                continue;
+            }
+            match marks.get(callee_name) {
+                Some(Mark::Black) => {}
+                Some(Mark::Grey) => {
+                    // Report once per cycle, against the edge that closes it,
+                    // naming the whole path so the reader can see the loop.
+                    if reported.insert(callee_name) {
+                        let start = stack
+                            .iter()
+                            .position(|f| f.name == callee_name)
+                            .unwrap_or(0);
+                        let mut path: Vec<&str> =
+                            stack[start..].iter().map(|f| f.name).collect();
+                        path.push(callee_name);
+                        // A one-node cycle reads better as what it is.
+                        let msg = if path.len() <= 2 {
+                            format!("`{}` cannot instantiate itself", callee_name)
+                        } else {
+                            format!(
+                                "`{}` instantiates itself through {}",
+                                callee_name,
+                                path.join(" -> ")
+                            )
+                        };
+                        sink.push(
+                            Diag::error(map.span_of(callee), msg)
+                            .with_note(
+                                "a graph is elaborated structurally, so a hierarchy that contains itself has no finite hardware; feedback between instances belongs on a pipe, not on an instantiation",
+                            ),
+                        );
+                    }
+                }
+                None => {
+                    marks.insert(callee_name, Mark::Grey);
+                    stack.push(Frame { name: callee_name, next: 0 });
+                }
+            }
+        }
     }
 }
 

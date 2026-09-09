@@ -316,3 +316,37 @@ fn a_trailing_comment_on_a_body_line_is_not_leftovers() {
     ));
     compile_to_verilog(&map, &EmitOptions::default()).expect("should compile");
 }
+
+#[test]
+fn a_range_that_will_not_fold_is_reported_rather_than_dropped() {
+    // `const_eval(..).ok()?` returned `None` with nothing in the sink, so the
+    // whole declaration vanished and the build still succeeded: `ddl build` on
+    // this file wrote a Verilog file containing only `good`, exit code 0.
+    let (line, msg) = first_error(concat!(
+        "fun broken (a: u8, hi: u3, o: out u8)\n",
+        "  o = a[hi..0]\n",
+        "fun good (a: u1, o: out u1)\n",
+        "  o = a\n",
+    ));
+    assert_eq!(line, 2);
+    assert!(msg.contains("must be a constant known at compile time"), "{}", msg);
+}
+
+#[test]
+fn a_declaration_that_fails_to_lower_cannot_leave_the_build_succeeding() {
+    // The point is the exit status, not the wording: a file whose function
+    // does not compile must not produce Verilog. Asserted separately from the
+    // message because the silent-drop bug was invisible to every test that
+    // only looked at diagnostics.
+    let map = SourceMap::new(
+        "t.ddl",
+        concat!(
+            "fun broken (a: u8, hi: u3, o: out u8)\n",
+            "  o = a[hi..0]\n",
+            "fun good (a: u1, o: out u1)\n",
+            "  o = a\n",
+        ),
+    );
+    let out = compile_to_verilog(&map, &EmitOptions::default());
+    assert!(out.is_err(), "compiled to:\n{}", out.unwrap_or_default());
+}

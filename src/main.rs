@@ -5,7 +5,7 @@
 
 use std::process::ExitCode;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use ddl::diag::{Diag, SourceMap};
 use ddl::driver::{self, Emit};
@@ -65,6 +65,54 @@ OPTIONS:
                     multi-write cell -- an FPGA has none, and infers no RAM at
                     all. Costs the table in flip-flops, so it is a choice.
 ";
+
+/// Whether two paths name the same file.
+///
+/// `canonicalize` resolves `.`, `..`, symlinks and (on Windows) case, so
+/// `-o SRC.DDL` is caught as well as `-o ./src.ddl`. It only works on files
+/// that exist; an output path that does not exist yet cannot be an input, so
+/// falling back to a plain comparison loses nothing.
+fn same_file(a: &Path, b: &Path) -> bool {
+    match (a.canonicalize(), b.canonicalize()) {
+        (Ok(x), Ok(y)) => x == y,
+        _ => a == b,
+    }
+}
+
+/// Writes `text` to `path` without a moment where the file is half-written.
+///
+/// A plain `fs::write` truncates first, so an interrupted or failing write
+/// leaves a partial file that still looks like an artifact -- and for a
+/// generated file, one that a later `--check` compares against. The temporary
+/// goes in the SAME directory so the rename stays on one filesystem, which is
+/// what makes it atomic.
+fn write_atomically(path: &Path, text: &str) -> std::io::Result<()> {
+    use std::io::Write;
+
+    let directory = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    let name = path.file_name().unwrap_or_default().to_string_lossy().to_string();
+    let temporary = directory.join(format!(".{}.{}.tmp", name, std::process::id()));
+
+    let outcome = (|| {
+        let mut file = std::fs::File::create(&temporary)?;
+        file.write_all(text.as_bytes())?;
+        // Flushed and closed before the rename, so what lands is whole.
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(&temporary, path)
+    })();
+    if outcome.is_ok() {
+        return outcome;
+    }
+    let _ = std::fs::remove_file(&temporary);
+
+    // Not every destination is a file that can be renamed onto: `-o /dev/null`
+    // (`nul` on Windows) is a device, and the rename fails with "cannot move
+    // to a different disk drive". Discarding output that way is a normal thing
+    // to ask for, so the direct write stays available -- it is only the
+    // atomicity that is unavailable there, and a device has nothing to lose.
+    std::fs::write(path, text)
+}
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -267,7 +315,18 @@ fn run_build(args: &[String]) -> ExitCode {
     if unchanged {
         return ExitCode::SUCCESS;
     }
-    match std::fs::write(out_path, &verilog) {
+    // The source has already been read by this point, so `-o` naming one of
+    // the inputs would replace it with Verilog and succeed: the program is
+    // gone and the build reports success. Roots and imports both.
+    let destination = Path::new(out_path);
+    if let Some(clobbered) = map.paths().find(|p| same_file(Path::new(p), destination)) {
+        eprintln!(
+            "error: `{}` is an input to this build; writing the output there would replace it",
+            clobbered
+        );
+        return ExitCode::FAILURE;
+    }
+    match write_atomically(destination, &verilog) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("error: cannot write `{}`: {}", out_path, e);
@@ -319,7 +378,7 @@ fn run_fmt(args: &[String]) -> ExitCode {
                 needs_formatting += 1;
                 if check_only {
                     eprintln!("{}: needs formatting", path);
-                } else if let Err(e) = std::fs::write(path, &formatted) {
+                } else if let Err(e) = write_atomically(Path::new(path), &formatted) {
                     eprintln!("error: cannot write `{}`: {}", path, e);
                     failed = true;
                 }
@@ -382,6 +441,24 @@ fn run_check(args: &[String]) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    // Accepting an option and then ignoring it is worse than refusing it: the
+    // old `check` took `--bare-export`, dropped it, and repeated the very
+    // message that had asked for it.
+    let irrelevant: &[(&str, bool)] = &[
+        ("-o", args.output.is_some()),
+        ("--export", !args.export.export.is_empty()),
+        ("--bare-export", !args.export.bare.is_empty()),
+        ("--emit", args.emit != Emit::Verilog),
+    ];
+    for (flag, given) in irrelevant {
+        if *given {
+            eprintln!(
+                "error: `{}` does not apply to `check`, which reports on the source rather than producing a file",
+                flag
+            );
+            return ExitCode::FAILURE;
+        }
+    }
     let (map, load_diags) = match load(&args.inputs, &args.include) {
         Ok(m) => m,
         Err(e) => {
@@ -393,8 +470,12 @@ fn run_check(args: &[String]) -> ExitCode {
         driver::report(&map, &load_diags);
         return ExitCode::FAILURE;
     }
-    match driver::compile_to_verilog(&map, &EmitOptions::default()) {
-        Ok(_) => ExitCode::SUCCESS,
+    // Only what checking can act on. `--lvt-bram` changes how memories lower,
+    // so it changes what there is to check; an output path and an export
+    // selection are about producing a file, and this produces none.
+    let opts = EmitOptions { lvt_bram: args.lvt_bram, ..EmitOptions::default() };
+    match driver::check(&map, &opts) {
+        Ok(()) => ExitCode::SUCCESS,
         Err(diags) => {
             driver::report(&map, &diags);
             ExitCode::FAILURE

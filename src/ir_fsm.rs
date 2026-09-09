@@ -1380,6 +1380,10 @@ pub fn lower_blocking(
     repeats: bool,
     sink: &mut DiagSink,
 ) -> Option<crate::ir::Module> {
+    // Errors from EARLIER declarations are not this one's failure: the sink
+    // is shared by the whole compilation, so `has_errors` would make every
+    // declaration after the first bad one return `None` without a reason.
+    let errors_before = sink.error_mark();
     let globals = env.keys().cloned()
         .chain(low.pipes.iter().map(|p| p.name.clone()))
         .chain(low.syms.funcs.keys().cloned())
@@ -2402,7 +2406,7 @@ pub fn lower_blocking(
     }
     regs.extend(generated);
 
-    if sink.has_errors() {
+    if sink.errored_since(errors_before) {
         return None;
     }
     let asserts = std::mem::take(&mut low.asserts);

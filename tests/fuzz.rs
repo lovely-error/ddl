@@ -266,16 +266,25 @@ fn survives(src: &str) -> Result<(), String> {
 fn survives_counting(src: &str, compiled: &mut u64, diagnosed: &mut u64) -> Result<(), String> {
     let outcome = panic::catch_unwind(AssertUnwindSafe(|| {
         let map = SourceMap::new("fuzz.ddl", src);
-        // Both answers are fine. The property is that there IS an answer.
-        compile_to_verilog(&map, &EmitOptions::default()).is_ok()
+        // Three answers, not two. Compiling and diagnosing are both fine --
+        // the property is that there IS an answer -- but the compiler failing
+        // is not, and it used to be invisible here: `compile_to_verilog` runs
+        // the compiler on its own thread and turns that thread's panic into an
+        // ordinary diagnostic, so a genuine crash arrived as `Ok(false)` and
+        // this test counted it as a job well done. The `catch_unwind` below
+        // never saw it, because nothing unwound this far.
+        classify(compile_to_verilog(&map, &EmitOptions::default()))
     }));
-    if let Ok(true) = &outcome {
-        *compiled += 1;
-    } else if let Ok(false) = &outcome {
-        *diagnosed += 1;
-    }
     match outcome {
-        Ok(_) => Ok(()),
+        Ok(Answer::Compiled) => {
+            *compiled += 1;
+            Ok(())
+        }
+        Ok(Answer::Diagnosed) => {
+            *diagnosed += 1;
+            Ok(())
+        }
+        Ok(Answer::Broke(why)) => Err(why),
         Err(payload) => {
             let what = payload
                 .downcast_ref::<String>()
@@ -285,6 +294,57 @@ fn survives_counting(src: &str, compiled: &mut u64, diagnosed: &mut u64) -> Resu
             Err(what)
         }
     }
+}
+
+/// What one compilation did, with the compiler's own failures kept apart from
+/// the input's.
+#[derive(Debug, PartialEq, Eq)]
+enum Answer {
+    Compiled,
+    Diagnosed,
+    Broke(String),
+}
+
+/// Sorts one compilation into those three.
+///
+/// A function of its own so the distinction that matters can be tested without
+/// having to find an input that breaks the compiler -- which is exactly the
+/// thing that will not stay reproducible as bugs get fixed.
+fn classify(result: Result<String, Vec<ddl::diag::Diag>>) -> Answer {
+    match result {
+        Ok(_) => Answer::Compiled,
+        Err(diags) if diags.iter().any(|d| d.internal) => {
+            Answer::Broke(diags.iter().map(|d| d.msg.clone()).collect::<Vec<_>>().join("; "))
+        }
+        Err(_) => Answer::Diagnosed,
+    }
+}
+
+#[test]
+fn the_oracle_fails_on_an_internal_error_and_passes_on_a_diagnosis() {
+    use ddl::diag::Diag;
+
+    // The bug this pins: `compile_to_verilog` runs the compiler on its own
+    // thread and converts that thread's panic into an ordinary `Err`, so a
+    // real crash reached the oracle as an ordinary rejection. Reducing the
+    // result to `is_ok()` then accepted it, and the fuzz suite counted a
+    // compiler panic as a successful diagnosis.
+    let internal = classify(Err(vec![Diag::internal_error("the compiler panicked")]));
+    assert!(matches!(internal, Answer::Broke(_)), "got {:?}", internal);
+
+    // An ordinary rejection still has to pass, or the oracle fails on every
+    // invalid input the fuzzer is supposed to generate.
+    let ordinary = classify(Err(vec![Diag::error_no_span("`x` is not defined")]));
+    assert_eq!(ordinary, Answer::Diagnosed);
+
+    // And one internal error among many ordinary ones is still a failure.
+    let mixed = classify(Err(vec![
+        Diag::error_no_span("`x` is not defined"),
+        Diag::internal_error("the compiler panicked"),
+    ]));
+    assert!(matches!(mixed, Answer::Broke(_)), "got {:?}", mixed);
+
+    assert_eq!(classify(Ok(String::new())), Answer::Compiled);
 }
 
 fn env_u64(name: &str, default: u64) -> u64 {
