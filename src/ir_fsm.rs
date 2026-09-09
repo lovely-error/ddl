@@ -1785,6 +1785,22 @@ pub fn lower_blocking(
                 }
                 low.emit(elem.clone(), Op::Mux { cond: held[0], then_val: held[1], else_val: q })
             } else { q };
+            // A depth the address can overrun answers zero outside it, as a
+            // packed array does. The decision is made where the address is,
+            // and rides the read's own clock edge in a register beside it --
+            // the same shape the forwarding decision above uses, for the same
+            // reason: by the time `_q` is readable, the address is gone.
+            let q = if let Some(ok) = low.address_in_bounds(read.mem_ix, addr) {
+                let reg = low.emit(Ty::BOOL, Op::RegRead(next_slot as u32));
+                next_slot += 1;
+                locals.push(LocalReg {
+                    name: format!("@inrange_s{}_{}", k, read.bind),
+                    ty: Ty::BOOL,
+                    held: reg,
+                    writes: vec![(k, ok)],
+                });
+                low.guarded_read(Some(reg), q, &elem)
+            } else { q };
             env.insert(read.bind.clone(), Binding::constant(q, elem));
         }
         if let Some(bind) = st.barrier.as_ref().and_then(|b| b.bind.as_ref()) {

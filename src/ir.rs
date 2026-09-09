@@ -1362,6 +1362,41 @@ impl<'a> Lowerer<'a> {
         None
     }
 
+    /// `addr < len`, or `None` when the address cannot name an element this
+    /// memory does not have.
+    ///
+    /// A packed array's dynamic index has had this since the review that found
+    /// it aliasing onto a real element; storage never did. `fit_address`
+    /// widens and diagnoses but does not range-check, so a `[u16; 12]` read at
+    /// index 12 was `t[12]` on a `reg [15:0] t [0:11]` -- `x` in simulation
+    /// and unconstrained in synthesis, where the packed-array contract in
+    /// docs/overview.md says zero.
+    ///
+    /// `None` for a power-of-two depth, so the common case costs no logic --
+    /// the same rule, and the same reason, as the array guard.
+    pub fn address_in_bounds(&mut self, ix: usize, addr: ValueId) -> Option<ValueId> {
+        let len = self.mems[ix].len as u128;
+        let w = self.mems[ix].addr_width;
+        let can_name_a_missing_element = w >= 128 || (1u128 << w) > len;
+        if !can_name_a_missing_element {
+            return None;
+        }
+        let ty = self.ty_of(addr);
+        let limit = self.emit(ty, Op::Const(len));
+        Some(self.emit(Ty::BOOL, Op::Cmp { op: CmpOp::Lt, lhs: addr, rhs: limit }))
+    }
+
+    /// Answers `value` when `ok`, and zero otherwise.
+    pub fn guarded_read(&mut self, ok: Option<ValueId>, value: ValueId, elem: &Ty) -> ValueId {
+        match ok {
+            None => value,
+            Some(cond) => {
+                let zero = self.emit(elem.clone(), Op::Const(0));
+                self.emit(elem.clone(), Op::Mux { cond, then_val: value, else_val: zero })
+            }
+        }
+    }
+
     /// Enters the `then` (or `else`) side of an `if`. The answer is the depth
     /// to hand back to `pop_path`.
     pub fn push_cond(&mut self, value: ValueId, taken: bool) -> usize {
@@ -1743,6 +1778,36 @@ impl<'a> Lowerer<'a> {
         self.coerce_const(value, want)
     }
 
+    /// The bit pattern a literal takes at another type, or `None` if it has
+    /// no honest one there.
+    ///
+    /// A NEGATIVE literal is the reason this is not just a copy. `-4` is a
+    /// three-bit signed `0b100`, and copying that into eight bits reads as
+    /// `+4`: the sign has to be extended with the value. It also has no
+    /// unsigned form at all, so `let k: u8 = -1` is refused rather than
+    /// silently becoming 1.
+    fn retype_literal(konst: u128, have: &Ty, want: &Ty) -> Option<u128> {
+        let hw = have.bit_width();
+        let is_negative =
+            have.is_signed() && hw < 128 && (konst >> (hw - 1)) & 1 == 1;
+        if !is_negative {
+            return literal_fits(konst, want).then_some(konst);
+        }
+        if !want.is_signed() {
+            return None;
+        }
+        let ww = want.bit_width();
+        if ww < hw {
+            return None;
+        }
+        let sign_bits = !((1u128 << hw) - 1);
+        Some(if ww >= 128 {
+            konst | sign_bits
+        } else {
+            (konst | sign_bits) & ((1u128 << ww) - 1)
+        })
+    }
+
     /// Coerces `value` to `want`, inserting an extension or truncation only
     /// when the value is a constant that provably fits. Anything else is the
     /// user's decision and must be written explicitly.
@@ -1762,9 +1827,8 @@ impl<'a> Lowerer<'a> {
             Op::Const(k) => *k,
             _ => return None,
         };
-        if !literal_fits(konst, want) {
-            return None;
-        }
+        let have = self.ty_of(value);
+        let konst = Self::retype_literal(konst, &have, want)?;
         let id = self.emit(want.clone(), Op::Const(konst));
         // Still unsized: it may be adapted again further up the expression.
         self.mark_unsized_literal(id);
@@ -1800,11 +1864,10 @@ impl<'a> Lowerer<'a> {
         // doing -- the index is a constant whose natural width is one bit, and
         // the address port wants two, so without this the output reads
         // `mem[{{1{1'b0}}, 1'b1}]` where it should read `mem[2'd1]`.
-        if !have.is_signed() && !want.is_signed()
-            && let Op::Const(k) = self.values[value.0 as usize].op
-                && literal_fits(k, want) {
-                    return self.emit(want.clone(), Op::Const(k));
-                }
+        if let Op::Const(k) = self.values[value.0 as usize].op
+            && let Some(v) = Self::retype_literal(k, &have, want) {
+                return self.emit(want.clone(), Op::Const(v));
+            }
 
         let to = want.bit_width();
         let width_already_matches = have.bit_width() == to;
@@ -4369,6 +4432,7 @@ fn lower_mem_read(
     let (elem, addr_width) = (low.mems[ix].elem.clone(), low.mems[ix].addr_width);
     let raw = lower_expr(low, index, env, sink)?;
     let addr = low.fit_address(raw, addr_width, &mem_name, sink)?;
+    let in_range = low.address_in_bounds(ix, addr);
     let array = low.emit(elem.clone(), Op::MemRead { mem: ix as u32, addr });
 
     // A write earlier in this state -- or this stage -- has not reached the
@@ -4379,18 +4443,22 @@ fn lower_mem_read(
     //
     // Synchronous reads use the same pending-write decision in ir_fsm and
     // ir_pipe, registering it across the read's clock edge.
-    match low.pending_write(ix, addr, env) {
-        None => Some(array),
+    let answer = match low.pending_write(ix, addr, env) {
+        None => array,
         // An UNCONDITIONAL write to the address being read answers the read by
         // itself. Keeping the mux would leave the array read feeding a branch
         // that can never be taken, which is a wire and a read port asked of
         // the memory for nothing.
-        Some((hit, wdata)) if matches!(low.values[hit.0 as usize].op, Op::Const(1)) => Some(wdata),
-        Some((hit, wdata)) => Some(low.emit(
-            elem,
+        Some((hit, wdata)) if matches!(low.values[hit.0 as usize].op, Op::Const(1)) => wdata,
+        Some((hit, wdata)) => low.emit(
+            elem.clone(),
             Op::Mux { cond: hit, then_val: wdata, else_val: array },
-        )),
-    }
+        ),
+    };
+    // Outermost, so an out-of-range read answers zero whether the array or a
+    // forwarded write would have answered it. A write to that address did not
+    // land either.
+    Some(low.guarded_read(in_range, answer, &elem))
 }
 
 /// `m[addr] = value` -- an offer to the one write port.
@@ -4778,6 +4846,61 @@ fn lower_builtin(
         }
         let arg = lower_expr(low, &args[0], env, sink)?;
         let ty = low.ty_of(arg);
+
+        // `-4` is a NEGATIVE LITERAL, not a negation applied to one.
+        //
+        // Lowered as an operation it kept the operand's type, and an unsized
+        // literal's provisional type is as narrow as possible and unsigned:
+        // `4` is `u3`, so `-4` was `u3` holding `0b100`, and every widening
+        // after that was a ZERO extension. `h < -100` compiled to `h < 28`,
+        // and it compiled silently, because a comparison is the one position
+        // that never checks a width or a signedness.
+        //
+        // Folding it here into a signed literal that is still unsized lets it
+        // take its partner's type the way any other literal does, and
+        // `retype_literal` extends the sign along with the value.
+        let negating_a_literal = matches!(op, Neg)
+            && low.values[arg.0 as usize].unsized_literal
+            && matches!(low.values[arg.0 as usize].op, Op::Const(_));
+        if negating_a_literal {
+            let Op::Const(bits) = low.values[arg.0 as usize].op else {
+                unreachable!("guarded above")
+            };
+            if bits == 0 {
+                return Some(arg);
+            }
+            // Negating one of these again gives a positive number back, so it
+            // becomes an ordinary unsized literal and adapts like any other.
+            // Without this `- -4` folded the bit pattern as a magnitude and
+            // came out as -4 a second time.
+            let w = ty.bit_width();
+            let already_negative = ty.is_signed() && w < 128 && (bits >> (w - 1)) & 1 == 1;
+            if already_negative {
+                let low_bits = if w >= 128 { u128::MAX } else { (1u128 << w) - 1 };
+                let magnitude = 0u128.wrapping_sub(bits) & low_bits;
+                let id = low.emit(Ty::UInt(ty::bits_for(magnitude)), Op::Const(magnitude));
+                low.mark_unsized_literal(id);
+                return Some(id);
+            }
+            let magnitude = bits;
+            // The narrowest signed width that holds -magnitude: one more bit
+            // than magnitude - 1 needs, because the negative range reaches one
+            // further than the positive one.
+            let w = (128 - (magnitude - 1).leading_zeros()) + 1;
+            if w > 128 {
+                sink.err_span(
+                    low.here(),
+                    format!("literal -{} does not fit in 128 bits", magnitude),
+                );
+                return None;
+            }
+            let low_bits = if w >= 128 { u128::MAX } else { (1u128 << w) - 1 };
+            let pattern = 0u128.wrapping_sub(magnitude) & low_bits;
+            let id = low.emit(Ty::SInt(w), Op::Const(pattern));
+            low.mark_unsized_literal(id);
+            return Some(id);
+        }
+
         let (un, out_ty) = match op {
             BitInvert => (UnOp::BitNot, ty.clone()),
             Neg => (UnOp::Neg, ty.clone()),
@@ -4825,6 +4948,27 @@ fn lower_builtin(
                     return None;
                 }
             }
+        }
+        // A comparison never complains about width, and an enum is scalar, so
+        // without this `small == big` between two unrelated enums compiled,
+        // zero-extending one to the other. Two named types with nothing to do
+        // with each other is the mistake a named type exists to prevent.
+        //
+        // BOTH sides, deliberately. An enum against a plain integer is left
+        // alone: k2g_decode.ddl matches a five-bit instruction field against
+        // named opcodes -- `arg2 == EP1_DISP_OFF` -- sixty-five times, so a
+        // same-width integer beside an enum is a shape this language means to
+        // allow, whatever a strict reading of docs/overview.md would say.
+        let lt = low.ty_of(lhs);
+        let rt = low.ty_of(rhs);
+        if lt != rt && lt.is_enum() && rt.is_enum() {
+            let e = OpTyError::EnumMismatch { lhs: lt, rhs: rt };
+            let mut d = Diag::error(low.here(), e.message());
+            if let Some(note) = e.note() {
+                d = d.with_note(note);
+            }
+            sink.push(d);
+            return None;
         }
         let (l, r) = low.extend_for_compare(lhs, rhs);
         return Some(low.emit(Ty::BOOL, Op::Cmp { op: cmp, lhs: l, rhs: r }));

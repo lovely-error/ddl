@@ -154,6 +154,10 @@ struct IssuedRead {
     /// `(hit, data)` from `Lowerer::pending_write`, both stage-`stage` values.
     /// `hit` is `1` exactly when `port` is `None`.
     forward: Option<(ValueId, ValueId)>,
+    /// `addr < len` when the address can overrun this memory, a stage-`stage`
+    /// value like `forward`. `None` when the depth is a power of two and no
+    /// address can name a missing element.
+    in_bounds: Option<ValueId>,
 }
 
 /// Declares the memories at the top of a sequence body, and returns how many
@@ -738,6 +742,7 @@ pub fn lower_sequence(
                 let raw = crate::ir::lower_expr(&mut low, r.addr, &env, sink)?;
                 let addr = low.fit_address(raw, addr_width, &decl.name, sink)?;
                 let forward = low.pending_write(r.mem_ix, addr, &env);
+                let in_bounds = low.address_in_bounds(r.mem_ix, addr);
                 // An UNCONDITIONAL write to this address, above this line in
                 // this stage, is the answer. Asking the array as well would be
                 // a read port and an output register for a value already in
@@ -758,6 +763,7 @@ pub fn lower_sequence(
                     bind: r.bind,
                     stage: k,
                     forward,
+                    in_bounds,
                 });
                 continue;
             }
@@ -875,6 +881,24 @@ pub fn lower_sequence(
                 }
                 // `port` is `None` only when the forward is unconditional.
                 (None, None) => unreachable!("a read with no port was answered by a write"),
+            };
+            // A depth the address can overrun answers zero outside it, as a
+            // packed array does. Decided back in the stage that had the
+            // address, and crossed like the forwarding decision beside it.
+            let value = match r.in_bounds {
+                None => value,
+                Some(ok) => {
+                    let ok_q = cross(
+                        &mut low,
+                        &mut pending,
+                        &mut next_slot,
+                        format!("{}_inrange{}_s{}", mem, r.port.unwrap_or(0), k + 1),
+                        Ty::BOOL,
+                        ok,
+                        en,
+                    );
+                    low.guarded_read(Some(ok_q), value, &elem)
+                }
             };
             env.insert(r.bind.clone(), Binding::constant(value, elem));
         }

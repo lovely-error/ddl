@@ -391,7 +391,7 @@ impl Folded {
     }
 }
 
-/// The width an operation's result carries.
+/// The width both operands are brought to before an operation.
 ///
 /// Mixing two different widths is a width error, which lowering reports
 /// against the operands with a span to point at. Folding has neither, so it
@@ -401,6 +401,35 @@ fn joined_width(a: Option<u32>, b: Option<u32>) -> Option<u32> {
         (Some(x), Some(y)) => Some(x.max(y)),
         (Some(x), None) | (None, Some(x)) => Some(x),
         (None, None) => None,
+    }
+}
+
+/// The width an operation's RESULT carries, which is not always the width its
+/// operands were brought to.
+///
+/// This has to agree with `binop_result`, or a constant means one thing folded
+/// and another lowered. Two operators do not simply keep the joined width:
+///
+///   * `*` produces the sum of the operand widths. Folding `4'd4 * 4'd4` at
+///     four bits gives zero where the hardware gives sixteen.
+///   * a shift keeps the LEFT operand's width, whatever the shift amount is
+///     typed as. Folding `4'd8 << 8'd1` at eight bits gives sixteen where the
+///     hardware, holding four, gives zero.
+///
+/// Both were caught in an array index, where a `let` offers a second opinion
+/// to disagree with. In a loop bound, a bit select, a bit range or an enum
+/// discriminant there is no second opinion: folding is the only path, so a
+/// wrong answer is simply the answer.
+fn result_width(op: BuiltinOp, lhs: Option<u32>, rhs: Option<u32>) -> Option<u32> {
+    use BuiltinOp::*;
+    match op {
+        // Shifts leave the amount out of it entirely.
+        Shl | Shr => lhs,
+        // Both operands are extended to the joined width first, so the product
+        // is twice that. Beyond 128 bits `Folded::wrapped` stops masking,
+        // which is the same ceiling the rest of this domain has.
+        Mul => joined_width(lhs, rhs).map(|w| w.saturating_mul(2).min(128)),
+        _ => joined_width(lhs, rhs),
     }
 }
 
@@ -432,7 +461,7 @@ fn fold(expr: &PrecResExpr) -> Result<Folded, ConstError> {
             let lhs = fold(&args[0])?;
             let rhs = fold(&args[1])?;
             let (a, b) = (lhs.value, rhs.value);
-            let w = joined_width(lhs.width, rhs.width);
+            let w = result_width(*op, lhs.width, rhs.width);
             // In the hardware domain the answer is what the register holds, so
             // running off the top is a wrap and not an error. In the
             // mathematical domain there is no top to run off, so it is.
@@ -540,6 +569,7 @@ pub enum OpTyError {
     NotScalar(Ty),
     NeedsBool(Ty),
     LiteralTooWide { value: u128, ty: Ty },
+    EnumMismatch { lhs: Ty, rhs: Ty },
 }
 
 impl OpTyError {
@@ -565,12 +595,21 @@ impl OpTyError {
             OpTyError::LiteralTooWide { value, ty } => {
                 format!("literal {} does not fit in `{}`", value, ty.display())
             }
+            OpTyError::EnumMismatch { lhs, rhs } => format!(
+                "`{}` and `{}` are different types and cannot be compared",
+                lhs.display(),
+                rhs.display()
+            ),
         }
     }
 
     /// The "here is what to write instead" half of the diagnostic.
     pub fn note(&self) -> Option<String> {
         match self {
+            OpTyError::EnumMismatch { .. } => Some(
+                "an enum compares only with its own type; convert one with                  `@cast(x)` if that is really what you meant"
+                    .to_string(),
+            ),
             OpTyError::WidthMismatch { lhs, rhs } => {
                 let (narrow, wide) = if lhs.bit_width() < rhs.bit_width() {
                     (lhs, rhs)
@@ -607,6 +646,18 @@ pub fn binop_result(op: BuiltinOp, lhs: &Ty, rhs: &Ty) -> Result<Ty, OpTyError> 
         let both_are_the_same_enum = lhs == rhs && lhs.is_enum();
         if both_are_the_same_enum {
             return Ok(Ty::BOOL);
+        }
+        // An enum IS scalar, so without this the general comparison rule below
+        // accepts it against any other scalar and the check above never
+        // rejects anything -- it only short-circuits a case the fallthrough
+        // would have taken anyway. `small == big` between two unrelated enums
+        // compiled, zero-extending one to the other, which is exactly the
+        // mistake a named type exists to prevent.
+        //
+        // Both sides, matching `lower_expr`: an enum beside a plain integer
+        // of the same width is a shape the language means to allow.
+        if lhs.is_enum() && rhs.is_enum() {
+            return Err(OpTyError::EnumMismatch { lhs: lhs.clone(), rhs: rhs.clone() });
         }
     }
 

@@ -545,10 +545,25 @@ fn compile_on_this_stack(
         // above the wrapper that names them.
         let have: std::collections::BTreeSet<String> =
             drawn.iter().map(|m| m.name.clone()).collect();
+        // `adapts` collected a use for every pipe of every `extern` in the
+        // whole compilation, and the retain above has just thrown some of
+        // those graphs away. Rebuilding the list wholesale put their adapters
+        // back: `--export wanted` emitted `ddl_salt_to_wport_7` for an extern
+        // only an unexported graph ever named, with no instantiation anywhere
+        // in the file. Nothing catches that downstream either -- an
+        // unreferenced module is Verilator's MULTITOP, and examples/lint.vlt
+        // waives it for a reason of its own.
+        //
+        // So an adapter is built when something KEPT asks for it, which after
+        // wrapping is exactly the instances the surviving modules name.
+        let referenced: std::collections::BTreeSet<&str> = drawn
+            .iter()
+            .flat_map(|m| m.instances.iter().map(|i| i.module.as_str()))
+            .collect();
         let mut fresh = Vec::new();
         for use_ in &adapts {
             let name = crate::ir_adapt::module_name(use_.kind, &use_.ty);
-            if have.contains(&name) {
+            if have.contains(&name) || !referenced.contains(name.as_str()) {
                 continue;
             }
             if let Some(module) =
