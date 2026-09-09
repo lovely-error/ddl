@@ -342,12 +342,29 @@ struct GraphPipeInfo {
 ///
 /// Collected rather than emitted here, because two graphs asking for the same
 /// shape want one module instantiated twice.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct CombUse {
     pub kind: crate::ir_comb::Comb,
     pub fan: usize,
     pub ty: Ty,
 }
+
+/// The shape, which is the width and not the type.
+///
+/// The same rule as `AdaptUse`, for the same reason: a combinator routes its
+/// payload and never looks inside it, so `ir_comb::module_name` names one by
+/// `bit_width` and the body follows. Deriving this compared the whole `Ty`,
+/// which made `@merge(a, b, o)` over `u16` and over a two-`u8` struct two
+/// uses that both built `ddl_merge_2x16`.
+impl PartialEq for CombUse {
+    fn eq(&self, other: &Self) -> bool {
+        self.kind == other.kind
+            && self.fan == other.fan
+            && self.ty.bit_width() == other.ty.bit_width()
+    }
+}
+
+impl Eq for CombUse {}
 
 pub fn lower_graph(
     map: &SourceMap,

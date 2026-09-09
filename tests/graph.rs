@@ -778,3 +778,33 @@ fn a_deep_acyclic_hierarchy_is_not_a_cycle() {
     };
     compile_to_verilog(&map, &opts).expect("a nested hierarchy is not a cycle");
 }
+
+#[test]
+fn two_merges_of_one_width_and_different_types_share_one_module() {
+    // `ir_comb::module_name` names a combinator by the width it routes, so the
+    // list of combinators to build has to be keyed on the width too. Keying it
+    // on the whole `Ty` made `u16` and a struct of two `u8`s two uses, both of
+    // which built `ddl_merge_2x16`, and the design was rejected for defining
+    // it twice -- the same defect as the boundary adapters', in the file the
+    // adapters' comment points at.
+    let v = compile(concat!(
+        "struct pair_t\n",
+        "  lo: u8\n",
+        "  hi: u8\n",
+        "graph top (a: buffer in u16, b: buffer in u16, c: buffer in pair_t, d: buffer in pair_t, o1: buffer out u16, o2: buffer out pair_t)\n",
+        "  @merge(a, b, o1)\n",
+        "  @merge(c, d, o2)\n",
+    ));
+    assert_eq!(
+        v.matches("\nmodule ddl_merge_2x16 (").count(),
+        1,
+        "one module for the shape, not one per type:\n{}",
+        v
+    );
+    assert_eq!(
+        v.matches("  ddl_merge_2x16 u_").count(),
+        2,
+        "both merges instantiate it:\n{}",
+        v
+    );
+}
