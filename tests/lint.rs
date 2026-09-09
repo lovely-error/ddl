@@ -58,6 +58,14 @@ const EXTERNS: &str = "examples/externs.v";
 /// insulated from, so the version is reported on failure instead of pinned.
 const CALIBRATED_AGAINST: &str = "5.046";
 
+/// The oldest Verilator that understands every rule the waivers name.
+///
+/// `MODMISSING` arrived in 5.038. Anything older rejects the WAIVER FILE and
+/// never reads a line of the generated Verilog, so it cannot judge this
+/// repository at all -- which is a different situation from a lint failure and
+/// is reported as one. Ubuntu ships 5.020, which is how CI found this.
+const NEEDS_AT_LEAST: &str = "5.038";
+
 /// `$VERILATOR`, else `verilator` on PATH.
 fn verilator() -> OsString {
     std::env::var_os("VERILATOR").unwrap_or_else(|| OsString::from("verilator"))
@@ -182,6 +190,23 @@ fn the_generated_verilog_passes_a_linter() {
             String::from_utf8_lossy(&out.stdout),
             String::from_utf8_lossy(&out.stderr)
         );
+        // A waiver naming a rule this Verilator has never heard of is a
+        // toolchain mismatch, not a defect in the netlist: the run stopped on
+        // examples/lint.vlt and never looked at the file being linted. Every
+        // file produces the identical message, so reporting them as lint
+        // failures buries the single fact that matters -- the version.
+        if text.contains("Unknown error code") {
+            let how = format!(
+                "{} does not understand a rule {} waives, so it stopped on the waivers and linted nothing. These need Verilator {} or newer; this is {}.",
+                bin.to_string_lossy(),
+                WAIVERS,
+                NEEDS_AT_LEAST,
+                version
+            );
+            assert!(!verilator_is_required(), "DDL_REQUIRE_VERILATOR is set, but {}", how);
+            eprintln!("SKIP: {}", how);
+            return;
+        }
         // A data directory Verilator cannot find is a broken install, not a
         // broken netlist. Reporting it as a lint failure would send a reader
         // looking for a compiler bug that is not there.

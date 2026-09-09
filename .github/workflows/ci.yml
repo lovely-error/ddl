@@ -73,14 +73,22 @@ jobs:
         with:
           toolchain: nightly-2026-06-25
 
+      # Pinned and built, not apt's. See .github/install-verilator.sh for why
+      # the distro one cannot lint this repository at all.
+      - name: Cache Verilator
+        id: verilator
+        uses: actions/cache@v4
+        with:
+          path: /opt/verilator
+          key: verilator-v5.046-${{ runner.os }}
+
       - name: Install Verilator
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y verilator
+        if: steps.verilator.outputs.cache-hit != 'true'
+        run: .github/install-verilator.sh
 
       # Named in the log, so a lint result can be tied to a version later.
       - name: Report Verilator version
-        run: verilator --version
+        run: /opt/verilator/bin/verilator --version
 
       # Both halves, and the order matters. The freshness test ties the
       # checked-in `.v` to the compiler in this commit; without it the linter
@@ -89,4 +97,5 @@ jobs:
       - name: Lint the generated Verilog, and check it is current
         env:
           DDL_REQUIRE_VERILATOR: '1'
+          VERILATOR: /opt/verilator/bin/verilator
         run: cargo test --locked --test lint
