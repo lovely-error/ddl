@@ -84,7 +84,7 @@ jobs:
 
       - name: Install Verilator
         if: steps.verilator.outputs.cache-hit != 'true'
-        run: .github/install-verilator.sh
+        run: bash .github/install-verilator.sh
 
       # Named in the log, so a lint result can be tied to a version later.
       - name: Report Verilator version

@@ -77,7 +77,7 @@ jobs:
 
       - name: Install Verilator
         if: steps.verilator.outputs.cache-hit != 'true'
-        run: .github/install-verilator.sh
+        run: bash .github/install-verilator.sh
 
       - name: Run tests
         run: cargo test --locked
