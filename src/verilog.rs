@@ -413,8 +413,9 @@ fn use_counts(module: &Module, live: &[bool]) -> Vec<u32> {
 /// toolchain's genuine failures are already documented as easy to miss.
 ///
 /// A value is folded when it is read exactly once and did not come from a
-/// named `let`. Constants are always folded: `32'd1` reads better inline, and
-/// a constant has no bus to eliminate.
+/// named `let`. An unsigned constant is always folded: `32'd1` reads better
+/// inline, and a constant has no bus to eliminate. A signed one keeps its
+/// wire, because the declaration is the only place `signed` is written.
 fn foldable(module: &Module, live: &[bool]) -> Vec<bool> {
     let counts = use_counts(module, live);
 
@@ -456,7 +457,14 @@ fn foldable(module: &Module, live: &[bool]) -> Vec<bool> {
             // for the same reason: it may not be folded into a bigger
             // expression that is then sliced.
             Op::Port(_) | Op::RegRead(_) | Op::Case { .. } | Op::MemRead { .. } => false,
-            Op::Const(_) => !must_be_named[def.id.0 as usize],
+            // A SIGNED constant keeps its wire, for the reason the
+            // `carries_signedness` test below spells out: signedness lives on
+            // the declaration, `render_const` has no `'sd` form, and Verilog
+            // makes one unsigned operand turn the whole expression unsigned.
+            // `x / 2` on an `i8` emitted `x / 8'd2` and answered 126 for -4.
+            // Every other operand kind was already guarded; a constant was the
+            // one that folded regardless.
+            Op::Const(_) => !must_be_named[def.id.0 as usize] && !def.ty.is_signed(),
             // A cast that changes nothing about the bits renders as its
             // operand. One that changes signedness must keep its wire, since
             // that is where `signed` is written.
