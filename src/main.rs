@@ -210,10 +210,9 @@ fn parse_build_args(args: &[String]) -> Result<BuildArgs, String> {
                 match args.get(ix) {
                     Some(list) => {
                         for spec in split_names(list, &flag)? {
-                            match ddl::ir_export::parse_crossing(&flag, &spec, is_extern) {
-                                Ok(c) => export.crossings.push(c),
-                                Err(why) => return Err(why),
-                            }
+                            export
+                                .crossings
+                                .push(ddl::ir_export::parse_crossing(&flag, &spec, is_extern)?);
                         }
                     }
                     None => return Err(format!("{} needs a boundary to cross", flag)),

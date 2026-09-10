@@ -110,8 +110,7 @@ pub fn emit_banner(opts: &EmitOptions) -> String {
         for d in &domains {
             out.push_str(&format!(" -group [get_clocks {}_clk]", d));
         }
-        out.push_str("
-");
+        out.push('\n');
         out.push_str("//
 ");
         out.push_str("// If a crossed pipe never moves, check that its clock is running before
