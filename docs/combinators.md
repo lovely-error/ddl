@@ -97,7 +97,7 @@ Output (rsalt) -------------------> [ rot reg ]
 ```
 
 - **Salt Preservation**: The unselected input's read salt (`rsalt`) is held constant; its item remains safely queued in its buffer without loss.
-- **Cycle-Decoupled**: The output write salt (`out_wsalt_q`) is driven from a register, ensuring that downstream backpressure does not form combinational paths back into upstream producers.
+- **Cycle-Decoupled**: The output write salt (`o_wsalt_q`) is driven from a register, ensuring that downstream backpressure does not form combinational paths back into upstream producers.
 
 ---
 

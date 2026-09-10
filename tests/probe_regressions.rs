@@ -487,10 +487,12 @@ fn sequence_tail_constants_use_the_output_type() {
 #[test]
 fn sequence_duplicate_transfers_and_nonblocking_buffers_are_diagnosed() {
     for (body, message) in [
-        ("  let x = @rcv(src)\n  let y = @rcv(src)\n  |||\n  @send(o, x)\n", "duplicate `@rcv`"),
-        ("  let x = @rcv(src)\n  |||\n  @send(o, 8'd1)\n  @send(o, 8'd2)\n", "duplicate `@send`"),
+        ("  let x = @rcv(src)\n  let y = @rcv(src)\n  |||\n  @send(o, x)\n", "`src` is received from twice"),
+        ("  let x = @rcv(src)\n  |||\n  @send(o, 8'd1)\n  @send(o, 8'd2)\n", "`o` is sent to twice"),
         ("  let x = @rcv(src)\n  |||\n  let (v, ok) = @peek(src)\n  @send(o, x)\n", "nonblocking buffer operations are not supported"),
-        ("  let x = @rcv(src)\n  |||\n  let (v, ok) = @try_rcv(src)\n  @send(o, x)\n", "nonblocking buffer operations are not supported"),
+        // A `@try_rcv` IS supported now, but only in the head: below it, it would
+        // take an item on behalf of a stage that is holding a different one.
+        ("  let x = @rcv(src)\n  |||\n  let (v, ok) = @try_rcv(src)\n  @send(o, x)\n", "receives from all of its `in` pipes in its first stage"),
         ("  let x = @rcv(src)\n  |||\n  @drop(src)\n  @send(o, x)\n", "nonblocking buffer operations are not supported"),
         ("  let x = @rcv(src)\n  |||\n  @try_send(o, x)\n  @send(o, x)\n", "nonblocking buffer operations are not supported"),
     ] {
@@ -700,4 +702,164 @@ fn process_conditional_read_evaluates_its_condition_once() {
     assert_eq!(flags, [7]);
     assert_eq!(c.read_events, [(0, 1)]);
     assert_eq!(c.out("o_data") & 255, 42);
+}
+
+// ---- sequences with several pipes -----------------------------------------
+
+/// A producer that always has both entries filled: the salt one lap ahead of
+/// whatever the consumer has acknowledged.
+fn keep_full(c: &mut Circuit, pipe: &str, data: u128) {
+    let acked = c.out(&format!("{}_rsalt", pipe));
+    c.set(&format!("{}_wsalt", pipe), (!acked) & 3);
+    c.set(&format!("{}_data", pipe), data);
+}
+
+const JOIN: &str = concat!(
+    "sequence s (a: buffer in u16, b: buffer in u16, o: buffer out u16)\n",
+    "  let x = @rcv(a)\n",
+    "  let y = @rcv(b)\n",
+    "  |||\n",
+    "  @send(o, x + y)\n",
+);
+
+#[test]
+fn a_join_waits_for_its_slowest_input() {
+    let mut c = Circuit::new(JOIN, "s");
+    c.set("a_wsalt", 1);
+    c.set("a_data", 5);
+    // `b` has nothing. Neither input may be consumed and nothing may leave:
+    // the item `a` is offering has no partner yet, and taking it would strand
+    // it a cycle deep in a pipeline that cannot finish it.
+    for _ in 0..20 {
+        c.tick();
+        assert_eq!(c.out("a_rsalt"), 0, "a was taken without b");
+        assert_eq!(c.out("o_wsalt"), 0, "an item left without b");
+    }
+    c.set("b_wsalt", 1);
+    c.set("b_data", 7);
+    c.tick();
+    assert_eq!(c.out("a_rsalt"), 1, "both step together");
+    assert_eq!(c.out("b_rsalt"), 1, "both step together");
+    c.tick();
+    assert_eq!(c.out("o_wsalt"), 1);
+    assert_eq!(c.out("o_data") & 0xffff, 12);
+}
+
+#[test]
+fn a_scatter_stalls_on_its_fullest_sink() {
+    let src = concat!(
+        "sequence s (a: buffer in u16, x: buffer out u16, y: buffer out u16)\n",
+        "  let p = @rcv(a)\n",
+        "  |||\n",
+        "  @send(x, p)\n",
+        "  @send(y, p)\n",
+    );
+    let mut c = Circuit::new(src, "s");
+    // `x` is drained every cycle and `y` never is. Every sink or none, so `x`
+    // stops accepting when `y` fills, however eagerly it is being read.
+    for _ in 0..30 {
+        keep_full(&mut c, "a", 4);
+        let drained = c.out("x_wsalt");
+        c.set("x_rsalt", drained);
+        c.tick();
+        assert_eq!(c.out("x_wsalt"), c.out("y_wsalt"), "the sinks move together");
+    }
+    assert_eq!(c.out("y_wsalt"), 3, "y took its two entries and no more");
+
+    // Releasing the slow sink releases the fast one, and the input with it.
+    // Counted rather than compared: a salt is two gray-coded bits and comes
+    // back round to where it started every four transfers.
+    let mut pushes = 0;
+    let mut last = c.out("y_wsalt");
+    for _ in 0..20 {
+        keep_full(&mut c, "a", 4);
+        let x_drained = c.out("x_wsalt");
+        let y_drained = c.out("y_wsalt");
+        c.set("x_rsalt", x_drained);
+        c.set("y_rsalt", y_drained);
+        c.tick();
+        assert_eq!(c.out("x_wsalt"), c.out("y_wsalt"), "the sinks move together");
+        let now = c.out("y_wsalt");
+        if now != last {
+            pushes += 1;
+            last = now;
+        }
+    }
+    assert!(pushes > 4, "the pipeline resumed; saw {} pushes", pushes);
+}
+
+const OPTIONAL: &str = concat!(
+    "sequence s (a: buffer in u16, b: buffer in u16, o: buffer out u16)\n",
+    "  let x = @rcv(a)\n",
+    "  let (y, ok) = @try_rcv(b)\n",
+    "  var t: u16 = x\n",
+    "  if ok then\n",
+    "    t = x + y\n",
+    "  |||\n",
+    "  @send(o, t)\n",
+);
+
+#[test]
+fn an_optional_input_does_not_stall_the_pipeline() {
+    let mut c = Circuit::new(OPTIONAL, "s");
+    c.set("a_wsalt", 1);
+    c.set("a_data", 5);
+    c.tick();
+    c.tick();
+    assert_eq!(c.out("o_wsalt"), 1, "the head fired without b");
+    assert_eq!(c.out("o_data") & 0xffff, 5, "ok was low, so t is x alone");
+    assert_eq!(c.out("b_rsalt"), 0, "an empty optional input is not consumed");
+
+    // Offer one item on the optional input; exactly one output carries it, and
+    // its salt steps exactly once.
+    c.set("a_wsalt", 3);
+    c.set("a_data", (6 << 16) | 5);
+    c.set("b_wsalt", 1);
+    c.set("b_data", 7);
+    c.tick();
+    assert_eq!(c.out("b_rsalt"), 1, "the optional input gave up its item");
+    c.tick();
+    assert_eq!(c.out("o_wsalt"), 3);
+    assert_eq!((c.out("o_data") >> 16) & 0xffff, 13, "x + y this time");
+    for _ in 0..10 {
+        c.tick();
+        assert_eq!(c.out("b_rsalt"), 1, "and only that one item");
+    }
+}
+
+#[test]
+fn an_idle_all_optional_head_commits_nothing() {
+    // The bubble, pinned. The pipeline shifts on every one of these cycles --
+    // both sinks have room -- and shifting is not committing: `offered` is low,
+    // so the validity bit it shifts in is low and nothing reaches the output.
+    let src = concat!(
+        "sequence s (a: buffer in u16, b: buffer in u16, o: buffer out u16)\n",
+        "  let (x, xok) = @try_rcv(a)\n",
+        "  let (y, yok) = @try_rcv(b)\n",
+        "  var t: u16 = 16'd0\n",
+        "  if xok then\n",
+        "    t = t + x\n",
+        "  if yok then\n",
+        "    t = t + y\n",
+        "  |||\n",
+        "  @send(o, t)\n",
+    );
+    let mut c = Circuit::new(src, "s");
+    for _ in 0..20 {
+        c.tick();
+        assert_eq!(c.out("o_wsalt"), 0, "a head with nothing must not produce");
+    }
+    // One item on either input is enough to fire it once.
+    c.set("b_wsalt", 1);
+    c.set("b_data", 7);
+    c.tick();
+    assert_eq!(c.out("b_rsalt"), 1);
+    c.tick();
+    assert_eq!(c.out("o_wsalt"), 1);
+    assert_eq!(c.out("o_data") & 0xffff, 7);
+    assert_eq!(c.out("a_rsalt"), 0, "the input that had nothing was not stepped");
+    for _ in 0..10 {
+        c.tick();
+        assert_eq!(c.out("o_wsalt"), 1, "and then it went quiet again");
+    }
 }

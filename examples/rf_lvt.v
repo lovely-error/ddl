@@ -19,10 +19,10 @@ module rf_lvt_core (
   reg v0;
   reg v1;
   reg v2;
-  reg [1:0] src_rsalt_q;
-  reg [127:0] out_e0;
-  reg [127:0] out_e1;
-  reg [1:0] out_wsalt_q;
+  reg [1:0] req_rsalt_q;
+  reg [127:0] resp_e0;
+  reg [127:0] resp_e1;
+  reg [1:0] resp_wsalt_q;
   reg vals_fwd0_s1;
   reg [31:0] vals_wdata0_s1;
   reg vals_fwd1_s1;
@@ -39,9 +39,9 @@ module rf_lvt_core (
   reg [31:0] vals_q0;
   reg [31:0] vals_q1;
 
-  wire resp_full = out_wsalt_q == (~resp_rsalt);
+  wire resp_full = resp_wsalt_q == (~resp_rsalt);
   wire shift = !resp_full;
-  wire req_ridx = src_rsalt_q[0] ^ src_rsalt_q[1];
+  wire req_ridx = req_rsalt_q[0] ^ req_rsalt_q[1];
   wire [95:0] req_item = req_ridx ? req_data[191:96] : req_data[95:0];
   wire [7:0] n18 = req_item[95:88];
   wire [31:0] n19 = req_item[87:56];
@@ -51,33 +51,33 @@ module rf_lvt_core (
   wire n26 = n24 == n21;
   wire [7:0] n29 = req_item[7:0];
   wire n31 = n29 == n21;
-  wire req_empty = req_wsalt == src_rsalt_q;
-  wire n36 = !req_empty;
-  wire n37 = n36 & shift;
+  wire req_empty = req_wsalt == req_rsalt_q;
+  wire req_present = !req_empty;
+  wire n37 = req_present & shift;
   wire [31:0] n43 = vals_fwd0_s1 ? vals_wdata0_s1 : vals_q0;
   wire [31:0] n49 = vals_fwd1_s1 ? vals_wdata1_s1 : vals_q1;
   wire [31:0] sum = n43 + n49;
   wire [31:0] dif = x_s2 - y_s2;
   wire [127:0] n66 = {x_s3, y_s3, sum_s3, dif_s3};
-  wire vals_re0 = n36 & shift;
-  wire vals_re1 = n36 & shift;
-  wire out_push = shift & v2;
-  wire out_widx = out_wsalt_q[0] ^ out_wsalt_q[1];
-  wire src_take = n36 & shift;
+  wire vals_re0 = req_present & shift;
+  wire vals_re1 = req_present & shift;
+  wire push = shift & v2;
+  wire resp_widx = resp_wsalt_q[0] ^ resp_wsalt_q[1];
+  wire take = req_present & shift;
 
-  assign req_rsalt = src_rsalt_q;
-  assign resp_wsalt = out_wsalt_q;
-  assign resp_data = {out_e1, out_e0};
+  assign resp_data = {resp_e1, resp_e0};
+  assign resp_wsalt = resp_wsalt_q;
+  assign req_rsalt = req_rsalt_q;
 
   always @(posedge clk) begin
     if (!rst_n) begin
       v0 <= 1'b0;
       v1 <= 1'b0;
       v2 <= 1'b0;
-      src_rsalt_q <= 2'd0;
-      out_e0 <= 128'd0;
-      out_e1 <= 128'd0;
-      out_wsalt_q <= 2'd0;
+      req_rsalt_q <= 2'd0;
+      resp_e0 <= 128'd0;
+      resp_e1 <= 128'd0;
+      resp_wsalt_q <= 2'd0;
       vals_fwd0_s1 <= 1'b0;
       vals_wdata0_s1 <= 32'd0;
       vals_fwd1_s1 <= 1'b0;
@@ -90,13 +90,13 @@ module rf_lvt_core (
       x_s3 <= 32'd0;
       y_s3 <= 32'd0;
     end else begin
-      v0 <= (shift ? n36 : v0);
+      v0 <= (shift ? req_present : v0);
       v1 <= (shift ? v0 : v1);
       v2 <= (shift ? v1 : v2);
-      src_rsalt_q <= (src_take ? (src_rsalt_q ^ (req_ridx ? 2'd2 : 2'd1)) : src_rsalt_q);
-      out_e0 <= ((out_push & (!out_widx)) ? n66 : out_e0);
-      out_e1 <= ((out_push & out_widx) ? n66 : out_e1);
-      out_wsalt_q <= (out_push ? (out_wsalt_q ^ (out_widx ? 2'd2 : 2'd1)) : out_wsalt_q);
+      req_rsalt_q <= (take ? (req_rsalt_q ^ (req_ridx ? 2'd2 : 2'd1)) : req_rsalt_q);
+      resp_e0 <= ((push & (!resp_widx)) ? n66 : resp_e0);
+      resp_e1 <= ((push & resp_widx) ? n66 : resp_e1);
+      resp_wsalt_q <= (push ? (resp_wsalt_q ^ (resp_widx ? 2'd2 : 2'd1)) : resp_wsalt_q);
       vals_fwd0_s1 <= (shift ? ((n24 == n18) | n26) : vals_fwd0_s1);
       vals_wdata0_s1 <= (shift ? (n26 ? n22 : n19) : vals_wdata0_s1);
       vals_fwd1_s1 <= (shift ? ((n29 == n18) | n31) : vals_fwd1_s1);

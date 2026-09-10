@@ -10,6 +10,10 @@ This document explains how the DDL compiler lowers high-level `sequence` declara
 - [Stage Cuts (`|||`) and Pipeline Partitioning](#stage-cuts--and-pipeline-partitioning)
 - [Shift-Register Insertion for Value Spanning](#shift-register-insertion-for-value-spanning)
 - [Backpressure and the Unified Pipeline Shift](#backpressure-and-the-unified-pipeline-shift)
+- [Head Gather and Tail Scatter](#head-gather-and-tail-scatter)
+  - [A Join Is Not a `@merge`](#a-join-is-not-a-merge)
+  - [Optional Inputs (`@try_rcv`)](#optional-inputs-try_rcv)
+  - [Loops of Pipes](#loops-of-pipes)
 - [Validity Bits and Stage Gating](#validity-bits-and-stage-gating)
 - [Zero-Cost BRAM Stage Alignment](#zero-cost-bram-stage-alignment)
 - [Memory Consistency in Pipelines](#memory-consistency-in-pipelines)
@@ -81,13 +85,105 @@ All inserted pipeline registers share the global pipeline shift enable (`shift`)
 A DDL pipeline moves forward as a single coordinated unit. The global advance signal is named `shift`:
 
 ```verilog
-wire dst_full = (out_wsalt_q == (~dst_rsalt));
+wire dst_full = (dst_wsalt_q == (~dst_rsalt));
 wire shift    = !dst_full;
 ```
 
 - When the downstream consumer has room (`dst_full == 0`), `shift` is high, and every pipeline stage advances simultaneously on the rising clock edge.
 - When downstream asserts backpressure (`dst_full == 1`), `shift` falls low. Every stage register and validity bit holds its current state.
 - Upstream items are safely held in the input buffer without dropping or stalling the producer until the pipeline's own skid capacity is exhausted.
+
+---
+
+## Head Gather and Tail Scatter
+
+A `sequence` may declare any number of `buffer in` and `buffer out`
+parameters. Every input is received exactly once in stage 0, every output sent
+to exactly once in the last stage, and the two sides reduce to one predicate
+each:
+
+```verilog
+  wire offered = a_present & b_present;   // every blocking input has an item
+  wire shift   = x_room & y_room;         // every sink has a slot
+
+  wire take = offered & shift;            // one take, for all inputs
+  wire push = shift & v_last;             // one push, for all outputs
+```
+
+One `take` and one `push` is the whole of it. The head is a **rendezvous**: the
+inputs of a single item arrive together, so either every blocking input gives up
+an entry on this edge or none does. The tail is a **broadcast**: every sink is
+written from the same item on the same edge.
+
+Both reductions are over **slot occupancy**, which is a register on this side of
+the wire, and never over the far side's handshake. That is the same argument
+[`@split`](combinators.md) makes: ANDing the consumers' readiness would put each
+one's logic into every other one's timing path, where asking whether each of
+*our* two-entry slots has room reads only local flops. Each sink gets its own
+slot, and the pipeline waits for the slowest of them.
+
+With one input and one output the reductions have a single term each and
+collapse to exactly what a single-pipe sequence always emitted -- `shift =
+!dst_full`, `take = src_present & shift` -- so nothing costs anything until it
+is used.
+
+### A Join Is Not a `@merge`
+
+They look alike in a graph and are not interchangeable:
+
+| | `@merge` | a sequence head |
+|---|---|---|
+| takes | one input per cycle | one item from *every* input |
+| when | any input is offering | all blocking inputs are offering |
+| picks | rotating priority | nothing to pick |
+| is | an arbiter, interleaving streams | a rendezvous, zipping them |
+
+Use `@merge` to funnel several producers of the same stream into one. Use a
+multi-input sequence when one item is a function of one item from each source.
+
+### Optional Inputs (`@try_rcv`)
+
+An input received with `@try_rcv` in stage 0 is **optional**: it is absent from
+`offered`, so it never holds the pipeline up, and it gives up an entry only on
+the cycles it had one.
+
+```verilog
+  wire take   = a_present & shift;      // b is not part of the pacing
+  wire b_take = take & b_present;       // b is consumed only when it has an item
+```
+
+The `ok` half of the pair *is* `b_present`, and crosses the stage cuts like any
+other value, so the stage that uses `y` sees the `ok` that belongs to the same
+item. When `ok` is low, `y` holds whatever the buffer still had -- the same
+bargain `@try_rcv` makes in a `process`.
+
+With *every* input optional, `offered` becomes the OR rather than the AND. It is
+deliberately not a constant: a head that fired with nothing on any input would be
+a free-running source, emitting an item per cycle out of nothing. A cycle in
+which nothing arrived is a **bubble** -- the pipeline shifts, the validity bit it
+shifts in is low, and `push` commits nothing. Shifting is not committing.
+
+### Loops of Pipes
+
+A sequence produces an item only after receiving one on every pipe it blocks on,
+and every pipe starts empty. So around a loop of sequences, each one is waiting
+for an item only its predecessor can make, and none of them ever fires. The
+compiler reports that loop rather than emitting it:
+
+```
+error: `acc` waits on itself through acc -> hold -> acc
+```
+
+Routing the feedback through a `@try_rcv` makes the same loop live -- an
+accumulator that reads last cycle's result on the cycles there is one. The check
+stops at sequences: a `process` may send before it ever receives, and an `extern`
+is opaque, so a loop through either is left alone. A clean compile is not a proof
+of liveness; only the diagnostic is a proof of the opposite.
+
+Note that *reconvergence* is not a loop and is never reported. A `@split` into
+two paths of unequal depth rejoining at a two-input sequence makes progress: the
+fast path fills and back-pressures, the slow path keeps draining into the join,
+and the design runs at the slow path's rate.
 
 ---
 
@@ -110,7 +206,7 @@ end
 
 - **Output Gating**: The tail stage pushes to the destination buffer only when both the pipeline advances and the final stage contains a valid item:
   ```verilog
-  wire out_push = shift & v_last;
+  wire push = shift & v_last;
   ```
 - **Assertion Gating**: Assertions written inside a pipeline stage execute only when `shift` is active, the stage validity bit is asserted, and any enclosing branch conditions are true. Spurious assertion failures on uninitialized bubbles are impossible.
 
@@ -205,13 +301,13 @@ module mac (
 
   wire dst_full = (dst_wsalt_q == ~dst_rsalt);
   wire shift    = !dst_full;
-  wire src_take = !src_empty & shift;
+  wire take = src_present & shift;
 
   always @(posedge clk) begin
     if (!rst_n) begin
       v0 <= 1'b0;
     end else if (shift) begin
-      v0 <= src_take;
+      v0 <= src_present;
       squared_s1 <= x * x;
       x_s1       <= x;      // Spans stage cut alongside squared
     end

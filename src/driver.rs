@@ -463,6 +463,22 @@ fn compile_on_this_stack(
         if sink.has_errors() {
             return Err(sink.into_diags());
         }
+        // And after that gate, because it reads sequence bodies for the pipes
+        // they block on: a body too malformed to lower has already been
+        // reported, and a second complaint derived from it would be noise.
+        let blocking: std::collections::BTreeMap<String, Vec<String>> = seqs
+            .iter()
+            .map(|seq| {
+                (
+                    anumspan_to_str(&seq.name).to_string(),
+                    crate::ir_pipe::blocking_inputs_of(seq),
+                )
+            })
+            .collect();
+        crate::ir_graph::check_pipe_deadlock(map, &sigs, &blocking, &graphs, &mut sink);
+        if sink.has_errors() {
+            return Err(sink.into_diags());
+        }
         // Combinators first, in the file: a graph instantiates them, and the
         // rule for this file is that everything a graph names has been emitted
         // above it so the whole thing reads top to bottom.
