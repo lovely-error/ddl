@@ -19,6 +19,7 @@ fn compile_exporting(src: &str, targets: &[&str]) -> String {
         export: crate::ir_export::ExportFlags {
             export: targets.iter().map(|s| s.to_string()).collect(),
             bare: Vec::new(),
+            crossings: Vec::new(),
         },
         ..EmitOptions::default()
     };

@@ -18,6 +18,7 @@ This document provides a comprehensive technical reference for the Dataflow Desc
   - [Backpressured Buffers (`buffer`)](#backpressured-buffers-buffer)
   - [The Internal Salt Protocol](#the-internal-salt-protocol)
   - [Show-Ahead FIFO Boundaries](#show-ahead-fifo-boundaries)
+  - [Clock Domain Crossings (CDC)](#clock-domain-crossings-cdc)
   - [Channel Operations & Intrinsics](#channel-operations--intrinsics)
   - [Hardware Combinators (`@merge` and `@split`)](#hardware-combinators-merge-and-split)
 - [Type System and Storage](#type-system-and-storage)
@@ -263,6 +264,16 @@ An **export target** is the module the build is for. It is discovered from the u
   ```
 
 For full details, see [**FIFO Boundary Adapters & Export Architecture**](fifo-boundaries-and-export.md).
+
+### Clock Domain Crossings (CDC)
+
+Every port on every module DDL generates is synchronous to `clk`. If an external module or IP core runs on a different clock, wiring it directly will cause silent data corruption (measured at 100% item corruption on hardware).
+
+To cross clock domains safely:
+- **Compiler-Automated**: Pass `--async-export <pipe>[=<domain>]` or `--async-extern <instance>.<pipe>[=<domain>]`. The compiler automatically synthesizes an asynchronous Gray-pointer FIFO (`ddl_cdc_fifo`) and an active-handshake reset synchronizer (`ddl_rst_cross`).
+- **Hand-Wired**: Instantiate [`lib/ddl_cdc_fifo.v`](../lib/ddl_cdc_fifo.v) or vendor CDC primitives (`XPM_CDC_FIFO`, `DCFIFO`) at the top-level boundary.
+
+For architecture details, empirical failure measurements, and the hand-wired route, see [**Clock Domains**](clock-domains.md). For practical recipes, port listings, and flags, see [**Guide 6: Clock Domain Crossings**](guides/6-clock-domain-crossings.md).
 
 ### Channel Operations & Intrinsics
 

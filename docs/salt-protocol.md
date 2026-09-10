@@ -225,6 +225,30 @@ Producer Push  :  STALLED RESUMED Active Active
 
 ---
 
+## The Protocol Is Single-Clock
+
+Everything above assumes **one clock**. The guarantee that makes the protocol
+work — a slot is stable for as long as it is offered — rests on the producer and
+the consumer agreeing about when a cycle is, and two clocks do not agree about
+that.
+
+Gray coding protects the *pointer*: one bit changes per step, so a salt sampled
+mid-transition reads as the old value or the new one and never a mixture.
+Nothing protects the decision made from it. The `empty` flag is a combinational
+function of the asynchronous incoming pointer `wsalt`. Because that flag fans out
+to multiple registers in the receiving domain, subtle routing skew causes registers
+to sample differing values within the exact same clock edge — one register advances
+the read pointer while another fails to capture the item.
+
+This is not theoretical. Driven across two PLL domains on a Tang Nano 9K, the
+compiler's own emitted link corrupted **100% of items at 54 million errors per
+second**, while the same design on one clock ran clean. The experiment is
+documented in [`cdc-demo/`](../cdc-demo/README.md). The remedy is to isolate the
+boundary with an asynchronous FIFO: wire [`lib/ddl_cdc_fifo.v`](../lib/ddl_cdc_fifo.v)
+by hand, or let the compiler automate it via `--async-export`. See [**Clock
+Domains**](clock-domains.md) and [**Guide 6: Clock Domain
+Crossings**](guides/6-clock-domain-crossings.md).
+
 ## Hardware Synthesis Properties
 
 1. **Pure Register-to-Register Paths**: Every inter-module wire (`wsalt`, `rsalt`, `data`) connects a flip-flop directly to downstream logic. Combinational paths never cross module boundaries.

@@ -1,5 +1,12 @@
 # FIFO Boundary Adapters & Export Architecture
 
+> **Every port on these faces is synchronous to that module's `clk`.** Wiring one
+> to logic on another clock corrupts data silently — measured at 100% of items on
+> hardware. If logic across a boundary runs on another clock, either wire
+> [`lib/ddl_cdc_fifo.v`](../lib/ddl_cdc_fifo.v) by hand, or let the compiler wire
+> one with `--async-export` / `--async-extern`. See [Guide 6](guides/6-clock-domain-crossings.md)
+> for the recipe and [Clock Domains](clock-domains.md) for the underlying measurements.
+
 This document provides a comprehensive hardware architecture specification of DDL's external boundary interfaces: how the compiler presents **Show-Ahead FIFOs (zero read latency)** at module boundaries, how the four adapter modules in [`src/ir_adapt.rs`](../src/ir_adapt.rs) translate between internal Gray-code salt and external FIFO protocols, and how export targets are resolved and wrapped in [`src/ir_export.rs`](../src/ir_export.rs).
 
 ---

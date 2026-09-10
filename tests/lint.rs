@@ -130,6 +130,7 @@ fn lvt_variants() -> Vec<PathBuf> {
         }
         let opts = EmitOptions {
             regenerate_cmd: format!("ddl build --lvt-bram {}", src),
+            crossings: Vec::new(),
             lvt_bram: true,
             ..EmitOptions::default()
         };
@@ -302,6 +303,7 @@ fn the_checked_in_verilog_is_what_this_compiler_produces() {
         }
         let opts = ddl::verilog::EmitOptions {
             regenerate_cmd: format!("ddl build {}", args.join(" ")),
+            crossings: Vec::new(),
             lvt_bram,
             export,
         };

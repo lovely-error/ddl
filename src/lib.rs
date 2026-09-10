@@ -19,6 +19,7 @@ pub mod parse;
 
 pub mod ir;
 pub mod ir_adapt;
+pub mod ir_cdc_lib;
 pub mod ir_comb;
 pub mod ir_export;
 pub mod ir_fsm;

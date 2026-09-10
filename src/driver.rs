@@ -382,6 +382,9 @@ fn compile_on_this_stack(
     // Collected across graphs and again across export wrappers: one module per
     // shape, however many boundaries ask for it.
     let mut adapts: Vec<crate::ir_adapt::AdaptUse> = Vec::new();
+    // Crossings, collected the same way and for the same reason: one module per
+    // shape, however many boundaries ask for it.
+    let mut cdcs: Vec<crate::ir_cdc_lib::CdcUse> = Vec::new();
     let mut render = |out: &mut String, module: &crate::ir::Module| {
         if drawing || !dumping_ir {
             drawn.push(module.clone());
@@ -467,7 +470,10 @@ fn compile_on_this_stack(
         let mut lowered = Vec::new();
         for graph in &graphs {
             if let Some(module) =
-                crate::ir_graph::lower_graph(map, &syms, &sigs, graph, &mut combs, &mut adapts, &mut sink)
+                crate::ir_graph::lower_graph(
+                    map, &syms, &sigs, graph, &mut combs, &mut adapts,
+                    &opts.export, &mut cdcs, &mut sink,
+                )
             {
                 lowered.push(module);
             }
@@ -535,11 +541,16 @@ fn compile_on_this_stack(
         // The file is the targets and what they use. A module that has nothing
         // to do with what was asked for is one a synthesizer would elaborate
         // and a reader would have to account for.
+        crate::ir_export::validate_crossings(&opts.export, &exports, &sigs)
+            .map_err(|d| vec![d])?;
+
         let keep = crate::ir_export::closure(&drawn, &exports.keep);
         drawn.retain(|m| keep.contains(&m.name));
 
         let wrappers_at = drawn.len();
-        drawn = crate::ir_export::apply(drawn, &exports.wrap, &sigs, &mut adapts);
+        drawn = crate::ir_export::apply(
+            drawn, &exports.wrap, &sigs, &mut adapts, &opts.export, &mut cdcs,
+        );
 
         // Wrapping asks for adapters of its own, and they have to appear
         // above the wrapper that names them.
@@ -581,6 +592,24 @@ fn compile_on_this_stack(
             emit_modules(&drawn, opts).map_err(|message| vec![Diag::error_no_span(message)])?;
         out.push('\n');
         out.push_str(&verilog);
+
+        // The crossing is EMITTED, not lowered. `emit_modules` has already
+        // reserved these names as external -- a module an instance mentions and
+        // the IR does not define -- so all that is left is to append the source.
+        //
+        // The two library files go out VERBATIM, because the bytes reviewed and
+        // measured on hardware are the bytes that should ship; only the thin
+        // per-shape shells are generated. See src/ir_cdc_lib.rs.
+        if !cdcs.is_empty() {
+            out.push('\n');
+            out.push_str(crate::ir_cdc_lib::CDC_FIFO_V);
+            out.push('\n');
+            out.push_str(crate::ir_cdc_lib::RST_CROSS_V);
+            for use_ in &cdcs {
+                out.push('\n');
+                out.push_str(&crate::ir_cdc_lib::shell(use_.kind, use_.width, use_.depth));
+            }
+        }
     }
     Ok(out)
 }

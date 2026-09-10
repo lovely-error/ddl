@@ -1,0 +1,99 @@
+// One rPLL, from KAMASUTRA2G/rtl/board/k2g_pll.sv.
+//
+// A TEMPLATE, NOT A SOURCE FILE, and the reason is a silent defect this demo
+// hit on its first build. Passing ODIV_SEL through a wrapper's parameter --
+//
+//     module cdc_pll #(parameter ODIV_SEL = 10) (...);
+//       rPLL #(.ODIV_SEL(ODIV_SEL)) u_rpll (...);
+//
+// -- produces this, and only this, in an otherwise green build:
+//
+//   WARN (EX0205) : Instance "u_rpll" 's parameter "ODIV_SEL" value invalid,
+//   replaced by default value "8"
+//
+// GowinSynthesis does not evaluate a parameter forwarded into the primitive:
+// it substitutes the default and carries on. Exit status, bitstream,
+// utilization and timing all stay green while the part runs at a frequency
+// nothing in the source names -- which for THIS experiment would silently
+// change the clock ratio being measured. So build.sh substitutes the numbers
+// into this file as LITERALS before the tool ever sees them, and greps the log
+// for EX0205 afterwards in case some other parameter goes the same way.
+//
+//   CLKOUT = FCLKIN * (FBDIV_SEL+1) / (IDIV_SEL+1)
+//   PFD    = FCLKIN / (IDIV_SEL+1)          must be 3..400 MHz
+//   VCO    = CLKOUT * ODIV_SEL              must be 400..1200 MHz
+//
+// ODIV_SEL IS NOT FREE AND THE TOOL WILL NOT SAY SO. The source file this came
+// from records four combinations tried on the way to a working one, every
+// failure being `gw_sh exit 1` with a ZERO-BYTE log:
+//
+//   FBDIV 2, ODIV 8    81 MHz, VCO  648   FAILS
+//   FBDIV 4, ODIV 8   135 MHz, VCO 1080   FAILS  -- so it is ODIV 8 itself
+//   FBDIV 2, ODIV 6    81 MHz, VCO  486   FAILS
+//   FBDIV 4, ODIV 6   135 MHz, VCO  810   works
+//   FBDIV 2, ODIV 10   81 MHz, VCO  810   works
+//
+// So the two settings this demo uses by default are the two that file proves:
+//
+//   clock A   IDIV 0, FBDIV 2, ODIV 10  ->  81 MHz, VCO  810
+//   clock B   IDIV 0, FBDIV 4, ODIV  6  -> 135 MHz, VCO  810
+//
+// The alternate pairs for the frequency sweep are NOT proven and are the first
+// suspect if a build dies with an empty log:
+//
+//   108  MHz  IDIV 0, FBDIV 3, ODIV 10, VCO 1080
+//   94.5 MHz  IDIV 1, FBDIV 6, ODIV 10, VCO  945   (PFD 13.5 MHz)
+//
+// And ODIV_SEL substitution is reported ONLY as a WARN in the build log, which
+// is why build.sh prints warnings on success.
+
+module @NAME@ (
+    input  clk_in,
+    output clk_out,
+    output lock
+);
+
+  wire unused_p, unused_d, unused_d3;
+
+  rPLL #(
+      .FCLKIN          ("27"),
+      .DEVICE          ("GW1NR-9C"),
+      .IDIV_SEL        (@IDIV@),
+      .FBDIV_SEL       (@FBDIV@),
+      .ODIV_SEL        (@ODIV@),
+      .DYN_IDIV_SEL    ("false"),
+      .DYN_FBDIV_SEL   ("false"),
+      .DYN_ODIV_SEL    ("false"),
+      .DYN_SDIV_SEL    (2),
+      .PSDA_SEL        ("0000"),
+      .DYN_DA_EN       ("false"),
+      .DUTYDA_SEL      ("1000"),
+      .CLKOUT_FT_DIR   (1'b1),
+      .CLKOUTP_FT_DIR  (1'b1),
+      .CLKOUT_DLY_STEP (0),
+      .CLKOUTP_DLY_STEP(0),
+      .CLKFB_SEL       ("internal"),
+      .CLKOUT_BYPASS   ("false"),
+      .CLKOUTP_BYPASS  ("false"),
+      .CLKOUTD_BYPASS  ("false"),
+      .CLKOUTD_SRC     ("CLKOUT"),
+      .CLKOUTD3_SRC    ("CLKOUT")
+  ) u_rpll (
+      .CLKOUT  (clk_out),
+      .LOCK    (lock),
+      .CLKOUTP (unused_p),
+      .CLKOUTD (unused_d),
+      .CLKOUTD3(unused_d3),
+      .RESET   (1'b0),
+      .RESET_P (1'b0),
+      .CLKIN   (clk_in),
+      .CLKFB   (1'b0),
+      .FBDSEL  (6'b000000),
+      .IDSEL   (6'b000000),
+      .ODSEL   (6'b000000),
+      .PSDA    (4'b0000),
+      .DUTYDA  (4'b0000),
+      .FDLY    (4'b0000)
+  );
+
+endmodule

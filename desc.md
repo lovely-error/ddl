@@ -187,7 +187,7 @@ the parts that are not built.
 ### unresolved issues
 1. io procs
    1. how to use serdes io in em?
-   4. how should we do cdc for io procs ?
+   4. how should we do cdc for io procs ? ANSWERED: not in the compiler -- put lib/ddl_cdc_fifo.v at the boundary, see docs/clock-domains.md (measured: wired directly, 100% of items corrupt; with the FIFO, zero in 1.14 billion at full rate)
    5. how should we clock em?
       1. every clock stmt introduces a constraint. integer multiple clocks are derived from ????
 

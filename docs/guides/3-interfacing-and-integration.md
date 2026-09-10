@@ -15,6 +15,14 @@ This guide explains how to integrate DDL-generated modules into existing FPGA or
 
 ## 1. The boundary is a FIFO
 
+> **One clock.** Everything in this guide assumes the external logic runs on the
+> same clock as the compiled design. If it does not, either put a
+> [`ddl_cdc_fifo`](../../lib/ddl_cdc_fifo.v) at the boundary yourself, or name
+> the boundary with `--async-export` / `--async-extern` and let the compiler wire
+> one — [Guide 6](6-clock-domain-crossings.md) is the recipe and
+> [Clock Domains](../clock-domains.md) is why. A crossing wired directly corrupts
+> data silently, and simulation will not show it.
+
 Internally, DDL connects two compiled modules with a gray-code pointer protocol (see [The Gray-Code Salt Protocol](../salt-protocol.md)). That protocol is between two modules the compiler wrote, and it never reaches you.
 
 Every boundary you wire up by hand — an `extern`, or the module you asked the compiler to export — presents an ordinary FIFO instead. For a pipe `p` carrying `W` bits:

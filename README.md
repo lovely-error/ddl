@@ -19,9 +19,11 @@ DDL came from dissatisfaction with existing methods of creating designs for FPGA
 - [**Guide 3: Interfacing DDL with Existing Verilog, AXI-Stream, and FPGA Pins**](docs/guides/3-interfacing-and-integration.md): Connecting to physical chip pins via `wire`, `extern` IP integration over the FIFO boundary, and AXI4-Stream master/slave wrappers.
 - [**Guide 4: Memory Patterns: ROMs, Block RAMs, and Multi-Port Register Files**](docs/guides/4-memory-and-register-files.md): `lutram` vs. `bram`, zero-cost BRAM stage alignment, and multi-write register files with `--lvt-bram`.
 - [**Guide 5: Simulation, Verification, and Build Workflows**](docs/guides/5-verification-and-simulation.md): Edge-triggered simulation assertions, SystemVerilog testbench templates, Verilator `-Wall` linting, and Makefiles.
+- [**Guide 6: Crossing a Clock Domain**](docs/guides/6-clock-domain-crossings.md): `--async-export` and `--async-extern` — naming a boundary that runs on another clock, the ports it adds, the constraint it needs, and what the reset handshake does for you.
 
 ### Architecture Deep Dives
 - [**FIFO Boundary Adapters & Export Architecture**](docs/fifo-boundaries-and-export.md): Standard Show-Ahead (zero read latency) FIFO interfaces at module boundaries, compiler-generated adapters (`ir_adapt.rs`), use-graph root discovery, dead-code pruning, and wrapper generation (`ir_export.rs`).
+- [**Clock Domains**](docs/clock-domains.md): every face a compiled design presents is synchronous to its `clk`; what a crossing does to your data (measured on hardware), `lib/ddl_cdc_fifo.v`, and `--async-export` / `--async-extern`, which make the compiler emit and wire one for a boundary you name.
 - [**The Gray-Code Salt Protocol**](docs/salt-protocol.md): 2-bit Gray-code pointer mathematics, cycle-by-cycle waveform traces, skid buffer proofs, and AXI-Stream adapters.
 - [**Pipeline Lowering & Memory Forwarding**](docs/pipeline-lowering.md): `sequence` stage cuts (`|||`), shift-register spanning, backpressure, and zero-cost BRAM alignment.
 - [**Finite State Machine Synthesis & Scoping**](docs/fsm-synthesis.md): `process` control-flow graph construction, zero-cycle branch dispatch, lexical register allocation, and resource sharing.

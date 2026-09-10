@@ -373,10 +373,14 @@ pub fn lower_graph(
     decl: &GraphDecl,
     combs: &mut Vec<CombUse>,
     adapts: &mut Vec<crate::ir_adapt::AdaptUse>,
+    flags: &crate::ir_export::ExportFlags,
+    cdcs: &mut Vec<crate::ir_cdc_lib::CdcUse>,
     sink: &mut DiagSink,
 ) -> Option<Module> {
     let graph_name = anumspan_to_str(&decl.name).to_string();
     let mut ports = Vec::new();
+    // One clock/reset pair per DOMAIN, however many pipes name it.
+    let mut domains: Vec<String> = Vec::new();
     let mut nets = Vec::new();
     let mut pipes: BTreeMap<String, GraphPipeInfo> = BTreeMap::new();
     let mut wires: BTreeMap<String, GraphWireInfo> = BTreeMap::new();
@@ -788,9 +792,68 @@ pub fn lower_graph(
                 (format!("{}_rsalt", salt), format!("{}_rsalt", actual_name)),
                 (format!("{}_data", salt), format!("{}_data", actual_name)),
             ];
-            for suffix in [flag, go, data] {
-                adapt_conns.push((suffix.to_string(), leg(suffix)));
-                conns.push((format!("{}_{}", formal.name, suffix), leg(suffix)));
+
+            // Is this pipe of this instance asked to cross a clock domain?
+            let crossed = flags.crossings.iter().find(|c| {
+                c.owner == graph_name
+                    && c.instance.as_deref() == Some(inst_name.as_str())
+                    && c.pipe == formal.name
+            });
+
+            if let Some(c) = crossed {
+                // The extern keeps its `clk`/`rst_n` -- that is its core clock,
+                // and nothing here touches it. What the crossed pipe adds is
+                // `<pipe>_clk` and `<pipe>_rst_n` on the SAME `<pipe>_<suffix>`
+                // ABI the face already uses, so the compiler never has to guess
+                // a clock name or make the author declare a `wire`.
+                let width = formal.ty.bit_width();
+                let ck = crate::ir_cdc_lib::Cdc::at(formal.is_input, true);
+                let use_ = crate::ir_cdc_lib::CdcUse { kind: ck, width, depth: c.depth };
+                if !cdcs.contains(&use_) {
+                    cdcs.push(use_);
+                }
+
+                let clk_port = format!("{}_clk", c.domain);
+                let rst_port = format!("{}_rst_n", c.domain);
+                if !domains.contains(&c.domain) {
+                    domains.push(c.domain.clone());
+                    ports.push(Port { name: clk_port.clone(), dir: PortDir::In, ty: Ty::BOOL });
+                    ports.push(Port { name: rst_port.clone(), dir: PortDir::In, ty: Ty::BOOL });
+                }
+
+                let mut shell = vec![
+                    ("clk".to_string(), "clk".to_string()),
+                    ("rst_n".to_string(), "rst_n".to_string()),
+                    ("f_clk".to_string(), clk_port),
+                ];
+                for (ix, suffix) in [flag, go, data].iter().enumerate() {
+                    // The adapter's face lands on internal nets; the shell
+                    // carries it the rest of the way to the extern.
+                    let core_net = format!("{}_{}_c_{}", inst_name, formal.name, suffix);
+                    nets.push(Net {
+                        name: core_net.clone(),
+                        ty: if ix == 2 { formal.ty.clone() } else { Ty::BOOL },
+                    });
+                    adapt_conns.push((suffix.to_string(), core_net.clone()));
+                    shell.push((format!("c_{}", suffix), core_net));
+                    shell.push((format!("f_{}", suffix), leg(suffix)));
+                    conns.push((format!("{}_{}", formal.name, suffix), leg(suffix)));
+                }
+                // The face's own clock and reset, named the way the face is.
+                conns.push((format!("{}_clk", formal.name), format!("{}_clk", c.domain)));
+                conns.push((format!("{}_rst_n", formal.name), rst_port));
+
+                adapters.push(Instance {
+                    module: crate::ir_cdc_lib::module_name(ck, width, c.depth),
+                    name: format!("{}_{}_cdc", inst_name, formal.name),
+                    conns: shell,
+                    produces: Vec::new(),
+                });
+            } else {
+                for suffix in [flag, go, data] {
+                    adapt_conns.push((suffix.to_string(), leg(suffix)));
+                    conns.push((format!("{}_{}", formal.name, suffix), leg(suffix)));
+                }
             }
             // The adapter drives no pipe of its own as far as the picture is
             // concerned: the extern is what the source named, and blaming the

@@ -24,7 +24,18 @@ fn flags(export: &[&str], bare: &[&str]) -> ExportFlags {
     ExportFlags {
         export: export.iter().map(|s| s.to_string()).collect(),
         bare: bare.iter().map(|s| s.to_string()).collect(),
+        crossings: Vec::new(),
     }
+}
+
+/// The same, plus `--async-export`-style crossings, as `<pipe>=<domain>`.
+fn crossed(export: &[&str], on: &str, pipes: &[&str]) -> ExportFlags {
+    let mut f = flags(export, &[]);
+    for spec in pipes {
+        f.crossings
+            .push(ddl::ir_export::parse_crossing("--async-export", &format!("{}.{}", on, spec), false).unwrap());
+    }
+    f
 }
 
 fn build(src: &str, f: ExportFlags) -> Result<String, String> {
@@ -331,4 +342,193 @@ fn checking_still_reports_errors_in_the_source() {
         .expect_err("a bad range is still an error when checking");
     let text = map.render_all(&diags);
     assert!(text.contains("must be a constant known at compile time"), "{}", text);
+}
+
+
+// ---------------------------------------------------------------------------
+// Clock-domain crossings. The load-bearing property is the first test: asking
+// for none must change nothing at all, because that is what makes the feature
+// free for the designs -- nearly all of them -- that have one clock.
+
+const TWO_PIPES: &str = "\
+sequence filt (rx: buffer in u16, tx: buffer out u16)
+  let v = @rcv(rx)
+  |||
+  @send(tx, v + 1)
+";
+
+#[test]
+fn without_a_crossing_flag_the_output_is_unchanged() {
+    let plain = ok(TWO_PIPES, flags(&["filt"], &[]));
+    assert!(!plain.contains("ddl_cdc"), "a build that asked for no crossing emitted one");
+    assert!(!plain.contains("_clk,"), "a build that asked for no crossing added a clock port");
+    assert!(!plain.contains("CLOCK-DOMAIN CROSSINGS"));
+}
+
+#[test]
+fn a_crossed_pipe_gains_one_clock_port_and_a_fifo() {
+    let v = ok(TWO_PIPES, crossed(&["filt"], "filt", &["rx=io"]));
+    assert!(v.contains("input         io_clk"), "{}", v);
+    assert!(v.contains("module ddl_cdc_in_16x8"), "{}", v);
+    assert!(v.contains("ddl_cdc_in_16x8 u_rx_cdc"), "{}", v);
+    // The library modules go out verbatim, once.
+    assert_eq!(v.matches("module ddl_cdc_fifo").count(), 1, "{}", v);
+    assert_eq!(v.matches("module ddl_rst_cross").count(), 1, "{}", v);
+    // The uncrossed pipe is untouched: no shell, no second clock.
+    assert!(!v.contains("u_tx_cdc"), "{}", v);
+}
+
+#[test]
+fn two_pipes_in_one_domain_share_one_clock_port() {
+    let v = ok(TWO_PIPES, crossed(&["filt"], "filt", &["rx=io", "tx=io"]));
+    assert_eq!(v.matches("io_clk,").count(), 1, "one port, not one per pipe:\n{}", v);
+    assert!(v.contains("u_rx_cdc") && v.contains("u_tx_cdc"), "{}", v);
+}
+
+#[test]
+fn two_pipes_in_two_domains_get_two_clock_ports() {
+    let v = ok(TWO_PIPES, crossed(&["filt"], "filt", &["rx=a", "tx=b"]));
+    assert!(v.contains("input         a_clk"), "{}", v);
+    assert!(v.contains("input         b_clk"), "{}", v);
+}
+
+#[test]
+fn each_direction_gets_the_shell_that_faces_the_right_way() {
+    let v = ok(TWO_PIPES, crossed(&["filt"], "filt", &["rx=io", "tx=io"]));
+    // `rx` is a `buffer in`: the outside writes, so data flows into the core.
+    assert!(v.contains("module ddl_cdc_in_16x8"), "{}", v);
+    // `tx` is a `buffer out`: the other way.
+    assert!(v.contains("module ddl_cdc_out_16x8"), "{}", v);
+}
+
+#[test]
+fn depth_is_per_boundary_and_names_the_module() {
+    let v = ok(TWO_PIPES, crossed(&["filt"], "filt", &["rx=io:4", "tx=io:16"]));
+    assert!(v.contains("module ddl_cdc_in_16x4"), "{}", v);
+    assert!(v.contains("module ddl_cdc_out_16x16"), "{}", v);
+    // Depth reaches the FIFO as an address width, not as a count.
+    assert!(v.contains(".AW(2)"), "{}", v);
+    assert!(v.contains(".AW(4)"), "{}", v);
+}
+
+#[test]
+fn the_banner_says_what_the_timing_tool_must_be_told() {
+    // Not through `ok`, which does not set the banner's crossing list -- this
+    // is the path `main.rs` takes, so it is built the same way here.
+    let f = crossed(&["filt"], "filt", &["rx=io"]);
+    let map = SourceMap::new("t.ddl", TWO_PIPES);
+    let opts = EmitOptions {
+        crossings: f.crossings.iter().map(|c| (format!("{}.{}", c.owner, c.pipe), c.domain.clone())).collect(),
+        export: f,
+        ..EmitOptions::default()
+    };
+    let v = compile_to_verilog(&map, &opts).expect("should compile");
+    assert!(v.contains("CLOCK-DOMAIN CROSSINGS"), "{}", v);
+    assert!(v.contains("set_clock_groups -asynchronous"), "{}", v);
+    assert!(v.contains("[get_clocks io_clk]"), "{}", v);
+}
+
+#[test]
+fn a_crossing_on_something_that_is_not_wrapped_is_refused() {
+    let f = crossed(&["filt"], "nope", &["rx=io"]);
+    let err = build(TWO_PIPES, f).expect_err("should be refused");
+    assert!(err.contains("not being wrapped"), "{}", err);
+}
+
+#[test]
+fn a_crossing_on_a_pipe_that_does_not_exist_is_refused_and_lists_the_real_ones() {
+    let f = crossed(&["filt"], "filt", &["nope=io"]);
+    let err = build(TWO_PIPES, f).expect_err("should be refused");
+    assert!(err.contains("no pipe called `nope`"), "{}", err);
+    assert!(err.contains("`rx`") && err.contains("`tx`"), "{}", err);
+}
+
+#[test]
+fn a_depth_that_the_fifo_cannot_use_is_refused_at_the_flag() {
+    for bad in ["filt.rx:5", "filt.rx:2", "filt.rx:0"] {
+        let e = ddl::ir_export::parse_crossing("--async-export", bad, false)
+            .expect_err("should be refused");
+        assert!(e.contains("power of two") || e.contains("at least 4"), "{}: {}", bad, e);
+    }
+    // And the shapes that are fine.
+    for good in ["filt.rx:4", "filt.rx:8", "filt.rx:64"] {
+        assert!(ddl::ir_export::parse_crossing("--async-export", good, false).is_ok(), "{}", good);
+    }
+}
+
+#[test]
+fn a_domain_defaults_to_the_pipes_own_name() {
+    let c = ddl::ir_export::parse_crossing("--async-export", "filt.rx", false).unwrap();
+    assert_eq!(c.domain, "rx");
+    assert_eq!(c.depth, ddl::ir_export::DEFAULT_CDC_DEPTH);
+}
+
+
+const WITH_EXTERN: &str = "\
+extern psram (req: buffer in u32, rsp: buffer out u32)
+
+sequence drive (i: buffer in u32, o: buffer out u32)
+  let v = @rcv(i)
+  |||
+  @send(o, v)
+
+graph top (src: buffer in u32, dst: buffer out u32)
+  let a: buffer u32
+  let b: buffer u32
+  drive(src, a)
+  psram(a, b)
+  drive(b, dst)
+";
+
+fn ext_crossed(pipes: &[&str]) -> ExportFlags {
+    let mut f = flags(&["top"], &[]);
+    for spec in pipes {
+        f.crossings.push(
+            ddl::ir_export::parse_crossing("--async-extern", &format!("top.u_psram.{}", spec), true)
+                .unwrap(),
+        );
+    }
+    f
+}
+
+#[test]
+fn a_crossed_extern_keeps_its_own_clk_and_gains_the_faces_clock() {
+    let v = ok(WITH_EXTERN, ext_crossed(&["req=mem"]));
+    // Its core clock is untouched -- that was the whole point of naming the
+    // face's clock on the ABI the face already uses.
+    assert!(v.contains(".clk               (clk)"), "{}", v);
+    assert!(v.contains(".req_clk           (mem_clk)"), "{}", v);
+    assert!(v.contains(".req_rst_n         (mem_rst_n)"), "{}", v);
+    assert!(v.contains("module ddl_cdc_to_ext_32x8"), "{}", v);
+}
+
+#[test]
+fn an_extern_domain_reaches_the_wrapper_rather_than_dangling() {
+    // The clock port is generated deep in `lower_graph`, on the graph itself.
+    // A wrapper built afterwards has to carry it out, or it is an input nothing
+    // drives -- which Verilog elaborates perfectly happily.
+    let v = ok(WITH_EXTERN, ext_crossed(&["req=mem"]));
+    let wrapper = v.split("module top (").nth(1).expect("a wrapper");
+    let header = wrapper.split(");").next().unwrap();
+    assert!(header.contains("mem_clk"), "not on the wrapper:\n{}", header);
+    assert!(header.contains("mem_rst_n"), "not on the wrapper:\n{}", header);
+    assert!(v.contains(".mem_clk   (mem_clk)") || v.contains(".mem_clk (mem_clk)"),
+            "not passed to the core:\n{}", v);
+}
+
+#[test]
+fn two_extern_pipes_can_sit_on_two_different_clocks() {
+    let v = ok(WITH_EXTERN, ext_crossed(&["req=a", "rsp=b"]));
+    assert!(v.contains(".req_clk           (a_clk)"), "{}", v);
+    assert!(v.contains(".rsp_clk           (b_clk)"), "{}", v);
+    // One in each direction.
+    assert!(v.contains("module ddl_cdc_to_ext_32x8"), "{}", v);
+    assert!(v.contains("module ddl_cdc_from_ext_32x8"), "{}", v);
+}
+
+#[test]
+fn an_untouched_extern_is_exactly_as_it_was() {
+    let v = ok(WITH_EXTERN, flags(&["top"], &[]));
+    assert!(!v.contains("ddl_cdc"), "{}", v);
+    assert!(!v.contains("_clk           ("), "no face clock should appear:\n{}", v);
 }

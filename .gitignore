@@ -1,1 +1,7 @@
 /target
+cdc-demo/out/
+cdc-demo/sim/work/
+cdc-demo/sim/work_lib/
+cdc-demo/sim/work_rst/
+cdc-demo/sim/work_shell/
+cdc-demo/sim/work_top/
