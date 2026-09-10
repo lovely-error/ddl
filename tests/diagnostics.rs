@@ -178,6 +178,65 @@ fn a_send_of_the_wrong_type_points_at_the_send() {
 }
 
 #[test]
+fn a_blocking_receive_nested_in_a_send_says_so_and_points_at_it() {
+    // `@send(dst, @rcv(src))`. The rule is the one every other position
+    // already states: a blocking transfer is a STATEMENT, because a state is
+    // built from a statement and nothing inside an expression can say that the
+    // rest of that expression waits. An `if` condition and a `match` scrutinee
+    // refuse one for exactly this reason; a `@send`'s operand list did not,
+    // because the scheduler peels the payload off before that check runs and
+    // hands it to expression lowering, which had no case for a transfer.
+    //
+    // It came out as "this operator takes two operands" -- the arithmetic
+    // fall-through, counting the `@rcv`'s single argument -- reported at line
+    // 1 column 1, the `process` header, because the payload is lowered outside
+    // any statement and so had no anchor. Neither half named anything real.
+    let (line, text) = first_error(concat!(
+        "process chk (src: buffer in u16, dst: buffer out u16)\n",
+        "  loop\n",
+        "    @send(dst, @rcv(src))\n",
+    ));
+    assert_eq!(line, 3, "expected the `@send` line, got {} in:\n{}", line, text);
+    assert!(
+        text.contains("a blocking `@rcv` has to be a statement of its own"),
+        "{}",
+        text
+    );
+    // The column matters here where the line alone does not: both operations
+    // are on line 3, and the one to fix is the inner one.
+    assert!(text.contains("t.ddl:3:21"), "expected the `@rcv`, got:\n{}", text);
+    // The split form the note describes is the rewrite, and it compiles.
+    let split = SourceMap::new(
+        "t.ddl",
+        concat!(
+            "process chk (src: buffer in u16, dst: buffer out u16)\n",
+            "  loop\n",
+            "    let v = @rcv(src)\n",
+            "    @send(dst, v)\n",
+        ),
+    );
+    assert!(compile_to_verilog(&split, &EmitOptions::default()).is_ok());
+}
+
+#[test]
+fn an_error_inside_a_send_payload_points_at_the_payload() {
+    // The same missing anchor, without the nesting. The scheduler takes a
+    // `@send` apart, so its payload is lowered with no statement around it,
+    // and every diagnostic the payload raised landed on the declaration
+    // header -- for this one, "width mismatch: `u8` and `u32`" at line 1.
+    assert_at(
+        5,
+        concat!(
+            "process p (a: buffer in u8, b: buffer in u32, dst: buffer out u32)\n",
+            "  loop\n",
+            "    let x = @rcv(a)\n",
+            "    let y = @rcv(b)\n",
+            "    @send(dst, x + y)\n",
+        ),
+    );
+}
+
+#[test]
 fn a_sequence_stage_error_points_into_the_stage() {
     assert_at(
         5,

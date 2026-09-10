@@ -455,7 +455,7 @@ The DDL compiler emphasizes strict validation, failing fast with descriptive dia
 - **Non-exhaustive matches**: Failing to match every variant of an enum.
 - **Width or signedness mismatches**: Mixing incompatible numeric types without explicit casts.
 - **Graph topology errors**: Binding a pipe to multiple producers, or leaving a pipe unattached.
-- **Invalid blocking operations**: Placing a blocking `@rcv` or `@send` inside an `if` condition, `match` scrutinee, or unrolled `for` loop.
+- **Invalid blocking operations**: Placing a blocking `@rcv` or `@send` anywhere but statement position — inside an `if` condition, a `match` scrutinee, an unrolled `for` loop, or another operation's operand list, as in `@send(dst, @rcv(src))`. A blocking transfer costs a cycle, and only a statement can be given one; bind it first with `let v = @rcv(src)` and send the name.
 - **Unsupported memory usage**: Invoking a synchronous `bram` read within a stateless `fun`, or attaching an asynchronous reset to a BRAM primitive.
 - **Dynamic indexing restrictions**: Placing computed indices at any position other than the terminal step of an assignment target.
 - **Tagged union misuse**: Performing direct comparisons (`==`) on tagged unions, or accessing variant payloads without matching.

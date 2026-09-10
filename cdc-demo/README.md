@@ -544,10 +544,18 @@ pointers instead and has no such path, which is the formulation Phase 1 keeps �
 and it is one cycle shorter in each direction of the credit loop as well. Every
 clock pair here is now at or under 108 MHz so that all four arms are comparable.
 
-**A DDL parser bug, found writing the DUT.** `@send(dst, @rcv(src))` is rejected
-with `error: this operator takes two operands` pointing at line 1 column 1 — the
-declaration, not the expression. Splitting it into `let v = @rcv(src)` then
-`@send(dst, v)` compiles, which is what `gen_chk.ddl` does.
+**A DDL diagnostic bug, found writing the DUT.** `@send(dst, @rcv(src))` is
+rejected, and the refusal is correct: a blocking transfer is a statement, not a
+subexpression, because a state is built from a statement and nothing inside an
+expression can say that the rest of that expression waits — the same rule that
+already refuses one in an `if` condition or a `match` scrutinee. What was wrong
+was the report. It came out as `error: this operator takes two operands` at line
+1 column 1, the declaration header: the payload reached arithmetic lowering,
+which counted the `@rcv`'s single argument, and it was lowered outside any
+statement so it carried no anchor. It now says
+`a blocking `@rcv` has to be a statement of its own, not part of a larger
+expression` and points at the `@rcv`. Splitting it into `let v = @rcv(src)` then
+`@send(dst, v)` is the fix, and is what `gen_chk.ddl` does.
 
 ## Files
 
