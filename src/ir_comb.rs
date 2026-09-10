@@ -92,7 +92,7 @@ pub fn pipe_names(kind: Comb, fan: usize) -> Vec<(String, bool)> {
 }
 
 /// ORs a list; false when empty.
-fn any_of(low: &mut Lowerer, conds: &[ValueId]) -> ValueId {
+pub(crate) fn any_of(low: &mut Lowerer, conds: &[ValueId]) -> ValueId {
     let mut acc: Option<ValueId> = None;
     for c in conds {
         acc = Some(match acc {
@@ -104,7 +104,7 @@ fn any_of(low: &mut Lowerer, conds: &[ValueId]) -> ValueId {
 }
 
 /// ANDs a list; true when empty.
-fn all_of(low: &mut Lowerer, conds: &[ValueId]) -> ValueId {
+pub(crate) fn all_of(low: &mut Lowerer, conds: &[ValueId]) -> ValueId {
     let mut acc: Option<ValueId> = None;
     for c in conds {
         acc = Some(match acc {

@@ -809,3 +809,145 @@ fn two_merges_of_one_width_and_different_types_share_one_module() {
         v
     );
 }
+
+// ---- pipe loops that can never carry their first item ---------------------
+//
+// `check_graph_cycles` refuses a hierarchy that contains itself and says, in
+// as many words, that feedback through a channel is a different thing and
+// stays legal. It is -- except around a loop of sequences, where every one of
+// them is waiting for an item only its predecessor can make, and every pipe
+// starts empty. That is provably dead, and these pin both the proof and its
+// two deliberate limits.
+
+/// The accumulator shape: one stream in, one feedback input, a result out and
+/// the same result fed back. `{}` is how the feedback is received.
+fn accumulator(feedback: &str, tail: &str) -> String {
+    format!(
+        concat!(
+            "sequence acc (x: buffer in u16, fb: buffer in u16, o: buffer out u16, fbo: buffer out u16)\n",
+            "  let a = @rcv(x)\n",
+            "{}",
+            "{}",
+            "  |||\n",
+            "  @send(o, s)\n",
+            "  @send(fbo, s)\n",
+            "sequence hold (i: buffer in u16, o: buffer out u16)\n",
+            "  let a = @rcv(i)\n",
+            "  |||\n",
+            "  @send(o, a)\n",
+            "graph accum (src: buffer in u16, dst: buffer out u16)\n",
+            "  let fwd: buffer u16\n",
+            "  let back: buffer u16\n",
+            "  acc(src, back, dst, fwd)\n",
+            "  hold(fwd, back)\n",
+        ),
+        feedback, tail,
+    )
+}
+
+#[test]
+fn a_loop_of_blocking_sequences_is_rejected_and_names_the_whole_loop() {
+    let text = compile_err(&accumulator(
+        "  let b = @rcv(fb)\n",
+        "  let s: u16 = a + b\n",
+    ));
+    assert!(text.contains("`acc` waits on itself through"), "{}", text);
+    assert!(text.contains("acc -> hold -> acc"), "{}", text);
+    // The note has to name the way out, or the diagnostic is only a refusal.
+    assert!(text.contains("@try_rcv"), "{}", text);
+}
+
+#[test]
+fn the_same_loop_is_live_once_the_feedback_is_optional() {
+    // The point of the check: a `@try_rcv` fires without waiting, so this loop
+    // has no first item to be missing. It is an accumulator that reads last
+    // cycle's result on the cycles there is one.
+    let v = compile(&accumulator(
+        "  let (b, ok) = @try_rcv(fb)\n",
+        "  var s: u16 = a\n  if ok then\n    s = a + b\n",
+    ));
+    assert!(v.contains("module acc ("), "{}", v);
+    assert!(v.contains("module hold ("), "{}", v);
+    // The feedback pipe is optional, so it is not part of what paces `acc`.
+    assert!(v.contains("wire take = x_present & shift;"), "{}", v);
+}
+
+#[test]
+fn a_loop_closed_through_a_process_is_left_alone() {
+    // Soundness, and the check's first limit. A process may send before it
+    // ever receives -- this one seeds the loop with a zero -- so the wait is
+    // not certain and refusing it would be a false positive.
+    let src = concat!(
+        "sequence acc (x: buffer in u16, fb: buffer in u16, o: buffer out u16, fbo: buffer out u16)\n",
+        "  let a = @rcv(x)\n",
+        "  let b = @rcv(fb)\n",
+        "  |||\n",
+        "  let s: u16 = a + b\n",
+        "  @send(o, s)\n",
+        "  @send(fbo, s)\n",
+        "process seeder (i: buffer in u16, o: buffer out u16)\n",
+        "  @send(o, 16'd0)\n",
+        "  loop\n",
+        "    let a = @rcv(i)\n",
+        "    @send(o, a)\n",
+        "graph accum (src: buffer in u16, dst: buffer out u16)\n",
+        "  let fwd: buffer u16\n",
+        "  let back: buffer u16\n",
+        "  acc(src, back, dst, fwd)\n",
+        "  seeder(fwd, back)\n",
+    );
+    let v = compile(src);
+    assert!(v.contains("module accum"), "{}", v);
+}
+
+#[test]
+fn a_sequence_wired_back_to_itself_reads_as_what_it_is() {
+    // One node, and "waits on itself through selfy -> selfy" would be a worse
+    // way to say it.
+    let text = compile_err(concat!(
+        "sequence selfy (x: buffer in u16, fb: buffer in u16, o: buffer out u16, fbo: buffer out u16)\n",
+        "  let a = @rcv(x)\n",
+        "  let b = @rcv(fb)\n",
+        "  |||\n",
+        "  let s: u16 = a + b\n",
+        "  @send(o, s)\n",
+        "  @send(fbo, s)\n",
+        "graph g (src: buffer in u16, dst: buffer out u16)\n",
+        "  let back: buffer u16\n",
+        "  selfy(src, back, dst, back)\n",
+    ));
+    assert!(
+        text.contains("`selfy` waits on an item it is the only source of"),
+        "{}",
+        text
+    );
+}
+
+#[test]
+fn a_feed_forward_graph_of_sequences_is_not_a_loop() {
+    // Anti-vacuous: the walk must not report reconvergence. `dbl` and `widen`
+    // both read `src`'s stream through a split and meet nowhere.
+    let src = format!(
+        "{}{}{}",
+        DBL,
+        WIDEN,
+        concat!(
+            "sequence pair (a: buffer in u16, b: buffer in u32, o: buffer out u32)\n",
+            "  let x = @rcv(a)\n",
+            "  let y = @rcv(b)\n",
+            "  |||\n",
+            "  @send(o, y + @zext(x, 32))\n",
+            "graph fanin (src: buffer in u16, dst: buffer out u32)\n",
+            "  let one: buffer u16\n",
+            "  let two: buffer u16\n",
+            "  let doubled: buffer u16\n",
+            "  let widened: buffer u32\n",
+            "  @split(src, one, two)\n",
+            "  dbl(one, doubled)\n",
+            "  widen(two, widened)\n",
+            "  pair(doubled, widened, dst)\n",
+        ),
+    );
+    let v = compile(&src);
+    assert!(v.contains("module fanin"), "{}", v);
+}

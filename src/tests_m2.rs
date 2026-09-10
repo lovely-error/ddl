@@ -1933,7 +1933,7 @@ fn a_stage_cut_becomes_a_register_bank_and_a_validity_bit() {
     // `|||` was parsed and thrown away since before this work started.
     let v = compile(PIPE3);
     // The chain is one shorter than the pipeline: the last stage's occupancy
-    // IS `out_wsalt_q`, told once rather than twice.
+    // IS the output's `wsalt`, told once rather than twice.
     assert!(v.contains("reg v0;"), "{}", v);
     assert!(v.contains("reg v1;"), "{}", v);
     assert!(!v.contains("reg v2;"), "the last stage's bit is the salt:
@@ -1948,9 +1948,9 @@ fn the_pipeline_shifts_when_its_sink_has_a_slot() {
     // The slot is two entries deep, so the room it reports is the skid being
     // empty rather than the sink taking something this cycle.
     assert!(v.contains("wire shift = !dst_full;"), "{}", v);
-    assert!(v.contains("wire src_take = "), "{}", v);
+    assert!(v.contains("wire take = "), "{}", v);
     // Rule 3: the output valid is the last validity bit, a register.
-    assert!(v.contains("assign dst_wsalt = out_wsalt_q;"), "{}", v);
+    assert!(v.contains("assign dst_wsalt = dst_wsalt_q;"), "{}", v);
     assert!(v.contains("v1 <= (shift ? v0 : v1);"), "{}", v);
 }
 
@@ -1989,8 +1989,8 @@ fn the_item_leaving_is_registered_alongside_its_validity_bit() {
     // Without this the pipeline would offer the CURRENT input while
     // advertising the validity of one three cycles older.
     let v = compile(PIPE3);
-    assert!(v.contains("reg [31:0] out_e0;"), "{}", v);
-    assert!(v.contains("assign dst_data = {out_e1, out_e0};"), "{}", v);
+    assert!(v.contains("reg [31:0] dst_e0;"), "{}", v);
+    assert!(v.contains("assign dst_data = {dst_e1, dst_e0};"), "{}", v);
 }
 
 #[test]
@@ -2014,6 +2014,220 @@ fn a_sequence_must_end_by_sending() {
         "  let b: u32 = @zext(a, 32)\n",
     ));
     assert!(text.contains("ends by sending"), "{}", text);
+}
+
+// ---- sequences with several pipes ----------------------------------------
+
+const JOIN: &str = concat!(
+    "sequence s (a: buffer in u16, b: buffer in u16, x: buffer out u16, y: buffer out u16)\n",
+    "  let p = @rcv(a)\n",
+    "  let q = @rcv(b)\n",
+    "  |||\n",
+    "  @send(x, p + q)\n",
+    "  @send(y, p - q)\n",
+);
+
+#[test]
+fn the_head_waits_for_every_blocking_input() {
+    // A rendezvous, not an arbiter: one item from each on the same cycle, or
+    // nothing moves and nothing is taken from either.
+    let v = compile(JOIN);
+    assert!(v.contains("wire offered = a_present & b_present;"), "{}", v);
+    assert!(v.contains("wire take = offered & shift;"), "{}", v);
+    for pipe in ["a", "b"] {
+        let step = format!("{p}_rsalt_q <= (take ? ({p}_rsalt_q ^ ", p = pipe);
+        assert!(v.contains(&step), "{} advances on the shared take:\n{}", pipe, v);
+    }
+}
+
+#[test]
+fn the_tail_waits_for_every_sink_to_have_room() {
+    // Each sink has its own two-entry slot and the pipeline waits for the
+    // slowest, rather than the sinks' readys being ANDed into each other's
+    // timing paths -- ir_comb.rs:234's argument, which holds here too.
+    let v = compile(JOIN);
+    assert!(v.contains("wire shift = x_room & y_room;"), "{}", v);
+    assert!(v.contains("wire x_room = !x_full;"), "{}", v);
+    assert!(v.contains("wire y_room = !y_full;"), "{}", v);
+    // One push for both, and a full slot each.
+    assert!(v.contains("wire push = shift & "), "{}", v);
+    for pipe in ["x", "y"] {
+        assert!(v.contains(&format!("reg [15:0] {}_e0;", pipe)), "{}", v);
+        assert!(v.contains(&format!("reg [15:0] {}_e1;", pipe)), "{}", v);
+        assert!(
+            v.contains(&format!("assign {p}_data = {{{p}_e1, {p}_e0}};", p = pipe)),
+            "{}",
+            v
+        );
+    }
+}
+
+#[test]
+fn no_pipe_of_a_multi_pipe_sequence_reaches_another_combinationally() {
+    // The rule-3 check the single-pipe fixture makes, made over every pipe:
+    // no driver of one side may mention the other side's salt.
+    let v = compile(JOIN);
+    for line in v.lines().filter(|l| l.trim_start().starts_with("assign ")) {
+        for out in ["x", "y"] {
+            let drives_out = line.contains(&format!("{}_wsalt", out))
+                || line.contains(&format!("{}_data", out));
+            if drives_out {
+                assert!(
+                    !line.contains(&format!("{}_rsalt", out)),
+                    "producer reads the consumer:\n{}",
+                    line
+                );
+            }
+        }
+        for inp in ["a", "b"] {
+            let drives_in = line.contains(&format!("{}_rsalt", inp));
+            if drives_in {
+                assert!(
+                    !line.contains(&format!("{}_wsalt", inp)),
+                    "consumer reads the producer:\n{}",
+                    line
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn an_optional_input_never_holds_the_pipeline_up() {
+    // `b` is absent from what paces the head, and gives up an item only on the
+    // cycles it had one.
+    let v = compile(concat!(
+        "sequence s (a: buffer in u16, b: buffer in u16, o: buffer out u16)\n",
+        "  let p = @rcv(a)\n",
+        "  let (q, ok) = @try_rcv(b)\n",
+        "  var t: u16 = p\n",
+        "  if ok then\n",
+        "    t = p + q\n",
+        "  |||\n",
+        "  @send(o, t)\n",
+    ));
+    assert!(v.contains("wire take = a_present & shift;"), "{}", v);
+    assert!(v.contains("wire b_take = take & b_present;"), "{}", v);
+    assert!(v.contains("b_rsalt_q <= (b_take ? "), "{}", v);
+    assert!(v.contains("a_rsalt_q <= (take ? "), "{}", v);
+}
+
+#[test]
+fn an_all_optional_head_fires_on_whichever_arrived() {
+    // Not a constant 1, which would make the head a free-running source. A
+    // cycle where neither input delivered is a bubble: the pipeline shifts and
+    // the validity bit it shifts is low, so nothing is committed.
+    let v = compile(concat!(
+        "sequence s (a: buffer in u16, b: buffer in u16, o: buffer out u16)\n",
+        "  let (p, pok) = @try_rcv(a)\n",
+        "  let (q, qok) = @try_rcv(b)\n",
+        "  var t: u16 = 16'd0\n",
+        "  if pok then\n",
+        "    t = t + p\n",
+        "  if qok then\n",
+        "    t = t + q\n",
+        "  |||\n",
+        "  @send(o, t)\n",
+    ));
+    assert!(v.contains("wire offered = a_present | b_present;"), "{}", v);
+    assert!(v.contains("v0 <= (shift ? offered : v0);"), "{}", v);
+    assert!(v.contains("wire push = shift & v0;"), "{}", v);
+}
+
+#[test]
+fn every_input_must_be_received_from() {
+    let text = compile_err(concat!(
+        "sequence s (a: buffer in u16, b: buffer in u16, o: buffer out u16)\n",
+        "  let p = @rcv(a)\n",
+        "  |||\n",
+        "  @send(o, p)\n",
+    ));
+    assert!(text.contains("`b` is never received from"), "{}", text);
+}
+
+#[test]
+fn every_output_must_be_sent_to() {
+    let text = compile_err(concat!(
+        "sequence s (a: buffer in u16, x: buffer out u16, y: buffer out u16)\n",
+        "  let p = @rcv(a)\n",
+        "  |||\n",
+        "  @send(x, p)\n",
+    ));
+    assert!(text.contains("`y` is never sent to"), "{}", text);
+}
+
+#[test]
+fn one_input_may_not_be_received_from_twice() {
+    let text = compile_err(concat!(
+        "sequence s (a: buffer in u16, b: buffer in u16, o: buffer out u16)\n",
+        "  let p = @rcv(a)\n",
+        "  let q = @rcv(a)\n",
+        "  let r = @rcv(b)\n",
+        "  |||\n",
+        "  @send(o, p + q + r)\n",
+    ));
+    assert!(text.contains("`a` is received from twice"), "{}", text);
+}
+
+#[test]
+fn one_output_may_not_be_sent_to_twice() {
+    let text = compile_err(concat!(
+        "sequence s (a: buffer in u16, x: buffer out u16, y: buffer out u16)\n",
+        "  let p = @rcv(a)\n",
+        "  |||\n",
+        "  @send(x, p)\n",
+        "  @send(x, p)\n",
+        "  @send(y, p)\n",
+    ));
+    assert!(text.contains("`x` is sent to twice"), "{}", text);
+}
+
+#[test]
+fn a_sequence_cannot_receive_from_its_own_output() {
+    let text = compile_err(concat!(
+        "sequence s (a: buffer in u16, o: buffer out u16)\n",
+        "  let p = @rcv(a)\n",
+        "  let q = @rcv(o)\n",
+        "  |||\n",
+        "  @send(o, p + q)\n",
+    ));
+    assert!(
+        text.contains("`o` is an `out` pipe; it cannot be received from"),
+        "{}",
+        text
+    );
+}
+
+#[test]
+fn a_sequence_needs_a_source_and_a_sink() {
+    let no_source = compile_err(concat!(
+        "sequence s (o: buffer out u16)\n",
+        "  @send(o, 16'd1)\n",
+    ));
+    assert!(no_source.contains("no `in` pipe"), "{}", no_source);
+    let no_sink = compile_err(concat!(
+        "sequence s (a: buffer in u16)\n",
+        "  let p = @rcv(a)\n",
+    ));
+    assert!(no_sink.contains("no `out` pipe"), "{}", no_sink);
+}
+
+#[test]
+fn a_try_rcv_below_the_head_is_rejected() {
+    // Supported in the head and only there: below it, it would take an item on
+    // behalf of a stage that is holding a different one.
+    let text = compile_err(concat!(
+        "sequence s (a: buffer in u16, b: buffer in u16, o: buffer out u16)\n",
+        "  let p = @rcv(a)\n",
+        "  |||\n",
+        "  let (q, ok) = @try_rcv(b)\n",
+        "  @send(o, p)\n",
+    ));
+    assert!(
+        text.contains("receives from all of its `in` pipes in its first stage"),
+        "{}",
+        text
+    );
 }
 
 

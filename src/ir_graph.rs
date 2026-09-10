@@ -309,6 +309,173 @@ pub fn check_graph_cycles(
     }
 }
 
+/// Reports a loop of pipes that can never carry its first item.
+///
+/// `check_graph_cycles` above walks instantiation edges and says, correctly,
+/// that feedback through a CHANNEL is a different thing and stays legal. It is
+/// -- but not in every shape. A `sequence` produces an item only after
+/// receiving one on every pipe it blocks on, and every pipe starts empty, so
+/// around a loop of sequences each one waits for an item only its predecessor
+/// can make, and none of them ever fires. That is a proof rather than a guess,
+/// which is what makes it worth reporting: there is no input and no timing
+/// under which such a graph works.
+///
+/// TWO deliberate limits, both of which keep it sound at the cost of being
+/// incomplete. It stops at sequences: a `process` may send before it ever
+/// receives, and an `extern` is opaque, so a loop through either may well be
+/// live and is left alone. And it does not follow a loop through a nested
+/// `graph` instance. A clean compile is therefore not a proof of liveness --
+/// only a report here is a proof of the opposite.
+///
+/// A `@try_rcv` input is not an edge at all. The head fires without it, so a
+/// feedback path wired through one is a live loop -- an accumulator reading
+/// last cycle's result on the cycles there is one -- and that is the fix this
+/// diagnostic points at.
+pub fn check_pipe_deadlock(
+    map: &crate::diag::SourceMap,
+    sigs: &BTreeMap<String, BlockSig>,
+    blocking: &BTreeMap<String, Vec<String>>,
+    graphs: &[crate::parse::GraphDecl],
+    sink: &mut DiagSink,
+) {
+    // One instance per node, in source order. Pipes are named per graph, so a
+    // name means nothing outside the one it was declared in, and the whole
+    // walk is rebuilt for each.
+    struct Node<'a> {
+        module: &'a str,
+        at: &'a AlphanumSpan,
+        is_sequence: bool,
+        waits_on: Vec<String>,
+        produces: Vec<String>,
+    }
+    #[derive(Clone, Copy, PartialEq)]
+    enum Mark {
+        Grey,
+        Black,
+    }
+    struct Frame {
+        node: usize,
+        next: usize,
+    }
+
+    for g in graphs {
+        let mut nodes: Vec<Node> = Vec::new();
+        for stmt in &g.body {
+            let crate::parse::GraphStmt::Instance(inst) = stmt else {
+                continue;
+            };
+            let module = anumspan_to_str(&inst.module);
+            let Some(sig) = sigs.get(module) else {
+                continue;
+            };
+            let is_sequence = sig.kind == "sequence";
+            let none = Vec::new();
+            let blocks_on = blocking.get(module).unwrap_or(&none);
+            let mut waits_on = Vec::new();
+            let mut produces = Vec::new();
+            for (formal, actual) in sig.args.iter().zip(inst.args.iter()) {
+                let ArgSig::Pipe(pipe) = formal else {
+                    continue;
+                };
+                let actual_name = anumspan_to_str(actual).to_string();
+                if !pipe.is_input {
+                    produces.push(actual_name);
+                    continue;
+                }
+                let is_awaited = is_sequence && blocks_on.contains(&pipe.name);
+                if is_awaited {
+                    waits_on.push(actual_name);
+                }
+            }
+            nodes.push(Node { module, at: &inst.module, is_sequence, waits_on, produces });
+        }
+
+        // `check_endpoints` refuses a pipe with two producers, so the one
+        // recorded here is the one.
+        let mut producer_of: BTreeMap<&str, usize> = BTreeMap::new();
+        for (ix, node) in nodes.iter().enumerate() {
+            for pipe in &node.produces {
+                producer_of.insert(pipe.as_str(), ix);
+            }
+        }
+        // An edge means "this instance cannot fire until that one has". Only
+        // between sequences: anywhere else the wait is not certain.
+        let mut edges: Vec<Vec<usize>> = vec![Vec::new(); nodes.len()];
+        for ix in 0..nodes.len() {
+            if !nodes[ix].is_sequence {
+                continue;
+            }
+            for pipe in &nodes[ix].waits_on {
+                let Some(source) = producer_of.get(pipe.as_str()).copied() else {
+                    continue;
+                };
+                if nodes[source].is_sequence {
+                    edges[ix].push(source);
+                }
+            }
+        }
+
+        // The same grey/black walk `check_graph_cycles` uses, over instances
+        // rather than declarations, and naming the whole loop for the same
+        // reason: the edge that closes it is not on its own a place to act.
+        let mut marks: Vec<Option<Mark>> = vec![None; nodes.len()];
+        let mut reported: std::collections::BTreeSet<usize> = Default::default();
+
+        for root in 0..nodes.len() {
+            if marks[root].is_some() {
+                continue;
+            }
+            let mut stack = vec![Frame { node: root, next: 0 }];
+            marks[root] = Some(Mark::Grey);
+            while let Some(top) = stack.last_mut() {
+                let node = top.node;
+                let ix = top.next;
+                top.next += 1;
+                let Some(callee) = edges[node].get(ix).copied() else {
+                    marks[node] = Some(Mark::Black);
+                    stack.pop();
+                    continue;
+                };
+                match marks[callee] {
+                    Some(Mark::Black) => {}
+                    Some(Mark::Grey) => {
+                        let is_new = reported.insert(callee);
+                        if !is_new {
+                            continue;
+                        }
+                        let start = stack.iter().position(|f| f.node == callee).unwrap_or(0);
+                        let mut path: Vec<&str> =
+                            stack[start..].iter().map(|f| nodes[f.node].module).collect();
+                        path.push(nodes[callee].module);
+                        let is_one_node = path.len() <= 2;
+                        let msg = if is_one_node {
+                            format!(
+                                "`{}` waits on an item it is the only source of",
+                                nodes[callee].module
+                            )
+                        } else {
+                            format!(
+                                "`{}` waits on itself through {}",
+                                nodes[callee].module,
+                                path.join(" -> ")
+                            )
+                        };
+                        sink.push(
+                            Diag::error(map.span_of(nodes[callee].at), msg).with_note(
+                                "a sequence produces an item only after receiving one on every blocking `in` pipe, and every pipe starts empty, so no item on this loop can ever be the first; break the loop with a `process`, or make one of the receives a `@try_rcv`, which fires without waiting",
+                            ),
+                        );
+                    }
+                    None => {
+                        marks[callee] = Some(Mark::Grey);
+                        stack.push(Frame { node: callee, next: 0 });
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// One `wire` parameter of the graph, and who drives it.
 ///
 /// A wire has no protocol to check, so the only thing worth counting is

@@ -18,40 +18,40 @@ module scale (
 
   reg v0;
   reg [1:0] src_rsalt_q;
-  reg [31:0] out_e0;
-  reg [31:0] out_e1;
-  reg [1:0] out_wsalt_q;
+  reg [31:0] dst_e0;
+  reg [31:0] dst_e1;
+  reg [1:0] dst_wsalt_q;
   reg [31:0] x_s1;
 
-  wire dst_full = out_wsalt_q == (~dst_rsalt);
+  wire dst_full = dst_wsalt_q == (~dst_rsalt);
   wire shift = !dst_full;
   wire src_ridx = src_rsalt_q[0] ^ src_rsalt_q[1];
   wire [31:0] src_item = src_ridx ? src_data[63:32] : src_data[31:0];
   wire [31:0] doubled = x_s1 + x_s1;
   wire src_empty = src_wsalt == src_rsalt_q;
-  wire n20 = !src_empty;
-  wire out_push = shift & v0;
-  wire out_widx = out_wsalt_q[0] ^ out_wsalt_q[1];
-  wire src_take = n20 & shift;
+  wire src_present = !src_empty;
+  wire push = shift & v0;
+  wire dst_widx = dst_wsalt_q[0] ^ dst_wsalt_q[1];
+  wire take = src_present & shift;
 
+  assign dst_data = {dst_e1, dst_e0};
+  assign dst_wsalt = dst_wsalt_q;
   assign src_rsalt = src_rsalt_q;
-  assign dst_wsalt = out_wsalt_q;
-  assign dst_data = {out_e1, out_e0};
 
   always @(posedge clk) begin
     if (!rst_n) begin
       v0 <= 1'b0;
       src_rsalt_q <= 2'd0;
-      out_e0 <= 32'd0;
-      out_e1 <= 32'd0;
-      out_wsalt_q <= 2'd0;
+      dst_e0 <= 32'd0;
+      dst_e1 <= 32'd0;
+      dst_wsalt_q <= 2'd0;
       x_s1 <= 32'd0;
     end else begin
-      v0 <= (shift ? n20 : v0);
-      src_rsalt_q <= (src_take ? (src_rsalt_q ^ (src_ridx ? 2'd2 : 2'd1)) : src_rsalt_q);
-      out_e0 <= ((out_push & (!out_widx)) ? doubled : out_e0);
-      out_e1 <= ((out_push & out_widx) ? doubled : out_e1);
-      out_wsalt_q <= (out_push ? (out_wsalt_q ^ (out_widx ? 2'd2 : 2'd1)) : out_wsalt_q);
+      v0 <= (shift ? src_present : v0);
+      src_rsalt_q <= (take ? (src_rsalt_q ^ (src_ridx ? 2'd2 : 2'd1)) : src_rsalt_q);
+      dst_e0 <= ((push & (!dst_widx)) ? doubled : dst_e0);
+      dst_e1 <= ((push & dst_widx) ? doubled : dst_e1);
+      dst_wsalt_q <= (push ? (dst_wsalt_q ^ (dst_widx ? 2'd2 : 2'd1)) : dst_wsalt_q);
       x_s1 <= (shift ? src_item : x_s1);
     end
   end

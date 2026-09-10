@@ -19,13 +19,13 @@ module mul3 (
   reg v0;
   reg v1;
   reg [1:0] src_rsalt_q;
-  reg [31:0] out_e0;
-  reg [31:0] out_e1;
-  reg [1:0] out_wsalt_q;
+  reg [31:0] dst_e0;
+  reg [31:0] dst_e1;
+  reg [1:0] dst_wsalt_q;
   reg [15:0] doubled_s1;
   reg [31:0] wide_s2;
 
-  wire dst_full = out_wsalt_q == (~dst_rsalt);
+  wire dst_full = dst_wsalt_q == (~dst_rsalt);
   wire shift = !dst_full;
   wire src_ridx = src_rsalt_q[0] ^ src_rsalt_q[1];
   wire [15:0] src_item = src_ridx ? src_data[31:16] : src_data[15:0];
@@ -33,32 +33,32 @@ module mul3 (
   wire [31:0] wide = {{16{1'b0}}, doubled_s1};
   wire [31:0] scaled = wide_s2 + wide_s2;
   wire src_empty = src_wsalt == src_rsalt_q;
-  wire n24 = !src_empty;
-  wire out_push = shift & v1;
-  wire out_widx = out_wsalt_q[0] ^ out_wsalt_q[1];
-  wire src_take = n24 & shift;
+  wire src_present = !src_empty;
+  wire push = shift & v1;
+  wire dst_widx = dst_wsalt_q[0] ^ dst_wsalt_q[1];
+  wire take = src_present & shift;
 
+  assign dst_data = {dst_e1, dst_e0};
+  assign dst_wsalt = dst_wsalt_q;
   assign src_rsalt = src_rsalt_q;
-  assign dst_wsalt = out_wsalt_q;
-  assign dst_data = {out_e1, out_e0};
 
   always @(posedge clk) begin
     if (!rst_n) begin
       v0 <= 1'b0;
       v1 <= 1'b0;
       src_rsalt_q <= 2'd0;
-      out_e0 <= 32'd0;
-      out_e1 <= 32'd0;
-      out_wsalt_q <= 2'd0;
+      dst_e0 <= 32'd0;
+      dst_e1 <= 32'd0;
+      dst_wsalt_q <= 2'd0;
       doubled_s1 <= 16'd0;
       wide_s2 <= 32'd0;
     end else begin
-      v0 <= (shift ? n24 : v0);
+      v0 <= (shift ? src_present : v0);
       v1 <= (shift ? v0 : v1);
-      src_rsalt_q <= (src_take ? (src_rsalt_q ^ (src_ridx ? 2'd2 : 2'd1)) : src_rsalt_q);
-      out_e0 <= ((out_push & (!out_widx)) ? scaled : out_e0);
-      out_e1 <= ((out_push & out_widx) ? scaled : out_e1);
-      out_wsalt_q <= (out_push ? (out_wsalt_q ^ (out_widx ? 2'd2 : 2'd1)) : out_wsalt_q);
+      src_rsalt_q <= (take ? (src_rsalt_q ^ (src_ridx ? 2'd2 : 2'd1)) : src_rsalt_q);
+      dst_e0 <= ((push & (!dst_widx)) ? scaled : dst_e0);
+      dst_e1 <= ((push & dst_widx) ? scaled : dst_e1);
+      dst_wsalt_q <= (push ? (dst_wsalt_q ^ (dst_widx ? 2'd2 : 2'd1)) : dst_wsalt_q);
       doubled_s1 <= (shift ? doubled : doubled_s1);
       wide_s2 <= (shift ? wide : wide_s2);
     end
@@ -79,40 +79,40 @@ module add_one (
 
   reg v0;
   reg [1:0] src_rsalt_q;
-  reg [15:0] out_e0;
-  reg [15:0] out_e1;
-  reg [1:0] out_wsalt_q;
+  reg [15:0] dst_e0;
+  reg [15:0] dst_e1;
+  reg [1:0] dst_wsalt_q;
   reg [15:0] a_s1;
 
-  wire dst_full = out_wsalt_q == (~dst_rsalt);
+  wire dst_full = dst_wsalt_q == (~dst_rsalt);
   wire shift = !dst_full;
   wire src_ridx = src_rsalt_q[0] ^ src_rsalt_q[1];
   wire [15:0] src_item = src_ridx ? src_data[31:16] : src_data[15:0];
   wire [15:0] b = a_s1 + 16'd1;
   wire src_empty = src_wsalt == src_rsalt_q;
-  wire n21 = !src_empty;
-  wire out_push = shift & v0;
-  wire out_widx = out_wsalt_q[0] ^ out_wsalt_q[1];
-  wire src_take = n21 & shift;
+  wire src_present = !src_empty;
+  wire push = shift & v0;
+  wire dst_widx = dst_wsalt_q[0] ^ dst_wsalt_q[1];
+  wire take = src_present & shift;
 
+  assign dst_data = {dst_e1, dst_e0};
+  assign dst_wsalt = dst_wsalt_q;
   assign src_rsalt = src_rsalt_q;
-  assign dst_wsalt = out_wsalt_q;
-  assign dst_data = {out_e1, out_e0};
 
   always @(posedge clk) begin
     if (!rst_n) begin
       v0 <= 1'b0;
       src_rsalt_q <= 2'd0;
-      out_e0 <= 16'd0;
-      out_e1 <= 16'd0;
-      out_wsalt_q <= 2'd0;
+      dst_e0 <= 16'd0;
+      dst_e1 <= 16'd0;
+      dst_wsalt_q <= 2'd0;
       a_s1 <= 16'd0;
     end else begin
-      v0 <= (shift ? n21 : v0);
-      src_rsalt_q <= (src_take ? (src_rsalt_q ^ (src_ridx ? 2'd2 : 2'd1)) : src_rsalt_q);
-      out_e0 <= ((out_push & (!out_widx)) ? b : out_e0);
-      out_e1 <= ((out_push & out_widx) ? b : out_e1);
-      out_wsalt_q <= (out_push ? (out_wsalt_q ^ (out_widx ? 2'd2 : 2'd1)) : out_wsalt_q);
+      v0 <= (shift ? src_present : v0);
+      src_rsalt_q <= (take ? (src_rsalt_q ^ (src_ridx ? 2'd2 : 2'd1)) : src_rsalt_q);
+      dst_e0 <= ((push & (!dst_widx)) ? b : dst_e0);
+      dst_e1 <= ((push & dst_widx) ? b : dst_e1);
+      dst_wsalt_q <= (push ? (dst_wsalt_q ^ (dst_widx ? 2'd2 : 2'd1)) : dst_wsalt_q);
       a_s1 <= (shift ? src_item : a_s1);
     end
   end
@@ -132,41 +132,41 @@ module saturate (
 
   reg v0;
   reg [1:0] src_rsalt_q;
-  reg [31:0] out_e0;
-  reg [31:0] out_e1;
-  reg [1:0] out_wsalt_q;
+  reg [31:0] dst_e0;
+  reg [31:0] dst_e1;
+  reg [1:0] dst_wsalt_q;
   reg [31:0] a_s1;
 
-  wire dst_full = out_wsalt_q == (~dst_rsalt);
+  wire dst_full = dst_wsalt_q == (~dst_rsalt);
   wire shift = !dst_full;
   wire src_ridx = src_rsalt_q[0] ^ src_rsalt_q[1];
   wire [31:0] src_item = src_ridx ? src_data[63:32] : src_data[31:0];
   wire too_big = a_s1 > 32'hFFFF;
   wire [31:0] b = too_big ? 32'hFFFF : a_s1;
   wire src_empty = src_wsalt == src_rsalt_q;
-  wire n23 = !src_empty;
-  wire out_push = shift & v0;
-  wire out_widx = out_wsalt_q[0] ^ out_wsalt_q[1];
-  wire src_take = n23 & shift;
+  wire src_present = !src_empty;
+  wire push = shift & v0;
+  wire dst_widx = dst_wsalt_q[0] ^ dst_wsalt_q[1];
+  wire take = src_present & shift;
 
+  assign dst_data = {dst_e1, dst_e0};
+  assign dst_wsalt = dst_wsalt_q;
   assign src_rsalt = src_rsalt_q;
-  assign dst_wsalt = out_wsalt_q;
-  assign dst_data = {out_e1, out_e0};
 
   always @(posedge clk) begin
     if (!rst_n) begin
       v0 <= 1'b0;
       src_rsalt_q <= 2'd0;
-      out_e0 <= 32'd0;
-      out_e1 <= 32'd0;
-      out_wsalt_q <= 2'd0;
+      dst_e0 <= 32'd0;
+      dst_e1 <= 32'd0;
+      dst_wsalt_q <= 2'd0;
       a_s1 <= 32'd0;
     end else begin
-      v0 <= (shift ? n23 : v0);
-      src_rsalt_q <= (src_take ? (src_rsalt_q ^ (src_ridx ? 2'd2 : 2'd1)) : src_rsalt_q);
-      out_e0 <= ((out_push & (!out_widx)) ? b : out_e0);
-      out_e1 <= ((out_push & out_widx) ? b : out_e1);
-      out_wsalt_q <= (out_push ? (out_wsalt_q ^ (out_widx ? 2'd2 : 2'd1)) : out_wsalt_q);
+      v0 <= (shift ? src_present : v0);
+      src_rsalt_q <= (take ? (src_rsalt_q ^ (src_ridx ? 2'd2 : 2'd1)) : src_rsalt_q);
+      dst_e0 <= ((push & (!dst_widx)) ? b : dst_e0);
+      dst_e1 <= ((push & dst_widx) ? b : dst_e1);
+      dst_wsalt_q <= (push ? (dst_wsalt_q ^ (dst_widx ? 2'd2 : 2'd1)) : dst_wsalt_q);
       a_s1 <= (shift ? src_item : a_s1);
     end
   end

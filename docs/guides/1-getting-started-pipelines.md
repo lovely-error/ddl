@@ -124,7 +124,7 @@ wire [31:0] result = quad_s2 + ({{16{1'b0}}, x_s2});
 All stage registers share a single enable wire: `shift`:
 
 ```verilog
-wire dst_full = out_wsalt_q == (~dst_rsalt);
+wire dst_full = dst_wsalt_q == (~dst_rsalt);
 wire shift    = !dst_full;
 ```
 
@@ -146,6 +146,8 @@ This draws each stage, channel buffer, and data connection as a visual flowchart
 
 ## 5. Rules to Keep in Mind
 
-1. **One Receive at Head, One Send at Tail**: A `sequence` must receive from its input buffer in Stage 0, and send to its output buffer in the final stage.
-2. **No Non-blocking Buffer Ops in Pipelines**: Primitives like `@peek`, `@try_rcv`, and `@drop` are not allowed in a `sequence` because every pipeline stage is active concurrently. If you need dynamic inspection or packet dropping, use a `process`.
-3. **Width Safety**: Adding a 16-bit number to a 32-bit number is a compile-time error. Always explicitly extend using `@zext(val, 32)` or `@sext(val, 32)`.
+1. **One Receive per Input at the Head, One Send per Output at the Tail**: a `sequence` may declare any number of `buffer in` and `buffer out` parameters. Every input must be received in Stage 0 and every output sent to in the final stage -- exactly once each.
+2. **The Head Waits for All of Them**: an item enters the pipeline only when every blocking input is offering one, and the pipeline shifts only when every output has room. A missing input on one pipe stalls all of them, which is what makes the inputs of one item arrive together.
+3. **`@try_rcv` Makes an Input Optional**: `let (v, ok) = @try_rcv(p)` in Stage 0 does not wait. The pipeline fires without it and `ok` says whether `v` is real. It is the only non-blocking buffer op a `sequence` allows, and only at the head.
+4. **No Other Non-blocking Buffer Ops in Pipelines**: `@peek`, `@drop` and `@try_send` are not allowed in a `sequence` because every pipeline stage is active concurrently. If you need dynamic inspection or packet dropping, use a `process`.
+5. **Width Safety**: Adding a 16-bit number to a 32-bit number is a compile-time error. Always explicitly extend using `@zext(val, 32)` or `@sext(val, 32)`.

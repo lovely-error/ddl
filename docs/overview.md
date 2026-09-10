@@ -81,8 +81,9 @@ sequence mul3 (src: buffer in u16, dst: buffer out u32)
 
 The compiler translates this into a three-stage pipeline (see [`examples/mul3.v`](../examples/mul3.v)):
 - Each stage includes an automatically managed validity bit and downstream backpressure handling.
-- A `sequence` receives once from its input buffer in the first stage and sends once to its output buffer in the final stage.
-- Non-blocking buffer operations (`@peek`, `@try_rcv`, `@drop`, `@try_send`) are not permitted in pipelines; use a `process` when non-blocking buffer access is required.
+- A `sequence` receives once from each of its input buffers in the first stage and sends once to each of its output buffers in the final stage. With several of either, the head is a join and the tail a scatter: an item enters only when every blocking input is offering, and the pipeline shifts only when every output has room.
+- `@try_rcv` in the first stage makes one input optional -- the pipeline fires without it and the `ok` half of the pair says whether the item is real. The other non-blocking buffer operations (`@peek`, `@drop`, `@try_send`) are not permitted in pipelines; use a `process` when they are needed.
+- A loop of pipes in which every block is a `sequence` waiting on a blocking input can never carry its first item, and the compiler reports it. Routing the feedback through a `@try_rcv` makes such a loop live.
 
 For details on shift-register generation, BRAM stage alignment, and same-cycle hazard forwarding, see [**Pipeline Lowering & Memory Forwarding**](pipeline-lowering.md).
 

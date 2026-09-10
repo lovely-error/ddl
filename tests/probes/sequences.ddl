@@ -37,3 +37,19 @@ sequence seq_literal (src: buffer in u16, dst: buffer out u16)
   let a = @rcv(src)
   |||
   @send(dst, 42)
+
+sequence seq_join (a: buffer in u16, b: buffer in u16, s: buffer out u16, d: buffer out u16)
+  let x = @rcv(a)
+  let y = @rcv(b)
+  |||
+  @send(s, x + y)
+  @send(d, x - y)
+
+sequence seq_optional (a: buffer in u16, b: buffer in u16, o: buffer out u16)
+  let x = @rcv(a)
+  let (y, ok) = @try_rcv(b)
+  var t: u16 = x
+  if ok then
+    t = x + y
+  |||
+  @send(o, t)
