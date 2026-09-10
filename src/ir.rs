@@ -4666,6 +4666,53 @@ fn lower_builtin(
 ) -> Option<ValueId> {
     use BuiltinOp::*;
 
+    // A blocking transfer only ever reaches expression lowering by mistake.
+    //
+    // Both live in STATEMENT position and nowhere else: the scheduler takes
+    // `let x = @rcv(p)` and `@send(p, v)` apart before lowering ever sees
+    // them, and turns each into a state that waits. What it cannot do is give
+    // one a state when it is buried in a larger expression, because there is
+    // no way to say that the rest of that expression waits -- the same reason
+    // an `if` condition and a `match` scrutinee refuse one (`ir_fsm.rs`).
+    //
+    // So arriving here means the operand list of something else held one:
+    // `@send(dst, @rcv(src))`. Say that, and point at the inner operation
+    // rather than at whatever contains it. Without this the call fell through
+    // to the arithmetic path below and came out as "this operator takes two
+    // operands", which describes neither the operation nor the mistake.
+    let blocking = match op {
+        // A receive has a value worth keeping, so its fix names it. A send has
+        // none -- it is a statement that happens to be spelled like a call --
+        // so telling the author to bind it would be telling them to bind
+        // nothing.
+        BlockingRecieve => Some((
+            "@rcv",
+            "bind it first -- `let v = @rcv(p)` on its own line -- then use the name here; a blocking transfer costs a cycle, and only a statement can be given one",
+        )),
+        BlockingSend => Some((
+            "@send",
+            "give it a line of its own; a `@send` is a statement rather than a value, and a blocking transfer costs a cycle that only a statement can be given",
+        )),
+        _ => None,
+    };
+    if let Some((name, fix)) = blocking {
+        // `Builtin` carries no span of its own, so the nearest thing to the
+        // operation is the first name inside it -- the pipe it names.
+        let at = args.iter().find_map(expr_anchor);
+        let span = at.map(|a| low.span_of(&a)).unwrap_or_else(|| low.here());
+        sink.push(
+            Diag::error(
+                span,
+                format!(
+                    "a blocking `{}` has to be a statement of its own, not part of a larger expression",
+                    name
+                ),
+            )
+            .with_note(fix),
+        );
+        return None;
+    }
+
     // `@try_send(p, v)`. The value is offered; the answer is whether the slot
     // took it. Only the offer is recorded here -- the handshake itself is
     // generated after the body, so it cannot be got wrong per call site.

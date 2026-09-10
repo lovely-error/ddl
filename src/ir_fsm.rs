@@ -1762,8 +1762,26 @@ pub fn lower_blocking(
         }
         // Capture a send's operand before post-barrier assignments mutate its
         // environment. The ValueId, unlike a source expression, is immutable.
+        //
+        // Anchored, for the same reason the type check further down is: the
+        // scheduler took the send apart, so this expression is not inside any
+        // statement lowering and `here()` would be the empty span -- which
+        // renders as line 1 column 1, the declaration header, for every
+        // diagnostic the payload raises. `x + y` on mismatched widths blamed
+        // the `process` line; so did a blocking operation nested in the
+        // payload.
         let barrier_value = match st.barrier.as_ref().and_then(|b| b.value.as_ref()) {
-            Some(expr) => Some(crate::ir::lower_expr(&mut low, expr, &env, sink)?),
+            Some(expr) => {
+                let depth = crate::ir::expr_anchor(expr).map(|at| {
+                    let span = low.span_of(&at);
+                    low.push_anchor(span)
+                });
+                let v = crate::ir::lower_expr(&mut low, expr, &env, sink)?;
+                if let Some(depth) = depth {
+                    low.pop_anchor(depth);
+                }
+                Some(v)
+            }
             None => None,
         };
         // A synchronous read: present the address now, and bind the name to
