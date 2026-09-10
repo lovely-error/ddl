@@ -1,0 +1,25 @@
+// Sipeed Tang Nano 9K -- GW1NR-LV9QN88PC6/I5
+//
+// I/O standards are left to the bank defaults deliberately. Bank 3 on this
+// device is locked to 1.8 V because it is shared with the in-package PSRAM,
+// so constraining those pins to LVCMOS33 is rejected outright. The LEDs still
+// light: they sit between the 3.3 V rail and the pin, so pulling low sinks
+// current regardless of the bank's drive level.
+
+IO_LOC  "clk_27m" 52;
+IO_LOC  "rst_n" 4;
+IO_PORT "rst_n" PULL_MODE=UP;
+
+// Six LEDs, ACTIVE LOW -- driving a 0 lights the LED.
+IO_LOC  "led[0]" 10;
+IO_LOC  "led[1]" 11;
+IO_LOC  "led[2]" 13;
+IO_LOC  "led[3]" 14;
+IO_LOC  "led[4]" 15;
+IO_LOC  "led[5]" 16;
+
+// UART through the on-board BL702 USB-serial bridge. Names are from the FPGA's
+// point of view: uart_tx is an FPGA output.
+IO_LOC  "uart_tx" 17;
+IO_LOC  "uart_rx" 18;
+IO_PORT "uart_rx" PULL_MODE=UP;

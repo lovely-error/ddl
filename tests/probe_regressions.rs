@@ -217,6 +217,7 @@ fn selection_bases_remain_signals_and_register_names_are_unique() {
             export: ddl::ir_export::ExportFlags {
                 export: targets.iter().map(|s| s.to_string()).collect(),
                 bare: Vec::new(),
+            crossings: Vec::new(),
             },
             ..Default::default()
         };

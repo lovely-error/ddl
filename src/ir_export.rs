@@ -41,11 +41,95 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::diag::Diag;
 use crate::ir::{Instance, Module, Net, Port, PortDir, SALT};
 use crate::ir_adapt::{Adapt, AdaptUse};
+use crate::ir_cdc_lib::{Cdc, CdcUse};
 use crate::ir_graph::{ArgSig, BlockSig};
 use crate::ty::Ty;
 
 /// The suffix a wrapped module's logic takes, so the wrapper can have the name.
 pub const CORE_SUFFIX: &str = "_core";
+
+/// One boundary the author asked to cross a clock domain.
+///
+/// `--async-export <module>.<pipe>[=<domain>][:<depth>]`, and the extern form
+/// which names an instance as well. The DOMAIN is the part the compiler cannot
+/// work out for itself: two pipes on one physical clock must share one port,
+/// and nothing in the source says which those are. Pipes given the same domain
+/// name share a `<domain>_clk`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CrossSpec {
+    /// The export target for `--async-export`; the graph for `--async-extern`.
+    pub owner: String,
+    /// The extern instance, for `--async-extern` only.
+    pub instance: Option<String>,
+    pub pipe: String,
+    pub domain: String,
+    pub depth: u32,
+}
+
+/// Entries, when the flag does not say. Eight is the smallest depth that
+/// streams at the full rate of the slower clock at any ratio -- `depth / RTT`
+/// with a six-cycle credit loop -- which cdc-demo measured rather than assumed.
+pub const DEFAULT_CDC_DEPTH: u32 = 8;
+
+/// Reads one `<owner>.<pipe>[=<domain>][:<depth>]`, or the three-part extern
+/// form. Errors are returned as text and become a `Diag` at the call site.
+pub fn parse_crossing(flag: &str, spec: &str, extern_form: bool) -> Result<CrossSpec, String> {
+    let bad = |why: &str| {
+        format!(
+            "`{}` is not a {} target: {}
+  expected {}",
+            spec,
+            flag,
+            why,
+            if extern_form {
+                "<graph>.<instance>.<pipe>[=<domain>][:<depth>]"
+            } else {
+                "<module>.<pipe>[=<domain>][:<depth>]"
+            }
+        )
+    };
+
+    // Split the tail off first, so a dot inside neither can confuse the path.
+    let (head, depth) = match spec.split_once(':') {
+        Some((h, d)) => {
+            let n: u32 = d.parse().map_err(|_| bad("the depth is not a number"))?;
+            if n < 4 || !n.is_power_of_two() {
+                return Err(format!(
+                    concat!(
+                        "depth {} is not usable: it must be a power of two and at least 4. ",
+                        "The full test compares the top two pointer bits and needs an address ",
+                        "bit beneath them; 8 is the smallest that streams at the full rate of ",
+                        "the slower clock",
+                    ),
+                    n
+                ));
+            }
+            (h, n)
+        }
+        None => (spec, DEFAULT_CDC_DEPTH),
+    };
+    let (path, domain) = match head.split_once('=') {
+        Some((p, d)) if !d.is_empty() => (p, Some(d.to_string())),
+        Some(_) => return Err(bad("the domain after `=` is empty")),
+        None => (head, None),
+    };
+
+    let parts: Vec<&str> = path.split('.').collect();
+    let want = if extern_form { 3 } else { 2 };
+    if parts.len() != want || parts.iter().any(|p| p.is_empty()) {
+        return Err(bad("wrong number of dotted parts"));
+    }
+    let pipe = parts[want - 1].to_string();
+    Ok(CrossSpec {
+        owner: parts[0].to_string(),
+        instance: if extern_form { Some(parts[1].to_string()) } else { None },
+        // A domain defaults to the pipe's own name, which is right for the
+        // common case of one crossed pipe and harmless otherwise.
+        domain: domain.unwrap_or_else(|| pipe.clone()),
+        pipe,
+        depth,
+    })
+}
 
 /// What the flags asked for.
 #[derive(Debug, Default, Clone)]
@@ -54,11 +138,39 @@ pub struct ExportFlags {
     pub export: Vec<String>,
     /// `--bare-export a,b` -- these keep the raw salt ports.
     pub bare: Vec<String>,
+    /// `--async-export` and `--async-extern` -- these boundaries cross a clock
+    /// domain. Empty is the overwhelmingly common case, and when it is empty
+    /// the compiler emits exactly what it emitted before this existed.
+    pub crossings: Vec<CrossSpec>,
 }
 
 impl ExportFlags {
     pub fn is_empty(&self) -> bool {
         self.export.is_empty() && self.bare.is_empty()
+    }
+
+    /// The crossings on one export target, by pipe name.
+    pub fn crossings_on(&self, module: &str) -> Vec<&CrossSpec> {
+        self.crossings
+            .iter()
+            .filter(|c| c.instance.is_none() && c.owner == module)
+            .collect()
+    }
+
+    /// Domains that crossings on EXTERNS inside one graph introduced.
+    ///
+    /// Those clock ports are generated on the graph itself, deep in
+    /// `lower_graph`, so a wrapper built afterwards has to be told to carry
+    /// them out to the world. Left behind, they are two input ports nothing
+    /// drives -- which Verilog is perfectly happy to elaborate.
+    pub fn extern_domains_in(&self, graph: &str) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for c in &self.crossings {
+            if c.instance.is_some() && c.owner == graph && !out.contains(&c.domain) {
+                out.push(c.domain.clone());
+            }
+        }
+        out
     }
 }
 
@@ -200,16 +312,76 @@ pub fn resolve(
     }
 }
 
+/// Checks every `--async-*` flag names something real.
+///
+/// A crossing flag that silently matches nothing is the worst outcome there is:
+/// the build succeeds, the port is absent, the crossing is absent, and the
+/// design corrupts data on hardware exactly as if the flag had never been
+/// typed. So every one is checked against what is actually being wrapped.
+pub fn validate_crossings(
+    flags: &ExportFlags,
+    exports: &Exports,
+    sigs: &BTreeMap<String, BlockSig>,
+) -> Result<(), Diag> {
+    for c in &flags.crossings {
+        if c.instance.is_some() {
+            // The extern form names a graph; its pipes are checked where the
+            // graph is lowered, which is the only place instances are known.
+            continue;
+        }
+        if !exports.wrap.contains(&c.owner) {
+            return Err(Diag::error_no_span(format!(
+                "`--async-export` names `{}`, which is not being wrapped",
+                c.owner
+            ))
+            .with_note(concat!(
+                "a crossing goes on a module that presents a FIFO, so it must be an `--export` ",
+                "target; `--bare-export` keeps the raw salt ports and cannot carry one",
+            )));
+        }
+        let Some(sig) = sigs.get(&c.owner) else {
+            return Err(Diag::error_no_span(format!(
+                "`--async-export` names `{}`, which has no pipe interface",
+                c.owner
+            )));
+        };
+        if !sig.pipes().any(|p| p.name == c.pipe) {
+            let listed: Vec<String> = sig.pipes().map(|p| format!("`{}`", p.name)).collect();
+            return Err(Diag::error_no_span(format!(
+                "`{}` has no pipe called `{}`",
+                c.owner, c.pipe
+            ))
+            .with_note(if listed.is_empty() {
+                "it has no `buffer` parameters at all".to_string()
+            } else {
+                format!("its pipes are: {}", listed.join(", "))
+            }));
+        }
+    }
+    Ok(())
+}
+
 /// Builds the wrapper for one target, and says what its logic is now called.
 ///
 /// The wrapper computes nothing. It declares the FIFO ports, one salt net per
 /// pipe, an adapter to translate between them, and one instance of the core.
 /// A `wire` needs none of that and is connected straight through.
-pub fn wrap(module: &Module, sig: &BlockSig, adapts: &mut Vec<AdaptUse>) -> (Module, String) {
+pub fn wrap(
+    module: &Module,
+    sig: &BlockSig,
+    adapts: &mut Vec<AdaptUse>,
+    crossings: &[&CrossSpec],
+    extern_domains: &[String],
+    cdcs: &mut Vec<CdcUse>,
+) -> (Module, String) {
     let core = format!("{}{}", module.name, CORE_SUFFIX);
     let mut ports = Vec::new();
     let mut nets = Vec::new();
     let mut instances = Vec::new();
+    // One clock port per DOMAIN, not per pipe: two pipes given the same domain
+    // name share a clock, which is the grouping the compiler cannot infer and
+    // the only reason the name exists.
+    let mut domains: Vec<String> = Vec::new();
 
     for implicit in ["clk", "rst_n"] {
         ports.push(Port { name: implicit.to_string(), dir: PortDir::In, ty: Ty::BOOL });
@@ -252,8 +424,57 @@ pub fn wrap(module: &Module, sig: &BlockSig, adapts: &mut Vec<AdaptUse>) -> (Mod
                     (format!("{}_rsalt", salt), format!("{}_rsalt", p.name)),
                     (format!("{}_data", salt), format!("{}_data", p.name)),
                 ];
-                for suffix in [flag, go, data] {
-                    conns.push((suffix.to_string(), format!("{}_{}", p.name, suffix)));
+
+                // A crossed pipe puts a `ddl_cdc_*` shell between the adapter
+                // and the outward face. The adapter is untouched and stays on
+                // `clk`; what changes is that its face now lands on internal
+                // nets rather than on the module's ports, and the shell carries
+                // it the rest of the way on the foreign clock.
+                //
+                // The shell's ports are `c_<suffix>` and `f_<suffix>` for the
+                // same three face signals, so the wiring is the same shape
+                // whichever direction the pipe runs.
+                let crossed = crossings.iter().find(|c| c.pipe == p.name);
+                if let Some(c) = crossed {
+                    let width = p.ty.bit_width();
+                    let ck = Cdc::at(p.is_input, false);
+                    let use_ = CdcUse { kind: ck, width, depth: c.depth };
+                    if !cdcs.contains(&use_) {
+                        cdcs.push(use_);
+                    }
+
+                    let clk_port = format!("{}_clk", c.domain);
+                    if !domains.contains(&c.domain) {
+                        domains.push(c.domain.clone());
+                        ports.push(Port { name: clk_port.clone(), dir: PortDir::In, ty: Ty::BOOL });
+                    }
+
+                    let mut shell = vec![
+                        ("clk".to_string(), "clk".to_string()),
+                        ("rst_n".to_string(), "rst_n".to_string()),
+                        ("f_clk".to_string(), clk_port),
+                    ];
+                    for (ix, suffix) in [flag, go, data].iter().enumerate() {
+                        let net = format!("{}_c_{}", p.name, suffix);
+                        nets.push(Net {
+                            name: net.clone(),
+                            ty: if ix == 2 { p.ty.clone() } else { Ty::BOOL },
+                        });
+                        // The adapter now talks to the shell, not to the world.
+                        conns.push((suffix.to_string(), net.clone()));
+                        shell.push((format!("c_{}", suffix), net));
+                        shell.push((format!("f_{}", suffix), format!("{}_{}", p.name, suffix)));
+                    }
+                    instances.push(Instance {
+                        module: crate::ir_cdc_lib::module_name(ck, width, c.depth),
+                        name: format!("u_{}_cdc", p.name),
+                        conns: shell,
+                        produces: Vec::new(),
+                    });
+                } else {
+                    for suffix in [flag, go, data] {
+                        conns.push((suffix.to_string(), format!("{}_{}", p.name, suffix)));
+                    }
                 }
                 instances.push(Instance {
                     module: crate::ir_adapt::module_name(kind, &p.ty),
@@ -275,6 +496,16 @@ pub fn wrap(module: &Module, sig: &BlockSig, adapts: &mut Vec<AdaptUse>) -> (Mod
             ty: wire.ty.clone(),
         });
         core_conns.push((wire.name.clone(), wire.name.clone()));
+    }
+
+    // Clock ports the GRAPH generated for crossed extern pipes. They exist on
+    // the core and would otherwise be left dangling.
+    for domain in extern_domains {
+        for suffix in ["clk", "rst_n"] {
+            let name = format!("{}_{}", domain, suffix);
+            ports.push(Port { name: name.clone(), dir: PortDir::In, ty: Ty::BOOL });
+            core_conns.push((name.clone(), name));
+        }
     }
 
     instances.push(Instance {
@@ -315,6 +546,8 @@ pub fn apply(
     targets: &[String],
     sigs: &BTreeMap<String, BlockSig>,
     adapts: &mut Vec<AdaptUse>,
+    flags: &ExportFlags,
+    cdcs: &mut Vec<CdcUse>,
 ) -> Vec<Module> {
     let mut renamed: BTreeMap<String, String> = BTreeMap::new();
     let mut wrappers = Vec::new();
@@ -332,7 +565,9 @@ pub fn apply(
         if !sig.args.iter().any(|a| matches!(a, ArgSig::Pipe(_))) {
             continue;
         }
-        let (wrapper, core) = wrap(module, sig, adapts);
+        let on = flags.crossings_on(target);
+        let ext = flags.extern_domains_in(target);
+        let (wrapper, core) = wrap(module, sig, adapts, &on, &ext, cdcs);
         renamed.insert(target.clone(), core);
         wrappers.push(wrapper);
     }

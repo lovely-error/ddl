@@ -15,6 +15,7 @@ fn scalar_operations_and_collision_fixture_compile() {
         export: ddl::ir_export::ExportFlags {
             export: Vec::new(),
             bare: vec!["collision_graph".to_string()],
+            crossings: Vec::new(),
         },
         ..EmitOptions::default()
     };

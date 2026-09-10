@@ -57,6 +57,21 @@ OPTIONS:
                     pointers and a packed pair of entries, exactly as the
                     lowering produces them. For someone who would rather speak
                     the protocol directly than through a FIFO.
+    --async-export <module>.<pipe>[=<domain>][:<depth>]
+                    that boundary crosses a clock domain. The module gains a
+                    `<domain>_clk` port and a `ddl_cdc_fifo` is emitted into the
+                    file and wired in. Pipes given the same <domain> share one
+                    clock port -- the grouping the compiler cannot infer.
+                    <depth> is entries, a power of two >= 4, default 8: the
+                    smallest that streams at the full rate of the slower clock.
+                    WITHOUT THIS FLAG NOTHING CHANGES; every face a compiled
+                    design presents is synchronous to its `clk`, and wiring one
+                    to another clock without a crossing corrupts data silently.
+                    See docs/clock-domains.md.
+    --async-extern <graph>.<instance>.<pipe>[=<domain>][:<depth>]
+                    the same, for one pipe of an `extern`. The instance keeps
+                    its `clk`/`rst_n`; the crossed pipe adds `<pipe>_clk` and
+                    `<pipe>_rst_n` to the face it already has.
     --lvt-bram      build a `bram` that has more than one write port out of
                     one-write blocks: one bank per write port, replicated per
                     read port, and a live value table saying which bank holds
@@ -188,6 +203,22 @@ fn parse_build_args(args: &[String]) -> Result<BuildArgs, String> {
                     None => return Err(format!("{} needs a module name", flag)),
                 }
             }
+            "--async-export" | "--async-extern" => {
+                let flag = args[ix].clone();
+                let is_extern = flag == "--async-extern";
+                ix += 1;
+                match args.get(ix) {
+                    Some(list) => {
+                        for spec in split_names(list, &flag)? {
+                            match ddl::ir_export::parse_crossing(&flag, &spec, is_extern) {
+                                Ok(c) => export.crossings.push(c),
+                                Err(why) => return Err(why),
+                            }
+                        }
+                    }
+                    None => return Err(format!("{} needs a boundary to cross", flag)),
+                }
+            }
             "--lvt-bram" => lvt_bram = true,
             other if other.starts_with("--emit=") => {
                 emit = match &other["--emit=".len()..] {
@@ -263,6 +294,22 @@ fn run_build(args: &[String]) -> ExitCode {
 
     let opts = EmitOptions {
         regenerate_cmd: regenerate_cmd(&args),
+        // Named for the banner: the compiler knows the port names and knows the
+        // domains are unrelated, so it can write the constraint out ready to
+        // paste. Without one the tool times the crossing and may report it
+        // closed, which is a design one placement change from breaking.
+        crossings: args
+            .export
+            .crossings
+            .iter()
+            .map(|c| {
+                let where_ = match &c.instance {
+                    Some(inst) => format!("{}.{}.{}", c.owner, inst, c.pipe),
+                    None => format!("{}.{}", c.owner, c.pipe),
+                };
+                (where_, c.domain.clone())
+            })
+            .collect(),
         lvt_bram: args.lvt_bram,
         export: args.export.clone(),
     };
@@ -429,6 +476,34 @@ fn regenerate_cmd(args: &BuildArgs) -> String {
         cmd.push_str(flag);
         cmd.push(' ');
         cmd.push_str(&names.join(","));
+    }
+    // And so does a crossing: it adds a clock port and a FIFO, so a command
+    // that left it out would name something that does not reproduce this file.
+    for (flag, want_extern) in [("--async-export", false), ("--async-extern", true)] {
+        let specs: Vec<String> = args
+            .export
+            .crossings
+            .iter()
+            .filter(|c| c.instance.is_some() == want_extern)
+            .map(|c| {
+                let path = match &c.instance {
+                    Some(inst) => format!("{}.{}.{}", c.owner, inst, c.pipe),
+                    None => format!("{}.{}", c.owner, c.pipe),
+                };
+                let mut spec = format!("{}={}", path, c.domain);
+                if c.depth != ddl::ir_export::DEFAULT_CDC_DEPTH {
+                    spec.push_str(&format!(":{}", c.depth));
+                }
+                spec
+            })
+            .collect();
+        if specs.is_empty() {
+            continue;
+        }
+        cmd.push(' ');
+        cmd.push_str(flag);
+        cmd.push(' ');
+        cmd.push_str(&specs.join(","));
     }
     cmd
 }

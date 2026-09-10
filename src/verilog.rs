@@ -24,6 +24,10 @@ use crate::ty::{MemKind, Ty};
 pub struct EmitOptions {
     /// Printed in the banner so a reader knows how to regenerate the file.
     pub regenerate_cmd: String,
+    /// `(boundary, domain)` for every clock-domain crossing in the file, so the
+    /// banner can name them and write out the constraint they need. Empty in
+    /// every build that did not ask for one, which is nearly all of them.
+    pub crossings: Vec<(String, String)>,
     /// Build a `bram` with several write ports out of one-write blocks and a
     /// live value table, instead of asking for a cell with several.
     ///
@@ -47,6 +51,7 @@ impl Default for EmitOptions {
     fn default() -> Self {
         EmitOptions {
             regenerate_cmd: "ddl build <source.ddl>".to_string(),
+            crossings: Vec::new(),
             lvt_bram: false,
             export: crate::ir_export::ExportFlags::default(),
         }
@@ -72,6 +77,48 @@ pub fn emit_banner(opts: &EmitOptions) -> String {
 ");
     out.push_str("// function calls: all three make GowinSynthesis exit with an empty log.
 ");
+
+    // Clock-domain crossings, and what the timing tool needs told about them.
+    //
+    // A crossing with no constraint is one the tool will TRY to time, and may
+    // report closed -- at which point the design is one placement change away
+    // from breaking and the timing report will not warn you. The compiler knows
+    // the port names and knows the domains are unrelated, so it can write the
+    // line out ready to paste; only the author knows where the .sdc lives.
+    if !opts.crossings.is_empty() {
+        let mut domains: Vec<&str> = Vec::new();
+        out.push_str("//
+");
+        out.push_str("// CLOCK-DOMAIN CROSSINGS in this file:
+");
+        for (boundary, domain) in &opts.crossings {
+            out.push_str(&format!("//   {} crosses into `{}_clk`
+", boundary, domain));
+            if !domains.contains(&domain.as_str()) {
+                domains.push(domain.as_str());
+            }
+        }
+        out.push_str("//
+");
+        out.push_str("// Your .sdc/.xdc MUST declare these asynchronous, or the tool will time
+");
+        out.push_str("// the crossing. One line, no continuation -- Gowin's parser takes none:
+");
+        out.push_str("//
+");
+        out.push_str("//   set_clock_groups -asynchronous -group [get_clocks clk]");
+        for d in &domains {
+            out.push_str(&format!(" -group [get_clocks {}_clk]", d));
+        }
+        out.push_str("
+");
+        out.push_str("//
+");
+        out.push_str("// If a crossed pipe never moves, check that its clock is running before
+");
+        out.push_str("// suspecting anything else. See docs/clock-domains.md.
+");
+    }
     out
 }
 

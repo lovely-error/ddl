@@ -773,6 +773,7 @@ fn a_deep_acyclic_hierarchy_is_not_a_cycle() {
         export: ddl::ir_export::ExportFlags {
             export: Vec::new(),
             bare: vec!["a".to_string()],
+            crossings: Vec::new(),
         },
         ..EmitOptions::default()
     };
