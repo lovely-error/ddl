@@ -295,6 +295,78 @@ fn a_bad_statement_blames_its_own_line_not_the_declaration() {
     assert!(text.contains("does not belong in a `fun` body"), "{}", text);
 }
 
+/// A `match` arm the parser cannot read blames the arm, not the `match`.
+///
+/// Wrapping an or-pattern used to fail, and the failure came out as ``match`
+/// does not belong in a `fun` body`: the body loop names the first word of the
+/// line it gave up on, and that word is the `match` keyword. So a parse error
+/// three lines down read as a rule against `match` in a function, which does
+/// not exist -- a `match` in a `fun` is the ordinary form.
+const LB: &str = concat!(
+    "enum lb_e: u2\n",
+    "  LB_ADD\n",
+    "  LB_SUB\n",
+    "  LB_AND\n",
+    "  LB_OR\n",
+);
+
+#[test]
+fn a_match_arm_without_an_arrow_says_so() {
+    let (line, text) = first_error(&format!(
+        concat!(
+            "{}fun f (lb: lb_e, a: u8, o: out u8)\n",
+            "  match lb\n",
+            "    .LB_ADD\n",
+            "      o = a\n",
+            "    _ =>\n",
+            "      o = a\n",
+        ),
+        LB
+    ));
+    assert_eq!(line, 8, "{}", text);
+    assert!(text.contains("needs `=>` after its pattern"), "{}", text);
+    assert!(!text.contains("does not belong"), "{}", text);
+}
+
+#[test]
+fn a_dangling_bar_says_a_pattern_is_missing() {
+    let (line, text) = first_error(&format!(
+        concat!(
+            "{}fun f (lb: lb_e, a: u8, o: out u8)\n",
+            "  match lb\n",
+            "    .LB_ADD | =>\n",
+            "      o = a\n",
+            "    _ =>\n",
+            "      o = a\n",
+        ),
+        LB
+    ));
+    assert_eq!(line, 8, "{}", text);
+    assert!(text.contains("needs another pattern after it"), "{}", text);
+}
+
+#[test]
+fn a_bar_dedented_below_its_arm_does_not_continue_it() {
+    // The list may wrap at the arm's depth or deeper. Below it the `match` has
+    // ended, and keeping that rule is what stops the wrap from reaching across
+    // a block boundary -- in an indentation-delimited language that is the one
+    // mistake a parser must not paper over.
+    let (line, text) = first_error(&format!(
+        concat!(
+            "{}fun f (lb: lb_e, a: u8, o: out u8)\n",
+            "  match lb\n",
+            "    .LB_ADD\n",
+            "  | .LB_SUB =>\n",
+            "      o = a\n",
+            "    _ =>\n",
+            "      o = a\n",
+        ),
+        LB
+    ));
+    assert_eq!(line, 8, "{}", text);
+    assert!(text.contains("needs `=>` after its pattern"), "{}", text);
+}
+
 #[test]
 fn each_kind_of_body_says_what_it_holds() {
     let cases = [

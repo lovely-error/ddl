@@ -1454,12 +1454,24 @@ unsafe fn try_parse_match_arm(
     char_end_ptr: *const u8,
     arm_depth: u32,
 ) -> Result<(MatchArm, *const u8), ()> {
-    let (bindings, tail) = try_parse_match_arm_lhs(char_ptr, char_end_ptr)?;
+    let (bindings, tail) = try_parse_match_arm_lhs(char_ptr, char_end_ptr, arm_depth)?;
     char_ptr = tail;
     let (_, tail) = skip_whitespaces(char_ptr, char_end_ptr);
     char_ptr = tail;
     let (is_lhr_rhs_delim, tail) = strip_prefix_on_match(char_ptr, char_end_ptr, "=>");
     if !is_lhr_rhs_delim {
+        // An arm whose patterns read and whose `=>` did not is not another
+        // construct to try -- it is this one, broken. Unsaid, the body loop
+        // reports the `match` keyword as the line that does not belong, which
+        // sends the reader looking for a rule against `match` instead.
+        diagnose(
+            char_ptr,
+            "a `match` arm needs `=>` after its pattern".to_string(),
+            Some(
+                "an arm is `.Variant =>`; alternatives join with `|`, and the list may wrap onto the next line"
+                    .to_string(),
+            ),
+        );
         return Err(());
     }
     char_ptr = tail;
@@ -1478,29 +1490,45 @@ unsafe fn try_parse_match_arm(
 fn try_parse_match_arm_lhs(
     mut char_ptr: *const u8,
     char_end_ptr: *const u8,
+    arm_depth: u32,
 ) -> Result<(Vec<BindingPattern>, *const u8), ()> {
     let mut bindings = Vec::new();
     loop {
         // One scrutinee position, which may offer several alternatives joined
-        // by `|`.
+        // by `|`. The list may wrap, on either side of the `|`: six
+        // alternatives on one arm is real -- examples/k2g_decode.ddl groups
+        // that many opcodes -- and the line it makes is past reading.
         let (first, tail) = try_parse_case_pattern(char_ptr, char_end_ptr)?;
         char_ptr = tail;
         let mut alternatives = vec![first];
         loop {
-            let (_, tail) = skip_whitespaces(char_ptr, char_end_ptr);
+            let tail = skip_pattern_continuation(char_ptr, char_end_ptr, arm_depth);
             // `||` is the logical operator, never a pattern separator.
             let (is_log_or, _) = strip_prefix_on_match(tail, char_end_ptr, "||");
             if is_log_or {
                 break;
             }
+            // Only committed to once the `|` is there, so a next line that
+            // does not continue the list is left for the arm loop to read.
             let (is_alt, tail) = strip_prefix_on_match(tail, char_end_ptr, "|");
             if !is_alt {
                 break;
             }
-            char_ptr = tail;
-            let (_, tail) = skip_whitespaces(char_ptr, char_end_ptr);
-            char_ptr = tail;
-            let (next, tail) = try_parse_case_pattern(char_ptr, char_end_ptr)?;
+            char_ptr = skip_pattern_continuation(tail, char_end_ptr, arm_depth);
+            let (next, tail) = match try_parse_case_pattern(char_ptr, char_end_ptr) {
+                Ok(val) => val,
+                Err(()) => {
+                    diagnose(
+                        char_ptr,
+                        "`|` needs another pattern after it".to_string(),
+                        Some(
+                            "alternatives are `.A | .B`, and the list may wrap onto the next line"
+                                .to_string(),
+                        ),
+                    );
+                    return Err(());
+                }
+            };
             char_ptr = tail;
             alternatives.push(next);
         }
@@ -1941,6 +1969,30 @@ fn skip_expr_continuation(
     }
     let (depth, after_break) = skip_trivia(after_spaces, char_end_ptr);
     let is_continuation = depth > parent_depth;
+    if is_continuation { after_break } else { after_spaces }
+}
+
+/// Skips spaces, and a line break too when what follows continues a `match`
+/// arm's list of alternatives.
+///
+/// The same job as `skip_expr_continuation` with one difference: the next line
+/// may sit at the ARM'S OWN depth rather than having to be deeper. A pattern
+/// list belongs to the arm's line, not to a block under it, so wrapping one
+/// does not want an indent -- and where an expression needs the depth rule to
+/// tell a continuation from the next statement, a pattern list has nothing to
+/// be confused with, because `|` begins neither an arm nor a statement.
+fn skip_pattern_continuation(
+    char_ptr: *const u8,
+    char_end_ptr: *const u8,
+    arm_depth: u32,
+) -> *const u8 {
+    let (_, after_spaces) = skip_whitespaces(char_ptr, char_end_ptr);
+    let (is_break, _) = strip_line_break(after_spaces, char_end_ptr);
+    if !is_break {
+        return after_spaces;
+    }
+    let (depth, after_break) = skip_trivia(after_spaces, char_end_ptr);
+    let is_continuation = depth >= arm_depth;
     if is_continuation { after_break } else { after_spaces }
 }
 
