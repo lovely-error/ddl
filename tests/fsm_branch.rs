@@ -233,6 +233,32 @@ fn a_match_can_hold_a_wait() {
     assert!(v.contains("endmodule"), "{}", v);
 }
 
+#[test]
+fn a_wrapped_or_pattern_can_hold_a_wait_too() {
+    // The parser is shared with a combinational `match`, but the arms reach
+    // hardware through the scheduler rather than `lower_match`, so a grouped
+    // arm's labels are collected in a second place.
+    let v = compile(concat!(
+        "enum e: u2\n",
+        "  A\n",
+        "  B\n",
+        "  C\n",
+        "  D\n",
+        "process p (src: buffer in u32, dst: buffer out u32, k: e = A)\n",
+        "  loop\n",
+        "    let a = @rcv(src)\n",
+        "    match k\n",
+        "      .A |\n",
+        "      .B =>\n",
+        "        @send(dst, a)\n",
+        "      .C\n",
+        "      | .D =>\n",
+        "        @send(dst, 32'd0)\n",
+    ));
+    // Two variants on the arm, so two labels reach the state it waits in.
+    assert!(v.contains("2'd0, 2'd1:"), "{}", v);
+}
+
 /// A tagged union dispatched on: each variant waits for something different.
 const DISPATCH: &str = concat!(
     "enum req_e\n",

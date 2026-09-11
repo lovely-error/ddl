@@ -1212,6 +1212,106 @@ fn or_patterns_compose_with_unreachable_on_a_sparse_enum() {
     assert!(v.contains("a ^ b"), "{}", v);
 }
 
+/// The grouped arm on one line, which every wrapped form below must come out
+/// identical to.
+const GROUPED: &str = concat!(
+    "fun f (lb: lb_e, a: u8, b: u8, o: out u8)\n",
+    "  match lb\n",
+    "    .LB_ADD | .LB_SUB | .LB_AND =>\n",
+    "      o = a + b\n",
+    "    .LB_OR =>\n",
+    "      o = a & b\n",
+);
+
+#[test]
+fn an_or_pattern_may_wrap_after_the_bar() {
+    // Wrapping used to fail, and as ``match` does not belong in a `fun` body`
+    // -- a parse error in the pattern list arriving as what reads like a rule
+    // against `match` itself. Six alternatives on one arm is real
+    // (examples/k2g_decode.ddl groups that many opcodes), so the line they
+    // make is past reading.
+    let wrapped = compile(&format!(
+        concat!(
+            "{}fun f (lb: lb_e, a: u8, b: u8, o: out u8)\n",
+            "  match lb\n",
+            "    .LB_ADD |\n",
+            "    .LB_SUB |\n",
+            "    .LB_AND =>\n",
+            "      o = a + b\n",
+            "    .LB_OR =>\n",
+            "      o = a & b\n",
+        ),
+        LB4
+    ));
+    // Byte for byte, not a substring: the wrap is notation and must cost
+    // nothing at all.
+    assert_eq!(wrapped, compile(&format!("{}{}", LB4, GROUPED)));
+}
+
+#[test]
+fn an_or_pattern_may_wrap_before_the_bar() {
+    // At the ARM'S OWN depth, which an expression continuation would refuse: a
+    // pattern list belongs to the arm's line rather than to a block under it,
+    // and `|` begins neither an arm nor a statement, so there is nothing here
+    // for the depth rule to disambiguate.
+    let wrapped = compile(&format!(
+        concat!(
+            "{}fun f (lb: lb_e, a: u8, b: u8, o: out u8)\n",
+            "  match lb\n",
+            "    .LB_ADD\n",
+            "    | .LB_SUB\n",
+            "    | .LB_AND =>\n",
+            "      o = a + b\n",
+            "    .LB_OR =>\n",
+            "      o = a & b\n",
+        ),
+        LB4
+    ));
+    assert_eq!(wrapped, compile(&format!("{}{}", LB4, GROUPED)));
+}
+
+#[test]
+fn a_wrapped_or_pattern_may_be_indented_further() {
+    // Indenting the continuation past the arm is the other way to write it,
+    // and reads as a continuation to anyone coming from a language with
+    // brackets.
+    let wrapped = compile(&format!(
+        concat!(
+            "{}fun f (lb: lb_e, a: u8, b: u8, o: out u8)\n",
+            "  match lb\n",
+            "    .LB_ADD\n",
+            "        | .LB_SUB\n",
+            "        | .LB_AND =>\n",
+            "      o = a + b\n",
+            "    .LB_OR =>\n",
+            "      o = a & b\n",
+        ),
+        LB4
+    ));
+    assert_eq!(wrapped, compile(&format!("{}{}", LB4, GROUPED)));
+}
+
+#[test]
+fn a_comment_may_sit_between_the_alternatives() {
+    // `skip_whitespaces` takes `--` comments with it, so the continuation
+    // inherits that for free -- worth pinning, because the one place a reader
+    // wants to say why an opcode is in the group is next to the opcode.
+    let wrapped = compile(&format!(
+        concat!(
+            "{}fun f (lb: lb_e, a: u8, b: u8, o: out u8)\n",
+            "  match lb\n",
+            "    .LB_ADD |   -- the arithmetic pair\n",
+            "    .LB_SUB |\n",
+            "    .LB_AND =>\n",
+            "      o = a + b\n",
+            "    .LB_OR =>\n",
+            "      o = a & b\n",
+        ),
+        LB4
+    ));
+    assert_eq!(wrapped, compile(&format!("{}{}", LB4, GROUPED)));
+}
+
 // ---- field assignment and @zeroed() --------------------------------------
 
 const UOP: &str = concat!(

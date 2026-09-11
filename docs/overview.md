@@ -423,7 +423,7 @@ This synthesizes a multi-write RAM using single-write BRAM blocks coordinated by
 ### Control Flow and Pattern Matching
 
 - **Conditionals (`if` / `else`)**: In FSMs, conditions can fork execution across states. In combinational blocks, all branches must assign outputs to avoid latches.
-- **Pattern Matching (`match`)**: Matches on enum variants. Exhaustiveness checking is strictly enforced.
+- **Pattern Matching (`match`)**: Matches on enum variants. Exhaustiveness checking is strictly enforced. One arm may name several variants by joining them with `|`, and that list may wrap onto the next line, indented at the arm's own depth or deeper.
 - **Loops**:
   - `loop { ... }`: Infinite loop in a `process`, modeling recurring state cycles.
   - `break`: Exits the innermost loop. At the top level of a process, `break` permanently halts execution.
