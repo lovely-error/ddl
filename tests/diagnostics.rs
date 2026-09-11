@@ -367,6 +367,89 @@ fn a_bar_dedented_below_its_arm_does_not_continue_it() {
     assert!(text.contains("needs `=>` after its pattern"), "{}", text);
 }
 
+/// The `,` wraps like the `|`, and reaching lowering is the proof.
+///
+/// A `match` on more than one scrutinee parses and is then refused -- the
+/// parser keeps a list of pattern positions that `plan_match` has never
+/// implemented. So what these assert is that the WRAPPED form gets the same
+/// answer as the one-line form: the arity error from lowering, rather than a
+/// parse error blaming the `match` keyword.
+#[test]
+fn a_wrapped_scrutinee_list_reaches_the_arity_check() {
+    let (line, text) = first_error(&format!(
+        concat!(
+            "{}fun f (x: lb_e, y: lb_e, a: u8, o: out u8)\n",
+            "  match x,\n",
+            "        y\n",
+            "    .LB_ADD | .LB_SUB,\n",
+            "    .LB_AND =>\n",
+            "      o = a\n",
+            "    _, _ =>\n",
+            "      o = 8'd0\n",
+        ),
+        LB
+    ));
+    assert_eq!(line, 7, "{}", text);
+    assert!(text.contains("takes one scrutinee here, found 2"), "{}", text);
+    assert!(!text.contains("does not belong"), "{}", text);
+}
+
+#[test]
+fn a_wrapped_arm_position_list_reaches_the_arity_check() {
+    let (line, text) = first_error(&format!(
+        concat!(
+            "{}fun f (x: lb_e, a: u8, o: out u8)\n",
+            "  match x\n",
+            "    .LB_ADD,\n",
+            "    .LB_SUB =>\n",
+            "      o = a\n",
+            "    _ =>\n",
+            "      o = a\n",
+        ),
+        LB
+    ));
+    assert_eq!(line, 7, "{}", text);
+    assert!(text.contains("wrong number of patterns"), "{}", text);
+    assert!(!text.contains("does not belong"), "{}", text);
+}
+
+#[test]
+fn a_dangling_comma_in_a_match_header_says_so() {
+    // The trap this closes: an expression that begins with a line break is a
+    // statement block, so a `,` with nothing after it used to take the arms as
+    // its second scrutinee.
+    let (line, text) = first_error(&format!(
+        concat!(
+            "{}fun f (x: lb_e, a: u8, o: out u8)\n",
+            "  match x,\n",
+            "    .LB_ADD =>\n",
+            "      o = a\n",
+            "    _ =>\n",
+            "      o = a\n",
+        ),
+        LB
+    ));
+    assert_eq!(line, 8, "{}", text);
+    assert!(text.contains("needs another scrutinee after it"), "{}", text);
+}
+
+#[test]
+fn a_dangling_comma_in_an_arm_says_so() {
+    let (line, text) = first_error(&format!(
+        concat!(
+            "{}fun f (x: lb_e, a: u8, o: out u8)\n",
+            "  match x\n",
+            "    .LB_ADD, =>\n",
+            "      o = a\n",
+            "    _ =>\n",
+            "      o = a\n",
+        ),
+        LB
+    ));
+    assert_eq!(line, 8, "{}", text);
+    assert!(text.contains("needs another pattern after it"), "{}", text);
+}
+
 #[test]
 fn each_kind_of_body_says_what_it_holds() {
     let cases = [
