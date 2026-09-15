@@ -44,6 +44,43 @@ module tb_sequence;
   wire [31:0] pod;
   seq_optional p(clk,rst_n,paws,par,pa_data,pbws,pbr,pb_data,pow,2'b00,pod);
 
+  // ---- sends from different stages, joined downstream ---------------------
+  //
+  // `x` leaves in stage 0 and `y` two stages later, and the consumer below
+  // takes from both together or from neither, stalling on an irregular
+  // pattern. It cannot drain `x` until the matching `y` arrives, so `x` fills
+  // while that item is still in the pipeline. One shift for the whole
+  // pipeline deadlocks here after two items; per-stage shifts let the stages
+  // below keep moving, so every item arrives, paired and in order.
+  localparam EARLY_N = 24;
+  reg [1:0] ews=0, erx=0, ery=0;
+  reg [15:0] ee0=0, ee1=0;
+  wire [1:0] er, exw, eyw;
+  wire [31:0] exd, eyd;
+  seq_early e(clk,rst_n,ews,er,{ee1,ee0},exw,erx,exd,eyw,ery,eyd);
+  reg early_go=0;
+  integer early_sent=0, early_got=0, early_cycle=0;
+  wire ews_idx = ews[0]^ews[1];
+  wire erx_idx = erx[0]^erx[1];
+  wire ery_idx = ery[0]^ery[1];
+  wire [15:0] ex_item = erx_idx ? exd[31:16] : exd[15:0];
+  wire [15:0] ey_item = ery_idx ? eyd[31:16] : eyd[15:0];
+  always @(negedge clk) if (early_go) begin
+    early_cycle = early_cycle + 1;
+    if (ews != ~er && early_sent < EARLY_N) begin
+      if (ews_idx) ee1 <= early_sent + 1; else ee0 <= early_sent + 1;
+      ews <= ews ^ (ews_idx ? 2'd2 : 2'd1);
+      early_sent = early_sent + 1;
+    end
+    if ((early_cycle % 13) < 9 && exw != erx && eyw != ery) begin
+      if (ex_item !== early_got + 1) $fatal(1,"early output out of order: %0d, wanted %0d",ex_item,early_got+1);
+      if (ey_item !== early_got + 3) $fatal(1,"late output not paired: %0d, wanted %0d",ey_item,early_got+3);
+      erx <= erx ^ (erx_idx ? 2'd2 : 2'd1);
+      ery <= ery ^ (ery_idx ? 2'd2 : 2'd1);
+      early_got = early_got + 1;
+    end
+  end
+
   // Both sinks of the join advance together, every cycle, always.
   always @(posedge clk) begin
     if (rst_n && jsw !== jdw) $fatal(1,"join sinks moved apart: %b vs %b",jsw,jdw);
@@ -89,7 +126,11 @@ module tb_sequence;
     if(pow !== 3 || pod !== 32'h00020007) $fatal(1,"optional input paired per item: %h",pod);
     if(pbr !== 1) $fatal(1,"the optional input gave up %b entries, not one",pbr);
     if(par !== 3) $fatal(1,"the blocking input ran to completion regardless");
-    $display("TB_PASS: sequence scoping, BRAM identities, assertions, literals, read-first, join/scatter, optional input RTL");
+
+    early_go=1;
+    repeat(400) @(negedge clk);
+    if(early_got !== EARLY_N) $fatal(1,"sends from different stages stalled: %0d of %0d joined",early_got,EARLY_N);
+    $display("TB_PASS: sequence scoping, BRAM identities, assertions, literals, read-first, join/scatter, optional input, sends from several stages RTL");
     $finish;
   end
 endmodule

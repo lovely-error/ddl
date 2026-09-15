@@ -2047,11 +2047,37 @@ fn the_pipeline_shifts_when_its_sink_has_a_slot() {
     let v = compile(PIPE3);
     // The slot is two entries deep, so the room it reports is the skid being
     // empty rather than the sink taking something this cycle.
-    assert!(v.contains("wire shift = !dst_full;"), "{}", v);
-    assert!(v.contains("wire take = "), "{}", v);
-    // Rule 3: the output valid is the last validity bit, a register.
+    assert!(v.contains("wire shift2 = !dst_full;"), "{}", v);
+    assert!(v.contains("wire take = src_present & shift0;"), "{}", v);
+    // Rule 3: what the output offers is its `wsalt`, a register.
     assert!(v.contains("assign dst_wsalt = dst_wsalt_q;"), "{}", v);
-    assert!(v.contains("v1 <= (shift ? v0 : v1);"), "{}", v);
+    assert!(v.contains("v1 <= (shift1 ? v0 : v1);"), "{}", v);
+}
+
+#[test]
+fn each_stage_shifts_when_the_cut_below_it_is_free() {
+    // Per stage rather than one shift for the whole pipeline: a stage moves
+    // when the stage below it is empty or moving too, so a stall closes up the
+    // bubbles behind it instead of freezing them.
+    let v = compile(PIPE3);
+    assert!(v.contains("wire shift1 = (!v1) | shift2;"), "{}", v);
+    assert!(v.contains("wire shift0 = (!v0) | shift1;"), "{}", v);
+    // A cut is loaded by the stage above it, not by a global enable.
+    assert!(v.contains("doubled_s1 <= (shift0 ? doubled : doubled_s1);"), "{}", v);
+    assert!(v.contains("wide_s2 <= (shift1 ? wide : wide_s2);"), "{}", v);
+    assert!(v.contains("wire push = shift2 & v1;"), "{}", v);
+}
+
+#[test]
+fn a_one_stage_sequence_keeps_its_unnumbered_names() {
+    let v = compile(concat!(
+        "sequence s (src: buffer in u16, dst: buffer out u16)\n",
+        "  let a = @rcv(src)\n",
+        "  @send(dst, a)\n",
+    ));
+    assert!(v.contains("wire shift = !dst_full;"), "{}", v);
+    assert!(v.contains("wire push = shift & src_present;"), "{}", v);
+    assert!(v.contains("wire take = src_present & shift;"), "{}", v);
 }
 
 #[test]
@@ -2113,7 +2139,8 @@ fn a_sequence_must_end_by_sending() {
         "  |||\n",
         "  let b: u32 = @zext(a, 32)\n",
     ));
-    assert!(text.contains("ends by sending"), "{}", text);
+    assert!(text.contains("`dst` is never sent to"), "{}", text);
+    assert!(text.contains("from whichever stage has the value"), "{}", text);
 }
 
 // ---- sequences with several pipes ----------------------------------------
@@ -2133,7 +2160,7 @@ fn the_head_waits_for_every_blocking_input() {
     // nothing moves and nothing is taken from either.
     let v = compile(JOIN);
     assert!(v.contains("wire offered = a_present & b_present;"), "{}", v);
-    assert!(v.contains("wire take = offered & shift;"), "{}", v);
+    assert!(v.contains("wire take = offered & shift0;"), "{}", v);
     for pipe in ["a", "b"] {
         let step = format!("{p}_rsalt_q <= (take ? ({p}_rsalt_q ^ ", p = pipe);
         assert!(v.contains(&step), "{} advances on the shared take:\n{}", pipe, v);
@@ -2146,11 +2173,11 @@ fn the_tail_waits_for_every_sink_to_have_room() {
     // slowest, rather than the sinks' readys being ANDed into each other's
     // timing paths -- ir_comb.rs:234's argument, which holds here too.
     let v = compile(JOIN);
-    assert!(v.contains("wire shift = x_room & y_room;"), "{}", v);
+    assert!(v.contains("wire shift1 = x_room & y_room;"), "{}", v);
     assert!(v.contains("wire x_room = !x_full;"), "{}", v);
     assert!(v.contains("wire y_room = !y_full;"), "{}", v);
     // One push for both, and a full slot each.
-    assert!(v.contains("wire push = shift & "), "{}", v);
+    assert!(v.contains("wire push = shift1 & v0;"), "{}", v);
     for pipe in ["x", "y"] {
         assert!(v.contains(&format!("reg [15:0] {}_e0;", pipe)), "{}", v);
         assert!(v.contains(&format!("reg [15:0] {}_e1;", pipe)), "{}", v);
@@ -2206,7 +2233,7 @@ fn an_optional_input_never_holds_the_pipeline_up() {
         "  |||\n",
         "  @send(o, t)\n",
     ));
-    assert!(v.contains("wire take = a_present & shift;"), "{}", v);
+    assert!(v.contains("wire take = a_present & shift0;"), "{}", v);
     assert!(v.contains("wire b_take = take & b_present;"), "{}", v);
     assert!(v.contains("b_rsalt_q <= (b_take ? "), "{}", v);
     assert!(v.contains("a_rsalt_q <= (take ? "), "{}", v);
@@ -2230,8 +2257,8 @@ fn an_all_optional_head_fires_on_whichever_arrived() {
         "  @send(o, t)\n",
     ));
     assert!(v.contains("wire offered = a_present | b_present;"), "{}", v);
-    assert!(v.contains("v0 <= (shift ? offered : v0);"), "{}", v);
-    assert!(v.contains("wire push = shift & v0;"), "{}", v);
+    assert!(v.contains("v0 <= (shift0 ? offered : v0);"), "{}", v);
+    assert!(v.contains("wire push = shift1 & v0;"), "{}", v);
 }
 
 #[test]
@@ -2280,6 +2307,95 @@ fn one_output_may_not_be_sent_to_twice() {
         "  @send(y, p)\n",
     ));
     assert!(text.contains("`x` is sent to twice"), "{}", text);
+}
+
+#[test]
+fn one_output_may_not_be_sent_to_from_two_stages() {
+    // The rule is per item, not per stage: a pipe written in stage 0 and again
+    // in stage 1 would hand its consumer two items for one.
+    let text = compile_err(concat!(
+        "sequence s (a: buffer in u16, x: buffer out u16)\n",
+        "  let p = @rcv(a)\n",
+        "  @send(x, p)\n",
+        "  |||\n",
+        "  @send(x, p)\n",
+    ));
+    assert!(text.contains("`x` is sent to twice"), "{}", text);
+    assert!(text.contains("the first is in stage 0"), "{}", text);
+}
+
+const EARLY_AND_LATE: &str = concat!(
+    "sequence s (src: buffer in u8, x: buffer out u8, y: buffer out u8)\n",
+    "  let a = @rcv(src)\n",
+    "  @send(x, a)\n",
+    "  |||\n",
+    "  let b: u8 = a + 8'd1\n",
+    "  |||\n",
+    "  @send(y, b + 8'd1)\n",
+);
+
+#[test]
+fn a_send_leaves_from_the_stage_it_is_written_in() {
+    let v = compile(EARLY_AND_LATE);
+    // One push per sending stage, each on that stage's liveness and shift.
+    assert!(v.contains("wire push0 = shift0 & src_present;"), "{}", v);
+    assert!(v.contains("wire push2 = shift2 & v1;"), "{}", v);
+    assert!(v.contains("((push0 & (!x_widx)) ? src_item : x_e0)"), "{}", v);
+    assert!(v.contains("((push2 & (!y_widx)) ? "), "{}", v);
+    // Stage 0 waits for its own sink AND for the cut below it; stage 1 sends
+    // nothing, so only the cut.
+    assert!(v.contains("wire shift2 = !y_full;"), "{}", v);
+    assert!(v.contains("wire shift1 = (!v1) | shift2;"), "{}", v);
+    assert!(v.contains("wire open0 = (!v0) | shift1;"), "{}", v);
+    assert!(v.contains("wire shift0 = x_room & open0;"), "{}", v);
+    assert!(v.contains("wire take = src_present & shift0;"), "{}", v);
+}
+
+#[test]
+fn a_cut_below_a_held_stage_takes_a_bubble() {
+    // Stage 0's sink is full while stage 1 moves on: the cut opens, and what
+    // it must take is nothing -- keeping `v0` would send stage 1's item twice.
+    let v = compile(EARLY_AND_LATE);
+    assert!(v.contains("v0 <= (open0 ? (src_present & x_room) : v0);"), "{}", v);
+    // The data beside it loads only when the stage really moves.
+    assert!(v.contains("a_s1 <= (shift0 ? src_item : a_s1);"), "{}", v);
+}
+
+#[test]
+fn no_pipe_reaches_another_combinationally_with_sends_in_several_stages() {
+    let v = compile(EARLY_AND_LATE);
+    for line in v.lines().filter(|l| l.trim_start().starts_with("assign ")) {
+        for out in ["x", "y"] {
+            let drives_out = line.contains(&format!("{}_wsalt", out))
+                || line.contains(&format!("{}_data", out));
+            if drives_out {
+                assert!(!line.contains("_rsalt"), "producer reads a consumer:\n{}", line);
+                assert!(!line.contains("src_wsalt"), "an output follows the input:\n{}", line);
+            }
+        }
+        let drives_in = line.contains("src_rsalt");
+        if drives_in {
+            assert!(!line.contains("_wsalt"), "consumer reads a producer:\n{}", line);
+        }
+    }
+}
+
+#[test]
+fn stages_below_the_last_send_move_on_every_cycle() {
+    // Nothing at or below stage 1 sends, so nothing can hold it up: its
+    // register is a plain one, and its assertion is gated on liveness alone.
+    let v = compile(concat!(
+        "sequence s (src: buffer in u8, o: buffer out u8)\n",
+        "  let a = @rcv(src)\n",
+        "  @send(o, a)\n",
+        "  |||\n",
+        "  |||\n",
+        "  @assert(a != 8'd0, \"zero\")\n",
+    ));
+    assert!(v.contains("wire shift0 = !o_full;"), "{}", v);
+    assert!(!v.contains("shift1"), "{}", v);
+    assert!(v.contains("v1 <= v0;"), "{}", v);
+    assert!(v.contains("a_s2 <= a_s1;"), "{}", v);
 }
 
 #[test]

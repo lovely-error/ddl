@@ -2814,7 +2814,7 @@ fn lower_try_rcv_binding(
         return None;
     }
     if low.in_pipeline {
-        sink.err_at(&decl.head_name(), "nonblocking buffer operations are not supported in a sequence; use its head `@rcv` and tail `@send`, or use a process");
+        sink.err_at(&decl.head_name(), "nonblocking buffer operations are not supported in a sequence; use `@rcv` in its head and `@send` in any of its stages, or use a process");
         return None;
     }
     if takes {
@@ -4744,7 +4744,7 @@ fn lower_builtin(
             return None;
         }
         if low.in_pipeline {
-            sink.err_span(low.here(), "nonblocking buffer operations are not supported in a sequence; use its head `@rcv` and tail `@send`, or use a process");
+            sink.err_span(low.here(), "nonblocking buffer operations are not supported in a sequence; use `@rcv` in its head and `@send` in any of its stages, or use a process");
             return None;
         }
         low.claim_transfer(&pipe_name, low.pipes[ix].used, true, sink)?;
@@ -4783,7 +4783,7 @@ fn lower_builtin(
             return None;
         }
         if low.in_pipeline {
-            sink.err_span(low.here(), "nonblocking buffer operations are not supported in a sequence; use its head `@rcv` and tail `@send`, or use a process");
+            sink.err_span(low.here(), "nonblocking buffer operations are not supported in a sequence; use `@rcv` in its head and `@send` in any of its stages, or use a process");
             return None;
         }
         low.claim_transfer(&pipe_name, low.pipes[ix].used, false, sink)?;

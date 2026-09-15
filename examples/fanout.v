@@ -24,15 +24,16 @@ module scale (
   reg [31:0] x_s1;
 
   wire dst_full = dst_wsalt_q == (~dst_rsalt);
-  wire shift = !dst_full;
+  wire shift1 = !dst_full;
+  wire shift0 = (!v0) | shift1;
   wire src_ridx = src_rsalt_q[0] ^ src_rsalt_q[1];
   wire [31:0] src_item = src_ridx ? src_data[63:32] : src_data[31:0];
   wire [31:0] doubled = x_s1 + x_s1;
   wire src_empty = src_wsalt == src_rsalt_q;
   wire src_present = !src_empty;
-  wire push = shift & v0;
+  wire push = shift1 & v0;
   wire dst_widx = dst_wsalt_q[0] ^ dst_wsalt_q[1];
-  wire take = src_present & shift;
+  wire take = src_present & shift0;
 
   assign dst_data = {dst_e1, dst_e0};
   assign dst_wsalt = dst_wsalt_q;
@@ -47,12 +48,12 @@ module scale (
       dst_wsalt_q <= 2'd0;
       x_s1 <= 32'd0;
     end else begin
-      v0 <= (shift ? src_present : v0);
+      v0 <= (shift0 ? src_present : v0);
       src_rsalt_q <= (take ? (src_rsalt_q ^ (src_ridx ? 2'd2 : 2'd1)) : src_rsalt_q);
       dst_e0 <= ((push & (!dst_widx)) ? doubled : dst_e0);
       dst_e1 <= ((push & dst_widx) ? doubled : dst_e1);
       dst_wsalt_q <= (push ? (dst_wsalt_q ^ (dst_widx ? 2'd2 : 2'd1)) : dst_wsalt_q);
-      x_s1 <= (shift ? src_item : x_s1);
+      x_s1 <= (shift0 ? src_item : x_s1);
     end
   end
 

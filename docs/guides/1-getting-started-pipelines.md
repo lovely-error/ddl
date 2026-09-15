@@ -56,7 +56,7 @@ sequence fir3 (src: buffer in u16, dst: buffer out u32)
 - `@rcv(src)`: Consumes one item at the head of the pipeline.
 - `|||`: Stage cut boundary (maps to one clock cycle latency).
 - `@zext(val, 32)`: Explicit zero-extension to 32 bits (DDL prohibits implicit width casting).
-- `@send(dst, result)`: Emits the result at the tail of the pipeline.
+- `@send(dst, result)`: Emits the result from the stage it is written in -- here the last one, three cycles after the item arrived.
 
 ---
 
@@ -106,9 +106,9 @@ reg [15:0] x_s2;
 always @(posedge clk) begin
   if (!rst_n) begin
     ...
-  end else if (shift) begin
-    x_s1 <= x;    // Captured in Stage 1
-    x_s2 <= x_s1; // Shifted into Stage 2
+  end else begin
+    x_s1 <= (shift0 ? x : x_s1);    // Captured in Stage 1
+    x_s2 <= (shift1 ? x_s1 : x_s2); // Shifted into Stage 2
   end
 end
 ```
@@ -119,16 +119,18 @@ In Stage 3, `result` uses `x_s2`, guaranteeing that `x` remains synchronized wit
 wire [31:0] result = quad_s2 + ({{16{1'b0}}, x_s2});
 ```
 
-### 3. Unified Backpressure Gating
+### 3. Per-Stage Backpressure Gating
 
-All stage registers share a single enable wire: `shift`:
+Each stage has its own enable. The last stage waits for its sink; every stage above it waits only until the stage below it is empty or moving:
 
 ```verilog
 wire dst_full = dst_wsalt_q == (~dst_rsalt);
-wire shift    = !dst_full;
+wire shift2   = !dst_full;
+wire shift1   = (!v1) | shift2;
+wire shift0   = (!v0) | shift1;
 ```
 
-When downstream stalls (`dst_full == 1`), `shift` goes low, freezing all pipeline stages simultaneously without dropping or corrupting any in-flight data.
+When downstream stalls (`dst_full == 1`), `shift2` goes low and the last stage holds. Stages above it keep moving into any empty stage below them, then hold too once they reach an occupied one -- without dropping or corrupting any in-flight data.
 
 ---
 
@@ -146,8 +148,8 @@ This draws each stage, channel buffer, and data connection as a visual flowchart
 
 ## 5. Rules to Keep in Mind
 
-1. **One Receive per Input at the Head, One Send per Output at the Tail**: a `sequence` may declare any number of `buffer in` and `buffer out` parameters. Every input must be received in Stage 0 and every output sent to in the final stage -- exactly once each.
-2. **The Head Waits for All of Them**: an item enters the pipeline only when every blocking input is offering one, and the pipeline shifts only when every output has room. A missing input on one pipe stalls all of them, which is what makes the inputs of one item arrive together.
+1. **One Receive per Input at the Head, One Send per Output Anywhere**: a `sequence` may declare any number of `buffer in` and `buffer out` parameters. Every input must be received in Stage 0, and every output sent to from any one stage -- exactly once each. An output sent from an earlier stage simply leaves earlier.
+2. **The Head Waits for All of Them**: an item enters the pipeline only when every blocking input is offering one, and a stage shifts only when every output it sends to has room. A missing input on one pipe stalls all of them, which is what makes the inputs of one item arrive together.
 3. **`@try_rcv` Makes an Input Optional**: `let (v, ok) = @try_rcv(p)` in Stage 0 does not wait. The pipeline fires without it and `ok` says whether `v` is real. It is the only non-blocking buffer op a `sequence` allows, and only at the head.
 4. **No Other Non-blocking Buffer Ops in Pipelines**: `@peek`, `@drop` and `@try_send` are not allowed in a `sequence` because every pipeline stage is active concurrently. If you need dynamic inspection or packet dropping, use a `process`.
 5. **Width Safety**: Adding a 16-bit number to a 32-bit number is a compile-time error. Always explicitly extend using `@zext(val, 32)` or `@sext(val, 32)`.

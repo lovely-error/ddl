@@ -509,7 +509,7 @@ fn the_read_enable_follows_the_shift() {
     // item behind by the time the stall lifted.
     let v = compile(SEQ_LOOKUP);
     assert!(v.contains("wire tbl_re = "), "{}", v);
-    assert!(v.contains("& shift;"), "{}", v);
+    assert!(v.contains("& shift0;"), "{}", v);
 }
 
 #[test]
@@ -562,8 +562,8 @@ fn a_table_may_be_read_from_several_stages() {
         "  |||\n",
         "  @send(val, x + y)\n",
     ));
-    assert!(v.contains("wire tbl_re1 = v0 & shift;"), "{}", v);
-    assert!(v.contains("x_s2 <= (shift ? tbl_q0 : x_s2);"), "{}", v);
+    assert!(v.contains("wire tbl_re1 = v0 & shift1;"), "{}", v);
+    assert!(v.contains("x_s2 <= (shift1 ? tbl_q0 : x_s2);"), "{}", v);
 }
 
 #[test]
@@ -624,7 +624,7 @@ fn a_write_is_gated_by_the_stage_that_owns_it_and_no_other() {
     ));
     let block = v.split("// tbl [0:31]").nth(1).expect("the memory block");
     let block = block.split("endmodule").next().expect("the end");
-    assert!(block.contains("& shift)"), "{}", block);
+    assert!(block.contains("& shift0)"), "{}", block);
     assert!(!block.contains("v0 & shift"), "gated by a stage that does not own it:\n{}", block);
     assert!(!block.contains("v1 & shift"), "gated by a stage that does not own it:\n{}", block);
 }
@@ -646,7 +646,7 @@ fn a_read_sees_a_write_above_it_in_the_same_stage() {
         "  @send(val, v)\n",
     ));
     assert!(v.contains("reg tbl_fwd0_s1;"), "{}", v);
-    assert!(v.contains("tbl_fwd0_s1 <= (shift ? (ra == wa) : tbl_fwd0_s1);"), "{}", v);
+    assert!(v.contains("tbl_fwd0_s1 <= (shift0 ? (ra == wa) : tbl_fwd0_s1);"), "{}", v);
     assert!(v.contains("tbl_fwd0_s1 ? tbl_wdata0_s1 : tbl_q"), "{}", v);
 }
 
@@ -666,7 +666,7 @@ fn an_unconditional_write_to_the_address_read_needs_no_port_at_all() {
     assert!(!v.contains("tbl_q"), "a read port for a value already in hand:\n{}", v);
     assert!(!v.contains("tbl_re"), "{}", v);
     // The written value crosses the cut like any other stage-0 value.
-    assert!(v.contains("v_s1 <= (shift ? 32'd7 : v_s1);"), "{}", v);
+    assert!(v.contains("v_s1 <= (shift0 ? 32'd7 : v_s1);"), "{}", v);
     // And the memory is still written, for the items behind this one.
     assert!(v.contains("tbl[req_item] <= 32'd7;"), "{}", v);
 }
@@ -722,7 +722,7 @@ fn a_read_two_stages_on_crosses_like_anything_else() {
         "  |||\n",
         "  @send(val, v + w)\n",
     ));
-    assert!(v.contains("v_s2 <= (shift ? tbl_q : v_s2);"), "{}", v);
+    assert!(v.contains("v_s2 <= (shift1 ? tbl_q : v_s2);"), "{}", v);
     assert!(!v.contains("v_s1"), "registered at the first cut too:\n{}", v);
 }
 
