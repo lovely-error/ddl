@@ -9,8 +9,9 @@ This document explains how the DDL compiler lowers high-level `sequence` declara
 - [Overview](#overview)
 - [Stage Cuts (`|||`) and Pipeline Partitioning](#stage-cuts--and-pipeline-partitioning)
 - [Shift-Register Insertion for Value Spanning](#shift-register-insertion-for-value-spanning)
-- [Backpressure and the Unified Pipeline Shift](#backpressure-and-the-unified-pipeline-shift)
-- [Head Gather and Tail Scatter](#head-gather-and-tail-scatter)
+- [Backpressure and Per-Stage Shifts](#backpressure-and-per-stage-shifts)
+  - [Why Not One Shift for the Whole Pipeline](#why-not-one-shift-for-the-whole-pipeline)
+- [Head Gather and Per-Stage Sends](#head-gather-and-per-stage-sends)
   - [A Join Is Not a `@merge`](#a-join-is-not-a-merge)
   - [Optional Inputs (`@try_rcv`)](#optional-inputs-try_rcv)
   - [Loops of Pipes](#loops-of-pipes)
@@ -42,7 +43,7 @@ sequence mul3 (src: buffer in u16, dst: buffer out u32)
 The compiler (`src/ir_pipe.rs`) synthesizes this into a hardware pipeline where:
 - Latency is exactly one clock cycle per stage cut.
 - Sustained throughput is **1 item per clock cycle** while downstream keeps pace.
-- Downstream backpressure automatically stalls the entire pipeline in unison.
+- Downstream backpressure stalls each stage only as far as it has to: a stage waits for its own sinks and for the stage below it.
 - Cross-stage values, validity signals, and hazard forwarding are managed automatically.
 
 ---
@@ -50,9 +51,11 @@ The compiler (`src/ir_pipe.rs`) synthesizes this into a hardware pipeline where:
 ## Stage Cuts (`|||`) and Pipeline Partitioning
 
 During lowering, `split_stages` partitions the statements of a `sequence` at every `|||` marker:
-- **Stage 0 (Head)**: Receives the item from the input buffer.
-- **Intermediate Stages**: Execute purely combinational datapath operations on the values available at that stage.
-- **Stage $N-1$ (Tail)**: Drives the result into the output buffer.
+- **Stage 0 (Head)**: Receives the item from the input buffers.
+- **Every Stage**: Executes purely combinational datapath operations on the values available at that stage, and may `@send` to output buffers.
+- **Stage $N-1$ (Tail)**: The last stage; nothing is registered below it.
+
+Each output is sent to exactly once per item, from whichever stage its `@send` is written in. An output sent from stage $k$ leaves $k$ cycles after the item entered; two outputs sent from different stages carry the same items in the same order, at different latencies.
 
 Every stage boundary maps to a physical bank of registers clocked by `clk`.
 
@@ -73,59 +76,94 @@ DDL solves this by automatically inferring a **shift register of depth $(k - j)$
 ```
 Stage 0 (j)           Stage 1               Stage 2 (k)
  [ Compute x ] ----> [ Reg x_s1 ] --------> [ Reg x_s2 ] ----> [ Use x ]
-                     (clocked by shift)     (clocked by shift)
+                     (clocked by shift0)    (clocked by shift1)
 ```
 
-All inserted pipeline registers share the global pipeline shift enable (`shift`), ensuring perfect synchronization across stalls.
+Each register at a cut is loaded by the shift of the stage above it (`shift0` for the first cut, `shift1` for the second), so a value moves exactly when the item it belongs to does.
 
 ---
 
-## Backpressure and the Unified Pipeline Shift
+## Backpressure and Per-Stage Shifts
 
-A DDL pipeline moves forward as a single coordinated unit. The global advance signal is named `shift`:
+Every stage has its own advance signal, `shift{k}`. A stage moves its item on when every sink it sends to has a slot **and** the cut below it is free -- empty, or emptying because the stage below is moving on the same edge:
 
 ```verilog
-wire dst_full = (dst_wsalt_q == (~dst_rsalt));
-wire shift    = !dst_full;
+wire dst_full = dst_wsalt_q == (~dst_rsalt);
+wire shift2   = !dst_full;         // the last stage: only its sink
+wire shift1   = (!v1) | shift2;    // cut below empty, or the stage below moves
+wire shift0   = (!v0) | shift1;
 ```
 
-- When the downstream consumer has room (`dst_full == 0`), `shift` is high, and every pipeline stage advances simultaneously on the rising clock edge.
-- When downstream asserts backpressure (`dst_full == 1`), `shift` falls low. Every stage register and validity bit holds its current state.
-- Upstream items are safely held in the input buffer without dropping or stalling the producer until the pipeline's own skid capacity is exhausted.
+In general, $shift_k = room_k \land (\lnot v_k \lor shift_{k+1})$, where $room_k$ is the AND over the slots stage $k$ sends to (true when it sends nothing) and $v_k$ is the validity bit of the cut below it.
+
+- When every sink has room, every `shift{k}` is high and the whole pipeline advances on the edge.
+- When a sink is full, the stage sending to it holds, and so does every occupied stage above it. Stages above a **bubble** keep moving into it, so a stall closes up the gaps instead of freezing them in place.
+- Upstream items are safely held in the input buffer until the pipeline's own capacity is exhausted.
+
+A one-stage sequence has a single enable, still named `shift`.
+
+The cost is a chain: `shift0` depends on every stage below it within the cycle. Every term in it is a register on this side of the module -- a validity bit, or a slot's own `wsalt` compared with the consumer's `rsalt` -- so the path stays inside the module and never runs through a pipe into another block.
+
+### Why Not One Shift for the Whole Pipeline
+
+A single `shift` over every sink is enough while every send sits in the last stage. It stops being enough once sends sit in different stages. Take a sequence that sends `x` from stage 0 and `y` from stage 2 into a consumer that joins them:
+
+```ddl
+sequence s (src: buffer in u8, x: buffer out u8, y: buffer out u8)
+  let a = @rcv(src)
+  @send(x, a)
+  |||
+  let b: u8 = a + 8'd1
+  |||
+  @send(y, b + 8'd1)
+```
+
+The consumer cannot drain `x` until the matching `y` arrives, so `x` fills with two items while the first one's `y` is still two stages up. With one global shift, a full `x` holds every stage, the late half never reaches its send, and the design deadlocks after two items. With per-stage shifts, the stages below stage 0 keep moving, `y` arrives, the join drains `x`, and the pipeline runs.
+
+Per-stage shifts make that shape **live**, not **fast**. The early pipe's two entries have to hold every item whose late half has not arrived yet; with a gap of $d$ stages, full throughput needs room for $d + 1$, so any gap runs below one item per cycle when the two outputs rejoin. A deeper buffer on the early path is the fix for rate.
 
 ---
 
-## Head Gather and Tail Scatter
+## Head Gather and Per-Stage Sends
 
 A `sequence` may declare any number of `buffer in` and `buffer out`
-parameters. Every input is received exactly once in stage 0, every output sent
-to exactly once in the last stage, and the two sides reduce to one predicate
-each:
+parameters. Every input is received exactly once in stage 0, and every output
+sent to exactly once, from whichever stage its `@send` is written in. Sending
+the same output twice -- in one stage or in two -- is an error: a consumer is
+owed one item per item.
+
+The head reduces to one predicate, and so do the sends of each stage:
 
 ```verilog
   wire offered = a_present & b_present;   // every blocking input has an item
-  wire shift   = x_room & y_room;         // every sink has a slot
+  wire shift1  = x_room & y_room;         // every sink of stage 1 has a slot
 
-  wire take = offered & shift;            // one take, for all inputs
-  wire push = shift & v_last;             // one push, for all outputs
+  wire take = offered & shift0;           // one take, for all inputs
+  wire push = shift1 & v0;                // one push, for all of stage 1's outputs
 ```
 
-One `take` and one `push` is the whole of it. The head is a **rendezvous**: the
-inputs of a single item arrive together, so either every blocking input gives up
-an entry on this edge or none does. The tail is a **broadcast**: every sink is
-written from the same item on the same edge.
+The head is a **rendezvous**: the inputs of a single item arrive together, so
+either every blocking input gives up an entry on this edge or none does. The
+sends of one stage are a **broadcast**: every sink that stage writes is written
+from the same item on the same edge. With sends in several stages there is one
+push per sending stage, named `push{k}`:
+
+```verilog
+  wire open0  = (!v0) | shift1;
+  wire shift0 = x_room & open0;           // stage 0 sends x, and waits on the cut below
+  wire push0  = shift0 & src_present;
+  wire push2  = shift2 & v1;
+```
 
 Both reductions are over **slot occupancy**, which is a register on this side of
 the wire, and never over the far side's handshake. That is the same argument
 [`@split`](combinators.md) makes: ANDing the consumers' readiness would put each
 one's logic into every other one's timing path, where asking whether each of
 *our* two-entry slots has room reads only local flops. Each sink gets its own
-slot, and the pipeline waits for the slowest of them.
+slot, and the stage sending to it waits for the slowest of them.
 
-With one input and one output the reductions have a single term each and
-collapse to exactly what a single-pipe sequence always emitted -- `shift =
-!dst_full`, `take = src_present & shift` -- so nothing costs anything until it
-is used.
+With one input and one output the reductions have a single term each, so
+nothing costs anything until it is used.
 
 ### A Join Is Not a `@merge`
 
@@ -148,7 +186,7 @@ An input received with `@try_rcv` in stage 0 is **optional**: it is absent from
 the cycles it had one.
 
 ```verilog
-  wire take   = a_present & shift;      // b is not part of the pacing
+  wire take   = a_present & shift0;     // b is not part of the pacing
   wire b_take = take & b_present;       // b is consumed only when it has an item
 ```
 
@@ -160,8 +198,8 @@ bargain `@try_rcv` makes in a `process`.
 With *every* input optional, `offered` becomes the OR rather than the AND. It is
 deliberately not a constant: a head that fired with nothing on any input would be
 a free-running source, emitting an item per cycle out of nothing. A cycle in
-which nothing arrived is a **bubble** -- the pipeline shifts, the validity bit it
-shifts in is low, and `push` commits nothing. Shifting is not committing.
+which nothing arrived is a **bubble** -- stage 0 shifts, the validity bit it
+shifts in is low, and no `push` commits anything. Shifting is not committing.
 
 ### Loops of Pipes
 
@@ -189,26 +227,25 @@ and the design runs at the slow path's rate.
 
 ## Validity Bits and Stage Gating
 
-Bubbles (empty pipeline slots) are tracked using single-bit validity registers: `v0`, `v1`, $\dots$, `v(N-1)`.
+Bubbles (empty pipeline slots) are tracked using single-bit validity registers, one per cut: `v0`, `v1`, $\dots$, `v(N-2)`. There is no cut below the last stage; what leaves it goes into the slots it sends to, whose `wsalt`s already say they hold it.
 
-On every clock edge:
+A validity bit changes when its cut **opens** -- the stage below is empty or moving -- which is not quite the same as the stage above it moving:
+
 ```verilog
 always @(posedge clk) begin
-  if (!rst_n) begin
-    v0 <= 1'b0;
-    v1 <= 1'b0;
-  end else if (shift) begin
-    v0 <= !src_empty;  // Stage 0 valid if fresh input was consumed
-    v1 <= v0;          // Validity propagates downstream
-  end
+  ...
+  v0 <= (open0 ? (src_present & x_room) : v0);   // stage 0 sends to x
+  v1 <= (shift1 ? v0 : v1);                      // stage 1 sends nothing
 end
 ```
 
-- **Output Gating**: The tail stage pushes to the destination buffer only when both the pipeline advances and the final stage contains a valid item:
+When stage 0's sink is full it holds its item, but the stage below may still leave. The cut then has to take a **bubble**: keeping its old `1` would send the item below a second time. So what enters is the item only if its stage was live and its sends went through. For a stage that sends nothing, the cut opens exactly when the stage moves, and the two signals are one.
+
+- **Output Gating**: A stage pushes to its output buffers only when it holds a valid item and it shifts:
   ```verilog
-  wire push = shift & v_last;
+  wire push = shift1 & v0;
   ```
-- **Assertion Gating**: Assertions written inside a pipeline stage execute only when `shift` is active, the stage validity bit is asserted, and any enclosing branch conditions are true. Spurious assertion failures on uninitialized bubbles are impossible.
+- **Assertion and Write Gating**: Assertions and memory writes inside stage $k$ take effect only when stage $k$ holds a valid item and `shift{k}` is high, under any enclosing branch conditions. Spurious assertion failures on bubbles are impossible, and a stalled stage never writes twice.
 
 ---
 
@@ -233,7 +270,7 @@ Lowering optimization:
 1. The address `a` is presented to the BRAM address port in Stage 0.
 2. The stage cut `|||` aligns with the BRAM's internal clocked output register.
 3. In Stage 1, the identifier `v` maps directly to `mem_q` (the output register of the BRAM).
-4. The BRAM read enable is tied directly to the pipeline `shift` signal.
+4. The BRAM read enable is the asking stage's liveness ANDed with its `shift` signal, so `mem_q` holds while that stage is stalled.
 
 **Result**: Zero dedicated flip-flops are consumed for the boundary; the Block RAM primitive's internal silicon output register functions as the pipeline register.
 
@@ -300,16 +337,17 @@ module mac (
   reg [15:0] x_s1;          // Automatically inserted shift register for x
 
   wire dst_full = (dst_wsalt_q == ~dst_rsalt);
-  wire shift    = !dst_full;
-  wire take = src_present & shift;
+  wire shift1   = !dst_full;
+  wire shift0   = (!v0) | shift1;
+  wire take = src_present & shift0;
 
   always @(posedge clk) begin
     if (!rst_n) begin
       v0 <= 1'b0;
-    end else if (shift) begin
-      v0 <= src_present;
-      squared_s1 <= x * x;
-      x_s1       <= x;      // Spans stage cut alongside squared
+    end else begin
+      v0 <= (shift0 ? src_present : v0);
+      squared_s1 <= (shift0 ? x * x : squared_s1);
+      x_s1       <= (shift0 ? x : x_s1);  // Spans stage cut alongside squared
     end
   end
 

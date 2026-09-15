@@ -869,7 +869,7 @@ fn the_same_loop_is_live_once_the_feedback_is_optional() {
     assert!(v.contains("module acc ("), "{}", v);
     assert!(v.contains("module hold ("), "{}", v);
     // The feedback pipe is optional, so it is not part of what paces `acc`.
-    assert!(v.contains("wire take = x_present & shift;"), "{}", v);
+    assert!(v.contains("wire take = x_present & shift0;"), "{}", v);
 }
 
 #[test]

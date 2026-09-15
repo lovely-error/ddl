@@ -53,3 +53,11 @@ sequence seq_optional (a: buffer in u16, b: buffer in u16, o: buffer out u16)
     t = x + y
   |||
   @send(o, t)
+
+sequence seq_early (src: buffer in u16, x: buffer out u16, y: buffer out u16)
+  let a = @rcv(src)
+  @send(x, a)
+  |||
+  let b: u16 = a + 16'd1
+  |||
+  @send(y, b + 16'd1)

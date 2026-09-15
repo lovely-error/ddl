@@ -2,7 +2,7 @@
 //! The companion Questa runner also checks the emitted Verilog itself.
 mod common;
 
-use common::Circuit;
+use common::{Circuit, mask};
 use ddl::diag::SourceMap;
 
 #[test]
@@ -436,17 +436,144 @@ fn sequence_assertions_follow_validity_and_shift_at_every_stage() {
             let src = format!("sequence s (src: buffer in u8, o: buffer out u8)\n{body}");
             let mut c = Circuit::new(&src, "s");
             for _ in 0..6 { assert!(c.assertions_ok()); c.tick(); }
+            // Full, and it stays full: write salt is still zero.
+            c.set("o_rsalt", 3);
+            // Each stage shifts on its own, so a stall holds an item only where
+            // the cut below it is occupied. Good items fill every stage below
+            // `stage`; the zero-valued one behind them stops AT `stage`.
+            let mut items = vec![1; 2 - stage];
+            items.push(0);
+            feed(&mut c, &items);
+            for _ in 0..6 { assert!(c.assertions_ok(), "stage {stage}, {builtin}"); c.tick(); }
             // A zero-valued transaction fails only when its stage advances.
-            c.set("src_wsalt", 1);
-            for _ in 0..stage { assert!(c.assertions_ok()); c.tick(); }
-            c.set("o_rsalt", 3); // Full: write salt is still zero.
-            for _ in 0..4 { assert!(c.assertions_ok()); c.tick(); }
             c.set("o_rsalt", 0);
             assert!(!c.assertions_ok(), "stage {stage}, {builtin}");
             c.tick();
             assert!(c.assertions_ok());
         }
     }
+}
+
+/// Offers `items` on `src` in order, waiting for room before each, then lets
+/// the pipeline settle. Assertions must hold throughout.
+///
+/// It does not insist the sequence took them all: an item meant to stop in
+/// stage 0 is one the head has not taken.
+fn feed(c: &mut Circuit, items: &[u128]) {
+    let mut w = 0u128;
+    let mut data = 0u128;
+    for item in items {
+        for _ in 0..20 {
+            let full = w == (!c.out("src_rsalt") & 3);
+            if !full { break; }
+            assert!(c.assertions_ok());
+            c.tick();
+        }
+        let ix = (w ^ (w >> 1)) & 1;
+        data = (data & !(0xff << (ix * 8))) | (item << (ix * 8));
+        c.set("src_data", data);
+        w ^= if ix == 0 { 1 } else { 2 };
+        c.set("src_wsalt", w);
+        assert!(c.assertions_ok());
+        c.tick();
+    }
+    for _ in 0..8 {
+        assert!(c.assertions_ok());
+        c.tick();
+    }
+}
+
+/// One side of a pipe as a consumer sees it: the next entry if one is on
+/// offer, and taking it.
+fn offered(c: &Circuit, pipe: &str, r: u128, width: u32) -> Option<u128> {
+    let has_item = c.out(&format!("{pipe}_wsalt")) != r;
+    if !has_item {
+        return None;
+    }
+    let ix = (r ^ (r >> 1)) & 1;
+    Some((c.out(&format!("{pipe}_data")) >> (ix as u32 * width)) & mask(width))
+}
+
+fn taken(r: u128) -> u128 {
+    let ix = (r ^ (r >> 1)) & 1;
+    r ^ if ix == 0 { 1 } else { 2 }
+}
+
+/// Runs sequence `s`, with outputs `x` and `y`, against a consumer that JOINS
+/// its two outputs -- takes from `x` and `y` together or from neither -- and
+/// stalls on an irregular pattern. Answers the pairs it received.
+fn run_join(src: &str, n: u128, cycles: usize) -> Vec<(u128, u128)> {
+    let mut c = Circuit::new(src, "s");
+    let (mut w, mut data, mut next) = (0u128, 0u128, 0u128);
+    let (mut rx, mut ry) = (0u128, 0u128);
+    let mut got = Vec::new();
+    for cycle in 0..cycles {
+        // The producer offers the next item whenever the input has room.
+        let input_has_room = w != (!c.out("src_rsalt") & 3);
+        if input_has_room && next < n {
+            let ix = (w ^ (w >> 1)) & 1;
+            data = (data & !(0xff << (ix * 8))) | ((next + 1) << (ix * 8));
+            c.set("src_data", data);
+            w = taken(w);
+            c.set("src_wsalt", w);
+            next += 1;
+        }
+        let consumer_is_stalling = cycle % 13 >= 9;
+        let pair = (offered(&c, "x", rx, 8), offered(&c, "y", ry, 8));
+        if let (false, (Some(a), Some(b))) = (consumer_is_stalling, pair) {
+            got.push((a, b));
+            rx = taken(rx);
+            ry = taken(ry);
+            c.set("x_rsalt", rx);
+            c.set("y_rsalt", ry);
+        }
+        assert!(c.assertions_ok());
+        c.tick();
+    }
+    got
+}
+
+#[test]
+fn outputs_sent_stages_apart_can_be_joined_downstream() {
+    // `x` leaves in stage 0 and `y` two stages later. The joining consumer
+    // cannot drain `x` until `y` arrives, so `x` fills while the item's late
+    // half is still in the pipeline. With one shift for the whole pipeline
+    // that is a deadlock after two items: `x` full holds every stage, and the
+    // late half never gets to its send. Per stage, the stages below keep
+    // moving and everything arrives, paired and in order.
+    let src = "sequence s (src: buffer in u8, x: buffer out u8, y: buffer out u8)\n  let a = @rcv(src)\n  @send(x, a)\n  |||\n  let b: u8 = a + 8'd1\n  |||\n  @send(y, b + 8'd1)\n";
+    let n = 40;
+    let got = run_join(src, n, 600);
+    let want: Vec<(u128, u128)> = (1..=n).map(|i| (i, i + 2)).collect();
+    assert_eq!(got, want);
+}
+
+#[test]
+fn outputs_sent_from_one_stage_join_the_same_way() {
+    // The shape that always worked, through the same harness, so the test
+    // above is not passing on something the harness does by itself.
+    let src = "sequence s (src: buffer in u8, x: buffer out u8, y: buffer out u8)\n  let a = @rcv(src)\n  |||\n  let b: u8 = a + 8'd1\n  |||\n  @send(x, a)\n  @send(y, b + 8'd1)\n";
+    let n = 40;
+    let got = run_join(src, n, 600);
+    let want: Vec<(u128, u128)> = (1..=n).map(|i| (i, i + 2)).collect();
+    assert_eq!(got, want);
+}
+
+#[test]
+fn a_stalled_sink_holds_only_the_stages_whose_cut_below_is_occupied() {
+    // The behavioural half of per-stage shifting. The sink is full from the
+    // start, and a bad item in stage 0 still moves -- and fires -- because
+    // nothing is below it to wait for. Under one global shift it would have
+    // sat in stage 0 forever.
+    let src = "sequence s (src: buffer in u8, o: buffer out u8)\n  let x = @rcv(src)\n  @assert(x != 8'd0, \"zero item\")\n  |||\n  |||\n  @send(o, x)\n";
+    let mut c = Circuit::new(src, "s");
+    c.set("o_rsalt", 3);
+    c.set("src_data", 0);
+    c.set("src_wsalt", 1);
+    assert!(!c.assertions_ok(), "stage 0 moves into an empty stage 1 while the sink is full");
+    c.tick();
+    assert_eq!(c.out("src_rsalt"), 1, "and the head took the item");
+    assert!(c.assertions_ok());
 }
 
 #[test]

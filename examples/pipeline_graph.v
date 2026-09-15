@@ -26,7 +26,9 @@ module mul3 (
   reg [31:0] wide_s2;
 
   wire dst_full = dst_wsalt_q == (~dst_rsalt);
-  wire shift = !dst_full;
+  wire shift2 = !dst_full;
+  wire shift1 = (!v1) | shift2;
+  wire shift0 = (!v0) | shift1;
   wire src_ridx = src_rsalt_q[0] ^ src_rsalt_q[1];
   wire [15:0] src_item = src_ridx ? src_data[31:16] : src_data[15:0];
   wire [15:0] doubled = src_item + src_item;
@@ -34,9 +36,9 @@ module mul3 (
   wire [31:0] scaled = wide_s2 + wide_s2;
   wire src_empty = src_wsalt == src_rsalt_q;
   wire src_present = !src_empty;
-  wire push = shift & v1;
+  wire push = shift2 & v1;
   wire dst_widx = dst_wsalt_q[0] ^ dst_wsalt_q[1];
-  wire take = src_present & shift;
+  wire take = src_present & shift0;
 
   assign dst_data = {dst_e1, dst_e0};
   assign dst_wsalt = dst_wsalt_q;
@@ -53,14 +55,14 @@ module mul3 (
       doubled_s1 <= 16'd0;
       wide_s2 <= 32'd0;
     end else begin
-      v0 <= (shift ? src_present : v0);
-      v1 <= (shift ? v0 : v1);
+      v0 <= (shift0 ? src_present : v0);
+      v1 <= (shift1 ? v0 : v1);
       src_rsalt_q <= (take ? (src_rsalt_q ^ (src_ridx ? 2'd2 : 2'd1)) : src_rsalt_q);
       dst_e0 <= ((push & (!dst_widx)) ? scaled : dst_e0);
       dst_e1 <= ((push & dst_widx) ? scaled : dst_e1);
       dst_wsalt_q <= (push ? (dst_wsalt_q ^ (dst_widx ? 2'd2 : 2'd1)) : dst_wsalt_q);
-      doubled_s1 <= (shift ? doubled : doubled_s1);
-      wide_s2 <= (shift ? wide : wide_s2);
+      doubled_s1 <= (shift0 ? doubled : doubled_s1);
+      wide_s2 <= (shift1 ? wide : wide_s2);
     end
   end
 
@@ -85,15 +87,16 @@ module add_one (
   reg [15:0] a_s1;
 
   wire dst_full = dst_wsalt_q == (~dst_rsalt);
-  wire shift = !dst_full;
+  wire shift1 = !dst_full;
+  wire shift0 = (!v0) | shift1;
   wire src_ridx = src_rsalt_q[0] ^ src_rsalt_q[1];
   wire [15:0] src_item = src_ridx ? src_data[31:16] : src_data[15:0];
   wire [15:0] b = a_s1 + 16'd1;
   wire src_empty = src_wsalt == src_rsalt_q;
   wire src_present = !src_empty;
-  wire push = shift & v0;
+  wire push = shift1 & v0;
   wire dst_widx = dst_wsalt_q[0] ^ dst_wsalt_q[1];
-  wire take = src_present & shift;
+  wire take = src_present & shift0;
 
   assign dst_data = {dst_e1, dst_e0};
   assign dst_wsalt = dst_wsalt_q;
@@ -108,12 +111,12 @@ module add_one (
       dst_wsalt_q <= 2'd0;
       a_s1 <= 16'd0;
     end else begin
-      v0 <= (shift ? src_present : v0);
+      v0 <= (shift0 ? src_present : v0);
       src_rsalt_q <= (take ? (src_rsalt_q ^ (src_ridx ? 2'd2 : 2'd1)) : src_rsalt_q);
       dst_e0 <= ((push & (!dst_widx)) ? b : dst_e0);
       dst_e1 <= ((push & dst_widx) ? b : dst_e1);
       dst_wsalt_q <= (push ? (dst_wsalt_q ^ (dst_widx ? 2'd2 : 2'd1)) : dst_wsalt_q);
-      a_s1 <= (shift ? src_item : a_s1);
+      a_s1 <= (shift0 ? src_item : a_s1);
     end
   end
 
@@ -138,16 +141,17 @@ module saturate (
   reg [31:0] a_s1;
 
   wire dst_full = dst_wsalt_q == (~dst_rsalt);
-  wire shift = !dst_full;
+  wire shift1 = !dst_full;
+  wire shift0 = (!v0) | shift1;
   wire src_ridx = src_rsalt_q[0] ^ src_rsalt_q[1];
   wire [31:0] src_item = src_ridx ? src_data[63:32] : src_data[31:0];
   wire too_big = a_s1 > 32'hFFFF;
   wire [31:0] b = too_big ? 32'hFFFF : a_s1;
   wire src_empty = src_wsalt == src_rsalt_q;
   wire src_present = !src_empty;
-  wire push = shift & v0;
+  wire push = shift1 & v0;
   wire dst_widx = dst_wsalt_q[0] ^ dst_wsalt_q[1];
-  wire take = src_present & shift;
+  wire take = src_present & shift0;
 
   assign dst_data = {dst_e1, dst_e0};
   assign dst_wsalt = dst_wsalt_q;
@@ -162,12 +166,12 @@ module saturate (
       dst_wsalt_q <= 2'd0;
       a_s1 <= 32'd0;
     end else begin
-      v0 <= (shift ? src_present : v0);
+      v0 <= (shift0 ? src_present : v0);
       src_rsalt_q <= (take ? (src_rsalt_q ^ (src_ridx ? 2'd2 : 2'd1)) : src_rsalt_q);
       dst_e0 <= ((push & (!dst_widx)) ? b : dst_e0);
       dst_e1 <= ((push & dst_widx) ? b : dst_e1);
       dst_wsalt_q <= (push ? (dst_wsalt_q ^ (dst_widx ? 2'd2 : 2'd1)) : dst_wsalt_q);
-      a_s1 <= (shift ? src_item : a_s1);
+      a_s1 <= (shift0 ? src_item : a_s1);
     end
   end
 

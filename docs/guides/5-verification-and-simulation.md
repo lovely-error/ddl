@@ -38,7 +38,7 @@ process proc_assert (src: buffer in u8, dst: buffer out u8)
 2. **Reset-Safe**: Checks are automatically gated on `if (rst_n)`. They never fire spuriously during hardware reset.
 3. **Execution-Scoped**:
    - In a `process`, assertions evaluate only when their specific state and branch fire (`fire_s0`). Idle cycles do not trigger assertions on stale registers.
-   - In a `sequence`, assertions evaluate only when the stage holds a valid item and the pipeline advances (`shift & v0`). Pipeline bubbles never trigger failures.
+   - In a `sequence`, assertions evaluate only when the stage holds a valid item and that stage advances (`v0 & shift1`). Pipeline bubbles never trigger failures.
 
 ---
 
