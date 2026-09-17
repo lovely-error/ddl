@@ -41,27 +41,27 @@ module rf_lvt_core (
 
   wire resp_full = resp_wsalt_q == (~resp_rsalt);
   wire shift3 = !resp_full;
+  wire req_ridx = req_rsalt_q[0] ^ req_rsalt_q[1];
+  wire [95:0] req_item = req_ridx ? req_data[191:96] : req_data[95:0];
+  wire [7:0] n18 = req_item[95:88];
+  wire [31:0] n19 = req_item[87:56];
+  wire [7:0] n21 = req_item[55:48];
+  wire [31:0] n22 = req_item[47:16];
+  wire [7:0] n24 = req_item[15:8];
+  wire n26 = n24 == n21;
+  wire [7:0] n29 = req_item[7:0];
+  wire n31 = n29 == n21;
+  wire [31:0] n37 = vals_fwd0_s1 ? vals_wdata0_s1 : vals_q0;
+  wire [31:0] n41 = vals_fwd1_s1 ? vals_wdata1_s1 : vals_q1;
+  wire [31:0] sum = n37 + n41;
+  wire [31:0] dif = x_s2 - y_s2;
+  wire [127:0] n51 = {x_s3, y_s3, sum_s3, dif_s3};
   wire shift2 = (!v2) | shift3;
   wire shift1 = (!v1) | shift2;
   wire shift0 = (!v0) | shift1;
-  wire req_ridx = req_rsalt_q[0] ^ req_rsalt_q[1];
-  wire [95:0] req_item = req_ridx ? req_data[191:96] : req_data[95:0];
-  wire [7:0] n27 = req_item[95:88];
-  wire [31:0] n28 = req_item[87:56];
-  wire [7:0] n30 = req_item[55:48];
-  wire [31:0] n31 = req_item[47:16];
-  wire [7:0] n33 = req_item[15:8];
-  wire n35 = n33 == n30;
-  wire [7:0] n38 = req_item[7:0];
-  wire n40 = n38 == n30;
   wire req_empty = req_wsalt == req_rsalt_q;
   wire req_present = !req_empty;
-  wire n46 = req_present & shift0;
-  wire [31:0] n52 = vals_fwd0_s1 ? vals_wdata0_s1 : vals_q0;
-  wire [31:0] n58 = vals_fwd1_s1 ? vals_wdata1_s1 : vals_q1;
-  wire [31:0] sum = n52 + n58;
-  wire [31:0] dif = x_s2 - y_s2;
-  wire [127:0] n75 = {x_s3, y_s3, sum_s3, dif_s3};
+  wire n64 = req_present & shift0;
   wire vals_re0 = req_present & shift0;
   wire vals_re1 = req_present & shift0;
   wire push = shift3 & v2;
@@ -97,16 +97,16 @@ module rf_lvt_core (
       v1 <= (shift1 ? v0 : v1);
       v2 <= (shift2 ? v1 : v2);
       req_rsalt_q <= (take ? (req_rsalt_q ^ (req_ridx ? 2'd2 : 2'd1)) : req_rsalt_q);
-      resp_e0 <= ((push & (!resp_widx)) ? n75 : resp_e0);
-      resp_e1 <= ((push & resp_widx) ? n75 : resp_e1);
+      resp_e0 <= ((push & (!resp_widx)) ? n51 : resp_e0);
+      resp_e1 <= ((push & resp_widx) ? n51 : resp_e1);
       resp_wsalt_q <= (push ? (resp_wsalt_q ^ (resp_widx ? 2'd2 : 2'd1)) : resp_wsalt_q);
-      vals_fwd0_s1 <= (shift0 ? ((n33 == n27) | n35) : vals_fwd0_s1);
-      vals_wdata0_s1 <= (shift0 ? (n35 ? n31 : n28) : vals_wdata0_s1);
-      vals_fwd1_s1 <= (shift0 ? ((n38 == n27) | n40) : vals_fwd1_s1);
-      vals_wdata1_s1 <= (shift0 ? (n40 ? n31 : n28) : vals_wdata1_s1);
+      vals_fwd0_s1 <= (shift0 ? ((n24 == n18) | n26) : vals_fwd0_s1);
+      vals_wdata0_s1 <= (shift0 ? (n26 ? n22 : n19) : vals_wdata0_s1);
+      vals_fwd1_s1 <= (shift0 ? ((n29 == n18) | n31) : vals_fwd1_s1);
+      vals_wdata1_s1 <= (shift0 ? (n31 ? n22 : n19) : vals_wdata1_s1);
       sum_s2 <= (shift1 ? sum : sum_s2);
-      x_s2 <= (shift1 ? n52 : x_s2);
-      y_s2 <= (shift1 ? n58 : y_s2);
+      x_s2 <= (shift1 ? n37 : x_s2);
+      y_s2 <= (shift1 ? n41 : y_s2);
       dif_s3 <= (shift2 ? dif : dif_s3);
       sum_s3 <= (shift2 ? sum_s2 : sum_s3);
       x_s3 <= (shift2 ? x_s2 : x_s3);
@@ -116,10 +116,10 @@ module rf_lvt_core (
 
   // vals [0:255] -- block RAM: 2 sync write ports, sync reads
   always @(posedge clk) begin
-    if (n46) vals[n27] <= n28;
-    if (n46) vals[n30] <= n31;
-    if (vals_re0) vals_q0 <= vals[n33];
-    if (vals_re1) vals_q1 <= vals[n38];
+    if (n64) vals[n18] <= n19;
+    if (n64) vals[n21] <= n22;
+    if (vals_re0) vals_q0 <= vals[n24];
+    if (vals_re1) vals_q1 <= vals[n29];
   end
 
 endmodule

@@ -569,6 +569,15 @@ pub struct PipeInfo {
     /// Outputs only: the first of the three registers backing the slot --
     /// entry 0, entry 1, then the `wsalt` register.
     pub slot_reg: Option<usize>,
+    /// Outputs of a sequence only: whether a BLOCKING `@send` names this
+    /// pipe, and the union of the paths it does so on -- `None` with `waits`
+    /// set is unconditionally. `send_guard` is every send, offers included;
+    /// this is the part of it the stage has to wait for.
+    pub waits: bool,
+    pub wait_guard: Option<ValueId>,
+    /// Outputs of a sequence only: whether a `@try_send` names this pipe.
+    /// An offer does not wait for room, so its push has to ask for it.
+    pub offers: bool,
 }
 
 /// A salt: two bits, gray-coded, counting 0..3 over a buffer that holds two.
@@ -743,7 +752,10 @@ impl<'a> Lowerer<'a> {
         };
         if conflict {
             let verb = if receive { "received from" } else { "sent to" };
-            sink.err_span(self.here(), format!("`{}` is {} more than once in one cycle", name, verb));
+            // A sequence's stage is not a cycle -- it may hold one item for
+            // several -- and what a pipe gets once of is an item's worth.
+            let when = if self.in_pipeline && !receive { "for one item" } else { "in one cycle" };
+            sink.err_span(self.here(), format!("`{}` is {} more than once {}", name, verb, when));
             return None;
         }
         self.transfer_paths.entry(name.to_string()).or_default().push(self.path.clone());
@@ -759,6 +771,13 @@ impl<'a> Lowerer<'a> {
     }
 
     fn request_pipe(&mut self, ix: usize, data: Option<ValueId>) -> ValueId {
+        self.request_pipe_on_path(ix, data).0
+    }
+
+    /// `request_pipe`, and the path it was made on, for a caller that has to
+    /// record that path somewhere else too -- materialising it twice would be
+    /// the same guard emitted twice.
+    fn request_pipe_on_path(&mut self, ix: usize, data: Option<ValueId>) -> (ValueId, Option<ValueId>) {
         let p = self.pipes[ix].clone();
         let path = self.materialise_path();
         let result = narrow_to_path(self, p.fired.expect("pipe eligibility"), path);
@@ -770,7 +789,7 @@ impl<'a> Lowerer<'a> {
         }
         self.pipes[ix].send_guard = self.union_transfer_guard(p.used, p.send_guard, path);
         self.pipes[ix].used = true;
-        result
+        (result, path)
     }
 
     /// One definition of a nonblocking transfer, shared by its success result
@@ -920,6 +939,9 @@ impl<'a> Lowerer<'a> {
             send_guard: None,
             fired: None,
             slot_reg: None,
+            waits: false,
+            wait_guard: None,
+            offers: false,
         });
         self.pipes.len() - 1
     }
@@ -2280,6 +2302,9 @@ pub fn lower_process(
             send_guard: None,
             fired: None,
             slot_reg: None,
+            waits: false,
+            wait_guard: None,
+            offers: false,
         });
     }
 
@@ -2854,6 +2879,99 @@ fn lower_try_rcv_binding(
     Some(())
 }
 
+/// `@try_send(p, v)` anywhere, and `@send(p, v)` in a sequence.
+///
+/// The value is offered; the answer is whether the slot can take it. Only the
+/// offer is recorded here -- the handshake itself is generated after the body,
+/// so it cannot be got wrong per call site. A process with no states computes
+/// it once before the body; a state machine computes one per state, because a
+/// pipe can be offered to in one state and sampled in another.
+///
+/// A sequence's `@send` is the same offer with one more fact attached: its
+/// stage must WAIT for it. That is recorded as `waits` and `wait_guard`, which
+/// the pipeline folds into the stage's room once every stage is lowered. It is
+/// a statement, so its answer is dropped.
+fn lower_offer(
+    low: &mut Lowerer,
+    args: &[PrecResExpr],
+    blocking: bool,
+    env: &Env,
+    sink: &mut DiagSink,
+) -> Option<ValueId> {
+    let what = if blocking { "@send" } else { "@try_send" };
+    let arity_is_right = args.len() == 2;
+    if !arity_is_right {
+        sink.err_span(low.here(), format!("`{}` takes a pipe and a value", what));
+        return None;
+    }
+    let pipe_name = match &args[0] {
+        PrecResExpr::Ref(n) => anumspan_to_str(n).to_string(),
+        _ => {
+            sink.err_span(low.here(), format!("`{}` needs a pipe name", what));
+            return None;
+        }
+    };
+
+    let ix = match low.pipes.iter().position(|p| p.name == pipe_name) {
+        Some(i) => i,
+        None => {
+            sink.err_span(
+                low.here(),
+                format!("`{}` is not a pipe of this {}", pipe_name, low.declaration_kind()),
+            );
+            return None;
+        }
+    };
+    if low.pipes[ix].is_input {
+        sink.err_span(
+            low.here(),
+            format!("`{}` is an `in` pipe; it cannot be sent to", pipe_name),
+        );
+        return None;
+    }
+    low.claim_transfer(&pipe_name, low.pipes[ix].used, false, sink)?;
+    let want = low.pipes[ix].ty.clone();
+    // A sequence types the value against the pipe, as its sends always have,
+    // so `@send(o, 42)` and `@zeroed()` need no annotation. A process keeps
+    // the plain lowering its netlists were generated with.
+    let mut value = if low.in_pipeline {
+        lower_expr_expecting(low, &args[1], Some(&want), env, sink)?
+    } else {
+        lower_expr(low, &args[1], env, sink)?
+    };
+    let have = low.ty_of(value);
+    if have != want {
+        match low.coerce_const(value, &want) {
+            Some(v) => value = v,
+            None => {
+                sink.push(
+                    Diag::error(
+                        low.here(),
+                        format!(
+                            "`{}` carries `{}` but `{}` was sent",
+                            pipe_name,
+                            want.display(),
+                            have.display()
+                        ),
+                    )
+                    .with_note(cast_hint(&have, &want)),
+                );
+                return None;
+            }
+        }
+    }
+    let (answer, path) = low.request_pipe_on_path(ix, Some(value));
+    if blocking {
+        let waited = low.pipes[ix].waits;
+        let before = low.pipes[ix].wait_guard;
+        low.pipes[ix].wait_guard = low.union_transfer_guard(waited, before, path);
+        low.pipes[ix].waits = true;
+    } else {
+        low.pipes[ix].offers = true;
+    }
+    Some(answer)
+}
+
 /// One statement, for the FSM scheduler, which lowers segment by segment.
 pub fn lower_stmt_pub(
     low: &mut Lowerer,
@@ -3266,6 +3384,15 @@ fn lower_stmt_at(
             // one branch and not the other is rejected by the SSA join.
             if let PrecResExpr::Builtin(BuiltinOp::TrySend) = &call.base {
                 lower_builtin(low, BuiltinOp::TrySend, &call.args, env, sink)?;
+                return Some(());
+            }
+            // A sequence's `@send`, wherever it sits in a stage. A process
+            // never gets here with one: its scheduler takes blocking sends
+            // apart into states before the body is lowered.
+            let is_a_stage_send = low.in_pipeline
+                && matches!(&call.base, PrecResExpr::Builtin(BuiltinOp::BlockingSend));
+            if is_a_stage_send {
+                lower_offer(low, &call.args, true, env, sink)?;
                 return Some(());
             }
             // A bare `@drop(p)` discards the answer as well as the item.
@@ -4755,72 +4882,7 @@ fn lower_builtin(
     }
 
     if op == TrySend {
-        let arity_is_right = args.len() == 2;
-        if !arity_is_right {
-            sink.err_span(low.here(), "`@try_send` takes a pipe and a value");
-            return None;
-        }
-        let pipe_name = match &args[0] {
-            PrecResExpr::Ref(n) => anumspan_to_str(n).to_string(),
-            _ => {
-                sink.err_span(low.here(), "`@try_send` needs a pipe name");
-                return None;
-            }
-        };
-
-        let ix = match low.pipes.iter().position(|p| p.name == pipe_name) {
-            Some(i) => i,
-            None => {
-                sink.err_span(
-                    low.here(),
-                    format!("`{}` is not a pipe of this {}", pipe_name, low.declaration_kind()),
-                );
-                return None;
-            }
-        };
-        if low.pipes[ix].is_input {
-            sink.err_span(
-                low.here(),
-                format!("`{}` is an `in` pipe; it cannot be sent to", pipe_name),
-            );
-            return None;
-        }
-        // A sequence's sends are unconditional and give their stage its
-        // shift; an offer that may be refused would be an item the stage
-        // moved on without delivering.
-        if low.in_pipeline {
-            sink.err_span(low.here(), "`@try_send` is not supported in a sequence; use `@send`, which holds its stage until the sink has room, or use a process");
-            return None;
-        }
-        low.claim_transfer(&pipe_name, low.pipes[ix].used, false, sink)?;
-        let want = low.pipes[ix].ty.clone();
-        let mut value = lower_expr(low, &args[1], env, sink)?;
-        let have = low.ty_of(value);
-        if have != want {
-            match low.coerce_const(value, &want) {
-                Some(v) => value = v,
-                None => {
-                    sink.push(
-                        Diag::error(
-                            low.here(),
-                            format!(
-                                "`{}` carries `{}` but `{}` was sent",
-                                pipe_name,
-                                want.display(),
-                                have.display()
-                            ),
-                        )
-                        .with_note(cast_hint(&have, &want)),
-                    );
-                    return None;
-                }
-            }
-        }
-        // Whether the offer was taken is decided by the generated handshake.
-        // A process with no states computes it once before the body; a state
-        // machine computes one per state, because a pipe can be offered to in
-        // one state and sampled in another.
-        return Some(low.request_pipe(ix, Some(value)));
+        return lower_offer(low, args, false, env, sink);
     }
 
     // `if c then a else b`, desugared by the parser. Both arms must agree on a

@@ -466,16 +466,16 @@ fn compile_on_this_stack(
         // And after that gate, because it reads sequence bodies for the pipes
         // they block on: a body too malformed to lower has already been
         // reported, and a second complaint derived from it would be noise.
-        let blocking: std::collections::BTreeMap<String, Vec<String>> = seqs
+        let heads: std::collections::BTreeMap<String, crate::ir_pipe::HeadInputs> = seqs
             .iter()
             .map(|seq| {
                 (
                     anumspan_to_str(&seq.name).to_string(),
-                    crate::ir_pipe::blocking_inputs_of(seq),
+                    crate::ir_pipe::head_inputs_of(seq),
                 )
             })
             .collect();
-        crate::ir_graph::check_pipe_deadlock(map, &sigs, &blocking, &graphs, &mut sink);
+        crate::ir_graph::check_pipe_deadlock(map, &sigs, &heads, &graphs, &mut sink);
         if sink.has_errors() {
             return Err(sink.into_diags());
         }

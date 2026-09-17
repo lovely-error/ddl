@@ -313,12 +313,34 @@ pub fn check_graph_cycles(
 ///
 /// `check_graph_cycles` above walks instantiation edges and says, correctly,
 /// that feedback through a CHANNEL is a different thing and stays legal. It is
-/// -- but not in every shape. A `sequence` produces an item only after
-/// receiving one on every pipe it blocks on, and every pipe starts empty, so
-/// around a loop of sequences each one waits for an item only its predecessor
-/// can make, and none of them ever fires. That is a proof rather than a guess,
-/// which is what makes it worth reporting: there is no input and no timing
-/// under which such a graph works.
+/// -- but not in every shape. A `sequence` produces nothing until an item
+/// enters its head, and every pipe starts empty, so around a loop of sequences
+/// each one can wait for an item only its predecessor can make, and none of
+/// them ever fires. That is a proof rather than a guess, which is what makes it
+/// worth reporting: there is no input and no timing under which such a graph
+/// works.
+///
+/// HOW A HEAD FIRES is the whole model, and it has two shapes:
+///
+///   * with blocking `@rcv`s it is an AND -- it fires only once EVERY one of
+///     those pipes has an item. Its nonblocking inputs, in any stage, do not
+///     matter: it fires without them.
+///   * with none it is an OR -- it fires when ANY pipe its first stage touches
+///     with `@try_rcv`, `@peek` or `@drop` has an item. Inputs a later stage
+///     touches do not matter either: they sample for items already inside.
+///
+/// Which heads can ever fire is then a least fixed point. Everything that is
+/// not a sequence can produce, as can any pipe no instance produces into (a
+/// port of the graph); a sequence can, once its AND or OR over those holds.
+/// Whatever never gets there is dead. A dead AND head waits on a dead producer
+/// and a dead OR head on nothing but dead ones, so every dead head has an edge
+/// to another, and the dead ones always contain a loop -- which is what gets
+/// reported, once, naming the whole loop. A head that is dead only because it
+/// hangs off such a loop is not reported separately: the loop is the cause.
+///
+/// Sends do not enter into it. A live producer is taken to be able to produce
+/// on every output, which a conditional `@send` or a `@try_send` may never do
+/// -- an over-approximation, and the safe direction for it.
 ///
 /// TWO deliberate limits, both of which keep it sound at the cost of being
 /// incomplete. It stops at sequences: a `process` may send before it ever
@@ -327,15 +349,14 @@ pub fn check_graph_cycles(
 /// `graph` instance. A clean compile is therefore not a proof of liveness --
 /// only a report here is a proof of the opposite.
 ///
-/// A nonblocking input -- `@try_rcv`, `@peek` or `@drop`, in any stage -- is
-/// not an edge at all. Nothing waits on it, so a feedback path wired through
-/// one is a live loop -- an accumulator reading
-/// last cycle's result on the cycles there is one -- and that is the fix this
-/// diagnostic points at.
+/// So a feedback path through a nonblocking input is live when something
+/// outside the loop can still make the head fire -- an accumulator that blocks
+/// on its input and reads last cycle's result on the cycles there is one -- and
+/// dead when that feedback is all the head has.
 pub fn check_pipe_deadlock(
     map: &crate::diag::SourceMap,
     sigs: &BTreeMap<String, BlockSig>,
-    blocking: &BTreeMap<String, Vec<String>>,
+    heads: &BTreeMap<String, crate::ir_pipe::HeadInputs>,
     graphs: &[crate::parse::GraphDecl],
     sink: &mut DiagSink,
 ) {
@@ -346,7 +367,10 @@ pub fn check_pipe_deadlock(
         module: &'a str,
         at: &'a AlphanumSpan,
         is_sequence: bool,
-        waits_on: Vec<String>,
+        /// The pipes, by the graph's names, the head needs ALL of.
+        waits_on_all: Vec<String>,
+        /// With nothing in `waits_on_all`: the pipes the head needs ANY of.
+        waits_on_any: Vec<String>,
         produces: Vec<String>,
     }
     #[derive(Clone, Copy, PartialEq)]
@@ -370,9 +394,9 @@ pub fn check_pipe_deadlock(
                 continue;
             };
             let is_sequence = sig.kind == "sequence";
-            let none = Vec::new();
-            let blocks_on = blocking.get(module).unwrap_or(&none);
-            let mut waits_on = Vec::new();
+            let head = heads.get(module).filter(|_| is_sequence);
+            let mut waits_on_all = Vec::new();
+            let mut waits_on_any = Vec::new();
             let mut produces = Vec::new();
             for (formal, actual) in sig.args.iter().zip(inst.args.iter()) {
                 let ArgSig::Pipe(pipe) = formal else {
@@ -383,12 +407,28 @@ pub fn check_pipe_deadlock(
                     produces.push(actual_name);
                     continue;
                 }
-                let is_awaited = is_sequence && blocks_on.contains(&pipe.name);
-                if is_awaited {
-                    waits_on.push(actual_name);
+                let Some(head) = head else {
+                    continue;
+                };
+                if head.blocking.contains(&pipe.name) {
+                    waits_on_all.push(actual_name);
+                } else if head.optional.contains(&pipe.name) {
+                    waits_on_any.push(actual_name);
                 }
             }
-            nodes.push(Node { module, at: &inst.module, is_sequence, waits_on, produces });
+            // An AND head fires without its optional inputs, so they are not
+            // part of the question at all.
+            if !waits_on_all.is_empty() {
+                waits_on_any.clear();
+            }
+            nodes.push(Node {
+                module,
+                at: &inst.module,
+                is_sequence,
+                waits_on_all,
+                waits_on_any,
+                produces,
+            });
         }
 
         // `check_endpoints` refuses a pipe with two producers, so the one
@@ -399,18 +439,52 @@ pub fn check_pipe_deadlock(
                 producer_of.insert(pipe.as_str(), ix);
             }
         }
-        // An edge means "this instance cannot fire until that one has". Only
-        // between sequences: anywhere else the wait is not certain.
+        // Which instances can ever fire: the least fixed point. Anything that
+        // is not a sequence is assumed to, and so is a pipe nothing here
+        // produces into -- it comes from outside the graph.
+        let mut can_fire: Vec<bool> = nodes.iter().map(|n| !n.is_sequence).collect();
+        loop {
+            let mut changed = false;
+            for ix in 0..nodes.len() {
+                if can_fire[ix] {
+                    continue;
+                }
+                let can_arrive = |pipe: &String| match producer_of.get(pipe.as_str()) {
+                    None => true,
+                    Some(source) => can_fire[*source],
+                };
+                let node = &nodes[ix];
+                let is_an_and = !node.waits_on_all.is_empty();
+                let fires = if is_an_and {
+                    node.waits_on_all.iter().all(can_arrive)
+                } else {
+                    node.waits_on_any.iter().any(can_arrive)
+                };
+                if fires {
+                    can_fire[ix] = true;
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+
+        // An edge means "this dead instance waits on that dead one". An AND
+        // head waits on each of its dead producers, and an OR head on all of
+        // its producers, which are all dead or it would not be.
         let mut edges: Vec<Vec<usize>> = vec![Vec::new(); nodes.len()];
         for ix in 0..nodes.len() {
-            if !nodes[ix].is_sequence {
+            if can_fire[ix] {
                 continue;
             }
-            for pipe in &nodes[ix].waits_on {
+            let node = &nodes[ix];
+            let awaited = node.waits_on_all.iter().chain(node.waits_on_any.iter());
+            for pipe in awaited {
                 let Some(source) = producer_of.get(pipe.as_str()).copied() else {
                     continue;
                 };
-                if nodes[source].is_sequence {
+                if !can_fire[source] {
                     edges[ix].push(source);
                 }
             }
@@ -463,7 +537,7 @@ pub fn check_pipe_deadlock(
                         };
                         sink.push(
                             Diag::error(map.span_of(nodes[callee].at), msg).with_note(
-                                "a sequence produces an item only after receiving one on every blocking `in` pipe, and every pipe starts empty, so no item on this loop can ever be the first; break the loop with a `process`, or make one of the receives a `@try_rcv`, which fires without waiting",
+                                "a sequence produces an item only after one enters its head -- on every pipe it blocks on with `@rcv`, or, with none, on any pipe its first stage reads with `@try_rcv`, `@peek` or `@drop` -- and every pipe starts empty, so no item on this loop can ever be the first; break the loop with a `process`, or give the head an input from outside the loop that it does not have to wait for the loop to fill",
                             ),
                         );
                     }

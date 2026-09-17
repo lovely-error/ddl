@@ -81,3 +81,27 @@ sequence seq_peek_drop (src: buffer in u16, b: buffer in u16, o: buffer out u32)
     @drop(b)
     h = 16'd1
   @send(o, {h, x})
+
+sequence seq_route (src: buffer in u16, odd: buffer out u16, all: buffer out u16)
+  let a = @rcv(src)
+  |||
+  if a[0] == 1'd1 then
+    @send(odd, a)
+  |||
+  @send(all, a)
+
+sequence seq_blocked_early (src: buffer in u16, x: buffer out u16, y: buffer out u16)
+  let a = @rcv(src)
+  @send(x, a)
+  |||
+  let b: u16 = a
+  |||
+  @send(y, b)
+
+sequence seq_offer (src: buffer in u16, side: buffer out u16, log: buffer out u32)
+  let x = @rcv(src)
+  |||
+  let ok = @try_send(side, x)
+  let f: u16 = if ok then 16'd1 else 16'd0
+  |||
+  @send(log, {f, x})

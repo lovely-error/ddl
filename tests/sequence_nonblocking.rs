@@ -14,7 +14,8 @@
 // entering it -- are at the bottom.
 mod common;
 
-use common::{Circuit, mask};
+use common::Circuit;
+use common::salt::{Consumer, Lcg, Producer, Steps};
 use ddl::diag::SourceMap;
 use ddl::driver::compile_to_verilog;
 use ddl::verilog::EmitOptions;
@@ -32,105 +33,6 @@ fn compile_err(src: &str) -> String {
     match compile_to_verilog(&map, &EmitOptions::default()) {
         Ok(v) => panic!("expected failure, got:\n{}", v),
         Err(diags) => map.render_all(&diags),
-    }
-}
-
-/// The entry a salt names: bit 0 of its gray-code index.
-fn index(salt: u128) -> u128 {
-    (salt ^ (salt >> 1)) & 1
-}
-
-/// A salt after one transfer.
-fn step(salt: u128) -> u128 {
-    salt ^ if index(salt) == 0 { 1 } else { 2 }
-}
-
-/// The producing end of an `in` pipe, offering `queue` in order.
-struct Producer {
-    pipe: &'static str,
-    width: u32,
-    wsalt: u128,
-    data: u128,
-    queue: std::collections::VecDeque<u128>,
-}
-
-impl Producer {
-    fn new(pipe: &'static str, width: u32, items: impl IntoIterator<Item = u128>) -> Self {
-        Producer { pipe, width, wsalt: 0, data: 0, queue: items.into_iter().collect() }
-    }
-
-    /// Writes the next item if `willing` and the pipe has room.
-    fn offer(&mut self, c: &mut Circuit, willing: bool) {
-        let rsalt = c.out(&format!("{}_rsalt", self.pipe));
-        let full = self.wsalt == (!rsalt & 3);
-        if full || !willing {
-            return;
-        }
-        let Some(item) = self.queue.pop_front() else { return };
-        let shift = index(self.wsalt) as u32 * self.width;
-        self.data = (self.data & !(mask(self.width) << shift)) | (item << shift);
-        self.wsalt = step(self.wsalt);
-        c.set(&format!("{}_data", self.pipe), self.data);
-        c.set(&format!("{}_wsalt", self.pipe), self.wsalt);
-    }
-}
-
-/// The consuming end of an `out` pipe.
-struct Consumer {
-    pipe: &'static str,
-    width: u32,
-    rsalt: u128,
-}
-
-impl Consumer {
-    fn new(pipe: &'static str, width: u32) -> Self {
-        Consumer { pipe, width, rsalt: 0 }
-    }
-
-    /// Takes the entry on offer, if there is one and the consumer is `willing`.
-    fn take(&mut self, c: &mut Circuit, willing: bool) -> Option<u128> {
-        let has_item = c.out(&format!("{}_wsalt", self.pipe)) != self.rsalt;
-        if !has_item || !willing {
-            return None;
-        }
-        let shift = index(self.rsalt) as u32 * self.width;
-        let item = (c.out(&format!("{}_data", self.pipe)) >> shift) & mask(self.width);
-        self.rsalt = step(self.rsalt);
-        c.set(&format!("{}_rsalt", self.pipe), self.rsalt);
-        Some(item)
-    }
-}
-
-/// A fixed pseudo-random stream, so a failure reproduces.
-struct Lcg(u64);
-
-impl Lcg {
-    fn chance(&mut self, percent: u64) -> bool {
-        self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-        (self.0 >> 33) % 100 < percent
-    }
-}
-
-/// Counts steps of an `rsalt` the module drives, one call per cycle.
-struct Steps {
-    port: String,
-    last: u128,
-    count: usize,
-}
-
-impl Steps {
-    fn new(pipe: &str) -> Self {
-        Steps { port: format!("{}_rsalt", pipe), last: 0, count: 0 }
-    }
-
-    fn watch(&mut self, c: &Circuit) {
-        let now = c.out(&self.port);
-        if now != self.last {
-            // One transfer per cycle at most: one bit of the gray code.
-            assert_eq!(step(self.last), now, "`{}` moved by more than one entry", self.port);
-            self.count += 1;
-            self.last = now;
-        }
     }
 }
 
@@ -622,7 +524,7 @@ fn two_unconditional_takes_in_one_stage_are_refused() {
 }
 
 #[test]
-fn try_send_is_still_refused_and_says_what_to_use() {
+fn a_try_send_beside_a_send_to_the_same_output_is_refused() {
     let text = compile_err(&seq(TWO_IN, concat!(
         "  let x = @rcv(src)\n",
         "  let z = @rcv(b)\n",
@@ -630,7 +532,7 @@ fn try_send_is_still_refused_and_says_what_to_use() {
         "  let sent = @try_send(o, x)\n",
         "  @send(o, x)\n",
     )));
-    assert!(text.contains("`@try_send` is not supported in a sequence; use `@send`"), "{}", text);
+    assert!(text.contains("`o` is sent to more than once for one item"), "{}", text);
 }
 
 #[test]

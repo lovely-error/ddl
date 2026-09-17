@@ -25,10 +25,10 @@ module scale (
 
   wire dst_full = dst_wsalt_q == (~dst_rsalt);
   wire shift1 = !dst_full;
-  wire shift0 = (!v0) | shift1;
   wire src_ridx = src_rsalt_q[0] ^ src_rsalt_q[1];
   wire [31:0] src_item = src_ridx ? src_data[63:32] : src_data[31:0];
   wire [31:0] doubled = x_s1 + x_s1;
+  wire shift0 = (!v0) | shift1;
   wire src_empty = src_wsalt == src_rsalt_q;
   wire src_present = !src_empty;
   wire push = shift1 & v0;

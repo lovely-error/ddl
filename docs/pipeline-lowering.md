@@ -85,7 +85,7 @@ Each register at a cut is loaded by the shift of the stage above it (`shift0` fo
 
 ## Backpressure and Per-Stage Shifts
 
-Every stage has its own advance signal, `shift{k}`. A stage moves its item on when every sink it sends to has a slot **and** the cut below it is free -- empty, or emptying because the stage below is moving on the same edge:
+Every stage has its own advance signal, `shift{k}`. A stage moves its item on when every sink it waits on has a slot **and** the cut below it is free -- empty, or emptying because the stage below is moving on the same edge:
 
 ```verilog
 wire dst_full = dst_wsalt_q == (~dst_rsalt);
@@ -94,15 +94,16 @@ wire shift1   = (!v1) | shift2;    // cut below empty, or the stage below moves
 wire shift0   = (!v0) | shift1;
 ```
 
-In general, $shift_k = room_k \land (\lnot v_k \lor shift_{k+1})$, where $room_k$ is the AND over the slots stage $k$ sends to (true when it sends nothing) and $v_k$ is the validity bit of the cut below it.
+In general, $shift_k = room_k \land (\lnot v_k \lor shift_{k+1})$, where $room_k$ is the AND over the slots stage $k$ waits on (true when it waits on none) and $v_k$ is the validity bit of the cut below it.
 
 - When every sink has room, every `shift{k}` is high and the whole pipeline advances on the edge.
 - When a sink is full, the stage sending to it holds, and so does every occupied stage above it. Stages above a **bubble** keep moving into it, so a stall closes up the gaps instead of freezing them in place.
+- **A blocked stage never holds the stages after it.** Nothing below stage $k$ reads $room_k$: stages $k+1, k+2, \dots$ keep moving and draining into their own sinks, and the cut below the held stage takes a bubble.
 - Upstream items are safely held in the input buffer until the pipeline's own capacity is exhausted.
 
 A one-stage sequence has a single enable, still named `shift`.
 
-The cost is a chain: `shift0` depends on every stage below it within the cycle. Every term in it is a register on this side of the module -- a validity bit, or a slot's own `wsalt` compared with the consumer's `rsalt` -- so the path stays inside the module and never runs through a pipe into another block.
+The cost is a chain: `shift0` depends on every stage below it within the cycle. Its terms are registers on this side of the module -- a validity bit, or a slot's own `wsalt` compared with the consumer's `rsalt` -- and the conditions sends sit under, which are stage logic over those same kinds of registers. So the path stays inside the module and never runs through a pipe's handshake into another block, but a stage with a conditional send puts that condition's logic into the shifts of every stage above it.
 
 ### Why Not One Shift for the Whole Pipeline
 
@@ -127,10 +128,12 @@ Per-stage shifts make that shape **live**, not **fast**. The early pipe's two en
 ## Head Gather and Per-Stage Sends
 
 A `sequence` may declare any number of `buffer in` and `buffer out`
-parameters. Every input is received exactly once in stage 0, and every output
-sent to exactly once, from whichever stage its `@send` is written in. Sending
-the same output twice -- in one stage or in two -- is an error: a consumer is
-owed one item per item.
+parameters. Every blocking input is received exactly once in stage 0. Every
+output is sent to from **one** stage, **at most once per item**, under whatever
+condition the source writes -- with `@send`, which waits for room, or
+`@try_send`, which does not. Two sends to one output on paths that can both run
+for one item, or sends to one output from two stages, are errors; sends in the
+disjoint arms of an `if` or a `match` are one send.
 
 The head reduces to one predicate, and so do the sends of each stage:
 
@@ -154,6 +157,32 @@ push per sending stage, named `push{k}`:
   wire push0  = shift0 & src_present;
   wire push2  = shift2 & v1;
 ```
+
+A send under a condition is only waited for on the items that meet it. Its
+term in the stage's room is `room | !waits`, and its push is the stage's push
+narrowed to those items:
+
+```ddl
+  if a[0] == 1'd1 then
+    @send(odd, a)
+```
+
+```verilog
+  wire odd_clear = odd_room | (!n12);      // an even item is not held by `odd`
+  wire shift1    = odd_clear & open1;
+  wire odd_push  = push1 & n12;            // and does not go into it
+```
+
+A `@try_send` is not waited for at all -- its sink is no term in the room -- and
+pushes only when there is room, which is what it answers:
+
+```verilog
+  wire side_push = push1 & side_room;      // `ok` is `side_room`, narrowed to its path
+```
+
+An item whose offer is declined moves on without it; `ok` is how the source
+knows. An unconditional `@send` adds none of this: its term is its room, and its
+push is the stage's.
 
 Both reductions are over **slot occupancy**, which is a register on this side of
 the wire, and never over the far side's handshake. That is the same argument
@@ -228,17 +257,28 @@ touches no input at all is refused.
 
 ### Loops of Pipes
 
-A sequence produces an item only after receiving one on every pipe it blocks on,
-and every pipe starts empty. So around a loop of sequences, each one is waiting
-for an item only its predecessor can make, and none of them ever fires. The
-compiler reports that loop rather than emitting it:
+A sequence produces nothing until an item enters its head, and every pipe starts
+empty. How a head fires has two shapes:
+
+- **With blocking `@rcv`s, an AND**: it fires once *every* one of those pipes has
+  an item. Its non-blocking inputs, in any stage, don't matter.
+- **With none, an OR**: it fires when *any* pipe its first stage reads with
+  `@try_rcv`, `@peek` or `@drop` has an item. Inputs read only in later stages
+  don't matter -- they sample for items already inside.
+
+The compiler works out which heads can ever fire, starting from what cannot be
+held up -- a `process`, an `extern`, a port of the graph -- and reports a loop of
+sequences none of which ever can:
 
 ```
 error: `acc` waits on itself through acc -> hold -> acc
 ```
 
-Routing the feedback through a `@try_rcv` makes the same loop live -- an
-accumulator that reads last cycle's result on the cycles there is one. The check
+So an accumulator that blocks on its outside input and reads last cycle's result
+with a `@try_rcv` is live, but one whose head's *only* input is that feedback is
+not, however it reads it. Sends don't change the verdict: a conditional `@send`
+or a `@try_send` produces less than a plain one, never more. A sequence that is
+dead only because it hangs off a dead loop is not reported separately. The check
 stops at sequences: a `process` may send before it ever receives, and an `extern`
 is opaque, so a loop through either is left alone. A clean compile is not a proof
 of liveness; only the diagnostic is a proof of the opposite.
