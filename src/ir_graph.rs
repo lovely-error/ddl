@@ -327,8 +327,9 @@ pub fn check_graph_cycles(
 /// `graph` instance. A clean compile is therefore not a proof of liveness --
 /// only a report here is a proof of the opposite.
 ///
-/// A `@try_rcv` input is not an edge at all. The head fires without it, so a
-/// feedback path wired through one is a live loop -- an accumulator reading
+/// A nonblocking input -- `@try_rcv`, `@peek` or `@drop`, in any stage -- is
+/// not an edge at all. Nothing waits on it, so a feedback path wired through
+/// one is a live loop -- an accumulator reading
 /// last cycle's result on the cycles there is one -- and that is the fix this
 /// diagnostic points at.
 pub fn check_pipe_deadlock(

@@ -564,3 +564,54 @@ fn a_declaration_that_fails_to_lower_cannot_leave_the_build_succeeding() {
     let out = compile_to_verilog(&map, &EmitOptions::default());
     assert!(out.is_err(), "compiled to:\n{}", out.unwrap_or_default());
 }
+
+#[test]
+fn a_blocking_read_below_a_sequence_head_points_at_the_read() {
+    let (line, msg) = first_error(concat!(
+        "sequence s (a: buffer in u8, b: buffer in u8, o: buffer out u8)\n",
+        "  let x = @rcv(a)\n",
+        "  |||\n",
+        "  let y = @rcv(b)\n",
+        "  @send(o, x)\n",
+    ));
+    assert_eq!(line, 4, "{}", msg);
+    assert!(msg.contains("only the first stage of a sequence may block on a read"), "{}", msg);
+}
+
+#[test]
+fn a_second_take_in_a_sequence_stage_points_at_the_second() {
+    // The second one in source order is the one in excess, whichever of the
+    // two kinds each is.
+    let (line, msg) = first_error(concat!(
+        "sequence s (a: buffer in u8, b: buffer in u8, o: buffer out u8)\n",
+        "  let x = @rcv(a)\n",
+        "  |||\n",
+        "  @drop(b)\n",
+        "  let (y, ok) = @try_rcv(b)\n",
+        "  @send(o, x)\n",
+    ));
+    assert_eq!(line, 5, "{}", msg);
+    assert!(msg.contains("`b` is received from more than once in one cycle"), "{}", msg);
+    let (line, msg) = first_error(concat!(
+        "sequence s (a: buffer in u8, o: buffer out u8)\n",
+        "  @drop(a)\n",
+        "  let x = @rcv(a)\n",
+        "  |||\n",
+        "  @send(o, x)\n",
+    ));
+    assert_eq!(line, 3, "{}", msg);
+    assert!(msg.contains("`a` is received from more than once in one cycle"), "{}", msg);
+}
+
+#[test]
+fn a_try_send_in_a_sequence_points_at_the_send() {
+    let (line, msg) = first_error(concat!(
+        "sequence s (a: buffer in u8, o: buffer out u8)\n",
+        "  let x = @rcv(a)\n",
+        "  |||\n",
+        "  let sent = @try_send(o, x)\n",
+        "  @send(o, x)\n",
+    ));
+    assert_eq!(line, 4, "{}", msg);
+    assert!(msg.contains("`@try_send` is not supported in a sequence"), "{}", msg);
+}

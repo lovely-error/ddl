@@ -13,7 +13,7 @@ This document explains how the DDL compiler lowers high-level `sequence` declara
   - [Why Not One Shift for the Whole Pipeline](#why-not-one-shift-for-the-whole-pipeline)
 - [Head Gather and Per-Stage Sends](#head-gather-and-per-stage-sends)
   - [A Join Is Not a `@merge`](#a-join-is-not-a-merge)
-  - [Optional Inputs (`@try_rcv`)](#optional-inputs-try_rcv)
+  - [Non-blocking Inputs in Any Stage](#non-blocking-inputs-in-any-stage)
   - [Loops of Pipes](#loops-of-pipes)
 - [Validity Bits and Stage Gating](#validity-bits-and-stage-gating)
 - [Zero-Cost BRAM Stage Alignment](#zero-cost-bram-stage-alignment)
@@ -179,27 +179,52 @@ They look alike in a graph and are not interchangeable:
 Use `@merge` to funnel several producers of the same stream into one. Use a
 multi-input sequence when one item is a function of one item from each source.
 
-### Optional Inputs (`@try_rcv`)
+### Non-blocking Inputs in Any Stage
 
-An input received with `@try_rcv` in stage 0 is **optional**: it is absent from
-`offered`, so it never holds the pipeline up, and it gives up an entry only on
-the cycles it had one.
+`@try_rcv`, `@peek` and `@drop` never wait, and may be written in any stage,
+inside an `if` or a `match` -- the same operations, lowered by the same code, as
+in a `process`. What makes them a pipeline's is *when they take*. An operation
+in stage $k$ acts for the item stage $k$ holds: it looks on every cycle, and
+takes an entry only on a cycle that stage is live and moving:
 
 ```verilog
-  wire take   = a_present & shift0;     // b is not part of the pacing
-  wire b_take = take & b_present;       // b is consumed only when it has an item
+  wire take   = a_present & shift0;     // the blocking head, as before
+  wire b_take = (v0 & shift1) & b_present;  // `@try_rcv(b)` in stage 1
 ```
 
-The `ok` half of the pair *is* `b_present`, and crosses the stage cuts like any
-other value, so the stage that uses `y` sees the `ok` that belongs to the same
-item. When `ok` is low, `y` holds whatever the buffer still had -- the same
-bargain `@try_rcv` makes in a `process`.
+So a bubble in stage $k$ takes nothing, and a stage held by a full sink takes
+nothing again on each cycle it waits. Under a condition, the arm's guard joins
+the `b_present` half. For a stage-0 input, `v0 & shift1` is `take`, which is
+exactly the `take & b_present` an optional head input always had.
 
-With *every* input optional, `offered` becomes the OR rather than the AND. It is
-deliberately not a constant: a head that fired with nothing on any input would be
-a free-running source, emitting an item per cycle out of nothing. A cycle in
-which nothing arrived is a **bubble** -- stage 0 shifts, the validity bit it
-shifts in is low, and no `push` commits anything. Shifting is not committing.
+The `ok` half of `@try_rcv`, and `present` from `@peek`, are `b_present` narrowed
+to the operation's path. They do not also say "and this stage moved": nothing a
+stage computes on a cycle it does not move is committed -- its crossing
+registers, writes, assertions and pushes all wait for the same shift. They cross
+the stage cuts like any other value, so a later stage sees the `ok` that belongs
+to its item. When `ok` is low, `y` holds whatever the buffer still had -- the
+same bargain `@try_rcv` makes in a `process`.
+
+**One stage per input.** Every operation on an `in` pipe must sit in one stage,
+for the reason a written memory must (see
+[Single-Stage Memory Ownership](#single-stage-memory-ownership)): at any cycle
+two stages hold two different items, so a `@peek` in one and a `@drop` in
+another would look at one item and throw away another's. Within its stage a
+pipe is taken from at most once per item, and two takes in disjoint arms of an
+`if` are one. A pipe must be taken from somewhere: one that is only peeked at
+never drains, and is refused.
+
+**What paces the head.** A non-blocking input never holds the pipeline up, so
+it is absent from `offered` -- a later stage's input has no say in whether stage
+0 holds an item at all. With *no* blocking input, `offered` becomes the OR over
+the inputs stage 0 touches. It is deliberately not a constant: a head that fired
+with nothing on any input would be a free-running source, emitting an item per
+cycle out of nothing. A cycle in which nothing arrived is a **bubble** -- stage
+0 shifts, the validity bit it shifts in is low, and no `push` commits anything.
+Shifting is not committing. A head built from `@peek` is live while its pipe
+offers, so an item it declines to `@drop` is emitted again on the next cycle,
+as a `process` written the same way would do. A sequence whose first stage
+touches no input at all is refused.
 
 ### Loops of Pipes
 

@@ -148,8 +148,8 @@ This draws each stage, channel buffer, and data connection as a visual flowchart
 
 ## 5. Rules to Keep in Mind
 
-1. **One Receive per Input at the Head, One Send per Output Anywhere**: a `sequence` may declare any number of `buffer in` and `buffer out` parameters. Every input must be received in Stage 0, and every output sent to from any one stage -- exactly once each. An output sent from an earlier stage simply leaves earlier.
+1. **Blocking Receives at the Head, Everything Else Anywhere**: a `sequence` may declare any number of `buffer in` and `buffer out` parameters. A blocking `@rcv` belongs in Stage 0; every output is sent to exactly once, from any one stage. An output sent from an earlier stage simply leaves earlier.
 2. **The Head Waits for All of Them**: an item enters the pipeline only when every blocking input is offering one, and a stage shifts only when every output it sends to has room. A missing input on one pipe stalls all of them, which is what makes the inputs of one item arrive together.
-3. **`@try_rcv` Makes an Input Optional**: `let (v, ok) = @try_rcv(p)` in Stage 0 does not wait. The pipeline fires without it and `ok` says whether `v` is real. It is the only non-blocking buffer op a `sequence` allows, and only at the head.
-4. **No Other Non-blocking Buffer Ops in Pipelines**: `@peek`, `@drop` and `@try_send` are not allowed in a `sequence` because every pipeline stage is active concurrently. If you need dynamic inspection or packet dropping, use a `process`.
+3. **Non-blocking Inputs Work in Any Stage**: `let (v, ok) = @try_rcv(p)`, `let (v, here) = @peek(p)` and `@drop(p)` never wait, and may sit in any stage, inside an `if` or a `match`. Each acts for the item its stage holds: it takes an entry only on a cycle that stage is holding an item and moving it on. In Stage 0 with no blocking `@rcv`, an item enters whenever any input the stage touches is offering.
+4. **One Stage per Input**: every stage holds a different item at once, so all the operations on one `in` pipe must be in the same stage, and something must take from it -- a pipe that is only peeked at never drains. `@try_send` is not allowed in a `sequence`; use `@send`, or a `process`.
 5. **Width Safety**: Adding a 16-bit number to a 32-bit number is a compile-time error. Always explicitly extend using `@zext(val, 32)` or `@sext(val, 32)`.

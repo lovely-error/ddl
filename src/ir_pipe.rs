@@ -47,22 +47,37 @@
 // stage that asked for it.
 //
 // A HEAD IS A JOIN AND A STAGE'S SENDS ARE A SCATTER. A sequence may name any
-// number of `buffer in` and `buffer out` parameters. Every input is received
-// exactly once in stage 0, and every output sent to exactly once in whichever
-// stage the source puts its `@send`. The head moves as one: `offered` is the
-// AND over the inputs that are offering, and one `take` serves all of them.
+// number of `buffer in` and `buffer out` parameters. Every blocking input is
+// received exactly once in stage 0, and every output sent to exactly once in
+// whichever stage the source puts its `@send`. The head moves as one: `offered`
+// is the AND over the blocking inputs, and one `take` serves all of them.
 // So do the sends of one stage: its `room` is the AND over the sinks it sends
 // to, and one `push` serves all of them. Every sink or none, for the reason
 // ir_comb.rs:234 gives about `@split` -- ANDing the sinks' readys would put
 // each consumer's logic in every other one's timing path, where asking whether
 // each has a slot only reads registers on this side.
 //
-// One input may instead be received with `@try_rcv`, which makes it OPTIONAL:
-// it is absent from `offered`, so it never holds the pipeline up, and its
-// `rsalt` advances on `take & <p>_present` so it gives up an item only on the
-// cycles it had one. `ok` is that same `present` bit and crosses the stage
-// cuts like any other value. With no blocking input left, `offered` becomes
-// the OR rather than the AND -- a cycle where nothing arrived carries nothing,
+// EVERY OTHER INPUT IS NONBLOCKING, AND MAY SIT IN ANY STAGE. `@try_rcv`,
+// `@peek` and `@drop` are lowered by the same code a process uses, anywhere in
+// a stage and under any condition. What makes them a pipeline's is when they
+// take: an operation in stage k acts for the item stage k holds, so it LOOKS
+// on every cycle and CONSUMES only on a cycle that stage is live and moving --
+//
+//     <p>_take = transfer & live_k & shift_k
+//
+// -- which for a stage-0 input is `take & <p>_present`, as it always was. A
+// bubble takes nothing and a held stage takes nothing twice. `ok` is the
+// pipe's `present` narrowed to the operation's path, and crosses the cuts like
+// any other value; on a cycle the stage does not move, nothing it computed is
+// committed, so `ok` never has to say more than "one is here".
+//
+// Each such pipe belongs to ONE stage, for the reason a written memory does:
+// stages j and k hold different items at once, and a peek in one with a drop
+// in the other would look at one item and throw away another.
+//
+// A nonblocking input does not hold the pipeline up, so it is absent from
+// `offered`. With no blocking input left, `offered` becomes the OR over the
+// inputs stage 0 touches -- a cycle where nothing arrived carries nothing,
 // which is a bubble the validity chain already expresses and `push` already
 // respects, and what it must not be is a constant, which would make the head a
 // free-running source.
@@ -139,32 +154,6 @@ fn as_recv(stmt: &PrecResInnerStmt) -> Option<(&VarDeclStmt, String)> {
     }
 }
 
-/// `let (x, ok) = @try_rcv(p)`, an OPTIONAL input of the head stage.
-///
-/// TWO names rather than one, which is what keeps this out of `as_recv`'s way:
-/// the pair is the item and whether there was one. The head does not wait on a
-/// pipe read this way -- it fires without it and says so in `ok` -- so the pipe
-/// contributes nothing to `offered` and advances its own `rsalt` only on the
-/// cycles it actually had something.
-fn as_try_recv(stmt: &PrecResInnerStmt) -> Option<(&VarDeclStmt, String)> {
-    let decl = match stmt {
-        PrecResInnerStmt::VarDecl(d) if d.names().len() == 2 => d,
-        _ => return None,
-    };
-    let (base, args) = match decl.assign_val.as_ref()? {
-        PrecResExpr::Call { base, args } => (base, args),
-        _ => return None,
-    };
-    match &**base {
-        PrecResExpr::Builtin(BuiltinOp::TryRecieve) if args.len() == 1 => {}
-        _ => return None,
-    }
-    match &args[0] {
-        PrecResExpr::Ref(n) => Some((decl, anumspan_to_str(n).to_string())),
-        _ => None,
-    }
-}
-
 /// A channel or memory read has its producer's type; an annotation must agree.
 /// These reads bypass ordinary initializer lowering to account for their
 /// handshake or latency, but must still check the declaration they initialize.
@@ -191,6 +180,13 @@ fn check_read_type(
         }
     }
     Some(())
+}
+
+/// What to do about an `in` pipe nothing ever takes from.
+fn never_taken_note(name: &str) -> String {
+    format!(
+        "a sequence takes from every one of its `in` pipes, or the pipe never drains and its producer waits forever; add `let x = @rcv({name})` above the first `|||`, or take from it in any one stage with `let (x, ok) = @try_rcv({name})` or `@drop({name})` -- a `@peek` looks and takes nothing",
+    )
 }
 
 /// `@send(p, v)`, an output of whichever stage it sits in.
@@ -365,25 +361,28 @@ fn per_stage(base: &str, k: usize, of: usize) -> String {
     if of == 1 { base.to_string() } else { format!("{}{}", base, k) }
 }
 
-/// The head's gather: the `in` pipes, in declaration order.
+/// The `in` pipes, in declaration order.
 ///
 /// A sequence takes one item from every blocking input on the same cycle, so
-/// these travel together everywhere -- `offered` is the reduction over their
+/// those travel together everywhere -- `offered` is the reduction over their
 /// `present` bits, and one `take` advances all of them.
 struct Head {
     ix: Vec<usize>,
-    /// Whether the receive was a blocking `@rcv`. A `@try_rcv` input is
-    /// OPTIONAL: it never holds the pipeline up, and it gives up an item only
-    /// on the cycles it had one.
+    /// Whether the receive was a blocking `@rcv`. Any other input is
+    /// NONBLOCKING: it never holds the pipeline up, and it gives up an item
+    /// only on the cycles its stage asked for one and had one.
     blocking: Vec<bool>,
+    /// The one stage whose operations touch this pipe. Always 0 for a
+    /// blocking input.
+    owner: Vec<usize>,
     rsalt_q: Vec<ValueId>,
     rsalt_slot: Vec<usize>,
     /// `data[ridx]`, emitted exactly once per pipe: `pipe_item_at` records the
     /// index ON the pipe, so a second call would overwrite it.
     item: Vec<ValueId>,
     /// `!empty` -- whether this pipe is offering. Emitted on demand and cached,
-    /// because a `@try_rcv` binds its own as `ok` while `offered` wants them
-    /// all. One fact, so one name.
+    /// because a nonblocking operation is eligible on it while `offered` wants
+    /// them all. One fact, so one name.
     present: Vec<Option<ValueId>>,
 }
 
@@ -436,15 +435,22 @@ fn stage_live(
         // is taken from the others either, because `take` is shared.
         //
         // With no blocking input there is nothing to wait for, and the question
-        // becomes whether ANY input delivered. A cycle where none did carries
-        // nothing, and a cycle carrying nothing is a bubble: it shifts through
-        // and commits nothing, which the validity chain already expresses and
-        // `push` already respects. What it must not be is a constant 1, which
-        // would make the head a free-running source emitting an item per cycle
-        // out of nothing.
+        // becomes whether ANY input stage 0 touches delivered. A cycle where
+        // none did carries nothing, and a cycle carrying nothing is a bubble:
+        // it shifts through and commits nothing, which the validity chain
+        // already expresses and `push` already respects. What it must not be
+        // is a constant 1, which would make the head a free-running source
+        // emitting an item per cycle out of nothing.
+        //
+        // An input a later stage owns is not asked. It samples for the item
+        // that stage holds, and has no say in whether there is one.
         let blocking: Vec<usize> = (0..head.ix.len()).filter(|j| head.blocking[*j]).collect();
         let is_a_join = !blocking.is_empty();
-        let which: Vec<usize> = if is_a_join { blocking } else { (0..head.ix.len()).collect() };
+        let which: Vec<usize> = if is_a_join {
+            blocking
+        } else {
+            (0..head.ix.len()).filter(|j| head.owner[*j] == 0).collect()
+        };
         let mut have = Vec::with_capacity(which.len());
         for j in which {
             have.push(head_present(low, head, j));
@@ -534,7 +540,7 @@ fn reads(stage: &[&PrecResInnerStmt]) -> HashSet<String> {
 
 /// The `in` pipes a sequence BLOCKS on, read straight off its source.
 ///
-/// A `@try_rcv` input is not one of them: the head fires without it. That
+/// A nonblocking input is not one of them: the head fires without it. That
 /// difference decides whether a loop of pipes between sequences can ever carry
 /// an item, which is `ir_graph::check_pipe_deadlock`'s question -- and it has
 /// to be answerable from the syntax, because a parameter list cannot say it and
@@ -661,7 +667,7 @@ pub fn lower_sequence(
     // Keyed by pipe index rather than held in a pair of Options: with several
     // of each, "was there one" is a question per pipe, and the answer has to
     // say WHICH.
-    let mut recv_of: Vec<Option<(&VarDeclStmt, bool)>> = vec![None; low.pipes.len()];
+    let mut recv_of: Vec<Option<&VarDeclStmt>> = vec![None; low.pipes.len()];
     // The stage each output is sent from.
     let mut send_stage: Vec<Option<usize>> = vec![None; low.pipes.len()];
     let mut plain: Vec<Vec<&PrecResInnerStmt>> = Vec::with_capacity(n);
@@ -675,32 +681,17 @@ pub fn lower_sequence(
             let at = crate::ir::stmt_anchor(stmt)
                 .map(|a| low.span_of(&a))
                 .unwrap_or_else(crate::driver::nowhere);
-            // A blocking `@rcv` and an optional `@try_rcv` differ in what they
-            // do to the head's liveness and in nothing else here: both name a
-            // pipe, both belong to stage 0, and both may happen once.
-            let received = as_recv(stmt)
-                .map(|(d, name)| (d, name, true))
-                .or_else(|| as_try_recv(stmt).map(|(d, name)| (d, name, false)));
-            if let Some((declaration, name, blocking)) = received {
+            // Only the blocking receive is picked out here. The nonblocking
+            // operations are ordinary statements, lowered where they stand.
+            if let Some((declaration, name)) = as_recv(stmt) {
                 let is_below_the_head = k != 0;
                 if is_below_the_head {
-                    if blocking {
-                        sink.err_span(
-                            at,
-                            "only the first stage of a sequence may block on a read",
-                        );
-                    } else {
-                        sink.push(
-                            Diag::error(
-                                at,
-                                "a sequence receives from all of its `in` pipes in its first stage"
-                                    .to_string(),
-                            )
+                    sink.push(
+                        Diag::error(at, "only the first stage of a sequence may block on a read")
                             .with_note(
-                                "a `@try_rcv` below the head would take an item on behalf of a stage that is holding a different one; move it above the first `|||`",
+                                "a blocking read below the head would hold every stage above it waiting for an item that belongs to a different one; use `@try_rcv` there, which samples for the item its stage holds",
                             ),
-                        );
-                    }
+                    );
                     return None;
                 }
                 let Some(ix) = low.pipes.iter().position(|p| p.name == name) else {
@@ -722,7 +713,7 @@ pub fn lower_sequence(
                     ));
                     return None;
                 }
-                recv_of[ix] = Some((declaration, blocking));
+                recv_of[ix] = Some(declaration);
             }
             if let Some((name, _)) = as_send(stmt) {
                 let Some(ix) = low.pipes.iter().position(|p| p.name == name) else {
@@ -766,24 +757,69 @@ pub fn lower_sequence(
         plain.push(keep);
     }
 
+    let defs: Vec<HashSet<String>> = plain
+        .iter()
+        .map(|st| defines(st))
+        .collect();
+    let rds: Vec<HashSet<String>> = plain
+        .iter()
+        .map(|st| reads(st))
+        .collect();
+
     // EVERY pipe, both ways. A pipe left out is not an oversight the hardware
     // can absorb: an input nothing reads never drains, an output nothing
     // writes never fills, and whatever is on the far side of it waits forever.
+    //
+    // Whether a nonblocking input is ever TAKEN from is a question for the
+    // lowering -- a pipe only peeked at is touched and still never drains --
+    // so here it is only asked whether something touches it, and where.
+    let mut owner_of: Vec<Option<usize>> = vec![None; low.pipes.len()];
     for ix in &inputs {
-        let was_received = recv_of[*ix].is_some();
-        if was_received {
-            continue;
-        }
         let name = low.pipes[*ix].name.clone();
+        // `reads_of` sees a pipe named inside any call, under any condition,
+        // which is every place an operation on it can be.
+        let touching: Vec<usize> = (0..n).filter(|k| rds[*k].contains(&name)).collect();
+        if touching.is_empty() {
+            sink.push(
+                Diag::error(
+                    map.span_of(&decl.name),
+                    format!("`{}` is never received from", name),
+                )
+                .with_note(never_taken_note(&name)),
+            );
+            return None;
+        }
+        // The rule a written memory follows, for its reason: at any cycle two
+        // stages hold two different items, so a pipe looked at in one and
+        // taken from in the other pairs one item's look with another's take.
+        let is_shared_by_stages = touching.len() > 1;
+        if is_shared_by_stages {
+            let stages: Vec<String> = touching.iter().map(|k| format!("stage {}", k)).collect();
+            sink.push(
+                Diag::error(
+                    map.span_of(&decl.name),
+                    format!("`{}` is received from in {}", name, stages.join(" and ")),
+                )
+                .with_note(
+                    "every stage of a pipeline is live at once holding a different item, so an operation on an `in` pipe belongs to one item and one in another stage belongs to another; put every operation on this pipe in one stage",
+                ),
+            );
+            return None;
+        }
+        owner_of[*ix] = Some(touching[0]);
+    }
+    // A blocking input is always stage 0's, so this is only ever reached by a
+    // head of nothing but nonblocking operations that all sit further down.
+    let head_touches_an_input = inputs.iter().any(|ix| owner_of[*ix] == Some(0));
+    if !head_touches_an_input {
         sink.push(
             Diag::error(
                 map.span_of(&decl.name),
-                format!("`{}` is never received from", name),
+                "nothing enters this sequence: its first stage receives from none of its `in` pipes",
             )
-            .with_note(format!(
-                "a sequence starts by receiving from every one of its `in` pipes, in its first stage, and the pipeline advances only when all of them are offering; add `let x = @rcv({})` there, or `let (x, ok) = @try_rcv({})` to take from it only on the cycles it has something",
-                name, name,
-            )),
+            .with_note(
+                "a pipeline's items are the ones its first stage takes, and an operation in a later stage only samples for the item that stage holds; receive from a pipe above the first `|||`, with `@rcv` to wait for it or `@try_rcv` not to",
+            ),
         );
         return None;
     }
@@ -842,6 +878,7 @@ pub fn lower_sequence(
     let mut head = Head {
         ix: Vec::new(),
         blocking: Vec::new(),
+        owner: Vec::new(),
         rsalt_q: Vec::new(),
         rsalt_slot: Vec::new(),
         item: Vec::new(),
@@ -855,9 +892,9 @@ pub fn lower_sequence(
             next_slot += 3;
             continue;
         }
-        let (_, blocking) = received.expect("every `in` pipe was received from above");
         head.ix.push(ix);
-        head.blocking.push(blocking);
+        head.blocking.push(received.is_some());
+        head.owner.push(owner_of[ix].expect("every `in` pipe was touched above"));
         head.rsalt_slot.push(next_slot);
         next_slot += 1;
     }
@@ -940,18 +977,40 @@ pub fn lower_sequence(
 
     // ---- stage bodies -----------------------------------------------------
     for j in 0..head.ix.len() {
-        let item = low.pipe_item_at(head.ix[j], head.rsalt_q[j]);
+        let ix = head.ix[j];
+        let item = low.pipe_item_at(ix, head.rsalt_q[j]);
         head.item.push(item);
+        // What a process's operations read off a pipe, so a nonblocking
+        // operation in a stage is lowered by the same code as one in a
+        // process. Its eligibility is `present` alone: whether the stage
+        // holding it moves is ANDed in once, into the `rsalt` enable, rather
+        // than into every answer -- nothing a stage computes on a cycle it
+        // does not move is committed.
+        low.pipes[ix].item = Some(item);
+        low.pipes[ix].salt_reg = Some(head.rsalt_slot[j]);
     }
-
-    let defs: Vec<HashSet<String>> = plain
-        .iter()
-        .map(|st| defines(st))
-        .collect();
-    let rds: Vec<HashSet<String>> = plain
-        .iter()
-        .map(|st| reads(st))
-        .collect();
+    // After every item rather than beside each, which is where a head
+    // `@try_rcv` always put them -- so its netlist does not move.
+    //
+    // A blocking input needs one only when stage 0 names it somewhere besides
+    // its `@rcv`: a `@peek` beside it, or a take that will be refused as a
+    // second one. Emitting it for every blocking input would renumber every
+    // sequence that does neither.
+    let head_mentions: HashSet<String> = {
+        let mut out = HashSet::new();
+        for stmt in plain[0].iter().filter(|s| as_recv(s).is_none()) {
+            reads_of(stmt, &mut out);
+        }
+        out
+    };
+    for j in 0..head.ix.len() {
+        let ix = head.ix[j];
+        let is_named_by_an_operation = !head.blocking[j] || head_mentions.contains(&low.pipes[ix].name);
+        if is_named_by_an_operation {
+            let present = head_present(&mut low, &mut head, j);
+            low.pipes[ix].fired = Some(present);
+        }
+    }
 
     // ---- who owns each memory --------------------------------------------
     //
@@ -1019,10 +1078,7 @@ pub fn lower_sequence(
     for (k, stage) in plain.iter().enumerate() {
         let assertion_start = low.asserts.len();
         for stmt in stage {
-            let received = as_recv(stmt)
-                .map(|(d, name)| (d, name, true))
-                .or_else(|| as_try_recv(stmt).map(|(d, name)| (d, name, false)));
-            if let Some((declaration, name, blocking)) = received {
+            if let Some((declaration, name)) = as_recv(stmt) {
                 let ix = low
                     .pipes
                     .iter()
@@ -1035,30 +1091,24 @@ pub fn lower_sequence(
                     .expect("an `in` pipe has a place in the head");
                 let ty = low.pipes[ix].ty.clone();
                 let item = head.item[j];
-                if blocking {
-                    check_read_type(&low, declaration, &ty, sink)?;
-                    let binding = if declaration.is_mutable {
-                        Binding::variable(item, ty)
-                    } else {
-                        Binding::constant(item, ty)
-                    };
-                    env.insert(anumspan_to_str(&declaration.head_name()).to_string(), binding);
-                    continue;
-                }
-                // The pair: the entry this side is owed, and whether there was
-                // one. When there was not, the item is whatever the buffer
-                // still holds -- the same bargain `@try_rcv` makes in a
-                // process (ir.rs:2836), and what `ok` is there to answer.
-                let present = head_present(&mut low, &mut head, j);
-                let names = declaration.names();
-                env.insert(
-                    anumspan_to_str(&names[0]).to_string(),
-                    Binding::constant(item, ty),
-                );
-                env.insert(
-                    anumspan_to_str(&names[1]).to_string(),
-                    Binding::constant(present, Ty::BOOL),
-                );
+                check_read_type(&low, declaration, &ty, sink)?;
+                // The claim a nonblocking operation makes, made here too, at
+                // this position: `take` spends the pipe's one transfer for the
+                // cycle, and a `@drop` or `@try_rcv` beside it, above or
+                // below, would spend it again.
+                let at = crate::ir::stmt_anchor(stmt)
+                    .map(|a| low.span_of(&a))
+                    .unwrap_or_else(crate::driver::nowhere);
+                let depth = low.push_anchor(at);
+                let claimed = low.claim_transfer(&name, false, true, sink);
+                low.pop_anchor(depth);
+                claimed?;
+                let binding = if declaration.is_mutable {
+                    Binding::variable(item, ty)
+                } else {
+                    Binding::constant(item, ty)
+                };
+                env.insert(anumspan_to_str(&declaration.head_name()).to_string(), binding);
                 continue;
             }
             if let Some((send_name, expr)) = as_send(stmt) {
@@ -1313,6 +1363,27 @@ pub fn lower_sequence(
     // bits.
     let offered = stage_live(&mut low, 0, &mut offered, &mut head, valid_base);
 
+    // A nonblocking input the stages only LOOKED at. `@peek` spends nothing,
+    // so the entry it saw is still there on the next cycle, and on every one
+    // after: the pipe never drains and its producer waits forever. `used` is
+    // set by every operation that takes.
+    if sink.errored_since(errors_before) {
+        return None;
+    }
+    for j in 0..head.ix.len() {
+        let ix = head.ix[j];
+        let is_ever_taken = head.blocking[j] || low.pipes[ix].used;
+        if is_ever_taken {
+            continue;
+        }
+        let name = low.pipes[ix].name.clone();
+        sink.push(
+            Diag::error(map.span_of(&decl.name), format!("`{}` is never received from", name))
+                .with_note(never_taken_note(&name)),
+        );
+        return None;
+    }
+
     // ---- the read ports ---------------------------------------------------
     //
     // Tied to the asking stage's shift, which is what keeps `<mem>_q` in step
@@ -1399,17 +1470,33 @@ pub fn lower_sequence(
     let head_shift = shift_at[0].expect("a sequence sends, so its head has a shift");
     let take = low.emit(Ty::BOOL, Op::Bin { op: BinOp::And, lhs: offered, rhs: head_shift });
     low.name_value(take, "take".to_string());
+    // Whether each stage is live and moving, for the inputs it owns; emitted
+    // once per stage that owns one. Stage 0's is `take`.
+    let mut moving_at: Vec<Option<ValueId>> = vec![None; n];
+    moving_at[0] = Some(take);
     for j in 0..head.ix.len() {
         let ix = head.ix[j];
         let name = low.pipes[ix].name.clone();
-        // An OPTIONAL input gives up an item only on the cycles it had one.
-        // `offered` never waited for it, so `take` on its own would step this
-        // `rsalt` past an entry that was never there.
+        // A NONBLOCKING input gives up an item only on the cycles its stage
+        // asked for one, under the condition it asked, and had one --
+        // `pipe_transfer` -- and only when that stage is live and moving. A
+        // bubble must not take, and a held stage would otherwise take again on
+        // every cycle it waited.
         let advance = if head.blocking[j] {
             take
         } else {
-            let present = head_present(&mut low, &mut head, j);
-            let v = low.emit(Ty::BOOL, Op::Bin { op: BinOp::And, lhs: take, rhs: present });
+            let k = head.owner[j];
+            let stage_moves = match moving_at[k] {
+                Some(m) => m,
+                None => {
+                    let live = stage_live(&mut low, k, &mut None, &mut head, valid_base);
+                    let m = moving(&mut low, live, shift_at[k]);
+                    moving_at[k] = Some(m);
+                    m
+                }
+            };
+            let transfer = low.pipe_transfer(ix);
+            let v = low.emit(Ty::BOOL, Op::Bin { op: BinOp::And, lhs: stage_moves, rhs: transfer });
             low.name_value_safe(v, format!("{}_take", name));
             v
         };

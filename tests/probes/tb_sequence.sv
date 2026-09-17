@@ -81,6 +81,91 @@ module tb_sequence;
     end
   end
 
+  // ---- nonblocking inputs below the head ----------------------------------
+  //
+  // `seq_side` samples `b` in stage 1 for the item passing through. `b` offers
+  // sparsely and the consumer stalls on a pattern, so stage 1 is by turns
+  // empty, moving and held while `b` has something. Every item must arrive in
+  // order, the ones that carry a `b` item must carry them in order with none
+  // repeated or skipped, and `b` must have been stepped once for each -- a
+  // stage that took on a bubble or while held would break the last two.
+  localparam SIDE_N = 40, SIDE_B = 12;
+  reg [1:0] sws=0, sbws=0, sorx=0;
+  reg [15:0] se0=0, se1=0, sb0=0, sb1=0;
+  wire [1:0] sr_side, sbr, sow;
+  wire [63:0] sod;
+  seq_side sd_side(clk,rst_n,sws,sr_side,{se1,se0},sbws,sbr,{sb1,sb0},sow,sorx,sod);
+  reg side_go=0;
+  reg [1:0] sbr_last=0;
+  integer side_sent=0, side_bsent=0, side_got=0, side_bgot=0, side_bsteps=0, side_cycle=0;
+  wire sws_idx = sws[0]^sws[1];
+  wire sbws_idx = sbws[0]^sbws[1];
+  wire sorx_idx = sorx[0]^sorx[1];
+  wire [31:0] so_item = sorx_idx ? sod[63:32] : sod[31:0];
+  always @(negedge clk) if (side_go) begin
+    side_cycle = side_cycle + 1;
+    if (sbr !== sbr_last) begin side_bsteps = side_bsteps + 1; sbr_last = sbr; end
+    if (sws != ~sr_side && side_sent < SIDE_N && (side_cycle % 3) != 0) begin
+      if (sws_idx) se1 <= side_sent + 1; else se0 <= side_sent + 1;
+      sws <= sws ^ (sws_idx ? 2'd2 : 2'd1);
+      side_sent = side_sent + 1;
+    end
+    if (sbws != ~sbr && side_bsent < SIDE_B && (side_cycle % 3) == 1) begin
+      if (sbws_idx) sb1 <= 1001 + side_bsent; else sb0 <= 1001 + side_bsent;
+      sbws <= sbws ^ (sbws_idx ? 2'd2 : 2'd1);
+      side_bsent = side_bsent + 1;
+    end
+    if ((side_cycle % 11) < 6 && sow != sorx) begin
+      if (so_item[15:0] !== side_got + 1) $fatal(1,"sideband item out of order: %0d, wanted %0d",so_item[15:0],side_got+1);
+      if (so_item[31:16] != 0) begin
+        if (so_item[31:16] !== 1001 + side_bgot) $fatal(1,"sideband sample out of order: %0d, wanted %0d",so_item[31:16],1001+side_bgot);
+        side_bgot = side_bgot + 1;
+      end
+      sorx <= sorx ^ (sorx_idx ? 2'd2 : 2'd1);
+      side_got = side_got + 1;
+    end
+  end
+
+  // `seq_peek_drop` looks at `b` in stage 1 and drops its head only when it
+  // equals the item passing. `b` holds 3, 7, 7, 20 and the items climb, so 3
+  // and the first 7 are dropped and the second 7 blocks the rest for good.
+  localparam PD_N = 24;
+  reg [1:0] pdws=0, pdbws=0, pdrx=0;
+  reg [15:0] pde0=0, pde1=0, pdb0=0, pdb1=0;
+  wire [1:0] pdr, pdbr, pdow;
+  wire [63:0] pdod;
+  seq_peek_drop pd(clk,rst_n,pdws,pdr,{pde1,pde0},pdbws,pdbr,{pdb1,pdb0},pdow,pdrx,pdod);
+  reg pd_go=0;
+  reg [1:0] pdbr_last=0;
+  integer pd_sent=0, pd_bsent=0, pd_got=0, pd_hits=0, pd_bsteps=0, pd_cycle=0;
+  reg [15:0] pd_b [0:3];
+  initial begin pd_b[0]=3; pd_b[1]=7; pd_b[2]=7; pd_b[3]=20; end
+  wire pdws_idx = pdws[0]^pdws[1];
+  wire pdbws_idx = pdbws[0]^pdbws[1];
+  wire pdrx_idx = pdrx[0]^pdrx[1];
+  wire [31:0] pd_item = pdrx_idx ? pdod[63:32] : pdod[31:0];
+  always @(negedge clk) if (pd_go) begin
+    pd_cycle = pd_cycle + 1;
+    if (pdbr !== pdbr_last) begin pd_bsteps = pd_bsteps + 1; pdbr_last = pdbr; end
+    if (pdws != ~pdr && pd_sent < PD_N && (pd_cycle % 2) == 0) begin
+      if (pdws_idx) pde1 <= pd_sent + 1; else pde0 <= pd_sent + 1;
+      pdws <= pdws ^ (pdws_idx ? 2'd2 : 2'd1);
+      pd_sent = pd_sent + 1;
+    end
+    if (pdbws != ~pdbr && pd_bsent < 4) begin
+      if (pdbws_idx) pdb1 <= pd_b[pd_bsent]; else pdb0 <= pd_b[pd_bsent];
+      pdbws <= pdbws ^ (pdbws_idx ? 2'd2 : 2'd1);
+      pd_bsent = pd_bsent + 1;
+    end
+    if ((pd_cycle % 5) < 3 && pdow != pdrx) begin
+      if (pd_item[15:0] !== pd_got + 1) $fatal(1,"peek/drop item out of order: %0d, wanted %0d",pd_item[15:0],pd_got+1);
+      if ((pd_item[31:16] == 1) !== (pd_item[15:0] == 3 || pd_item[15:0] == 7)) $fatal(1,"peek/drop hit on the wrong item: %h",pd_item);
+      if (pd_item[31:16] == 1) pd_hits = pd_hits + 1;
+      pdrx <= pdrx ^ (pdrx_idx ? 2'd2 : 2'd1);
+      pd_got = pd_got + 1;
+    end
+  end
+
   // Both sinks of the join advance together, every cycle, always.
   always @(posedge clk) begin
     if (rst_n && jsw !== jdw) $fatal(1,"join sinks moved apart: %b vs %b",jsw,jdw);
@@ -130,7 +215,18 @@ module tb_sequence;
     early_go=1;
     repeat(400) @(negedge clk);
     if(early_got !== EARLY_N) $fatal(1,"sends from different stages stalled: %0d of %0d joined",early_got,EARLY_N);
-    $display("TB_PASS: sequence scoping, BRAM identities, assertions, literals, read-first, join/scatter, optional input, sends from several stages RTL");
+
+    side_go=1;
+    repeat(600) @(negedge clk);
+    if(side_got !== SIDE_N) $fatal(1,"sideband pipeline stalled: %0d of %0d",side_got,SIDE_N);
+    if(side_bsteps !== side_bgot) $fatal(1,"sideband stepped %0d times for %0d samples",side_bsteps,side_bgot);
+    if(side_bgot !== SIDE_B) $fatal(1,"sideband samples: %0d of %0d (offered %0d, items sent %0d, cycles %0d)",side_bgot,SIDE_B,side_bsent,side_sent,side_cycle);
+
+    pd_go=1;
+    repeat(400) @(negedge clk);
+    if(pd_got !== PD_N) $fatal(1,"peek/drop pipeline stalled: %0d of %0d",pd_got,PD_N);
+    if(pd_hits !== 2 || pd_bsteps !== 2) $fatal(1,"peek/drop took %0d (hits %0d), wanted 2",pd_bsteps,pd_hits);
+    $display("TB_PASS: sequence scoping, BRAM identities, assertions, literals, read-first, join/scatter, optional input, sends from several stages, nonblocking inputs below the head RTL");
     $finish;
   end
 endmodule
