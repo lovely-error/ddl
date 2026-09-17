@@ -2429,21 +2429,24 @@ fn a_sequence_needs_a_source_and_a_sink() {
 }
 
 #[test]
-fn a_try_rcv_below_the_head_is_rejected() {
-    // Supported in the head and only there: below it, it would take an item on
-    // behalf of a stage that is holding a different one.
-    let text = compile_err(concat!(
-        "sequence s (a: buffer in u16, b: buffer in u16, o: buffer out u16)\n",
-        "  let p = @rcv(a)\n",
-        "  |||\n",
-        "  let (q, ok) = @try_rcv(b)\n",
-        "  @send(o, p)\n",
+fn a_try_rcv_below_the_head_samples_for_its_stage() {
+    // Allowed in any stage now. It takes for the item its stage holds: on a
+    // cycle that stage is live and moving, and not otherwise -- and the head
+    // is not paced by it.
+    let v = compile(concat!(
+        "sequence s (a: buffer in u16, b: buffer in u16, o: buffer out u16)
+",
+        "  let p = @rcv(a)
+",
+        "  |||
+",
+        "  let (q, ok) = @try_rcv(b)
+",
+        "  @send(o, p)
+",
     ));
-    assert!(
-        text.contains("receives from all of its `in` pipes in its first stage"),
-        "{}",
-        text
-    );
+    assert!(v.contains("wire take = a_present & shift0;"), "{}", v);
+    assert!(v.contains("wire b_take = (v0 & shift1) & b_present;"), "{}", v);
 }
 
 

@@ -33,7 +33,7 @@ $exportManifest = @{
     'p7'            = @('p7a','p7b')
     'p8'            = @('p8')
     'p9'            = @('p9')
-    'sequences'     = @('seq_address','seq_assert','seq_early','seq_join','seq_literal','seq_optional','seq_read_first','seq_scope')
+    'sequences'     = @('seq_address','seq_assert','seq_early','seq_join','seq_literal','seq_optional','seq_peek_drop','seq_read_first','seq_scope','seq_side')
 }
 
 Push-Location $compilerRoot

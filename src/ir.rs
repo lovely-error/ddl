@@ -717,7 +717,12 @@ pub struct Lowerer<'a> {
 }
 
 impl<'a> Lowerer<'a> {
-    fn claim_transfer(&mut self, name: &str, occupied: bool, receive: bool, sink: &mut DiagSink) -> Option<()> {
+    /// What the source calls the declaration being lowered.
+    pub(crate) fn declaration_kind(&self) -> &'static str {
+        if self.in_pipeline { "sequence" } else { "process" }
+    }
+
+    pub(crate) fn claim_transfer(&mut self, name: &str, occupied: bool, receive: bool, sink: &mut DiagSink) -> Option<()> {
         fn disjoint(a: &[PathTerm], b: &[PathTerm]) -> bool {
             a.iter().any(|x| b.iter().any(|y| match (x, y) {
                 (PathTerm::Cond { value: x, taken: a }, PathTerm::Cond { value: y, taken: b }) => x == y && a != b,
@@ -2801,7 +2806,7 @@ fn lower_try_rcv_binding(
     let ix = match low.pipes.iter().position(|p| p.name == pipe_name) {
         Some(i) => i,
         None => {
-            sink.err_at(&decl.head_name(), format!("`{}` is not a pipe of this process", pipe_name));
+            sink.err_at(&decl.head_name(), format!("`{}` is not a pipe of this {}", pipe_name, low.declaration_kind()));
             return None;
         }
     };
@@ -2811,10 +2816,6 @@ fn lower_try_rcv_binding(
             &decl.head_name(),
             format!("`{}` is an `out` pipe; it cannot be {}", pipe_name, verb),
         );
-        return None;
-    }
-    if low.in_pipeline {
-        sink.err_at(&decl.head_name(), "nonblocking buffer operations are not supported in a sequence; use `@rcv` in its head and `@send` in any of its stages, or use a process");
         return None;
     }
     if takes {
@@ -2829,6 +2830,12 @@ fn lower_try_rcv_binding(
     // accepting, the two disagree, and that disagreement is what a peek is for.
     let answer = if takes {
         low.request_pipe(ix, None)
+    } else if low.in_pipeline {
+        // A sequence's eligibility for a nonblocking input IS `present` --
+        // whether the stage moves is applied to the take, not to the answers
+        // (ir_pipe.rs) -- so it is already in hand, and a second compare would
+        // be the same wire twice.
+        low.pipes[ix].fired.expect("a sequence's nonblocking input has its `present`")
     } else {
         let rsalt_q = {
             let slot = low.pipes[ix].salt_reg.expect("an input pipe has an rsalt register");
@@ -4732,7 +4739,7 @@ fn lower_builtin(
         let Some(ix) = low.pipes.iter().position(|p| p.name == pipe_name) else {
             sink.err_span(
                 low.here(),
-                format!("`{}` is not a pipe of this process", pipe_name),
+                format!("`{}` is not a pipe of this {}", pipe_name, low.declaration_kind()),
             );
             return None;
         };
@@ -4741,10 +4748,6 @@ fn lower_builtin(
                 low.here(),
                 format!("`{}` is an `out` pipe; there is nothing on it to drop", pipe_name),
             );
-            return None;
-        }
-        if low.in_pipeline {
-            sink.err_span(low.here(), "nonblocking buffer operations are not supported in a sequence; use `@rcv` in its head and `@send` in any of its stages, or use a process");
             return None;
         }
         low.claim_transfer(&pipe_name, low.pipes[ix].used, true, sink)?;
@@ -4770,7 +4773,7 @@ fn lower_builtin(
             None => {
                 sink.err_span(
                     low.here(),
-                    format!("`{}` is not a pipe of this process", pipe_name),
+                    format!("`{}` is not a pipe of this {}", pipe_name, low.declaration_kind()),
                 );
                 return None;
             }
@@ -4782,8 +4785,11 @@ fn lower_builtin(
             );
             return None;
         }
+        // A sequence's sends are unconditional and give their stage its
+        // shift; an offer that may be refused would be an item the stage
+        // moved on without delivering.
         if low.in_pipeline {
-            sink.err_span(low.here(), "nonblocking buffer operations are not supported in a sequence; use `@rcv` in its head and `@send` in any of its stages, or use a process");
+            sink.err_span(low.here(), "`@try_send` is not supported in a sequence; use `@send`, which holds its stage until the sink has room, or use a process");
             return None;
         }
         low.claim_transfer(&pipe_name, low.pipes[ix].used, false, sink)?;

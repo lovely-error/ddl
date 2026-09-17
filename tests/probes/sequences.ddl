@@ -61,3 +61,23 @@ sequence seq_early (src: buffer in u16, x: buffer out u16, y: buffer out u16)
   let b: u16 = a + 16'd1
   |||
   @send(y, b + 16'd1)
+
+sequence seq_side (src: buffer in u16, b: buffer in u16, o: buffer out u32)
+  let x = @rcv(src)
+  |||
+  let (y, ok) = @try_rcv(b)
+  var t: u16 = 16'd0
+  if ok then
+    t = y
+  |||
+  @send(o, {t, x})
+
+sequence seq_peek_drop (src: buffer in u16, b: buffer in u16, o: buffer out u32)
+  let x = @rcv(src)
+  |||
+  let (y, here) = @peek(b)
+  var h: u16 = 16'd0
+  if here & (y == x) then
+    @drop(b)
+    h = 16'd1
+  @send(o, {h, x})

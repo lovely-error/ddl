@@ -612,16 +612,17 @@ fn sequence_tail_constants_use_the_output_type() {
 }
 
 #[test]
-fn sequence_duplicate_transfers_and_nonblocking_buffers_are_diagnosed() {
+fn sequence_duplicate_transfers_and_misplaced_nonblocking_buffers_are_diagnosed() {
     for (body, message) in [
         ("  let x = @rcv(src)\n  let y = @rcv(src)\n  |||\n  @send(o, x)\n", "`src` is received from twice"),
         ("  let x = @rcv(src)\n  |||\n  @send(o, 8'd1)\n  @send(o, 8'd2)\n", "`o` is sent to twice"),
-        ("  let x = @rcv(src)\n  |||\n  let (v, ok) = @peek(src)\n  @send(o, x)\n", "nonblocking buffer operations are not supported"),
-        // A `@try_rcv` IS supported now, but only in the head: below it, it would
-        // take an item on behalf of a stage that is holding a different one.
-        ("  let x = @rcv(src)\n  |||\n  let (v, ok) = @try_rcv(src)\n  @send(o, x)\n", "receives from all of its `in` pipes in its first stage"),
-        ("  let x = @rcv(src)\n  |||\n  @drop(src)\n  @send(o, x)\n", "nonblocking buffer operations are not supported"),
-        ("  let x = @rcv(src)\n  |||\n  @try_send(o, x)\n  @send(o, x)\n", "nonblocking buffer operations are not supported"),
+        // `@peek`, `@try_rcv` and `@drop` are supported in every stage, but a
+        // pipe belongs to one: below the head, these touch the pipe the head
+        // already receives from, and would act for a different item.
+        ("  let x = @rcv(src)\n  |||\n  let (v, ok) = @peek(src)\n  @send(o, x)\n", "`src` is received from in stage 0 and stage 1"),
+        ("  let x = @rcv(src)\n  |||\n  let (v, ok) = @try_rcv(src)\n  @send(o, x)\n", "`src` is received from in stage 0 and stage 1"),
+        ("  let x = @rcv(src)\n  |||\n  @drop(src)\n  @send(o, x)\n", "`src` is received from in stage 0 and stage 1"),
+        ("  let x = @rcv(src)\n  |||\n  @try_send(o, x)\n  @send(o, x)\n", "`@try_send` is not supported in a sequence"),
     ] {
         let map = SourceMap::new("invalid_sequence.ddl", format!("sequence s (src: buffer in u8, o: buffer out u8)\n{body}"));
         // Calling the API directly ensures a panic cannot masquerade as a diagnostic.
