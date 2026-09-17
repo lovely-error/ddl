@@ -872,6 +872,124 @@ fn the_same_loop_is_live_once_the_feedback_is_optional() {
     assert!(v.contains("wire take = x_present & shift0;"), "{}", v);
 }
 
+/// The same loop with `acc`'s whole body up to the caller, which decides how
+/// its head fires. `x` comes from outside the graph; `fb` is the feedback.
+fn feedback_loop(acc_body: &str) -> String {
+    format!(
+        concat!(
+            "sequence acc (x: buffer in u16, fb: buffer in u16, o: buffer out u16, fbo: buffer out u16)\n",
+            "{}",
+            "sequence hold (i: buffer in u16, o: buffer out u16)\n",
+            "  let a = @rcv(i)\n",
+            "  |||\n",
+            "  @send(o, a)\n",
+            "graph accum (src: buffer in u16, dst: buffer out u16)\n",
+            "  let fwd: buffer u16\n",
+            "  let back: buffer u16\n",
+            "  acc(src, back, dst, fwd)\n",
+            "  hold(fwd, back)\n",
+        ),
+        acc_body,
+    )
+}
+
+#[test]
+fn a_head_that_only_samples_the_feedback_is_a_deadlock_too() {
+    // No blocking receive, so the head fires on any input its FIRST stage
+    // reads -- and the only one is the feedback. `x` is read one stage later,
+    // where it samples for an item that can never have entered.
+    let text = compile_err(&feedback_loop(concat!(
+        "  let (b, ok) = @try_rcv(fb)\n",
+        "  |||\n",
+        "  let (a, aok) = @try_rcv(x)\n",
+        "  @send(o, b)\n",
+        "  @send(fbo, b)\n",
+    )));
+    assert!(text.contains("`acc` waits on itself through acc -> hold -> acc"), "{}", text);
+    assert!(text.contains("any pipe its first stage reads"), "{}", text);
+}
+
+#[test]
+fn a_head_that_peeks_and_drops_the_feedback_is_a_deadlock_too() {
+    let text = compile_err(&feedback_loop(concat!(
+        "  let (b, here) = @peek(fb)\n",
+        "  @drop(fb)\n",
+        "  |||\n",
+        "  @drop(x)\n",
+        "  @send(o, b)\n",
+        "  @send(fbo, b)\n",
+    )));
+    assert!(text.contains("`acc` waits on itself through"), "{}", text);
+}
+
+#[test]
+fn a_head_that_blocks_on_the_feedback_is_dead_whatever_else_it_samples() {
+    // An AND head fires without its optional inputs, so an outside `@try_rcv`
+    // beside a blocking feedback receive changes nothing.
+    let text = compile_err(&feedback_loop(concat!(
+        "  let b = @rcv(fb)\n",
+        "  let (a, ok) = @try_rcv(x)\n",
+        "  |||\n",
+        "  @send(o, b)\n",
+        "  @send(fbo, b)\n",
+    )));
+    assert!(text.contains("`acc` waits on itself through"), "{}", text);
+}
+
+#[test]
+fn a_head_that_samples_an_outside_input_beside_the_feedback_is_live() {
+    let v = compile(&feedback_loop(concat!(
+        "  let (a, aok) = @try_rcv(x)\n",
+        "  let (b, bok) = @try_rcv(fb)\n",
+        "  |||\n",
+        "  @send(o, a)\n",
+        "  @send(fbo, b)\n",
+    )));
+    assert!(v.contains("module accum"), "{}", v);
+}
+
+#[test]
+fn a_loop_is_dead_however_its_producers_send() {
+    // Conditional sends and offers produce less than a plain `@send`, never
+    // more, so they cannot bring a dead loop to life.
+    let text = compile_err(&feedback_loop(concat!(
+        "  let a = @rcv(x)\n",
+        "  let b = @rcv(fb)\n",
+        "  |||\n",
+        "  if a != 16'd0 then\n",
+        "    @send(o, a)\n",
+        "  let ok = @try_send(fbo, b)\n",
+    )));
+    assert!(text.contains("`acc` waits on itself through"), "{}", text);
+}
+
+#[test]
+fn a_dead_chain_hanging_off_a_dead_loop_is_one_report() {
+    // `tail` can never fire either, but only because of the loop, and the loop
+    // is what there is to fix.
+    let src = concat!(
+        "sequence acc (x: buffer in u16, fb: buffer in u16, o: buffer out u16, fbo: buffer out u16)\n",
+        "  let b = @rcv(fb)\n",
+        "  let (a, ok) = @try_rcv(x)\n",
+        "  |||\n",
+        "  @send(o, b)\n",
+        "  @send(fbo, b)\n",
+        "sequence hold (i: buffer in u16, o: buffer out u16)\n",
+        "  let a = @rcv(i)\n",
+        "  |||\n",
+        "  @send(o, a)\n",
+        "graph accum (src: buffer in u16, dst: buffer out u16)\n",
+        "  let fwd: buffer u16\n",
+        "  let back: buffer u16\n",
+        "  let mid: buffer u16\n",
+        "  acc(src, back, mid, fwd)\n",
+        "  hold(fwd, back)\n",
+        "  hold(mid, dst)\n",
+    );
+    let text = compile_err(src);
+    assert_eq!(text.matches("waits on itself").count(), 1, "{}", text);
+}
+
 #[test]
 fn a_loop_closed_through_a_process_is_left_alone() {
     // Soundness, and the check's first limit. A process may send before it

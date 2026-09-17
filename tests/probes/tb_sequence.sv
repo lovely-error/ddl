@@ -166,6 +166,125 @@ module tb_sequence;
     end
   end
 
+  // ---- sends under conditions, and offers --------------------------------
+  //
+  // A tiny producer and consumer per pipe, as tasks would be if this bench
+  // had them: `*_idx` is the entry a salt names, and a transfer toggles it.
+
+  // `seq_route` sends odd items to `odd` from stage 1 and every item to `all`
+  // from stage 2. `odd` is not drained at first: it fills with 1 and 3, the
+  // even items must pass it, and 5 must hold stage 1 while 1..4 still reach
+  // `all`. Then `odd` drains and everything completes in order.
+  localparam ROUTE_N = 20;
+  reg [1:0] rws=0, rox=0, rax=0;
+  reg [15:0] re0=0, re1=0;
+  wire [1:0] rr, row, raw;
+  wire [31:0] rod, rad;
+  seq_route rt(clk,rst_n,rws,rr,{re1,re0},row,rox,rod,raw,rax,rad);
+  reg route_go=0, route_drain_odd=0;
+  integer route_sent=0, route_all=0, route_odd=0;
+  wire rws_idx = rws[0]^rws[1];
+  wire rox_idx = rox[0]^rox[1];
+  wire rax_idx = rax[0]^rax[1];
+  wire [15:0] ro_item = rox_idx ? rod[31:16] : rod[15:0];
+  wire [15:0] ra_item = rax_idx ? rad[31:16] : rad[15:0];
+  always @(negedge clk) if (route_go) begin
+    if (rws != ~rr && route_sent < ROUTE_N) begin
+      if (rws_idx) re1 <= route_sent + 1; else re0 <= route_sent + 1;
+      rws <= rws ^ (rws_idx ? 2'd2 : 2'd1);
+      route_sent = route_sent + 1;
+    end
+    if (raw != rax) begin
+      if (ra_item !== route_all + 1) $fatal(1,"route: `all` out of order: %0d, wanted %0d",ra_item,route_all+1);
+      rax <= rax ^ (rax_idx ? 2'd2 : 2'd1);
+      route_all = route_all + 1;
+    end
+    if (route_drain_odd && row != rox) begin
+      if (ro_item !== 2*route_odd + 1) $fatal(1,"route: `odd` out of order: %0d, wanted %0d",ro_item,2*route_odd+1);
+      rox <= rox ^ (rox_idx ? 2'd2 : 2'd1);
+      route_odd = route_odd + 1;
+    end
+  end
+
+  // `seq_blocked_early` sends to `x` from stage 0 and to `y` from stage 2.
+  // `y` is held back first, so stages 1 and 2 fill; then `x` stops draining
+  // and `y` starts. Stage 0 blocks on `x` -- and every item that left stage 0
+  // must still reach `y`.
+  localparam BE_N = 30;
+  reg [1:0] bws=0, bxx=0, byx=0;
+  reg [15:0] be0=0, be1=0;
+  wire [1:0] br, bxw, byw;
+  wire [31:0] bxd, byd;
+  seq_blocked_early be(clk,rst_n,bws,br,{be1,be0},bxw,bxx,bxd,byw,byx,byd);
+  reg be_go=0, be_drain_x=0, be_drain_y=0;
+  reg [1:0] bxw_last=0;
+  integer be_sent=0, be_x=0, be_y=0, be_x_pushes=0;
+  wire bws_idx = bws[0]^bws[1];
+  wire bxx_idx = bxx[0]^bxx[1];
+  wire byx_idx = byx[0]^byx[1];
+  wire [15:0] bx_item = bxx_idx ? bxd[31:16] : bxd[15:0];
+  wire [15:0] by_item = byx_idx ? byd[31:16] : byd[15:0];
+  always @(negedge clk) if (be_go) begin
+    if (bxw !== bxw_last) begin be_x_pushes = be_x_pushes + 1; bxw_last = bxw; end
+    if (bws != ~br && be_sent < BE_N) begin
+      if (bws_idx) be1 <= be_sent + 1; else be0 <= be_sent + 1;
+      bws <= bws ^ (bws_idx ? 2'd2 : 2'd1);
+      be_sent = be_sent + 1;
+    end
+    if (be_drain_x && bxw != bxx) begin
+      if (bx_item !== be_x + 1) $fatal(1,"blocked early: `x` out of order: %0d, wanted %0d",bx_item,be_x+1);
+      bxx <= bxx ^ (bxx_idx ? 2'd2 : 2'd1);
+      be_x = be_x + 1;
+    end
+    if (be_drain_y && byw != byx) begin
+      if (by_item !== be_y + 1) $fatal(1,"blocked early: `y` out of order: %0d, wanted %0d",by_item,be_y+1);
+      byx <= byx ^ (byx_idx ? 2'd2 : 2'd1);
+      be_y = be_y + 1;
+    end
+  end
+
+  // `seq_offer` offers every item to `side` and logs whether it was taken.
+  // `side` drains on a slow pattern, so offers are both accepted and
+  // declined; every logged `ok` must be exactly an item `side` received, in
+  // order, and no offer may hold the pipeline.
+  localparam OF_N = 60;
+  reg [1:0] ows=0, osx=0, olx=0;
+  reg [15:0] oe0=0, oe1=0;
+  wire [1:0] or_, osw, olw;
+  wire [31:0] osd;
+  wire [63:0] old;
+  seq_offer of(clk,rst_n,ows,or_,{oe1,oe0},osw,osx,osd,olw,olx,old);
+  reg offer_go=0;
+  integer of_sent=0, of_logged=0, of_side=0, of_accepted=0, of_declined=0, of_cycle=0;
+  integer of_side_items [0:OF_N-1];
+  integer of_accepted_items [0:OF_N-1];
+  integer of_i;
+  wire ows_idx = ows[0]^ows[1];
+  wire osx_idx = osx[0]^osx[1];
+  wire olx_idx = olx[0]^olx[1];
+  wire [15:0] os_item = osx_idx ? osd[31:16] : osd[15:0];
+  wire [31:0] ol_item = olx_idx ? old[63:32] : old[31:0];
+  always @(negedge clk) if (offer_go) begin
+    of_cycle = of_cycle + 1;
+    if (ows != ~or_ && of_sent < OF_N) begin
+      if (ows_idx) oe1 <= of_sent + 1; else oe0 <= of_sent + 1;
+      ows <= ows ^ (ows_idx ? 2'd2 : 2'd1);
+      of_sent = of_sent + 1;
+    end
+    if ((of_cycle % 5) == 0 && osw != osx) begin
+      of_side_items[of_side] = os_item;
+      osx <= osx ^ (osx_idx ? 2'd2 : 2'd1);
+      of_side = of_side + 1;
+    end
+    if (olw != olx) begin
+      if (ol_item[15:0] !== of_logged + 1) $fatal(1,"offer: log out of order: %0d, wanted %0d",ol_item[15:0],of_logged+1);
+      if (ol_item[31:16] == 1) begin of_accepted_items[of_accepted] = ol_item[15:0]; of_accepted = of_accepted + 1; end
+      else of_declined = of_declined + 1;
+      olx <= olx ^ (olx_idx ? 2'd2 : 2'd1);
+      of_logged = of_logged + 1;
+    end
+  end
+
   // Both sinks of the join advance together, every cycle, always.
   always @(posedge clk) begin
     if (rst_n && jsw !== jdw) $fatal(1,"join sinks moved apart: %b vs %b",jsw,jdw);
@@ -226,7 +345,33 @@ module tb_sequence;
     repeat(400) @(negedge clk);
     if(pd_got !== PD_N) $fatal(1,"peek/drop pipeline stalled: %0d of %0d",pd_got,PD_N);
     if(pd_hits !== 2 || pd_bsteps !== 2) $fatal(1,"peek/drop took %0d (hits %0d), wanted 2",pd_bsteps,pd_hits);
-    $display("TB_PASS: sequence scoping, BRAM identities, assertions, literals, read-first, join/scatter, optional input, sends from several stages, nonblocking inputs below the head RTL");
+
+    route_go=1;
+    repeat(200) @(negedge clk);
+    if(route_all !== 4) $fatal(1,"route: a full `odd` let %0d items through, wanted 4",route_all);
+    if(row !== 2'b11) $fatal(1,"route: `odd` should hold 1 and 3: wsalt %b",row);
+    route_drain_odd=1;
+    repeat(300) @(negedge clk);
+    if(route_all !== ROUTE_N || route_odd !== ROUTE_N/2) $fatal(1,"route stalled: all %0d, odd %0d",route_all,route_odd);
+
+    be_go=1; be_drain_x=1;
+    repeat(20) @(negedge clk);
+    be_drain_x=0; be_drain_y=1;
+    repeat(200) @(negedge clk);
+    if(be_x_pushes < 6) $fatal(1,"blocked early: only %0d items left stage 0 before it blocked",be_x_pushes);
+    if(be_y !== be_x_pushes) $fatal(1,"blocked early: %0d items left stage 0 but %0d reached `y`",be_x_pushes,be_y);
+    be_drain_x=1;
+    repeat(300) @(negedge clk);
+    if(be_x !== BE_N || be_y !== BE_N) $fatal(1,"blocked early stalled: x %0d, y %0d",be_x,be_y);
+
+    offer_go=1;
+    repeat(600) @(negedge clk);
+    if(of_logged !== OF_N) $fatal(1,"offer: an offer held the pipeline: %0d of %0d logged",of_logged,OF_N);
+    if(of_accepted == 0 || of_declined == 0) $fatal(1,"offer: accepted %0d, declined %0d",of_accepted,of_declined);
+    if(of_accepted !== of_side) $fatal(1,"offer: %0d said ok, `side` received %0d",of_accepted,of_side);
+    for (of_i = 0; of_i < of_side; of_i = of_i + 1)
+      if(of_accepted_items[of_i] !== of_side_items[of_i]) $fatal(1,"offer: ok item %0d is %0d, `side` received %0d",of_i,of_accepted_items[of_i],of_side_items[of_i]);
+    $display("TB_PASS: sequence scoping, BRAM identities, assertions, literals, read-first, join/scatter, optional input, sends from several stages, nonblocking inputs below the head, conditional sends, blocked early sends, offers RTL");
     $finish;
   end
 endmodule

@@ -615,14 +615,14 @@ fn sequence_tail_constants_use_the_output_type() {
 fn sequence_duplicate_transfers_and_misplaced_nonblocking_buffers_are_diagnosed() {
     for (body, message) in [
         ("  let x = @rcv(src)\n  let y = @rcv(src)\n  |||\n  @send(o, x)\n", "`src` is received from twice"),
-        ("  let x = @rcv(src)\n  |||\n  @send(o, 8'd1)\n  @send(o, 8'd2)\n", "`o` is sent to twice"),
+        ("  let x = @rcv(src)\n  |||\n  @send(o, 8'd1)\n  @send(o, 8'd2)\n", "`o` is sent to more than once for one item"),
         // `@peek`, `@try_rcv` and `@drop` are supported in every stage, but a
         // pipe belongs to one: below the head, these touch the pipe the head
         // already receives from, and would act for a different item.
         ("  let x = @rcv(src)\n  |||\n  let (v, ok) = @peek(src)\n  @send(o, x)\n", "`src` is received from in stage 0 and stage 1"),
         ("  let x = @rcv(src)\n  |||\n  let (v, ok) = @try_rcv(src)\n  @send(o, x)\n", "`src` is received from in stage 0 and stage 1"),
         ("  let x = @rcv(src)\n  |||\n  @drop(src)\n  @send(o, x)\n", "`src` is received from in stage 0 and stage 1"),
-        ("  let x = @rcv(src)\n  |||\n  @try_send(o, x)\n  @send(o, x)\n", "`@try_send` is not supported in a sequence"),
+        ("  let x = @rcv(src)\n  |||\n  @try_send(o, x)\n  @send(o, x)\n", "`o` is sent to more than once for one item"),
     ] {
         let map = SourceMap::new("invalid_sequence.ddl", format!("sequence s (src: buffer in u8, o: buffer out u8)\n{body}"));
         // Calling the API directly ensures a panic cannot masquerade as a diagnostic.

@@ -12,6 +12,8 @@ use ddl::lex::TopLevelDecl;
 use ddl::parse::*;
 use std::collections::HashMap;
 
+pub mod salt;
+
 pub fn modules(src: &str) -> Vec<Module> {
     let map = SourceMap::new("regression.ddl", src);
     let parsed = ddl::driver::parse_source(&map).unwrap();

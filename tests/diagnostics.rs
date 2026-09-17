@@ -604,7 +604,8 @@ fn a_second_take_in_a_sequence_stage_points_at_the_second() {
 }
 
 #[test]
-fn a_try_send_in_a_sequence_points_at_the_send() {
+fn a_second_send_to_one_output_in_a_sequence_points_at_the_second() {
+    // Offer or blocking send, the second one in source order is the excess.
     let (line, msg) = first_error(concat!(
         "sequence s (a: buffer in u8, o: buffer out u8)\n",
         "  let x = @rcv(a)\n",
@@ -612,6 +613,6 @@ fn a_try_send_in_a_sequence_points_at_the_send() {
         "  let sent = @try_send(o, x)\n",
         "  @send(o, x)\n",
     ));
-    assert_eq!(line, 4, "{}", msg);
-    assert!(msg.contains("`@try_send` is not supported in a sequence"), "{}", msg);
+    assert_eq!(line, 5, "{}", msg);
+    assert!(msg.contains("`o` is sent to more than once for one item"), "{}", msg);
 }

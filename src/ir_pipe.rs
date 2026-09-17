@@ -5,13 +5,14 @@
 // data -- desc.md:80's "implicit is_valid condition at each stage".
 //
 // EACH STAGE SHIFTS ON ITS OWN. Stage k moves its item on when every sink it
-// sends to has a slot and the cut below it is free -- empty, or emptying
+// waits on has a slot and the cut below it is free -- empty, or emptying
 // because the stage below is moving too:
 //
 //     shift_k = room_k & (!v_k | shift_{k+1})
 //
 // desc.md:77's "pipeline fires when all buffer sinks have slots", said per
-// stage. Latency is one cycle per stage; throughput is one item per cycle
+// stage. Nothing after stage k reads `room_k`, so a stage held by its sinks
+// never holds the stages below it; the cut under it takes a bubble instead. Latency is one cycle per stage; throughput is one item per cycle
 // while the sinks keep up.
 //
 // It used to be one `shift` for the whole pipeline, which was enough while
@@ -25,9 +26,13 @@
 // in place.
 //
 // What that costs is a chain: `shift_0` depends on every stage below it
-// within the cycle. Every term in it is a register on this side -- a validity
-// bit, or a slot's occupancy -- so the chain is local to the module and never
-// reaches through a pipe into another one.
+// within the cycle. Its terms are registers on this side -- a validity bit, a
+// slot's occupancy -- and the conditions the stages put their sends under,
+// which are this module's logic over its own registers and the other sides'
+// salts, themselves registers. So the chain is local to the module and never
+// reaches through a pipe's handshake into another one. That is also why the
+// shifts are built after every stage is lowered: a send's condition is one of
+// their terms, and a value cannot be used before it is emitted.
 //
 // A value defined in one stage and read two stages later needs TWO registers,
 // not one. It has to arrive alongside the item it belongs to, and that item is
@@ -48,14 +53,19 @@
 //
 // A HEAD IS A JOIN AND A STAGE'S SENDS ARE A SCATTER. A sequence may name any
 // number of `buffer in` and `buffer out` parameters. Every blocking input is
-// received exactly once in stage 0, and every output sent to exactly once in
-// whichever stage the source puts its `@send`. The head moves as one: `offered`
-// is the AND over the blocking inputs, and one `take` serves all of them.
-// So do the sends of one stage: its `room` is the AND over the sinks it sends
-// to, and one `push` serves all of them. Every sink or none, for the reason
-// ir_comb.rs:234 gives about `@split` -- ANDing the sinks' readys would put
-// each consumer's logic in every other one's timing path, where asking whether
-// each has a slot only reads registers on this side.
+// received exactly once in stage 0. The head moves as one: `offered` is the
+// AND over the blocking inputs, and one `take` serves all of them.
+//
+// Every output is sent to from ONE stage, at most once per item, under any
+// condition -- `@send`, which waits, or `@try_send`, which does not. A stage's
+// `room` is the AND over the sinks it waits on, each term `room | !waits` so an
+// item that does not send there is not held by it, and an offer is no term at
+// all. Every waited sink or none, for the reason ir_comb.rs:234 gives about
+// `@split` -- ANDing the sinks' readys would put each consumer's logic in every
+// other one's timing path, where asking whether each has a slot only reads
+// registers on this side. A stage's `push{k}` is its shift and its liveness; a
+// sink's push narrows that to the items that send to it, and for an offer to
+// there being room, which the offer answers with.
 //
 // EVERY OTHER INPUT IS NONBLOCKING, AND MAY SIT IN ANY STAGE. `@try_rcv`,
 // `@peek` and `@drop` are lowered by the same code a process uses, anywhere in
@@ -189,22 +199,6 @@ fn never_taken_note(name: &str) -> String {
     )
 }
 
-/// `@send(p, v)`, an output of whichever stage it sits in.
-fn as_send(stmt: &PrecResInnerStmt) -> Option<(String, PrecResExpr)> {
-    let call = match stmt {
-        PrecResInnerStmt::CallStmt(c) => c,
-        _ => return None,
-    };
-    match &call.base {
-        PrecResExpr::Builtin(BuiltinOp::BlockingSend) if call.args.len() == 2 => {}
-        _ => return None,
-    }
-    match &call.args[0] {
-        PrecResExpr::Ref(n) => Some((anumspan_to_str(n).to_string(), call.args[1].clone())),
-        _ => None,
-    }
-}
-
 /// A `bram` read that has had its address presented, waiting for the cut it
 /// lands on.
 ///
@@ -311,26 +305,25 @@ fn declare_memories(
 /// Registers `v` across one cut, and answers with the register.
 ///
 /// The same shape the crossing loop builds by hand for a named binding: a slot,
-/// a `RegRead` off it, and a next-value that takes `v` when the stage above the
-/// cut moves and holds otherwise. Pulled out because a forwarded write needs
-/// two of these and is not a name in the environment, so the loop that walks
-/// `env` cannot make them.
-#[allow(clippy::too_many_arguments)]
+/// a `RegRead` off it, and a load -- `v` when the stage above the cut moves,
+/// held otherwise -- recorded in `loads` and built once that stage's shift
+/// exists. Pulled out because a forwarded write needs two of these and is not
+/// a name in the environment, so the loop that walks `env` cannot make them.
+#[allow(clippy::type_complexity)]
 fn cross(
     low: &mut Lowerer,
-    pending: &mut Vec<(usize, String, Ty, ValueId)>,
+    loads: &mut Vec<(usize, String, Ty, ValueId, ValueId, usize)>,
     next_slot: &mut usize,
     name: String,
     ty: Ty,
     v: ValueId,
-    shift: Option<ValueId>,
+    stage: usize,
 ) -> ValueId {
     let slot = *next_slot;
     *next_slot += 1;
     let held = low.emit(ty.clone(), Op::RegRead(slot as u32));
     low.name_value(held, name.clone());
-    let next = load_on(low, shift, ty.clone(), v, held);
-    pending.push((slot, name, ty, next));
+    loads.push((slot, name, ty, v, held, stage));
     held
 }
 
@@ -538,24 +531,44 @@ fn reads(stage: &[&PrecResInnerStmt]) -> HashSet<String> {
     out
 }
 
-/// The `in` pipes a sequence BLOCKS on, read straight off its source.
+/// How a sequence's head fires, read straight off its source.
 ///
-/// A nonblocking input is not one of them: the head fires without it. That
-/// difference decides whether a loop of pipes between sequences can ever carry
-/// an item, which is `ir_graph::check_pipe_deadlock`'s question -- and it has
-/// to be answerable from the syntax, because a parameter list cannot say it and
-/// the answer is wanted before any graph is lowered.
+/// `blocking` is every pipe stage 0 takes with `@rcv`; the head waits for ALL
+/// of them. `optional` is every name stage 0 mentions anywhere else -- its
+/// `@try_rcv`, `@peek` and `@drop` among them -- and with no blocking input,
+/// the head fires when ANY of those pipes offers. Inputs a later stage touches
+/// are in neither: they sample for items already inside, and have no say in
+/// whether one enters.
+///
+/// That decides whether a loop of pipes between sequences can ever carry an
+/// item, which is `ir_graph::check_pipe_deadlock`'s question -- and it has to
+/// be answerable from the syntax, because a parameter list cannot say it and
+/// the answer is wanted before any graph is lowered. `optional` holds names
+/// that are not pipes too, and a local that shadows a pipe can put one there
+/// that nothing reads. The checker only ever asks about the sequence's own
+/// `in` parameters, and a spurious one can only make a head look likelier to
+/// fire -- a missed report, never a false one.
 ///
 /// A body too malformed to lower gives whatever it does say here. That is
 /// harmless: the check runs only once nothing else has been reported.
-pub fn blocking_inputs_of(decl: &crate::parse::SequenceDecl) -> Vec<String> {
+pub struct HeadInputs {
+    pub blocking: Vec<String>,
+    pub optional: HashSet<String>,
+}
+
+pub fn head_inputs_of(decl: &crate::parse::SequenceDecl) -> HeadInputs {
     let stages = split_stages(&decl.body);
+    let mut inputs = HeadInputs { blocking: Vec::new(), optional: HashSet::new() };
     let Some(head) = stages.first() else {
-        return Vec::new();
+        return inputs;
     };
-    head.iter()
-        .filter_map(|stmt| as_recv(stmt).map(|(_, name)| name))
-        .collect()
+    for stmt in head {
+        match as_recv(stmt) {
+            Some((_, name)) => inputs.blocking.push(name),
+            None => reads_of(stmt, &mut inputs.optional),
+        }
+    }
+    inputs
 }
 
 pub fn lower_sequence(
@@ -668,7 +681,7 @@ pub fn lower_sequence(
     // of each, "was there one" is a question per pipe, and the answer has to
     // say WHICH.
     let mut recv_of: Vec<Option<&VarDeclStmt>> = vec![None; low.pipes.len()];
-    // The stage each output is sent from.
+    // The stage each output is sent from, settled below with the inputs'.
     let mut send_stage: Vec<Option<usize>> = vec![None; low.pipes.len()];
     let mut plain: Vec<Vec<&PrecResInnerStmt>> = Vec::with_capacity(n);
 
@@ -714,41 +727,6 @@ pub fn lower_sequence(
                     return None;
                 }
                 recv_of[ix] = Some(declaration);
-            }
-            if let Some((name, _)) = as_send(stmt) {
-                let Some(ix) = low.pipes.iter().position(|p| p.name == name) else {
-                    sink.err_span(at, format!("`{}` is not a pipe of this sequence", name));
-                    return None;
-                };
-                if low.pipes[ix].is_input {
-                    sink.err_span(
-                        at,
-                        format!("`{}` is an `in` pipe; it cannot be sent to", name),
-                    );
-                    return None;
-                }
-                // Across the whole body, not per stage: an item that went into
-                // a pipe in stage 0 and again in stage 2 would be two items to
-                // the consumer, and a consumer of a sequence is owed one each.
-                if let Some(first) = send_stage[ix] {
-                    let where_first = if first == k {
-                        "the first is in this stage too".to_string()
-                    } else {
-                        format!("the first is in stage {}", first)
-                    };
-                    sink.push(
-                        Diag::error(
-                            at,
-                            format!(
-                                "`{}` is sent to twice; a sequence puts exactly one item into each of its `out` pipes",
-                                name,
-                            ),
-                        )
-                        .with_note(where_first),
-                    );
-                    return None;
-                }
-                send_stage[ix] = Some(k);
             }
             // Keep reads and sends at their source positions. Their values
             // and side effects must see only the statements preceding them.
@@ -823,23 +801,42 @@ pub fn lower_sequence(
         );
         return None;
     }
+    // The same question for an output, and the same rule. A send is a
+    // statement like any other now, written under whatever condition the stage
+    // likes, so where the sends to a pipe are is read off the stage the way an
+    // input's operations are -- and two stages sending to one pipe would put
+    // two different items' values into one slot's worth of decision.
     for ix in &outputs {
-        let was_sent = send_stage[*ix].is_some();
-        if was_sent {
-            continue;
-        }
         let name = low.pipes[*ix].name.clone();
-        sink.push(
-            Diag::error(
-                map.span_of(&decl.name),
-                format!("`{}` is never sent to", name),
-            )
-            .with_note(format!(
-                "a sequence sends to every one of its `out` pipes exactly once, from whichever stage has the value, and that stage shifts only when all of its sinks have room; add `@send({}, ..)` to one",
-                name,
-            )),
-        );
-        return None;
+        let touching: Vec<usize> = (0..n).filter(|k| rds[*k].contains(&name)).collect();
+        if touching.is_empty() {
+            sink.push(
+                Diag::error(
+                    map.span_of(&decl.name),
+                    format!("`{}` is never sent to", name),
+                )
+                .with_note(format!(
+                    "a sequence sends to every one of its `out` pipes from one stage, at most once per item; add `@send({}, ..)` to one, under whatever condition the item needs",
+                    name,
+                )),
+            );
+            return None;
+        }
+        let is_shared_by_stages = touching.len() > 1;
+        if is_shared_by_stages {
+            let stages: Vec<String> = touching.iter().map(|k| format!("stage {}", k)).collect();
+            sink.push(
+                Diag::error(
+                    map.span_of(&decl.name),
+                    format!("`{}` is sent to in {}", name, stages.join(" and ")),
+                )
+                .with_note(
+                    "every stage of a pipeline is live at once holding a different item, so sends to one pipe from two stages would be two items competing for one slot, in no order the source says; put every send to this pipe in one stage",
+                ),
+            );
+            return None;
+        }
+        send_stage[*ix] = Some(touching[0]);
     }
 
     // ---- the shift enables -----------------------------------------------
@@ -912,13 +909,12 @@ pub fn lower_sequence(
         tail.wsalt_q.push(q);
     }
 
-    // A stage moves when there is somewhere for everything leaving it to go.
-    // EVERY SINK IT SENDS TO, OR NONE -- the policy `ir_comb.rs:234` states
-    // for `@split`, and for its reason: ANDing the sinks' READYS would put each
-    // consumer's logic in every other one's timing path, where this asks only
-    // whether each has a slot, which is a register on this side.
+    // Whether each output has a slot: registers on both sides, so it can
+    // exist before any stage is lowered. It is also what a send asks of the
+    // pipe while it is being lowered -- `fired`, the eligibility a process's
+    // offers read -- so `@try_send` answers with it.
     let mut full: Vec<ValueId> = Vec::with_capacity(tail.ix.len());
-    let mut rooms_at: Vec<Vec<ValueId>> = vec![Vec::new(); n];
+    let mut room_of: Vec<Option<ValueId>> = vec![None; low.pipes.len()];
     for j in 0..tail.ix.len() {
         let ix = tail.ix[j];
         let name = low.pipes[ix].name.clone();
@@ -926,53 +922,8 @@ pub fn lower_sequence(
         let room = low.emit(Ty::BOOL, Op::Un { op: UnOp::LogNot, arg: is_full });
         low.name_value_safe(room, format!("{}_room", name));
         full.push(is_full);
-        let k = send_stage[ix].expect("every `out` pipe was sent to above");
-        rooms_at[k].push(room);
-    }
-
-    // And the cut below it is free: empty, or emptying because the stage
-    // below moves on this same edge. Built from the last stage up, since each
-    // stage's answer is the one below it plus its own sinks.
-    //
-    // `None` is a stage nothing can hold up, because no stage at or below it
-    // sends: it moves every cycle, and every register it loads is a plain
-    // register. `room_at[k]` and `open_at[k]` are kept apart because the
-    // validity bit needs them apart -- see the chain at the bottom.
-    let mut room_at: Vec<Option<ValueId>> = vec![None; n];
-    let mut open_at: Vec<Option<ValueId>> = vec![None; chain];
-    let mut shift_at: Vec<Option<ValueId>> = vec![None; n];
-    for k in (0..n).rev() {
-        let sends_here = !rooms_at[k].is_empty();
-        let room = sends_here.then(|| crate::ir_comb::all_of(&mut low, &rooms_at[k]));
-        let has_a_cut_below = k < chain;
-        let below = if has_a_cut_below { shift_at[k + 1] } else { None };
-        let open = below.map(|below| {
-            let occupied = low.emit(Ty::BOOL, Op::RegRead((valid_base + k) as u32));
-            let vacant = low.emit(Ty::BOOL, Op::Un { op: UnOp::LogNot, arg: occupied });
-            low.emit(Ty::BOOL, Op::Bin { op: BinOp::Or, lhs: vacant, rhs: below })
-        });
-        let shift = match (room, open) {
-            (Some(r), Some(o)) => {
-                // Both halves are signals of their own only here; elsewhere the
-                // shift IS the one there is, and takes its name instead.
-                if rooms_at[k].len() > 1 {
-                    low.name_value_safe(r, per_stage("room", k, n));
-                }
-                low.name_value_safe(o, per_stage("open", k, n));
-                Some(low.emit(Ty::BOOL, Op::Bin { op: BinOp::And, lhs: r, rhs: o }))
-            }
-            (Some(r), None) => Some(r),
-            (None, Some(o)) => Some(o),
-            (None, None) => None,
-        };
-        if let Some(s) = shift {
-            low.name_value(s, per_stage("shift", k, n));
-        }
-        room_at[k] = room;
-        if has_a_cut_below {
-            open_at[k] = open;
-        }
-        shift_at[k] = shift;
+        room_of[ix] = Some(room);
+        low.pipes[ix].fired = Some(room);
     }
 
     // ---- stage bodies -----------------------------------------------------
@@ -1070,10 +1021,17 @@ pub fn lower_sequence(
     // enables refer to is known.
     let mut issued: Vec<IssuedRead> = Vec::new();
 
-    // Per output: what its `@send` produced, captured at the send's own source
-    // position so an assignment sitting between two sends is seen by the later
-    // one and not by the earlier.
-    let mut sent: Vec<Option<ValueId>> = vec![None; low.pipes.len()];
+    // Registers that load when their stage moves, and what else waits for a
+    // stage's shift: all of it is decided at the end of a stage, and none of it
+    // can be built there any more. A shift is only known once every stage below
+    // has been lowered, because a send's condition is part of it -- and values
+    // are emitted in order, so nothing may use one before it exists. Recorded
+    // here, and built once the shifts are.
+    //
+    // `(slot, name, ty, value, held, stage)`.
+    let mut loads: Vec<(usize, String, Ty, ValueId, ValueId, usize)> = Vec::new();
+    // `(stage, first, end)` into `low.asserts`.
+    let mut stage_asserts: Vec<(usize, usize, usize)> = Vec::new();
 
     for (k, stage) in plain.iter().enumerate() {
         let assertion_start = low.asserts.len();
@@ -1109,40 +1067,6 @@ pub fn lower_sequence(
                     Binding::constant(item, ty)
                 };
                 env.insert(anumspan_to_str(&declaration.head_name()).to_string(), binding);
-                continue;
-            }
-            if let Some((send_name, expr)) = as_send(stmt) {
-                let out_ix = low
-                    .pipes
-                    .iter()
-                    .position(|p| p.name == send_name)
-                    .expect("the tail sends were resolved above");
-                let out_ty = low.pipes[out_ix].ty.clone();
-                // Capture the payload now, before later assignments. Nested
-                // port sends and assertions are part of this stage as well,
-                // before its transfers are collected and execution-gated.
-                let at = crate::ir::stmt_anchor(stmt)
-                    .map(|a| low.span_of(&a))
-                    .unwrap_or_else(crate::driver::nowhere);
-                let depth = low.push_anchor(at);
-                let value = crate::ir::lower_expr_expecting(
-                    &mut low, &expr, Some(&out_ty), &env, sink,
-                );
-                low.pop_anchor(depth);
-                let mut value = value?;
-                if low.ty_of(value) != out_ty
-                    && let Some(coerced) = low.coerce_const_pub(value, &out_ty) {
-                        value = coerced;
-                    }
-                let have = low.ty_of(value);
-                if have != out_ty {
-                    sink.err_span(at, format!(
-                        "`{}` carries `{}` but `{}` was sent",
-                        low.pipes[out_ix].name, out_ty.display(), have.display(),
-                    ));
-                    return None;
-                }
-                sent[out_ix] = Some(value);
                 continue;
             }
             // `let x = mem[i]` on a `bram`, in its own place in the stage.
@@ -1224,14 +1148,8 @@ pub fn lower_sequence(
             crate::ir::lower_stmt_pub(&mut low, stmt, &mut env, sink)?;
         }
         if low.asserts.len() != assertion_start {
-            let live = stage_live(&mut low, k, &mut offered, &mut head, valid_base);
-            let executing = moving(&mut low, live, shift_at[k]);
-            gate_assertions(&mut low, assertion_start, executing);
+            stage_asserts.push((k, assertion_start, low.asserts.len()));
         }
-        // A write belongs to the item in this stage, on the cycle the stage
-        // moves it on. Ungated, a stall would rewrite every cycle it waited and
-        // a bubble would write whatever the wires happened to hold.
-        gate_writes(&mut low, k, &mem_owner, &mut env, shift_at[k], &mut offered, &mut head, valid_base);
         // What this stage offered, and then cleared so the next stage's answer
         // is its own. Without the reset a send in stage 0 would read as a send
         // in every stage after it.
@@ -1267,8 +1185,7 @@ pub fn lower_sequence(
             next_slot += 1;
             let held = low.emit(b.ty.clone(), Op::RegRead(slot as u32));
             low.name_value(held, format!("{}_s{}", name, k + 1));
-            let next = load_on(&mut low, shift_at[k], b.ty.clone(), v, held);
-            pending.push((slot, format!("{}_s{}", name, k + 1), b.ty.clone(), next));
+            loads.push((slot, format!("{}_s{}", name, k + 1), b.ty.clone(), v, held, k));
             let stays_mutable = b.is_mutable;
             env.insert(
                 name,
@@ -1298,12 +1215,12 @@ pub fn lower_sequence(
                 // Answered by the write above it; the array was never asked.
                 (None, Some((_, wdata))) => cross(
                     &mut low,
-                    &mut pending,
+                    &mut loads,
                     &mut next_slot,
                     format!("{}_s{}", r.bind, k + 1),
                     elem.clone(),
                     wdata,
-                    shift_at[k],
+                    k,
                 ),
                 (Some(p), Some((hit, wdata))) => {
                     let q = low.emit(
@@ -1312,21 +1229,21 @@ pub fn lower_sequence(
                     );
                     let hit_q = cross(
                         &mut low,
-                        &mut pending,
+                        &mut loads,
                         &mut next_slot,
                         format!("{}_fwd{}_s{}", mem, p, k + 1),
                         Ty::BOOL,
                         hit,
-                        shift_at[k],
+                        k,
                     );
                     let data_q = cross(
                         &mut low,
-                        &mut pending,
+                        &mut loads,
                         &mut next_slot,
                         format!("{}_wdata{}_s{}", mem, p, k + 1),
                         elem.clone(),
                         wdata,
-                        shift_at[k],
+                        k,
                     );
                     low.emit(elem.clone(), Op::Mux { cond: hit_q, then_val: data_q, else_val: q })
                 }
@@ -1341,18 +1258,127 @@ pub fn lower_sequence(
                 Some(ok) => {
                     let ok_q = cross(
                         &mut low,
-                        &mut pending,
+                        &mut loads,
                         &mut next_slot,
                         format!("{}_inrange{}_s{}", mem, r.port.unwrap_or(0), k + 1),
                         Ty::BOOL,
                         ok,
-                        shift_at[k],
+                        k,
                     );
                     low.guarded_read(Some(ok_q), value, &elem)
                 }
             };
             env.insert(r.bind.clone(), Binding::constant(value, elem));
         }
+    }
+
+    // ---- the shift enables, now that every send's condition exists --------
+    // A stage moves when there is somewhere for everything leaving it to go.
+    // EVERY SINK IT SENDS TO, OR NONE -- the policy `ir_comb.rs:234` states
+    // for `@split`, and for its reason: ANDing the sinks' READYS would put each
+    // consumer's logic in every other one's timing path, where this asks only
+    // whether each has a slot, which is a register on this side.
+    //
+    // Only the sinks the stage WAITS for count, and only on the items that
+    // send to them. A `@send` under a condition the item does not meet is a
+    // send that is not happening, and a full sink it is not going to has no
+    // business holding the item up -- so its term is `room | !waits`, which
+    // for an unconditional send is `room` and emits nothing extra. A pipe
+    // only ever offered to with `@try_send` is not waited for at all.
+    //
+    // What that costs: the condition is stage logic, so `shift_0` now reaches
+    // through the conditions of every stage below it. It is still this
+    // module's logic and this side's registers -- and the other side's
+    // `wsalt`, which is a register too -- so the chain stays inside the module.
+    let mut rooms_at: Vec<Vec<ValueId>> = vec![Vec::new(); n];
+    for j in 0..tail.ix.len() {
+        let ix = tail.ix[j];
+        if !low.pipes[ix].waits {
+            continue;
+        }
+        let room = room_of[ix].expect("every output's room was emitted before the stages");
+        let k = send_stage[ix].expect("every `out` pipe was sent to above");
+        let term = match low.pipes[ix].wait_guard {
+            None => room,
+            Some(waits) => {
+                let skips = low.emit(Ty::BOOL, Op::Un { op: UnOp::LogNot, arg: waits });
+                let clear = low.emit(Ty::BOOL, Op::Bin { op: BinOp::Or, lhs: room, rhs: skips });
+                let name = format!("{}_clear", low.pipes[ix].name);
+                low.name_value_safe(clear, name);
+                clear
+            }
+        };
+        rooms_at[k].push(term);
+    }
+
+    // And the cut below it is free: empty, or emptying because the stage
+    // below moves on this same edge. Built from the last stage up, since each
+    // stage's answer is the one below it plus its own sinks.
+    //
+    // `None` is a stage nothing can hold up, because no stage at or below it
+    // waits on a sink: it moves every cycle, and every register it loads is a plain
+    // register. `room_at[k]` and `open_at[k]` are kept apart because the
+    // validity bit needs them apart -- see the chain at the bottom.
+    let mut room_at: Vec<Option<ValueId>> = vec![None; n];
+    let mut open_at: Vec<Option<ValueId>> = vec![None; chain];
+    let mut shift_at: Vec<Option<ValueId>> = vec![None; n];
+    for k in (0..n).rev() {
+        let sends_here = !rooms_at[k].is_empty();
+        let room = sends_here.then(|| crate::ir_comb::all_of(&mut low, &rooms_at[k]));
+        let has_a_cut_below = k < chain;
+        let below = if has_a_cut_below { shift_at[k + 1] } else { None };
+        let open = below.map(|below| {
+            let occupied = low.emit(Ty::BOOL, Op::RegRead((valid_base + k) as u32));
+            let vacant = low.emit(Ty::BOOL, Op::Un { op: UnOp::LogNot, arg: occupied });
+            low.emit(Ty::BOOL, Op::Bin { op: BinOp::Or, lhs: vacant, rhs: below })
+        });
+        let shift = match (room, open) {
+            (Some(r), Some(o)) => {
+                // Both halves are signals of their own only here; elsewhere the
+                // shift IS the one there is, and takes its name instead.
+                if rooms_at[k].len() > 1 {
+                    low.name_value_safe(r, per_stage("room", k, n));
+                }
+                low.name_value_safe(o, per_stage("open", k, n));
+                Some(low.emit(Ty::BOOL, Op::Bin { op: BinOp::And, lhs: r, rhs: o }))
+            }
+            (Some(r), None) => Some(r),
+            (None, Some(o)) => Some(o),
+            (None, None) => None,
+        };
+        if let Some(s) = shift {
+            low.name_value(s, per_stage("shift", k, n));
+        }
+        room_at[k] = room;
+        if has_a_cut_below {
+            open_at[k] = open;
+        }
+        shift_at[k] = shift;
+    }
+
+
+    // ---- what waited for the shifts ---------------------------------------
+    //
+    // An assertion belongs to the item in its stage, and fires only on the
+    // cycle that stage moves it on.
+    for (k, start, end) in stage_asserts {
+        let live = stage_live(&mut low, k, &mut offered, &mut head, valid_base);
+        let executing = moving(&mut low, live, shift_at[k]);
+        gate_assertions(&mut low, start, end, executing);
+    }
+    // So does a write. Ungated, a stall would rewrite every cycle it waited
+    // and a bubble would write whatever the wires happened to hold. Late is
+    // safe: only the stage that owns a memory ever touches its write ports, so
+    // what the environment holds for them is still what that stage left.
+    for (k, shift) in shift_at.iter().enumerate() {
+        gate_writes(&mut low, k, &mem_owner, &mut env, *shift, &mut offered, &mut head, valid_base);
+    }
+    // Everything that crossed a cut loads when the stage above it moves: the
+    // cut can also open under a stage that is held, and then what it takes is
+    // a bubble, whose values nothing reads.
+    for (slot, name, ty, v, held, k) in loads {
+        let next = load_on(&mut low, shift_at[k], ty.clone(), v, held);
+        pending.push((slot, name, ty, next));
     }
 
     // ---- the output -------------------------------------------------------
@@ -1411,12 +1437,16 @@ pub fn lower_sequence(
     low.settle_memories(&env);
 
     // Nothing leaves a stage on a cycle it does not shift. ONE `push` per
-    // sending stage, for every sink that stage sends to: they were all given
-    // room by its shift and they all take the item it holds, so naming it after
-    // any one of them would be a lie about the rest. With one sending stage it
-    // is `push`, whichever stage that is; with several, `push{k}` -- the
+    // sending stage: every sink that stage sends to was given room by its
+    // shift, and they all take the item it holds, so naming it after any one
+    // of them would be a lie about the rest. With one sending stage it is
+    // `push`, whichever stage that is; with several, `push{k}` -- the
     // `<mem>_re` rule again.
-    let sending: Vec<usize> = (0..n).filter(|k| room_at[*k].is_some()).collect();
+    //
+    // A stage whose sinks are all offers has no shift of its own when nothing
+    // below it waits either. It moves every cycle, and its push is simply
+    // whether it holds an item.
+    let sending: Vec<usize> = (0..n).filter(|k| send_stage.contains(&Some(*k))).collect();
     let mut push_at: Vec<Option<ValueId>> = vec![None; n];
     for &k in &sending {
         // Stage 0 holds what the head gathered; stage k what the cut above it
@@ -1426,10 +1456,15 @@ pub fn lower_sequence(
         } else {
             low.emit(Ty::BOOL, Op::RegRead((valid_base + k - 1) as u32))
         };
-        let shift = shift_at[k].expect("a stage that sends has a shift");
-        let push = low.emit(Ty::BOOL, Op::Bin { op: BinOp::And, lhs: shift, rhs: live });
-        let name = if sending.len() == 1 { "push".to_string() } else { format!("push{}", k) };
-        low.name_value(push, name);
+        let push = match shift_at[k] {
+            Some(shift) => {
+                let push = low.emit(Ty::BOOL, Op::Bin { op: BinOp::And, lhs: shift, rhs: live });
+                let name = if sending.len() == 1 { "push".to_string() } else { format!("push{}", k) };
+                low.name_value(push, name);
+                push
+            }
+            None => live,
+        };
         push_at[k] = Some(push);
     }
 
@@ -1455,9 +1490,30 @@ pub fn lower_sequence(
             full: *is_full,
             base,
         };
-        let item = sent[ix].expect("every `out` pipe was sent to");
+        let item = low.pipes[ix].sent.expect("every `out` pipe was sent to");
         let stage = send_stage[ix].expect("every `out` pipe was sent to");
-        let push = push_at[stage].expect("a sending stage has a push");
+        let stage_push = push_at[stage].expect("a sending stage has a push");
+        // Per sink, the stage's push narrowed to the items that send here, and
+        // -- when any send here is an offer -- to there being room. A blocking
+        // send already had room, or its stage would not have moved; an offer
+        // did not wait, so it has to ask. An unconditional `@send` is the
+        // stage's push itself, and emits nothing more.
+        let wants = low.pipes[ix].send_guard;
+        let offers = low.pipes[ix].offers;
+        let push = if wants.is_none() && !offers {
+            stage_push
+        } else {
+            let mut push = stage_push;
+            if let Some(wants) = wants {
+                push = low.emit(Ty::BOOL, Op::Bin { op: BinOp::And, lhs: push, rhs: wants });
+            }
+            if offers {
+                let room = room_of[ix].expect("every output's room was emitted before the stages");
+                push = low.emit(Ty::BOOL, Op::Bin { op: BinOp::And, lhs: push, rhs: room });
+            }
+            low.name_value_safe(push, format!("{}_push", name));
+            push
+        };
         crate::ir_comb::push_out(&mut low, ix, &side, item, push, &mut pending, &mut drivers);
     }
 
@@ -1465,11 +1521,17 @@ pub fn lower_sequence(
     // `take`, because the head is a join -- every blocking input gives up its
     // item on the same cycle, or none of them does.
     //
-    // Stage 0 always has a shift: every sequence sends to something, and a
-    // send at or below a stage is what gives it one.
-    let head_shift = shift_at[0].expect("a sequence sends, so its head has a shift");
-    let take = low.emit(Ty::BOOL, Op::Bin { op: BinOp::And, lhs: offered, rhs: head_shift });
-    low.name_value(take, "take".to_string());
+    // Stage 0 has a shift whenever some stage waits on a sink. A sequence
+    // whose every send is an offer has none, never holds its head, and takes
+    // whatever is offered.
+    let take = match shift_at[0] {
+        Some(head_shift) => {
+            let take = low.emit(Ty::BOOL, Op::Bin { op: BinOp::And, lhs: offered, rhs: head_shift });
+            low.name_value(take, "take".to_string());
+            take
+        }
+        None => offered,
+    };
     // Whether each stage is live and moving, for the inputs it owns; emitted
     // once per stage that owns one. Stage 0's is `take`.
     let mut moving_at: Vec<Option<ValueId>> = vec![None; n];
@@ -1576,9 +1638,9 @@ pub fn lower_sequence(
     })
 }
 
-fn gate_assertions(low: &mut Lowerer, start: usize, executing: ValueId) {
+fn gate_assertions(low: &mut Lowerer, start: usize, end: usize, executing: ValueId) {
     let inactive = low.emit(Ty::BOOL, Op::Un { op: UnOp::LogNot, arg: executing });
-    for ix in start..low.asserts.len() {
+    for ix in start..end {
         let cond = low.asserts[ix].cond;
         low.asserts[ix].cond = low.emit(Ty::BOOL, Op::Bin { op: BinOp::Or, lhs: inactive, rhs: cond });
     }

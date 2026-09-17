@@ -2140,7 +2140,7 @@ fn a_sequence_must_end_by_sending() {
         "  let b: u32 = @zext(a, 32)\n",
     ));
     assert!(text.contains("`dst` is never sent to"), "{}", text);
-    assert!(text.contains("from whichever stage has the value"), "{}", text);
+    assert!(text.contains("from one stage, at most once per item"), "{}", text);
 }
 
 // ---- sequences with several pipes ----------------------------------------
@@ -2306,13 +2306,13 @@ fn one_output_may_not_be_sent_to_twice() {
         "  @send(x, p)\n",
         "  @send(y, p)\n",
     ));
-    assert!(text.contains("`x` is sent to twice"), "{}", text);
+    assert!(text.contains("`x` is sent to more than once for one item"), "{}", text);
 }
 
 #[test]
 fn one_output_may_not_be_sent_to_from_two_stages() {
-    // The rule is per item, not per stage: a pipe written in stage 0 and again
-    // in stage 1 would hand its consumer two items for one.
+    // Two stages hold two different items at once, so sends to one pipe from
+    // both would compete for its slot in no order the source says.
     let text = compile_err(concat!(
         "sequence s (a: buffer in u16, x: buffer out u16)\n",
         "  let p = @rcv(a)\n",
@@ -2320,8 +2320,7 @@ fn one_output_may_not_be_sent_to_from_two_stages() {
         "  |||\n",
         "  @send(x, p)\n",
     ));
-    assert!(text.contains("`x` is sent to twice"), "{}", text);
-    assert!(text.contains("the first is in stage 0"), "{}", text);
+    assert!(text.contains("`x` is sent to in stage 0 and stage 1"), "{}", text);
 }
 
 const EARLY_AND_LATE: &str = concat!(

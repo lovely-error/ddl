@@ -27,13 +27,13 @@ module mul3 (
 
   wire dst_full = dst_wsalt_q == (~dst_rsalt);
   wire shift2 = !dst_full;
-  wire shift1 = (!v1) | shift2;
-  wire shift0 = (!v0) | shift1;
   wire src_ridx = src_rsalt_q[0] ^ src_rsalt_q[1];
   wire [15:0] src_item = src_ridx ? src_data[31:16] : src_data[15:0];
   wire [15:0] doubled = src_item + src_item;
   wire [31:0] wide = {{16{1'b0}}, doubled_s1};
   wire [31:0] scaled = wide_s2 + wide_s2;
+  wire shift1 = (!v1) | shift2;
+  wire shift0 = (!v0) | shift1;
   wire src_empty = src_wsalt == src_rsalt_q;
   wire src_present = !src_empty;
   wire push = shift2 & v1;
@@ -88,10 +88,10 @@ module add_one (
 
   wire dst_full = dst_wsalt_q == (~dst_rsalt);
   wire shift1 = !dst_full;
-  wire shift0 = (!v0) | shift1;
   wire src_ridx = src_rsalt_q[0] ^ src_rsalt_q[1];
   wire [15:0] src_item = src_ridx ? src_data[31:16] : src_data[15:0];
   wire [15:0] b = a_s1 + 16'd1;
+  wire shift0 = (!v0) | shift1;
   wire src_empty = src_wsalt == src_rsalt_q;
   wire src_present = !src_empty;
   wire push = shift1 & v0;
@@ -142,11 +142,11 @@ module saturate (
 
   wire dst_full = dst_wsalt_q == (~dst_rsalt);
   wire shift1 = !dst_full;
-  wire shift0 = (!v0) | shift1;
   wire src_ridx = src_rsalt_q[0] ^ src_rsalt_q[1];
   wire [31:0] src_item = src_ridx ? src_data[63:32] : src_data[31:0];
   wire too_big = a_s1 > 32'hFFFF;
   wire [31:0] b = too_big ? 32'hFFFF : a_s1;
+  wire shift0 = (!v0) | shift1;
   wire src_empty = src_wsalt == src_rsalt_q;
   wire src_present = !src_empty;
   wire push = shift1 & v0;
